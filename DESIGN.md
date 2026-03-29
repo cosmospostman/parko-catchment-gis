@@ -568,6 +568,23 @@ Run as:
 ./run.sh 2025 06-01 10-31   # adjusted composite window
 ```
 
+### Per-step resource estimates
+
+Data download figures are for first run; subsequent runs fetch only newly available scenes (cache hit rate typically >90% on re-runs). Runtime assumes a 16-core workstation with 16 GB RAM and a 100 Mbps connection, processing with Dask over the full 72,229 km² catchment extent.
+
+| Step | Description | Data download (first run) | Estimated runtime | Output size |
+|---|---|---|---|---|
+| 1 | S2 dry-season composite | ~25 GB (6 bands × ~20 scenes via COG range requests) | 40–60 min | ~4 GB (NDVI median + band stack, Float32 10 m) |
+| 2 | NDVI anomaly | ~15 GB (DEA Landsat, ~700 scenes × 3 bands; computed once, reused annually) | 50–70 min | ~2 GB (anomaly raster resampled to 10 m) |
+| 3 | Flowering index | ~5 GB (S2 Aug–Oct scenes; largely already cached from Step 1) | 10–20 min | ~600 MB (single-band ratio, Float32 10 m) |
+| 4 | S1 flood extent | ~8 GB (~15 GRD scenes × ~500 MB each) | 50–70 min | ~50 MB (vector .gpkg) |
+| 5 | Random Forest classifier | Negligible (ALA training points via API) | 20–40 min | ~3 GB (probability raster, Float32 10 m) |
+| 6 | Vectorise and prioritise | None | 10–20 min | ~20 MB (two .gpkg files) |
+| 7 | Change detection | None | 5–10 min | ~3 GB (difference raster) + negligible CSV |
+| **Total** | | **~53 GB first run; ~5–10 GB annually thereafter** | **3–5 hours** | **~13 GB per annual run** |
+
+Step 2's Landsat baseline is the largest one-time cost — once computed and cached it does not need to be redownloaded unless the cache is cleared. Step 4 is the most time-intensive per GB because S1 GRD preprocessing (terrain correction) is CPU-bound rather than I/O-bound.
+
 **Design notes:**
 - `set -euo pipefail` means any failed command or failed verification exits immediately. Downstream steps never run on bad inputs.
 - Year and composite window are arguments so the pipeline can be re-run for any year or adjusted window without touching code.
