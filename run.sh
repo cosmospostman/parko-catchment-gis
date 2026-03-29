@@ -59,11 +59,13 @@ export REBUILD_BASELINE
 export CODE_DIR
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
-mkdir -p "${LOG_DIR}"
+mkdir -p "${LOG_DIR}" 2>/dev/null || true
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="${LOG_DIR}/run_${YEAR}_${TIMESTAMP}.log"
-# Redirect all output through tee to log file
-exec > >(tee -a "${LOG_FILE}") 2>&1
+# Redirect all output through tee to log file (fall back to no log if dir unwritable)
+if [[ -w "${LOG_DIR}" ]]; then
+    exec > >(tee -a "${LOG_FILE}") 2>&1
+fi
 
 echo ""
 printf "${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}\n"
