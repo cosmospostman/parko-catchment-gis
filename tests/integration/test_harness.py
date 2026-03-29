@@ -58,8 +58,8 @@ def _write_stub_scripts(project_root: Path, step_nums=range(1, 8)):
     }
     analysis_dir = project_root / "analysis"
     verify_dir   = project_root / "verify"
-    analysis_dir.mkdir(exist_ok=True)
-    verify_dir.mkdir(exist_ok=True)
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+    verify_dir.mkdir(parents=True, exist_ok=True)
 
     for n in step_nums:
         a_name, v_name = step_map[n]

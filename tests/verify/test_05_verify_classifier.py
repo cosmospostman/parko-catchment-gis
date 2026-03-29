@@ -47,11 +47,15 @@ def _write_model_cache(cache_path: Path, top_feature: str, cv_mean: float = 0.90
     idx = feature_names.index(top_feature)
     importances = np.zeros(len(feature_names))
     importances[idx] = 1.0
-    clf.feature_importances_ = importances
     cv_scores = np.array([cv_mean] * 5)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     with open(cache_path, "wb") as f:
-        pickle.dump({"model": clf, "feature_names": feature_names, "cv_scores": cv_scores}, f)
+        pickle.dump({
+            "model": clf,
+            "feature_names": feature_names,
+            "cv_scores": cv_scores,
+            "feature_importances": importances,
+        }, f)
 
 
 def test_geographic_top_feature_fails(tmp_dirs):

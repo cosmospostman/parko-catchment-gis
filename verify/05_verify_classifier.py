@@ -42,7 +42,7 @@ def main() -> None:
         clf = cache["model"]
         feature_names = cache.get("feature_names", [])
         cv_scores = cache.get("cv_scores")
-        importances = clf.feature_importances_
+        importances = cache.get("feature_importances", clf.feature_importances_)
         if len(importances) == len(feature_names):
             top_idx = int(np.argmax(importances))
             top_feature = feature_names[top_idx]
