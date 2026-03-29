@@ -4,7 +4,23 @@ Detects and maps *Parkinsonia aculeata* (parkinsonia) across a catchment using
 Sentinel-2 NDVI composites, flood extent, flowering index, and a random-forest
 classifier. Outputs priority-patch polygons and year-on-year change detection.
 
+## Virtual environment
+
+Create the venv once:
+
+```bash
+python3 -m venv .venv
+```
+
+Activate it before running any code:
+
+```bash
+source .venv/bin/activate
+```
+
 ## Setup
+
+Install dependencies (with the venv active):
 
 ```bash
 pip install -r requirements.txt
