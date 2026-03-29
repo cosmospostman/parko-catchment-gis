@@ -31,6 +31,15 @@ You must also place the catchment boundary file at:
 $BASE_DIR/mitchell_catchment.geojson
 ```
 
+Fetch it from the Queensland Government drainage basins dataset:
+
+```bash
+curl -s "https://spatial-gis.information.qld.gov.au/arcgis/rest/services/InlandWaters/DrainageBasins/MapServer/1/query?where=BASIN_NAME+LIKE+%27%25Mitchell%25%27&f=geojson&outFields=*" \
+  -o "${BASE_DIR}/mitchell_catchment.geojson"
+```
+
+This queries the Queensland spatial data service for the Mitchell drainage basin and writes it directly to the expected path. Run it after sourcing `config.sh` so `$BASE_DIR` is set.
+
 Source the config before running anything:
 
 ```bash
