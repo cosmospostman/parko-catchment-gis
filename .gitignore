@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+*.so
+.venv/
+venv/
+env/
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Data (large files — managed separately)
+data/cache/
+data/working/
+outputs/
+*.tif
+*.gpkg
+*.nc
+*.h5
+
+# Keep fixtures and small test data
+!tests/fixtures/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model cache
+*.pkl
