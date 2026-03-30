@@ -16,6 +16,17 @@ export CODE_DIR="${CODE_DIR:-${SCRIPT_DIR}}"
 # PROJ_DATA — when rasterio and pyproj bundle different libproj versions, point
 # PROJ_DATA at rasterio's proj_data so the minor version matches the libproj
 # that wins at runtime (rasterio's is newer and takes precedence).
-if python3 -c "import rasterio" 2>/dev/null; then
-    export PROJ_DATA="${PROJ_DATA:-$(python3 -c "import os, rasterio; print(os.path.join(os.path.dirname(rasterio.__file__), 'proj_data'))")}"
+# Use 'python' (not 'python3') so this works inside an activated venv on EC2.
+_PYTHON="${VIRTUAL_ENV:+${VIRTUAL_ENV}/bin/python}"
+_PYTHON="${_PYTHON:-$(command -v python 2>/dev/null || command -v python3 2>/dev/null)}"
+if [[ -n "${_PYTHON}" ]] && "${_PYTHON}" -c "import rasterio" 2>/dev/null; then
+    _RASTERIO_PROJ_DATA="$("${_PYTHON}" -c "import os, rasterio; p=os.path.join(os.path.dirname(rasterio.__file__),'proj_data'); print(p if os.path.isdir(p) else '')" 2>/dev/null || echo "")"
+    if [[ -n "${_RASTERIO_PROJ_DATA}" ]]; then
+        export PROJ_DATA="${PROJ_DATA:-${_RASTERIO_PROJ_DATA}}"
+    else
+        # Fall back to pyproj's bundled data directory
+        _PYPROJ_DATA="$("${_PYTHON}" -c "from pyproj.datadir import get_data_dir; print(get_data_dir())" 2>/dev/null || echo "")"
+        [[ -n "${_PYPROJ_DATA}" ]] && export PROJ_DATA="${PROJ_DATA:-${_PYPROJ_DATA}}"
+    fi
 fi
+unset _PYTHON _RASTERIO_PROJ_DATA _PYPROJ_DATA

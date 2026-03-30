@@ -56,17 +56,41 @@ def main() -> None:
     load_bands = config.COMPOSITE_BANDS + ["scl"]
     logger.info("Loading %d scenes, bands: %s", len(items), load_bands)
 
-    # Set GDAL env vars before ThreadPoolExecutor so all worker threads inherit them
+    # Set GDAL/PROJ env vars before ThreadPoolExecutor so all worker threads inherit them.
+    # AWS_NO_SIGN_REQUEST and AWS_DEFAULT_REGION are set unconditionally: on EC2 instances
+    # the IAM role credential chain is auto-detected by GDAL/libcurl and will produce signed
+    # requests that 403 against the public sentinel-cogs bucket even if NO_SIGN_REQUEST is
+    # already in the environment via a prior setdefault.
+    os.environ["AWS_NO_SIGN_REQUEST"] = "YES"
+    os.environ["AWS_DEFAULT_REGION"] = "us-west-2"
     gdal_env = {
-        "GDAL_HTTP_MAX_RETRY": "3",
-        "GDAL_HTTP_RETRY_DELAY": "0.5",
+        "GDAL_HTTP_MAX_RETRY": "5",
+        "GDAL_HTTP_RETRY_DELAY": "2",
+        "GDAL_HTTP_RETRY_ON_HTTP_ERROR": "429,500,502,503,504",
         "GDAL_HTTP_MERGE_CONSECUTIVE_RANGES": "YES",
         "CPL_VSIL_CURL_CHUNK_SIZE": "10485760",  # 10 MB
         "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
-        "AWS_NO_SIGN_REQUEST": "YES",
     }
     for k, v in gdal_env.items():
         os.environ.setdefault(k, v)
+
+    # Ensure PROJ_DATA is set so worker threads can find proj.db regardless of
+    # whether config.sh was sourced.  Prefer the rasterio-bundled proj_data
+    # (matches the libproj rasterio links against); fall back to pyproj's copy.
+    if "PROJ_DATA" not in os.environ:
+        try:
+            import rasterio
+            proj_data = os.path.join(os.path.dirname(rasterio.__file__), "proj_data")
+            if os.path.isdir(proj_data):
+                os.environ["PROJ_DATA"] = proj_data
+        except Exception:
+            pass
+    if "PROJ_DATA" not in os.environ:
+        try:
+            from pyproj.datadir import get_data_dir
+            os.environ["PROJ_DATA"] = get_data_dir()
+        except Exception:
+            pass
 
     tile_bboxes = make_tile_bboxes(bbox, config.TARGET_RESOLUTION, TILE_SIZE_PX)
     n_tiles = len(tile_bboxes)
