@@ -91,21 +91,66 @@ Optional flags:
 | `--force` | Clear step sentinels and re-run all steps for the year |
 | `--dry-run` | Print steps that would run without executing anything |
 | `--tile-size N` | Spatial tile size in pixels (default `256`; lower values reduce peak RAM at the cost of more tiles and merge overhead) |
-| `--tile-workers N` | Number of concurrent tiles (default `4`; tune for available CPU and network bandwidth) |
+| `--tile-workers N` | Number of concurrent tiles (default `32`; tune for available CPU and network bandwidth) |
 
 The pipeline runs 7 steps in sequence. Completed steps are recorded as
 sentinels in `$WORKING_DIR` and skipped on re-runs unless `--force` is passed.
 Logs are written to `$BASE_DIR/logs/`.
 
-## Run pipeline steps 1–3 on DigitalOcean
+## Run pipeline steps 1–3 on a cloud instance
 
-Steps 1–3 download several terabytes of COG tiles from `sentinel-cogs.s3.us-west-2.amazonaws.com`. Running them on a DigitalOcean droplet in San Francisco (SFO3) avoids routing that traffic over a local internet connection.
+Steps 1–3 download several terabytes of COG tiles from `sentinel-cogs.s3.us-west-2.amazonaws.com`. Running them on a cloud instance avoids routing that traffic over a local internet connection.
 
-Steps 1–3 use spatial tiling: the catchment is split into ~256 px × 256 px tiles, and up to 4 tiles are processed concurrently. Each concurrent tile issues many simultaneous S3 range requests, so the full network pipe is utilised without any single tile exceeding the memory budget (~5 GB peak per tile on a 32 GB machine).
+Steps 1–3 use spatial tiling: the catchment is split into ~256 px × 256 px tiles, and up to 32 tiles are processed concurrently. Each concurrent tile issues many simultaneous S3 range requests, so the full network pipe is utilised without any single tile exceeding the memory budget (~5 GB peak per tile on a 32 GB machine).
+
+### Option A — AWS EC2 (recommended)
+
+The Sentinel-2 COGs are hosted in `us-west-2`. An EC2 instance in the same region transfers data over AWS's internal network — significantly faster and with no egress charges.
+
+**Instance spec:** Ubuntu 24.04 LTS, `c6a.4xlarge` (16 vCPU, 32 GB), region `us-west-2`. Add your SSH key during creation. 100 GiB `gp3` root volume.
+
+**First-time setup:**
+
+```bash
+scp $BASE_DIR/mitchell_catchment.geojson ubuntu@<instance-ip>:/data/mrc-parko/
+ssh ubuntu@<instance-ip>
+```
+
+```bash
+sudo apt-get update && sudo apt-get install -y python3-pip python3-venv git gdal-bin libgdal-dev
+git clone <your-repo-url> parko-catchment-gis
+cd parko-catchment-gis
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+pip install GDAL==3.8.4
+sudo mkdir -p /data/mrc-parko && sudo chown $USER /data/mrc-parko
+```
+
+> **Note:** install GDAL 3.8.4 via pip after `requirements.txt` to ensure the Python bindings match the system library version. Do not add any GDAL PPAs — use the version from the standard Ubuntu 24.04 repos only.
+
+**Each run** — use `tmux` so the pipeline survives SSH disconnection:
+
+```bash
+ssh ubuntu@<instance-ip>
+cd parko-catchment-gis && source .venv/bin/activate
+tmux new -s pipeline
+./run.sh 2025 --to-step 3
+# Ctrl+B then D to detach; tmux attach -t pipeline to return
+```
+
+**Copy outputs back** once all three steps complete:
+
+```bash
+scp -r ubuntu@<instance-ip>:/data/mrc-parko/outputs/2025 ./outputs/
+```
+
+Then stop or terminate the instance.
+
+### Option B — DigitalOcean (alternative)
 
 **Droplet spec:** Ubuntu 24.04 LTS, `c2-8vcpu-16gb` (CPU-optimised), region SFO3. Add your SSH key during creation.
 
-**First-time setup** — copy the catchment file up, then SSH in and install dependencies:
+**First-time setup:**
 
 ```bash
 scp $BASE_DIR/mitchell_catchment.geojson root@<droplet-ip>:/data/mrc-parko/
@@ -118,10 +163,11 @@ git clone <your-repo-url> parko-catchment-gis
 cd parko-catchment-gis
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+pip install GDAL==3.8.4
 sudo mkdir -p /data/mrc-parko && sudo chown $USER /data/mrc-parko
 ```
 
-**Each run** — use `tmux` so the pipeline survives SSH disconnection:
+**Each run:**
 
 ```bash
 ssh root@<droplet-ip>
@@ -131,7 +177,7 @@ tmux new -s pipeline
 # Ctrl+B then D to detach; tmux attach -t pipeline to return
 ```
 
-**Copy outputs back** once all three steps complete:
+**Copy outputs back:**
 
 ```bash
 scp -r root@<droplet-ip>:/data/mrc-parko/outputs/2025 ./outputs/
