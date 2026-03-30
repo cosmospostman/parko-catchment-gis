@@ -28,7 +28,7 @@ def _write_prob_raster(path: Path, values: np.ndarray):
         str(path), "w",
         driver="GTiff", dtype="float32", count=1,
         width=W, height=H, transform=transform,
-        crs=CRS.from_epsg(7844),
+        crs=CRS.from_epsg(7854),
     ) as dst:
         dst.write(values[np.newaxis])
 
