@@ -85,6 +85,7 @@ Optional flags:
 | `--composite-start MM-DD` | Start of Sentinel-2 composite window (default `05-01`) |
 | `--composite-end MM-DD` | End of composite window (default `10-31`) |
 | `--from-step N` | Resume from step N, skipping earlier steps |
+| `--to-step N` | Stop after step N (e.g. `--to-step 3` runs steps 1–3 only) |
 | `--only-step N` | Run a single step only |
 | `--rebuild-baseline` | Recompute the NDVI baseline (Landsat 1986–present) |
 | `--force` | Clear step sentinels and re-run all steps for the year |
@@ -93,6 +94,55 @@ Optional flags:
 The pipeline runs 7 steps in sequence. Completed steps are recorded as
 sentinels in `$WORKING_DIR` and skipped on re-runs unless `--force` is passed.
 Logs are written to `$BASE_DIR/logs/`.
+
+## Run pipeline steps 1–3 on DigitalOcean
+
+Steps 1–3 download several terabytes of COG tiles from `sentinel-cogs.s3.us-west-2.amazonaws.com`. Running them on a DigitalOcean droplet in San Francisco (SFO3) avoids routing that traffic over a local internet connection.
+
+**Droplet spec:** Ubuntu 24.04 LTS, `c2-8vcpu-16gb` (CPU-optimised), region SFO3. Add your SSH key during creation.
+
+**First-time setup** — copy the catchment file up, then SSH in and install dependencies:
+
+```bash
+scp $BASE_DIR/mitchell_catchment.geojson root@<droplet-ip>:/data/mrc-parko/
+ssh root@<droplet-ip>
+```
+
+```bash
+sudo apt-get update && sudo apt-get install -y python3-pip python3-venv git gdal-bin libgdal-dev
+git clone <your-repo-url> parko-catchment-gis
+cd parko-catchment-gis
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+sudo mkdir -p /data/mrc-parko && sudo chown $USER /data/mrc-parko
+```
+
+**Each run** — use `tmux` so the pipeline survives SSH disconnection:
+
+```bash
+ssh root@<droplet-ip>
+cd parko-catchment-gis && source .venv/bin/activate
+tmux new -s pipeline
+./run.sh 2025 --to-step 3
+# Ctrl+B then D to detach; tmux attach -t pipeline to return
+```
+
+**Copy outputs back** once all three steps complete:
+
+```bash
+scp -r root@<droplet-ip>:/data/mrc-parko/outputs/2025 ./outputs/
+```
+
+Then power off or destroy the droplet.
+
+## Run the remainder of the pipeline
+
+Steps 4–7 work entirely from the GeoTIFFs written by steps 1–3 and can be run locally. With the outputs copied back from DO:
+
+```bash
+source config.sh
+./run.sh 2025 --from-step 4
+```
 
 ## Running tests
 

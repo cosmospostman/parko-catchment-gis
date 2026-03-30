@@ -211,6 +211,8 @@ Note: B05, B06, B07 are at 20 m native resolution. Resample to 10 m when combini
 
 The long-term baseline is computed once and cached; only the current-year composite changes annually. Using DEA Collection 3 ARD eliminates inter-sensor calibration work across five Landsat missions — this is technically the most complex step in the pipeline and DEA has already solved it for Australian conditions.
 
+**Back-analysis performance note:** The cache invalidation logic keys the baseline on `1986–YEAR-1`, so each year of a back-analysis (e.g. 2017–2025) triggers a full baseline rebuild — approximately 8× redundant Landsat fetches and compute across a 9-year run. Before running a multi-year back-analysis, the baseline end year should be decoupled from `YEAR` and built once to the full extent (e.g. 1986–2024), then reused across all years. This is not yet implemented.
+
 **Known confound:** Dense Wet Tropics forest in the upper Mitchell headwaters (Atherton Tablelands, Walsh and Lynd headwaters) creates persistently high NDVI that may produce false anomalies in those zones. Apply a habitat mask (watercourse buffer + vegetation type exclusion) to reduce but not eliminate this.
 
 ### Step 3 — Flowering spectral index

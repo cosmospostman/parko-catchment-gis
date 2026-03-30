@@ -20,7 +20,7 @@ RESET='\033[0m'
 # ── Argument parsing ──────────────────────────────────────────────────────────
 if [[ $# -lt 1 ]]; then
     echo "Usage: $0 YEAR [--composite-start MM-DD] [--composite-end MM-DD]" >&2
-    echo "            [--from-step N] [--only-step N] [--dry-run]" >&2
+    echo "            [--from-step N] [--to-step N] [--only-step N] [--dry-run]" >&2
     echo "            [--rebuild-baseline] [--force]" >&2
     exit 3
 fi
@@ -37,6 +37,7 @@ COMPOSITE_START="05-01"
 COMPOSITE_END="10-31"
 FROM_STEP=1
 ONLY_STEP=""
+TO_STEP=""
 DRY_RUN=false
 REBUILD_BASELINE=false
 FORCE=false
@@ -46,6 +47,7 @@ while [[ $# -gt 0 ]]; do
         --composite-start) COMPOSITE_START="$2"; shift 2 ;;
         --composite-end)   COMPOSITE_END="$2";   shift 2 ;;
         --from-step)       FROM_STEP="$2";        shift 2 ;;
+        --to-step)         TO_STEP="$2";          shift 2 ;;
         --only-step)       ONLY_STEP="$2";        shift 2 ;;
         --dry-run)         DRY_RUN=true;          shift   ;;
         --rebuild-baseline) REBUILD_BASELINE=true; shift  ;;
@@ -53,6 +55,11 @@ while [[ $# -gt 0 ]]; do
         *) echo "ERROR: Unknown argument: $1" >&2; exit 3 ;;
     esac
 done
+
+if [[ -n "${ONLY_STEP}" && -n "${TO_STEP}" ]]; then
+    echo "ERROR: --only-step and --to-step are mutually exclusive" >&2
+    exit 3
+fi
 
 export YEAR COMPOSITE_START COMPOSITE_END
 export REBUILD_BASELINE
@@ -265,6 +272,14 @@ run_step() {
     # Apply --from-step filter
     if [[ "${step_num}" -lt "${FROM_STEP}" ]]; then
         printf "${CYAN}[SKIP]${RESET} Step %s — before --from-step %s\n" "${step_nn}" "${FROM_STEP}"
+        STEP_STATUSES+=("SKIP")
+        STEP_DURATIONS+=("—")
+        return 0
+    fi
+
+    # Apply --to-step filter
+    if [[ -n "${TO_STEP}" && "${step_num}" -gt "${TO_STEP}" ]]; then
+        printf "${CYAN}[SKIP]${RESET} Step %s — after --to-step %s\n" "${step_nn}" "${TO_STEP}"
         STEP_STATUSES+=("SKIP")
         STEP_DURATIONS+=("—")
         return 0
