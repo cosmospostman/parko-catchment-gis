@@ -230,7 +230,9 @@ class TestCheckpointing02:
              patch("utils.tiling.merge_tile_rasters", side_effect=fake_merge), \
              patch("utils.quicklook.save_quicklook"), \
              patch("utils.io.write_cog", side_effect=lambda da, path: da.rio.to_raster(
-                 str(path), driver="GTiff", dtype="float32")):
+                 str(path), driver="GTiff", dtype="float32")), \
+             patch("rioxarray.raster_array.RasterArray.reproject_match",
+                   return_value=da_2d):
             mod = _load_module(self.SCRIPT, f"step02_ckpt_{tile_exists}_{tile_size}")
             # Force baseline rebuild so _build_baseline is always invoked
             with patch.dict("os.environ", {"REBUILD_BASELINE": "true"}):

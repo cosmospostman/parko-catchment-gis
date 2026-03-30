@@ -12,12 +12,13 @@ from pathlib import Path
 import geopandas as gpd
 import numpy as np
 import rasterio
+from rasterio.enums import Resampling
 import xarray as xr
 
 # Script-level constants
 DEA_BANDS = ["nbart_red", "nbart_nir"]
 FC_PV_BAND = "pv"
-RESAMPLING_METHOD = "bilinear"
+RESAMPLING_METHOD = Resampling.bilinear
 BASELINE_CACHE_FILENAME = "ndvi_baseline_median.tif"
 
 # Baseline tiles can be larger: only 2 bands at 30 m
