@@ -6,7 +6,6 @@ Produces: probability_raster_{year}.tif  (COG, EPSG:7844, float32 [0,1])
 import logging
 import os
 import pickle
-import sys
 from pathlib import Path
 from typing import List, Tuple
 
@@ -89,14 +88,10 @@ def _compute_glcm_features(ndvi: np.ndarray, kernel: int = 7) -> Tuple[np.ndarra
 
 def main() -> None:
     import config
-    from utils.io import ensure_output_dirs, read_raster, write_cog
+    from utils.io import configure_logging, ensure_output_dirs, read_raster, write_cog
     from utils.quicklook import save_quicklook
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-        stream=sys.stdout,
-    )
+    configure_logging()
 
     ensure_output_dirs(config.YEAR)
 

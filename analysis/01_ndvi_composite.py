@@ -4,12 +4,9 @@ Step 01 — Dry-season NDVI composite (Sentinel-2).
 Produces: ndvi_median_{year}.tif  (COG, EPSG:7855, 10 m)
 """
 import logging
-import sys
 from pathlib import Path
 
 import os
-import threading
-import time
 
 import dask
 import geopandas as gpd
@@ -26,26 +23,15 @@ logger = logging.getLogger(__name__)
 PIPELINE_RUN = os.environ.get("PIPELINE_RUN") == "1"
 
 
-def _log_progress(label: str, stop_event: threading.Event, interval: int = 60) -> None:
-    """Log elapsed time periodically until stop_event is set."""
-    start = time.monotonic()
-    while not stop_event.wait(interval):
-        elapsed = int(time.monotonic() - start)
-        logger.info("%s — still running (%dm %02ds elapsed)", label, elapsed // 60, elapsed % 60)
-
-
 def main() -> None:
     import config
-    from utils.io import ensure_output_dirs, write_cog
+    from utils.io import configure_logging, ensure_output_dirs, write_cog
     from utils.stac import search_sentinel2, load_stackstac
     from utils.mask import apply_scl_mask
     from utils.quicklook import save_quicklook
+    from utils.progress import LogProgressCallback
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-        stream=sys.stdout,
-    )
+    configure_logging()
 
     ensure_output_dirs(config.YEAR)
 
@@ -99,16 +85,8 @@ def main() -> None:
 
         # Median composite over time
         logger.info("Computing median composite (scheduler=%s)...", dask_scheduler)
-        stop = threading.Event()
-        progress_thread = threading.Thread(
-            target=_log_progress, args=("median composite", stop), daemon=True
-        )
-        progress_thread.start()
-        try:
+        with LogProgressCallback(label="median composite", log_every=200):
             ndvi_median = ndvi.median(dim="time", skipna=True).compute()
-        finally:
-            stop.set()
-            progress_thread.join()
 
     # Reproject to target CRS if needed (should already be correct from stackstac)
     ndvi_median = ndvi_median.rio.write_crs(config.TARGET_CRS)

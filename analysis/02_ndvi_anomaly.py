@@ -8,9 +8,6 @@ import os
 import sys
 from pathlib import Path
 
-import threading
-import time
-
 import dask
 import geopandas as gpd
 import numpy as np
@@ -28,16 +25,10 @@ logger = logging.getLogger(__name__)
 PIPELINE_RUN = os.environ.get("PIPELINE_RUN") == "1"
 
 
-def _log_progress(label: str, stop_event: threading.Event, interval: int = 60) -> None:
-    start = time.monotonic()
-    while not stop_event.wait(interval):
-        elapsed = int(time.monotonic() - start)
-        logger.info("%s — still running (%dm %02ds elapsed)", label, elapsed // 60, elapsed % 60)
-
-
 def _build_baseline(bbox, config) -> xr.DataArray:
     """Download and compute the Landsat NDVI baseline median (1986 to year-1)."""
     from utils.stac import load_dea_landsat
+    from utils.progress import LogProgressCallback
 
     start = f"{config.BASELINE_START_YEAR}-01-01"
     end   = f"{config.YEAR - 1}-12-31"
@@ -58,31 +49,19 @@ def _build_baseline(bbox, config) -> xr.DataArray:
     ndvi = ndvi.clip(-1.0, 1.0)
     dask_scheduler = "threads" if PIPELINE_RUN else "synchronous"
     logger.info("Computing baseline median (scheduler=%s)...", dask_scheduler)
-    stop = threading.Event()
-    progress_thread = threading.Thread(
-        target=_log_progress, args=("baseline median", stop), daemon=True
-    )
-    progress_thread.start()
-    try:
-        with dask.config.set(scheduler=dask_scheduler):
-            baseline = ndvi.median(dim="time", skipna=True).compute()
-    finally:
-        stop.set()
-        progress_thread.join()
+    with dask.config.set(scheduler=dask_scheduler), \
+         LogProgressCallback(label="baseline median", log_every=200):
+        baseline = ndvi.median(dim="time", skipna=True).compute()
     baseline = baseline.rio.write_crs(config.TARGET_CRS)
     return baseline
 
 
 def main() -> None:
     import config
-    from utils.io import ensure_output_dirs, write_cog, read_raster
+    from utils.io import configure_logging, ensure_output_dirs, write_cog, read_raster
     from utils.quicklook import save_quicklook
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-        stream=sys.stdout,
-    )
+    configure_logging()
 
     ensure_output_dirs(config.YEAR)
 

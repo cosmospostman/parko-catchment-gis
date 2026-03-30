@@ -4,7 +4,6 @@ Step 06 — Treatment priority patch delineation.
 Produces: priority_patches_{year}.gpkg  (GeoPackage, EPSG:7844)
 """
 import logging
-import sys
 from pathlib import Path
 from typing import Dict, List
 
@@ -40,14 +39,10 @@ def _stream_order_for_patch(patch_geom, drainage: gpd.GeoDataFrame) -> int:
 
 def main() -> None:
     import config
-    from utils.io import ensure_output_dirs, read_raster
+    from utils.io import configure_logging, ensure_output_dirs, read_raster
     from utils.quicklook import save_quicklook
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-        stream=sys.stdout,
-    )
+    configure_logging()
 
     ensure_output_dirs(config.YEAR)
 

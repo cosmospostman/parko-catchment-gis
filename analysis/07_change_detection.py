@@ -6,7 +6,6 @@ Produces: change_detection_{year}.tif  (COG, EPSG:7844, float32 in [-1,1])
 Exits 0 with a log message (no output file) when no prior-year raster exists (Year 1 run).
 """
 import logging
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -17,14 +16,10 @@ logger = logging.getLogger(__name__)
 
 def main() -> None:
     import config
-    from utils.io import ensure_output_dirs, read_raster, write_cog
+    from utils.io import configure_logging, ensure_output_dirs, read_raster, write_cog
     from utils.quicklook import save_quicklook
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-        stream=sys.stdout,
-    )
+    configure_logging()
 
     ensure_output_dirs(config.YEAR)
 

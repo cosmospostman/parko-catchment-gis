@@ -4,10 +4,8 @@ Step 04 — Wet-season flood extent mapping (Sentinel-1 SAR).
 Produces: flood_extent_{year}.gpkg  (GeoPackage, EPSG:7844 geometries)
 """
 import logging
-import sys
-from pathlib import Path
-
 import os
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import dask
@@ -36,16 +34,12 @@ def _sigma_to_db(arr: xr.DataArray) -> xr.DataArray:
 
 def main() -> None:
     import config
-    from utils.io import ensure_output_dirs
+    from utils.io import configure_logging, ensure_output_dirs
     from utils.stac import search_sentinel1
     from utils.sar import preprocess_s1_scene
     from utils.quicklook import save_quicklook
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-        stream=sys.stdout,
-    )
+    configure_logging()
 
     ensure_output_dirs(config.YEAR)
 

@@ -2,6 +2,7 @@
 
 import logging
 import os
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -9,6 +10,22 @@ import rioxarray
 import xarray as xr
 
 logger = logging.getLogger(__name__)
+
+
+def configure_logging() -> None:
+    """Configure root logging for pipeline scripts.
+
+    - Standard timestamped format to stdout
+    - Suppresses noisy third-party warnings that are not actionable
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+        stream=sys.stdout,
+    )
+    # rasterio emits repeated CPLE_NotSupported warnings about unsupported warp
+    # options (SHARING, WARP_EXTRAS) — cosmetic only, not actionable.
+    logging.getLogger("rasterio._env").setLevel(logging.ERROR)
 
 
 def ensure_output_dirs(year: int) -> None:
