@@ -38,16 +38,41 @@ def _build_baseline(bbox, config) -> xr.DataArray:
     logger.info("Building Landsat baseline %s → %s", start, end)
 
     # Set GDAL env vars before ThreadPoolExecutor so all worker threads inherit them
+    os.environ["AWS_NO_SIGN_REQUEST"] = "YES"
+    os.environ["AWS_DEFAULT_REGION"] = "us-west-2"
     gdal_env = {
-        "GDAL_HTTP_MAX_RETRY": "3",
-        "GDAL_HTTP_RETRY_DELAY": "0.5",
+        "GDAL_HTTP_MAX_RETRY": "5",
+        "GDAL_HTTP_RETRY_DELAY": "2",
+        "GDAL_HTTP_RETRY_ON_HTTP_ERROR": "429,500,502,503,504",
         "GDAL_HTTP_MERGE_CONSECUTIVE_RANGES": "YES",
-        "CPL_VSIL_CURL_CHUNK_SIZE": "10485760",
+        "GDAL_HTTP_MULTIPLEX": "YES",
+        "GDAL_HTTP_VERSION": "2",
+        "CPL_VSIL_CURL_CACHE_SIZE": "67108864",  # 64 MB connection cache
+        "CPL_VSIL_CURL_CHUNK_SIZE": "10485760",  # 10 MB
         "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
-        "AWS_NO_SIGN_REQUEST": "YES",
     }
     for k, v in gdal_env.items():
         os.environ.setdefault(k, v)
+
+    if "PROJ_DATA" not in os.environ:
+        try:
+            import rasterio
+            proj_data = os.path.join(os.path.dirname(rasterio.__file__), "proj_data")
+            if os.path.isdir(proj_data):
+                os.environ["PROJ_DATA"] = proj_data
+        except Exception:
+            pass
+    if "PROJ_DATA" not in os.environ:
+        try:
+            from pyproj.datadir import get_data_dir
+            os.environ["PROJ_DATA"] = get_data_dir()
+        except Exception:
+            pass
+    try:
+        from pyproj.datadir import set_data_dir
+        set_data_dir(os.environ["PROJ_DATA"])
+    except Exception:
+        pass
 
     tile_bboxes = make_tile_bboxes(bbox, 30, BASELINE_TILE_SIZE_PX)
     n_tiles = len(tile_bboxes)
