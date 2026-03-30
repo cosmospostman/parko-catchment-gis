@@ -70,7 +70,7 @@ export CODE_DIR
 export PIPELINE_RUN=1
 export PYTHONPATH="${CODE_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 export TILE_SIZE_PX="${TILE_SIZE_PX:-256}"
-export TILE_WORKERS="${TILE_WORKERS:-4}"
+export TILE_WORKERS="${TILE_WORKERS:-32}"
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
 mkdir -p "${LOG_DIR}" 2>/dev/null || true

@@ -22,7 +22,7 @@ BASELINE_CACHE_FILENAME = "ndvi_baseline_median.tif"
 
 # Baseline tiles can be larger: only 2 bands at 30 m
 BASELINE_TILE_SIZE_PX = int(os.environ.get("TILE_SIZE_PX", "1024"))
-BASELINE_TILE_WORKERS  = int(os.environ.get("TILE_WORKERS",  "4"))
+BASELINE_TILE_WORKERS  = int(os.environ.get("TILE_WORKERS",  "32"))
 
 logger = logging.getLogger(__name__)
 
@@ -49,9 +49,10 @@ def _build_baseline(bbox, config) -> xr.DataArray:
         os.environ.setdefault(k, v)
 
     tile_bboxes = make_tile_bboxes(bbox, 30, BASELINE_TILE_SIZE_PX)
+    n_tiles = len(tile_bboxes)
     logger.info(
         "Processing %d spatial tiles for baseline (%d px, %d concurrent)",
-        len(tile_bboxes), BASELINE_TILE_SIZE_PX, BASELINE_TILE_WORKERS,
+        n_tiles, BASELINE_TILE_SIZE_PX, BASELINE_TILE_WORKERS,
     )
 
     scratch_dir = Path(config.WORKING_DIR) / f"tiles_baseline_{config.YEAR}"
@@ -59,6 +60,12 @@ def _build_baseline(bbox, config) -> xr.DataArray:
 
     def process_tile(args):
         tile_idx, tile_bbox = args
+        tile_path = scratch_dir / f"tile_{tile_idx:05d}.tif"
+
+        if tile_path.exists() and tile_path.stat().st_size > 0:
+            logger.info("Tile %d/%d skipped (cached)", tile_idx + 1, n_tiles)
+            return tile_path
+
         import dask
         try:
             ds = load_dea_landsat(
@@ -80,11 +87,12 @@ def _build_baseline(bbox, config) -> xr.DataArray:
 
             baseline_tile = baseline_tile.rio.write_crs(config.TARGET_CRS)
 
-            tile_path = scratch_dir / f"tile_{tile_idx:05d}.tif"
             baseline_tile.rio.to_raster(
                 str(tile_path), driver="GTiff", dtype="float32",
                 compress="deflate",
             )
+            logger.info("Tile %d/%d complete (%.1f%%)", tile_idx + 1, n_tiles,
+                        100 * (tile_idx + 1) / n_tiles)
             return tile_path
         except Exception as exc:
             logger.warning("Baseline tile %d failed: %s", tile_idx, exc)

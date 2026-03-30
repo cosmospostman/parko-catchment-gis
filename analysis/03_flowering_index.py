@@ -19,7 +19,7 @@ NDRE_NODATA = -9999.0
 DASK_CHUNK_SPATIAL = 1024
 
 TILE_SIZE_PX = int(os.environ.get("TILE_SIZE_PX", "256"))
-TILE_WORKERS  = int(os.environ.get("TILE_WORKERS",  "4"))
+TILE_WORKERS  = int(os.environ.get("TILE_WORKERS",  "32"))
 
 logger = logging.getLogger(__name__)
 
@@ -70,9 +70,10 @@ def main() -> None:
         os.environ.setdefault(k, v)
 
     tile_bboxes = make_tile_bboxes(bbox, config.TARGET_RESOLUTION, TILE_SIZE_PX)
+    n_tiles = len(tile_bboxes)
     logger.info(
         "Processing %d spatial tiles (%d px, %d concurrent)",
-        len(tile_bboxes), TILE_SIZE_PX, TILE_WORKERS,
+        n_tiles, TILE_SIZE_PX, TILE_WORKERS,
     )
 
     scratch_dir = Path(config.WORKING_DIR) / f"tiles_flowering_{config.YEAR}"
@@ -80,6 +81,12 @@ def main() -> None:
 
     def process_tile(args):
         tile_idx, tile_bbox = args
+        tile_path = scratch_dir / f"tile_{tile_idx:05d}.tif"
+
+        if tile_path.exists() and tile_path.stat().st_size > 0:
+            logger.info("Tile %d/%d skipped (cached)", tile_idx + 1, n_tiles)
+            return tile_path
+
         import dask
         try:
             stack = load_stackstac(
@@ -106,11 +113,12 @@ def main() -> None:
 
             flowering_index = flowering_index.rio.write_crs(config.TARGET_CRS)
 
-            tile_path = scratch_dir / f"tile_{tile_idx:05d}.tif"
             flowering_index.rio.to_raster(
                 str(tile_path), driver="GTiff", dtype="float32",
                 compress="deflate",
             )
+            logger.info("Tile %d/%d complete (%.1f%%)", tile_idx + 1, n_tiles,
+                        100 * (tile_idx + 1) / n_tiles)
             return tile_path
         except Exception as exc:
             logger.warning("Tile %d failed: %s", tile_idx, exc)
