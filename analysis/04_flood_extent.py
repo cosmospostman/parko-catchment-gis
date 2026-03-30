@@ -7,6 +7,9 @@ import logging
 import sys
 from pathlib import Path
 
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import dask
 import geopandas as gpd
 import numpy as np
@@ -19,8 +22,11 @@ S1_POLARISATIONS = ["VV", "VH"]
 VV_OPEN_WATER_THRESHOLD_DB = -14.0          # dB — below this = open water
 FLOOD_UNION_SIMPLIFY_TOLERANCE = 20         # metres
 DASK_CHUNK_SPATIAL = 2048
+S1_MAX_WORKERS = 8                          # concurrent S1 scene downloads
 
 logger = logging.getLogger(__name__)
+
+PIPELINE_RUN = os.environ.get("PIPELINE_RUN") == "1"
 
 
 def _sigma_to_db(arr: xr.DataArray) -> xr.DataArray:
@@ -60,20 +66,31 @@ def main() -> None:
     if not items:
         raise RuntimeError(f"No Sentinel-1 items found for flood season {config.YEAR}")
 
-    logger.info("Processing %d S1 scenes", len(items))
+    n_workers = S1_MAX_WORKERS if PIPELINE_RUN else 1
+    logger.info("Processing %d S1 scenes (workers=%d)", len(items), n_workers)
+
+    def _process_scene(item):
+        ds = preprocess_s1_scene(item, bbox=bbox_wgs84, resolution=config.TARGET_RESOLUTION)
+        if "VV" not in ds:
+            logger.warning("VV band missing in item %s — skipping", item.id)
+            return None
+        vv_db = _sigma_to_db(ds["VV"])
+        return (vv_db < VV_OPEN_WATER_THRESHOLD_DB).compute()
 
     flood_masks = []
-    for item in items:
-        try:
-            ds = preprocess_s1_scene(item, bbox=bbox_wgs84, resolution=config.TARGET_RESOLUTION)
-            if "VV" not in ds:
-                logger.warning("VV band missing in item %s — skipping", item.id)
-                continue
-            vv_db = _sigma_to_db(ds["VV"])
-            flood_mask = (vv_db < VV_OPEN_WATER_THRESHOLD_DB).compute()
-            flood_masks.append(flood_mask)
-        except Exception as exc:
-            logger.warning("Failed to process S1 scene %s: %s", item.id, exc)
+    completed = 0
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        futures = {executor.submit(_process_scene, item): item for item in items}
+        for future in as_completed(futures):
+            item = futures[future]
+            completed += 1
+            try:
+                mask = future.result()
+                if mask is not None:
+                    flood_masks.append(mask)
+                    logger.info("S1 scene processed (%d/%d): %s", completed, len(items), item.id)
+            except Exception as exc:
+                logger.warning("Failed to process S1 scene %s: %s", item.id, exc)
 
     if not flood_masks:
         raise RuntimeError("No valid S1 scenes processed")

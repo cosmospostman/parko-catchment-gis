@@ -57,6 +57,7 @@ done
 export YEAR COMPOSITE_START COMPOSITE_END
 export REBUILD_BASELINE
 export CODE_DIR
+export PIPELINE_RUN=1
 export PYTHONPATH="${CODE_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 
 # ── Logging setup ─────────────────────────────────────────────────────────────

@@ -8,6 +8,10 @@ import logging
 import sys
 from pathlib import Path
 
+import os
+import threading
+import time
+
 import dask
 import geopandas as gpd
 import numpy as np
@@ -20,6 +24,15 @@ NDRE_NODATA = -9999.0
 DASK_CHUNK_SPATIAL = 2048
 
 logger = logging.getLogger(__name__)
+
+PIPELINE_RUN = os.environ.get("PIPELINE_RUN") == "1"
+
+
+def _log_progress(label: str, stop_event: threading.Event, interval: int = 60) -> None:
+    start = time.monotonic()
+    while not stop_event.wait(interval):
+        elapsed = int(time.monotonic() - start)
+        logger.info("%s — still running (%dm %02ds elapsed)", label, elapsed // 60, elapsed % 60)
 
 
 def main() -> None:
@@ -58,7 +71,9 @@ def main() -> None:
     load_bands = FLOWERING_BANDS + ["scl"]
     logger.info("Loading %d scenes for flowering index", len(items))
 
-    with dask.config.set(scheduler="synchronous"):
+    dask_scheduler = "threads" if PIPELINE_RUN else "synchronous"
+
+    with dask.config.set(scheduler=dask_scheduler):
         stack = load_stackstac(
             items=items,
             bands=load_bands,
@@ -80,7 +95,17 @@ def main() -> None:
         ratio = ratio.where(nir > 0)
 
         # Median over flowering window
-        flowering_index = ratio.median(dim="time", skipna=True).compute()
+        logger.info("Computing flowering index median (scheduler=%s)...", dask_scheduler)
+        stop = threading.Event()
+        progress_thread = threading.Thread(
+            target=_log_progress, args=("flowering index median", stop), daemon=True
+        )
+        progress_thread.start()
+        try:
+            flowering_index = ratio.median(dim="time", skipna=True).compute()
+        finally:
+            stop.set()
+            progress_thread.join()
 
     flowering_index = flowering_index.rio.write_crs(config.TARGET_CRS)
 

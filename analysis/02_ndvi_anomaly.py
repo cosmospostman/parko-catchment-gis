@@ -8,6 +8,9 @@ import os
 import sys
 from pathlib import Path
 
+import threading
+import time
+
 import dask
 import geopandas as gpd
 import numpy as np
@@ -21,6 +24,15 @@ RESAMPLING_METHOD = "bilinear"
 BASELINE_CACHE_FILENAME = "ndvi_baseline_median.tif"
 
 logger = logging.getLogger(__name__)
+
+PIPELINE_RUN = os.environ.get("PIPELINE_RUN") == "1"
+
+
+def _log_progress(label: str, stop_event: threading.Event, interval: int = 60) -> None:
+    start = time.monotonic()
+    while not stop_event.wait(interval):
+        elapsed = int(time.monotonic() - start)
+        logger.info("%s — still running (%dm %02ds elapsed)", label, elapsed // 60, elapsed % 60)
 
 
 def _build_baseline(bbox, config) -> xr.DataArray:
@@ -44,7 +56,19 @@ def _build_baseline(bbox, config) -> xr.DataArray:
     red = ds["nbart_red"].astype(np.float32)
     ndvi = (nir - red) / (nir + red + 1e-10)
     ndvi = ndvi.clip(-1.0, 1.0)
-    baseline = ndvi.median(dim="time", skipna=True).compute()
+    dask_scheduler = "threads" if PIPELINE_RUN else "synchronous"
+    logger.info("Computing baseline median (scheduler=%s)...", dask_scheduler)
+    stop = threading.Event()
+    progress_thread = threading.Thread(
+        target=_log_progress, args=("baseline median", stop), daemon=True
+    )
+    progress_thread.start()
+    try:
+        with dask.config.set(scheduler=dask_scheduler):
+            baseline = ndvi.median(dim="time", skipna=True).compute()
+    finally:
+        stop.set()
+        progress_thread.join()
     baseline = baseline.rio.write_crs(config.TARGET_CRS)
     return baseline
 
@@ -87,8 +111,7 @@ def main() -> None:
             rebuild = True
 
     if rebuild or not baseline_path.exists():
-        with dask.config.set(scheduler="synchronous"):
-            baseline = _build_baseline(bbox, config)
+        baseline = _build_baseline(bbox, config)
         baseline_path.parent.mkdir(parents=True, exist_ok=True)
         write_cog(baseline, baseline_path)
         # Tag with year range
