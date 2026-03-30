@@ -59,29 +59,18 @@ def _fake_load_stackstac(items, bands, resolution, bbox, crs, chunk_spatial=1024
     return _make_synthetic_stack(bands=bands)
 
 
-def test_process_tile_called_once_per_tile(tmp_dirs, monkeypatch):
-    """process_tile should be called once per tile returned by make_tile_bboxes."""
+def test_tile_bboxes_and_merge_called_once(tmp_dirs, monkeypatch):
+    """make_tile_bboxes and merge_tile_rasters are each called exactly once."""
     if "analysis.01_ndvi_composite" in sys.modules:
         del sys.modules["analysis.01_ndvi_composite"]
     if "config" in sys.modules:
         del sys.modules["config"]
 
-    import config
-
-    # Patch STAC search to return 1 dummy item
     dummy_item = MagicMock()
     mock_search = MagicMock(return_value=[dummy_item])
-
-    # make_tile_bboxes returns a single tile (the full bbox)
-    full_bbox = [141.0, -17.0, 143.0, -15.0]
-    single_tile = [full_bbox]
-    mock_tile_bboxes = MagicMock(return_value=single_tile)
+    mock_tile_bboxes = MagicMock(return_value=[[141.0, -17.0, 143.0, -15.0]])
 
     script = PROJECT_ROOT / "analysis" / "01_ndvi_composite.py"
-
-    call_count = []
-
-    original_process_tile = None
 
     with patch("utils.stac.search_sentinel2", mock_search), \
          patch("utils.stac.load_stackstac", _fake_load_stackstac), \
@@ -91,7 +80,6 @@ def test_process_tile_called_once_per_tile(tmp_dirs, monkeypatch):
          patch("utils.tiling.merge_tile_rasters") as mock_merge, \
          patch("xarray.open_dataarray", return_value=_make_synthetic_stack(n_scenes=1, height=2, width=2, bands=["nir"])):
 
-        # Patch merge to write a real file so the script doesn't crash
         def fake_merge(tile_paths, out_path, nodata, crs):
             da = _make_synthetic_stack(n_scenes=1, height=2, width=2, bands=["nir"])
             result = da.isel(time=0, band=0)
@@ -99,14 +87,9 @@ def test_process_tile_called_once_per_tile(tmp_dirs, monkeypatch):
 
         mock_merge.side_effect = fake_merge
 
-        mod = _load_module(script, "step01_tile_count")
-        original_fn = mod.main.__globals__.get("process_tile") if hasattr(mod, "main") else None
+        _load_module(script, "step01_tile_count").main()
 
-        mod.main()
-
-    # make_tile_bboxes was called once
     mock_tile_bboxes.assert_called_once()
-    # merge_tile_rasters was called once
     mock_merge.assert_called_once()
 
 

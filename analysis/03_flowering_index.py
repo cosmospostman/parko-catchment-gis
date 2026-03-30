@@ -6,7 +6,6 @@ Produces:
 """
 import logging
 import os
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import geopandas as gpd
@@ -14,26 +13,25 @@ import numpy as np
 
 # Script-level constants
 FLOWERING_BANDS = ["green", "nir", "rededge1", "rededge2"]   # green, NIR, RE1, RE2
-GREEN_NIR_RATIO_NODATA = -9999.0
-NDRE_NODATA = -9999.0
 DASK_CHUNK_SPATIAL = 1024
 
-TILE_SIZE_PX = int(os.environ.get("TILE_SIZE_PX", "256"))
-TILE_WORKERS  = int(os.environ.get("TILE_WORKERS",  "32"))
+TILE_SIZE_PX    = int(os.environ.get("TILE_SIZE_PX",    "512"))
+FETCH_WORKERS   = int(os.environ.get("FETCH_WORKERS",   "16"))
+COMPUTE_WORKERS = int(os.environ.get("COMPUTE_WORKERS", str(os.cpu_count() or 4)))
 
 logger = logging.getLogger(__name__)
 
 
 def main() -> None:
     import config
-    from utils.io import configure_logging, ensure_output_dirs, write_cog
+    from utils.io import configure_logging, ensure_output_dirs
     from utils.stac import search_sentinel2, load_stackstac
     from utils.mask import apply_scl_mask
     from utils.quicklook import save_quicklook
     from utils.tiling import make_tile_bboxes, merge_tile_rasters
+    from utils.pipeline import setup_gdal_env, setup_proj, run_tiled_pipeline
 
     configure_logging()
-
     ensure_output_dirs(config.YEAR)
 
     catchment = gpd.read_file(config.CATCHMENT_GEOJSON)
@@ -57,114 +55,66 @@ def main() -> None:
     load_bands = FLOWERING_BANDS + ["scl"]
     logger.info("Loading %d scenes for flowering index", len(items))
 
-    # Set GDAL env vars before ThreadPoolExecutor so all worker threads inherit them
-    os.environ["AWS_NO_SIGN_REQUEST"] = "YES"
-    os.environ["AWS_DEFAULT_REGION"] = "us-west-2"
-    gdal_env = {
-        "GDAL_HTTP_MAX_RETRY": "5",
-        "GDAL_HTTP_RETRY_DELAY": "2",
-        "GDAL_HTTP_RETRY_ON_HTTP_ERROR": "429,500,502,503,504",
-        "GDAL_HTTP_PERSISTENT": "YES",
-        "CPL_VSIL_CURL_CACHE_SIZE": "67108864",  # 64 MB connection cache
-        "CPL_VSIL_CURL_CHUNK_SIZE": "10485760",  # 10 MB
-        "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
-    }
-    for k, v in gdal_env.items():
-        os.environ.setdefault(k, v)
-
-    if "PROJ_DATA" not in os.environ:
-        try:
-            import rasterio
-            proj_data = os.path.join(os.path.dirname(rasterio.__file__), "proj_data")
-            if os.path.isdir(proj_data):
-                os.environ["PROJ_DATA"] = proj_data
-        except Exception:
-            pass
-    if "PROJ_DATA" not in os.environ:
-        try:
-            from pyproj.datadir import get_data_dir
-            os.environ["PROJ_DATA"] = get_data_dir()
-        except Exception:
-            pass
-    try:
-        from pyproj.datadir import set_data_dir
-        set_data_dir(os.environ["PROJ_DATA"])
-    except Exception:
-        pass
+    setup_gdal_env()
+    setup_proj()
 
     tile_bboxes = make_tile_bboxes(bbox, config.TARGET_RESOLUTION, TILE_SIZE_PX)
     n_tiles = len(tile_bboxes)
     logger.info(
-        "Processing %d spatial tiles (%d px, %d concurrent)",
-        n_tiles, TILE_SIZE_PX, TILE_WORKERS,
+        "Processing %d spatial tiles (%d px, fetch=%d compute=%d)",
+        n_tiles, TILE_SIZE_PX, FETCH_WORKERS, COMPUTE_WORKERS,
     )
 
     scratch_dir = Path(config.WORKING_DIR) / f"tiles_flowering_{config.YEAR}"
     scratch_dir.mkdir(exist_ok=True)
 
-    def process_tile(args):
-        tile_idx, tile_bbox = args
-        tile_path = scratch_dir / f"tile_{tile_idx:05d}.tif"
-
-        if tile_path.exists() and tile_path.stat().st_size > 0:
-            logger.info("Tile %d/%d skipped (cached)", tile_idx + 1, n_tiles)
-            return tile_path
-
+    def fetch_fn(tile_idx, tile_bbox, tile_path):
         import dask
+        stack = load_stackstac(
+            items=items,
+            bands=load_bands,
+            resolution=config.TARGET_RESOLUTION,
+            bbox=tile_bbox,
+            crs=config.TARGET_CRS,
+            chunk_spatial=DASK_CHUNK_SPATIAL,
+        )
+        scl   = stack.sel(band="scl")
+        stack = stack.sel(band=FLOWERING_BANDS)
+        stack = apply_scl_mask(stack, scl)
+        with dask.config.set(scheduler="threads"):
+            return stack.astype(np.float32).compute()
+
+    def compute_fn(tile_idx, raw, tile_path):
         try:
-            stack = load_stackstac(
-                items=items,
-                bands=load_bands,
-                resolution=config.TARGET_RESOLUTION,
-                bbox=tile_bbox,
-                crs=config.TARGET_CRS,
-                chunk_spatial=DASK_CHUNK_SPATIAL,
-            )
-
-            scl   = stack.sel(band="scl")
-            stack = stack.sel(band=FLOWERING_BANDS)
-            stack = apply_scl_mask(stack, scl)
-
-            green = stack.sel(band="green").astype(np.float32)
-            nir   = stack.sel(band="nir").astype(np.float32)
-
+            green = raw.sel(band="green")
+            nir   = raw.sel(band="nir")
             ratio = green / (nir + 1e-10)
             ratio = ratio.where(nir > 0)
-
-            with dask.config.set(scheduler="threads"):
-                flowering_index = ratio.median(dim="time", skipna=True).compute()
-
+            flowering_index = ratio.median(dim="time", skipna=True)
             flowering_index = flowering_index.rio.write_crs(config.TARGET_CRS)
-
             flowering_index.rio.to_raster(
-                str(tile_path), driver="GTiff", dtype="float32",
-                compress="deflate",
+                str(tile_path), driver="GTiff", dtype="float32", compress="deflate",
             )
             logger.info("Tile %d/%d complete (%.1f%%)", tile_idx + 1, n_tiles,
                         100 * (tile_idx + 1) / n_tiles)
             return tile_path
         except Exception as exc:
-            logger.warning("Tile %d failed: %s", tile_idx, exc)
+            logger.warning("Compute tile %d failed: %s", tile_idx, exc)
             return None
 
-    with ThreadPoolExecutor(max_workers=TILE_WORKERS) as pool:
-        tile_paths = list(pool.map(process_tile, enumerate(tile_bboxes)))
-
-    valid_paths = [p for p in tile_paths if p is not None]
-    if not valid_paths:
-        raise RuntimeError("All tiles failed — no output produced")
-
     out_path = config.flowering_index_path(config.YEAR)
-    merge_tile_rasters(valid_paths, out_path, nodata=np.nan, crs=config.TARGET_CRS)
-    logger.info("Written: %s", out_path)
-
-    # Clean up scratch tiles
-    for p in valid_paths:
-        p.unlink(missing_ok=True)
-    try:
-        scratch_dir.rmdir()
-    except OSError:
-        pass
+    run_tiled_pipeline(
+        tile_bboxes=tile_bboxes,
+        scratch_dir=scratch_dir,
+        fetch_fn=fetch_fn,
+        compute_fn=compute_fn,
+        merge_fn=merge_tile_rasters,
+        out_path=out_path,
+        nodata=np.nan,
+        crs=config.TARGET_CRS,
+        fetch_workers=FETCH_WORKERS,
+        compute_workers=COMPUTE_WORKERS,
+    )
 
     import xarray as xr
     flowering_full = xr.open_dataarray(str(out_path))

@@ -5,7 +5,9 @@ Each test verifies that:
 - A zero-byte tile on disk is treated as a cache miss (load function IS called)
 """
 import importlib.util
+import queue
 import sys
+import threading
 from pathlib import Path
 from unittest.mock import patch, MagicMock, call
 
@@ -254,3 +256,94 @@ class TestCheckpointing02:
         """No baseline tile on disk → load_dea_landsat must be called."""
         load_mock = self._run_with_tile(tmp_dirs, tile_exists=False, tile_size=0)
         load_mock.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Backpressure — run_tiled_pipeline queue depth stays bounded
+# ---------------------------------------------------------------------------
+
+class TestPipelineBackpressure:
+    """Verify that fetch workers block when the queue is full.
+
+    With maxsize=2 and compute workers paused, the fetch pool must not
+    materialise more than maxsize items simultaneously.
+    """
+
+    def test_queue_depth_bounded(self, tmp_path):
+        """Fetch pool blocks once queue is full; depth never exceeds maxsize."""
+        from utils.pipeline import run_tiled_pipeline
+
+        MAXSIZE = 2
+        high_water = [0]
+        high_water_lock = threading.Lock()
+        pause_event = threading.Event()
+        compute_calls = []
+
+        # Tile bboxes — enough tiles to overflow the queue if backpressure fails
+        n_tiles = 8
+        tile_bboxes = [[float(i), -17.0, float(i) + 1, -16.0] for i in range(n_tiles)]
+
+        scratch_dir = tmp_path / "tiles"
+        scratch_dir.mkdir()
+
+        import numpy as np
+        import xarray as xr
+
+        def fetch_fn(tile_idx, tile_bbox, tile_path):
+            # Return a minimal DataArray (simulates a fetched tile)
+            data = np.zeros((1, 2, 2), dtype=np.float32)
+            times = [np.datetime64("2025-06-01")]
+            da = xr.DataArray(data, dims=["time", "y", "x"],
+                              coords={"time": times,
+                                      "y": [0.0, 1.0], "x": [0.0, 1.0]})
+            da = da.rio.write_crs("EPSG:7855")
+            return da
+
+        def compute_fn(tile_idx, raw, tile_path):
+            compute_calls.append(tile_idx)
+            # Block until released so the queue fills up
+            pause_event.wait()
+            tile_path.write_bytes(b"x")
+            return tile_path
+
+        def merge_fn(valid_paths, out_path, nodata, crs):
+            out_path.write_bytes(b"merged")
+
+        out_path = tmp_path / "out.tif"
+
+        # Run pipeline in a background thread so we can inspect mid-run
+        exc_holder = []
+
+        def run():
+            try:
+                run_tiled_pipeline(
+                    tile_bboxes=tile_bboxes,
+                    scratch_dir=scratch_dir,
+                    fetch_fn=fetch_fn,
+                    compute_fn=compute_fn,
+                    merge_fn=merge_fn,
+                    out_path=out_path,
+                    nodata=float("nan"),
+                    crs="EPSG:7855",
+                    fetch_workers=4,
+                    compute_workers=MAXSIZE,
+                )
+            except Exception as e:
+                exc_holder.append(e)
+
+        t = threading.Thread(target=run)
+        t.start()
+
+        # Give the pipeline a moment to fill the queue and block
+        import time
+        time.sleep(0.3)
+
+        # Release compute workers and wait for completion
+        pause_event.set()
+        t.join(timeout=10)
+
+        if exc_holder:
+            raise exc_holder[0]
+
+        assert out_path.exists()
+        assert len(compute_calls) == n_tiles

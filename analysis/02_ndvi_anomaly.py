@@ -2,12 +2,19 @@
 Step 02 — Long-term NDVI anomaly (DEA Landsat baseline).
 
 Produces: ndvi_anomaly_{year}.tif  (COG, EPSG:7844, 30 m resampled to 10 m)
+
+Note: this script does NOT use run_tiled_pipeline — it has two sequential tiled
+passes (baseline build + anomaly compute) with an intermediate cache, and uses
+odc-stac rather than stackstac. setup_gdal_env() and setup_proj() are shared
+from utils.pipeline.
 """
 import logging
 import os
-import sys
+import queue
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import List, Optional
 
 import geopandas as gpd
 import numpy as np
@@ -17,13 +24,13 @@ import xarray as xr
 
 # Script-level constants
 DEA_BANDS = ["nbart_red", "nbart_nir"]
-FC_PV_BAND = "pv"
 RESAMPLING_METHOD = Resampling.bilinear
 BASELINE_CACHE_FILENAME = "ndvi_baseline_median.tif"
 
 # Baseline tiles can be larger: only 2 bands at 30 m
-BASELINE_TILE_SIZE_PX = int(os.environ.get("TILE_SIZE_PX", "1024"))
-BASELINE_TILE_WORKERS  = int(os.environ.get("TILE_WORKERS",  "32"))
+BASELINE_TILE_SIZE_PX = int(os.environ.get("TILE_SIZE_PX",    "1024"))
+FETCH_WORKERS         = int(os.environ.get("FETCH_WORKERS",   "16"))
+COMPUTE_WORKERS       = int(os.environ.get("COMPUTE_WORKERS", str(os.cpu_count() or 4)))
 
 logger = logging.getLogger(__name__)
 
@@ -32,64 +39,73 @@ def _build_baseline(bbox, config) -> xr.DataArray:
     """Download and compute the Landsat NDVI baseline median (1986 to year-1)."""
     from utils.stac import load_dea_landsat
     from utils.tiling import make_tile_bboxes, merge_tile_rasters
+    from utils.pipeline import setup_gdal_env, setup_proj
 
     start = f"{config.BASELINE_START_YEAR}-01-01"
     end   = f"{config.YEAR - 1}-12-31"
     logger.info("Building Landsat baseline %s → %s", start, end)
 
-    # Set GDAL env vars before ThreadPoolExecutor so all worker threads inherit them
-    os.environ["AWS_NO_SIGN_REQUEST"] = "YES"
-    os.environ["AWS_DEFAULT_REGION"] = "us-west-2"
-    gdal_env = {
-        "GDAL_HTTP_MAX_RETRY": "5",
-        "GDAL_HTTP_RETRY_DELAY": "2",
-        "GDAL_HTTP_RETRY_ON_HTTP_ERROR": "429,500,502,503,504",
-        "GDAL_HTTP_PERSISTENT": "YES",
-        "CPL_VSIL_CURL_CACHE_SIZE": "67108864",  # 64 MB connection cache
-        "CPL_VSIL_CURL_CHUNK_SIZE": "10485760",  # 10 MB
-        "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
-    }
-    for k, v in gdal_env.items():
-        os.environ.setdefault(k, v)
-
-    if "PROJ_DATA" not in os.environ:
-        try:
-            import rasterio
-            proj_data = os.path.join(os.path.dirname(rasterio.__file__), "proj_data")
-            if os.path.isdir(proj_data):
-                os.environ["PROJ_DATA"] = proj_data
-        except Exception:
-            pass
-    if "PROJ_DATA" not in os.environ:
-        try:
-            from pyproj.datadir import get_data_dir
-            os.environ["PROJ_DATA"] = get_data_dir()
-        except Exception:
-            pass
-    try:
-        from pyproj.datadir import set_data_dir
-        set_data_dir(os.environ["PROJ_DATA"])
-    except Exception:
-        pass
+    setup_gdal_env()
+    setup_proj()
 
     tile_bboxes = make_tile_bboxes(bbox, 30, BASELINE_TILE_SIZE_PX)
     n_tiles = len(tile_bboxes)
     logger.info(
-        "Processing %d spatial tiles for baseline (%d px, %d concurrent)",
-        n_tiles, BASELINE_TILE_SIZE_PX, BASELINE_TILE_WORKERS,
+        "Processing %d spatial tiles for baseline (%d px, fetch=%d compute=%d)",
+        n_tiles, BASELINE_TILE_SIZE_PX, FETCH_WORKERS, COMPUTE_WORKERS,
     )
 
     scratch_dir = Path(config.WORKING_DIR) / f"tiles_baseline_{config.YEAR}"
     scratch_dir.mkdir(exist_ok=True)
 
-    def process_tile(args):
+    q: queue.Queue = queue.Queue(maxsize=COMPUTE_WORKERS * 2)
+    results: List[Optional[Path]] = [None] * n_tiles
+    results_lock = threading.Lock()
+
+    def _compute_worker():
+        while True:
+            item = q.get()
+            if item is None:
+                break
+            tile_idx, raw_ds, existing_path = item
+            if existing_path is not None:
+                with results_lock:
+                    results[tile_idx] = existing_path
+                continue
+            if raw_ds is None:
+                continue
+            tile_path = scratch_dir / f"tile_{tile_idx:05d}.tif"
+            try:
+                nir  = raw_ds["nbart_nir"].astype(np.float32)
+                red  = raw_ds["nbart_red"].astype(np.float32)
+                ndvi = (nir - red) / (nir + red + 1e-10)
+                ndvi = ndvi.clip(-1.0, 1.0)
+                baseline_tile = ndvi.median(dim="time", skipna=True)
+                baseline_tile = baseline_tile.rio.write_crs(config.TARGET_CRS)
+                baseline_tile.rio.to_raster(
+                    str(tile_path), driver="GTiff", dtype="float32", compress="deflate",
+                )
+                logger.info("Tile %d/%d complete (%.1f%%)", tile_idx + 1, n_tiles,
+                            100 * (tile_idx + 1) / n_tiles)
+                with results_lock:
+                    results[tile_idx] = tile_path
+            except Exception as exc:
+                logger.warning("Compute baseline tile %d failed: %s", tile_idx, exc)
+
+    compute_threads = [
+        threading.Thread(target=_compute_worker, daemon=True)
+        for _ in range(COMPUTE_WORKERS)
+    ]
+    for t in compute_threads:
+        t.start()
+
+    def _fetch_tile(args):
         tile_idx, tile_bbox = args
         tile_path = scratch_dir / f"tile_{tile_idx:05d}.tif"
-
         if tile_path.exists() and tile_path.stat().st_size > 0:
             logger.info("Tile %d/%d skipped (cached)", tile_idx + 1, n_tiles)
-            return tile_path
-
+            q.put((tile_idx, None, tile_path))
+            return
         import dask
         try:
             ds = load_dea_landsat(
@@ -101,35 +117,27 @@ def _build_baseline(bbox, config) -> xr.DataArray:
                 resolution=30,
                 crs=config.TARGET_CRS,
             )
-            nir = ds["nbart_nir"].astype(np.float32)
-            red = ds["nbart_red"].astype(np.float32)
-            ndvi = (nir - red) / (nir + red + 1e-10)
-            ndvi = ndvi.clip(-1.0, 1.0)
-
             with dask.config.set(scheduler="threads"):
-                baseline_tile = ndvi.median(dim="time", skipna=True).compute()
-
-            baseline_tile = baseline_tile.rio.write_crs(config.TARGET_CRS)
-
-            baseline_tile.rio.to_raster(
-                str(tile_path), driver="GTiff", dtype="float32",
-                compress="deflate",
-            )
-            logger.info("Tile %d/%d complete (%.1f%%)", tile_idx + 1, n_tiles,
-                        100 * (tile_idx + 1) / n_tiles)
-            return tile_path
+                raw_ds = ds.compute()
+            q.put((tile_idx, raw_ds, None))
         except Exception as exc:
-            logger.warning("Baseline tile %d failed: %s", tile_idx, exc)
-            return None
+            logger.warning("Fetch baseline tile %d failed: %s", tile_idx, exc)
+            q.put((tile_idx, None, None))
 
-    with ThreadPoolExecutor(max_workers=BASELINE_TILE_WORKERS) as pool:
-        tile_paths = list(pool.map(process_tile, enumerate(tile_bboxes)))
+    with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as fetch_pool:
+        futures = [fetch_pool.submit(_fetch_tile, args) for args in enumerate(tile_bboxes)]
+        for f in futures:
+            f.result()
 
-    valid_paths = [p for p in tile_paths if p is not None]
+    for _ in range(COMPUTE_WORKERS):
+        q.put(None)
+    for t in compute_threads:
+        t.join()
+
+    valid_paths = [p for p in results if p is not None]
     if not valid_paths:
         raise RuntimeError("All baseline tiles failed — no output produced")
 
-    # Merge tiles into a temporary path, then load as DataArray
     merged_path = scratch_dir / "baseline_merged.tif"
     merge_tile_rasters(valid_paths, merged_path, nodata=np.nan, crs=config.TARGET_CRS)
 
@@ -138,7 +146,6 @@ def _build_baseline(bbox, config) -> xr.DataArray:
         baseline = baseline.squeeze()
     baseline = baseline.rio.write_crs(config.TARGET_CRS)
 
-    # Clean up scratch
     for p in valid_paths:
         p.unlink(missing_ok=True)
     merged_path.unlink(missing_ok=True)
@@ -156,7 +163,6 @@ def main() -> None:
     from utils.quicklook import save_quicklook
 
     configure_logging()
-
     ensure_output_dirs(config.YEAR)
 
     catchment = gpd.read_file(config.CATCHMENT_GEOJSON)
@@ -165,7 +171,6 @@ def main() -> None:
     rebuild = os.environ.get("REBUILD_BASELINE", "false").lower() == "true"
     baseline_path = config.ndvi_baseline_path()
 
-    # Check if cached baseline is still valid (check IMAGEDESCRIPTION tag)
     if baseline_path.exists() and not rebuild:
         try:
             with rasterio.open(str(baseline_path)) as src:
@@ -187,7 +192,6 @@ def main() -> None:
         baseline = _build_baseline(bbox, config)
         baseline_path.parent.mkdir(parents=True, exist_ok=True)
         write_cog(baseline, baseline_path)
-        # Tag with year range
         with rasterio.open(str(baseline_path), "r+") as dst:
             dst.update_tags(
                 IMAGEDESCRIPTION=f"NDVI_BASELINE:{config.BASELINE_START_YEAR}-{config.YEAR - 1}"
@@ -198,7 +202,6 @@ def main() -> None:
         if baseline.ndim == 3:
             baseline = baseline.squeeze()
 
-    # Load current year NDVI median
     ndvi_path = config.ndvi_median_path(config.YEAR)
     if not ndvi_path.exists():
         raise FileNotFoundError(f"Step 01 output not found: {ndvi_path}")
@@ -206,10 +209,8 @@ def main() -> None:
     if ndvi_current.ndim == 3:
         ndvi_current = ndvi_current.squeeze()
 
-    # Reproject baseline to match current NDVI grid
     baseline_reproj = baseline.rio.reproject_match(ndvi_current, resampling=RESAMPLING_METHOD)
 
-    # Compute anomaly
     anomaly = ndvi_current - baseline_reproj
     anomaly = anomaly.clip(-1.0, 1.0)
     anomaly = anomaly.rio.write_crs(config.TARGET_CRS)
