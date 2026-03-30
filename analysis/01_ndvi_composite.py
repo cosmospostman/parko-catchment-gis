@@ -77,6 +77,8 @@ def main() -> None:
     # Ensure PROJ_DATA is set so worker threads can find proj.db regardless of
     # whether config.sh was sourced.  Prefer the rasterio-bundled proj_data
     # (matches the libproj rasterio links against); fall back to pyproj's copy.
+    # Must also call pyproj.datadir.set_data_dir() because pyproj caches the
+    # data directory at import time — setting the env var alone is not enough.
     if "PROJ_DATA" not in os.environ:
         try:
             import rasterio
@@ -91,6 +93,11 @@ def main() -> None:
             os.environ["PROJ_DATA"] = get_data_dir()
         except Exception:
             pass
+    try:
+        from pyproj.datadir import set_data_dir
+        set_data_dir(os.environ["PROJ_DATA"])
+    except Exception:
+        pass
 
     tile_bboxes = make_tile_bboxes(bbox, config.TARGET_RESOLUTION, TILE_SIZE_PX)
     n_tiles = len(tile_bboxes)
