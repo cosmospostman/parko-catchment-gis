@@ -41,7 +41,7 @@ COMPOSITE_END: str = os.environ.get("COMPOSITE_END", "10-31")
 # Analysis constants
 # ---------------------------------------------------------------------------
 
-TARGET_CRS: str = "EPSG:7844"
+TARGET_CRS: str = "EPSG:7854"
 TARGET_RESOLUTION: int = 10
 CLOUD_COVER_MAX: int = 20
 COMPOSITE_BANDS: list = ["B02", "B03", "B04", "B08", "B8A", "B11", "B12"]

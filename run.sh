@@ -274,56 +274,73 @@ run_step() {
     return 0
 }
 
+# ── Summary table ─────────────────────────────────────────────────────────────
+print_summary() {
+    echo ""
+    printf "${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}\n"
+    printf "${BOLD}  Run Summary — Year %s${RESET}\n" "${YEAR}"
+    printf "${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}\n"
+    printf "  %-5s  %-35s  %-10s  %s\n" "Step" "Name" "Duration" "Status"
+    printf "  %-5s  %-35s  %-10s  %s\n" "-----" "-----------------------------------" "----------" "------"
+
+    for i in "${!STEP_NAMES[@]}"; do
+        status="${STEP_STATUSES[$i]}"
+        name="${STEP_NAMES[$i]}"
+        dur="${STEP_DURATIONS[$i]}"
+        step_n=$(( i + 1 ))
+        nn="$(printf '%02d' "${step_n}")"
+        case "${status}" in
+            PASS)        colour="${GREEN}" ;;
+            FAIL|VERIFY_FAIL) colour="${RED}" ;;
+            SKIP)        colour="${CYAN}" ;;
+            *)           colour="${RESET}" ;;
+        esac
+        printf "  %-5s  %-35s  %-10s  ${colour}%s${RESET}\n" "${nn}" "${name}" "${dur}" "${status}"
+    done
+
+    echo ""
+    printf "  Log: %s\n" "${LOG_FILE}"
+    echo ""
+
+    if [[ "${OVERALL_EXIT}" -eq 0 ]]; then
+        printf "${GREEN}${BOLD}Pipeline completed successfully.${RESET}\n"
+    elif [[ "${OVERALL_EXIT}" -eq 2 ]]; then
+        printf "${RED}${BOLD}Pipeline failed: science verification checks did not pass (exit 2).${RESET}\n"
+    else
+        printf "${RED}${BOLD}Pipeline failed: analysis script crashed (exit 1).${RESET}\n"
+    fi
+}
+
 # ── Run all steps ─────────────────────────────────────────────────────────────
 OVERALL_EXIT=0
 
-run_step 1 "01_ndvi_composite"    "01_verify_ndvi_composite"    || { code=$?; [[ $code -eq 2 ]] && OVERALL_EXIT=2 || OVERALL_EXIT=1; }
-run_step 2 "02_ndvi_anomaly"      "02_verify_ndvi_anomaly"      || { code=$?; [[ $code -eq 2 ]] && OVERALL_EXIT=2 || OVERALL_EXIT=1; }
-run_step 3 "03_flowering_index"   "03_verify_flowering_index"   || { code=$?; [[ $code -eq 2 ]] && OVERALL_EXIT=2 || OVERALL_EXIT=1; }
-run_step 4 "04_flood_extent"      "04_verify_flood_extent"      || { code=$?; [[ $code -eq 2 ]] && OVERALL_EXIT=2 || OVERALL_EXIT=1; }
-run_step 5 "05_classifier"        "05_verify_classifier"        || { code=$?; [[ $code -eq 2 ]] && OVERALL_EXIT=2 || OVERALL_EXIT=1; }
-run_step 6 "06_priority_patches"  "06_verify_priority_patches"  || { code=$?; [[ $code -eq 2 ]] && OVERALL_EXIT=2 || OVERALL_EXIT=1; }
-run_step 7 "07_change_detection"  "07_verify_change_detection"  || { code=$?; [[ $code -eq 2 ]] && OVERALL_EXIT=2 || OVERALL_EXIT=1; }
+run_step_or_abort() {
+    local code=0
+    run_step "$@" || code=$?
+    if [[ $code -ne 0 ]]; then
+        OVERALL_EXIT=$code
+        print_summary
+        exit "${OVERALL_EXIT}"
+    fi
+}
 
-# ── Summary table ─────────────────────────────────────────────────────────────
-echo ""
-printf "${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}\n"
-printf "${BOLD}  Run Summary — Year %s${RESET}\n" "${YEAR}"
-printf "${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}\n"
-printf "  %-5s  %-35s  %-10s  %s\n" "Step" "Name" "Duration" "Status"
-printf "  %-5s  %-35s  %-10s  %s\n" "-----" "-----------------------------------" "----------" "------"
+run_step_or_abort 1 "01_ndvi_composite"    "01_verify_ndvi_composite"
+run_step_or_abort 2 "02_ndvi_anomaly"      "02_verify_ndvi_anomaly"
+run_step_or_abort 3 "03_flowering_index"   "03_verify_flowering_index"
+run_step_or_abort 4 "04_flood_extent"      "04_verify_flood_extent"
+run_step_or_abort 5 "05_classifier"        "05_verify_classifier"
+run_step_or_abort 6 "06_priority_patches"  "06_verify_priority_patches"
+run_step_or_abort 7 "07_change_detection"  "07_verify_change_detection"
 
-for i in "${!STEP_NAMES[@]}"; do
-    status="${STEP_STATUSES[$i]}"
-    name="${STEP_NAMES[$i]}"
-    dur="${STEP_DURATIONS[$i]}"
-    step_n=$(( i + 1 ))
-    nn="$(printf '%02d' "${step_n}")"
-    case "${status}" in
-        PASS)        colour="${GREEN}" ;;
-        FAIL|VERIFY_FAIL) colour="${RED}" ;;
-        SKIP)        colour="${CYAN}" ;;
-        *)           colour="${RESET}" ;;
-    esac
-    printf "  %-5s  %-35s  %-10s  ${colour}%s${RESET}\n" "${nn}" "${name}" "${dur}" "${status}"
-done
+print_summary
 
-echo ""
-printf "  Log: %s\n" "${LOG_FILE}"
-echo ""
-
-# Git tag suggestion
-SAFE_YEAR="${YEAR}"
-printf "${YELLOW}Suggested git tag (not auto-applied):${RESET}\n"
-printf "  git tag -a v%s-run-%s -m 'Pipeline run for %s'\n" "${SAFE_YEAR}" "${TIMESTAMP}" "${SAFE_YEAR}"
-echo ""
-
+# Git tag suggestion (only on success)
 if [[ "${OVERALL_EXIT}" -eq 0 ]]; then
-    printf "${GREEN}${BOLD}Pipeline completed successfully.${RESET}\n"
-elif [[ "${OVERALL_EXIT}" -eq 2 ]]; then
-    printf "${RED}${BOLD}Pipeline failed: science verification checks did not pass (exit 2).${RESET}\n"
-else
-    printf "${RED}${BOLD}Pipeline failed: analysis script crashed (exit 1).${RESET}\n"
+    SAFE_YEAR="${YEAR}"
+    echo ""
+    printf "${YELLOW}Suggested git tag (not auto-applied):${RESET}\n"
+    printf "  git tag -a v%s-run-%s -m 'Pipeline run for %s'\n" "${SAFE_YEAR}" "${TIMESTAMP}" "${SAFE_YEAR}"
+    echo ""
 fi
 
 exit "${OVERALL_EXIT}"
