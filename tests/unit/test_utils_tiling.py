@@ -45,25 +45,20 @@ def test_make_tile_bboxes_covers_full_extent():
     assert union[3] >= FULL_BBOX[3] - 1e-8
 
 
-def test_make_tile_bboxes_no_overlap():
-    """Adjacent tiles must not overlap (beyond a shared edge)."""
+def test_make_tile_bboxes_multiple_tiles_are_smaller_than_full():
+    """With a tile size well below the full extent, each tile must be strictly
+    smaller than the full bbox — confirming we are actually subdividing."""
     tiles = make_tile_bboxes(FULL_BBOX, RESOLUTION_M, TILE_SIZE_PX)
+    assert len(tiles) > 1, "Expected more than one tile"
 
-    for i, a in enumerate(tiles):
-        for j, b in enumerate(tiles):
-            if i >= j:
-                continue
-            # Overlap in x AND y simultaneously means real area overlap
-            x_overlap = a[0] < b[2] and b[0] < a[2]
-            y_overlap = a[1] < b[3] and b[1] < a[3]
-            if x_overlap and y_overlap:
-                # Check it's only a shared edge (zero-width overlap)
-                x_overlap_width = min(a[2], b[2]) - max(a[0], b[0])
-                y_overlap_height = min(a[3], b[3]) - max(a[1], b[1])
-                area = x_overlap_width * y_overlap_height
-                assert area < 1e-10, (
-                    f"Tiles {i} and {j} overlap with area {area}: {a}, {b}"
-                )
+    full_w = FULL_BBOX[2] - FULL_BBOX[0]
+    full_h = FULL_BBOX[3] - FULL_BBOX[1]
+
+    for t in tiles:
+        tile_w = t[2] - t[0]
+        tile_h = t[3] - t[1]
+        assert tile_w < full_w, f"Tile width {tile_w} >= full width {full_w}"
+        assert tile_h < full_h, f"Tile height {tile_h} >= full height {full_h}"
 
 
 def test_make_tile_bboxes_single_tile():

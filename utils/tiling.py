@@ -62,16 +62,14 @@ def make_tile_bboxes(
             g_miny = min(corners_y)
             g_maxy = max(corners_y)
 
-            # Snap outermost tile edges exactly to full_bbox so the union of all
-            # tiles equals full_bbox precisely (no gap, no overshoot).
-            if col == 0:
-                g_minx = minx_geo
-            if col == n_cols - 1:
-                g_maxx = maxx_geo
-            if row == 0:
-                g_miny = miny_geo
-            if row == n_rows - 1:
-                g_maxy = maxy_geo
+            # Clamp every tile to full_bbox.  Interior tiles may bulge slightly
+            # beyond the full extent due to CRS nonlinearity; clamping keeps them
+            # within bounds.  Outermost edges are snapped exactly so the union of
+            # all tiles equals full_bbox precisely (no gap at the boundary).
+            g_minx = minx_geo if col == 0         else max(g_minx, minx_geo)
+            g_maxx = maxx_geo if col == n_cols - 1 else min(g_maxx, maxx_geo)
+            g_miny = miny_geo if row == 0         else max(g_miny, miny_geo)
+            g_maxy = maxy_geo if row == n_rows - 1 else min(g_maxy, maxy_geo)
 
             bboxes.append([g_minx, g_miny, g_maxx, g_maxy])
 
