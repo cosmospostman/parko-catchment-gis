@@ -57,6 +57,7 @@ done
 export YEAR COMPOSITE_START COMPOSITE_END
 export REBUILD_BASELINE
 export CODE_DIR
+export PYTHONPATH="${CODE_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
 mkdir -p "${LOG_DIR}" 2>/dev/null || true
