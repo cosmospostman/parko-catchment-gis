@@ -127,7 +127,75 @@ else
     preflight_check "Python dependencies importable (stackstac, odc, rioxarray, sklearn, geopandas)" "false"
 fi
 
-# 4. Prior year probability raster (only for year > baseline)
+# 4. Composite window is valid (start < end, both parseable as MM-DD dates)
+_cs_days=$(python -c "
+import sys
+from datetime import datetime
+try:
+    s = datetime.strptime('2000-${COMPOSITE_START}', '%Y-%m-%d')
+    e = datetime.strptime('2000-${COMPOSITE_END}',   '%Y-%m-%d')
+    sys.exit(0 if s < e else 1)
+except ValueError:
+    sys.exit(1)
+" 2>/dev/null; echo $?)
+if [[ "${_cs_days}" == "0" ]]; then
+    preflight_check "Composite window valid (${COMPOSITE_START} → ${COMPOSITE_END})" "true"
+else
+    preflight_check "Composite window valid — start must be before end and in MM-DD format (got ${COMPOSITE_START} → ${COMPOSITE_END})" "false"
+fi
+
+# 5. YEAR is within sensible range (>= 2015 Sentinel-2 launch, <= current year)
+_current_year=$(date +%Y)
+if [[ ${YEAR} -ge 2015 && ${YEAR} -le ${_current_year} ]]; then
+    preflight_check "YEAR ${YEAR} is within valid range (2015 – ${_current_year})" "true"
+else
+    preflight_check "YEAR ${YEAR} is out of range — Sentinel-2 launched 2015, future years not supported" "false"
+fi
+
+# 6. TARGET_CRS covers the catchment bbox (catches wrong zone / unprojected CRS)
+_crs_check=$(python -c "
+import sys
+sys.path.insert(0, '${CODE_DIR}')
+import config
+import geopandas as gpd
+from pyproj import CRS, Transformer
+
+try:
+    crs = CRS.from_string(config.TARGET_CRS)
+    if not crs.is_projected:
+        print('not projected')
+        sys.exit(1)
+    catchment = gpd.read_file(config.CATCHMENT_GEOJSON)
+    bbox = catchment.to_crs('EPSG:4326').total_bounds  # minx miny maxx maxy
+    t = Transformer.from_crs('EPSG:4326', config.TARGET_CRS, always_xy=True)
+    xs, ys = t.transform([bbox[0], bbox[2]], [bbox[1], bbox[3]])
+    import math
+    if any(math.isinf(v) or math.isnan(v) for v in xs + ys):
+        print('inf/nan bounds')
+        sys.exit(1)
+    if xs[1] <= xs[0] or ys[1] <= ys[0]:
+        print('degenerate bounds')
+        sys.exit(1)
+    print('ok')
+except Exception as e:
+    print(str(e))
+    sys.exit(1)
+" 2>/dev/null || echo "error")
+if [[ "${_crs_check}" == "ok" ]]; then
+    preflight_check "TARGET_CRS covers catchment bbox" "true"
+else
+    preflight_check "TARGET_CRS covers catchment bbox — ${_crs_check}" "false"
+fi
+
+# 7. STAC endpoint reachable (soft warning only — network may be unavailable)
+_stac_url=$(python -c "import sys; sys.path.insert(0,'${CODE_DIR}'); import config; print(config.STAC_ENDPOINT_ELEMENT84)" 2>/dev/null || echo "")
+if [[ -n "${_stac_url}" ]] && curl --silent --max-time 5 --head "${_stac_url}" -o /dev/null 2>/dev/null; then
+    preflight_check "STAC endpoint reachable (${_stac_url})" "true"
+else
+    printf "  ${YELLOW}⚠${RESET} STAC endpoint unreachable (%s) — Steps 01–04 will fail if network is unavailable\n" "${_stac_url}"
+fi
+
+# 8. Prior year probability raster (only for year > baseline)
 PRIOR_YEAR=$(( YEAR - 1 ))
 if [[ ${YEAR} -gt 2020 ]]; then
     PRIOR_PROB="$(python -c "
