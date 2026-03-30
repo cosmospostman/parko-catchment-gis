@@ -76,8 +76,8 @@ def main() -> None:
         stack = apply_scl_mask(stack, scl)
 
         # Compute NDVI per scene: (B08 - B04) / (B08 + B04)
-        nir = stack.sel(band="b08").astype(np.float32)
-        red = stack.sel(band="b04").astype(np.float32)
+        nir = stack.sel(band="nir").astype(np.float32)
+        red = stack.sel(band="red").astype(np.float32)
         ndvi = (nir - red) / (nir + red + 1e-10)
         ndvi = ndvi.clip(-1.0, 1.0)
 

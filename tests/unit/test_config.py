@@ -51,8 +51,8 @@ def test_composite_bands_list(tmp_dirs):
         del sys.modules["config"]
     import config
     assert isinstance(config.COMPOSITE_BANDS, list)
-    assert "b08" in config.COMPOSITE_BANDS
-    assert "b04" in config.COMPOSITE_BANDS
+    assert "nir" in config.COMPOSITE_BANDS
+    assert "red" in config.COMPOSITE_BANDS
 
 
 def test_data_source_constants(tmp_dirs):

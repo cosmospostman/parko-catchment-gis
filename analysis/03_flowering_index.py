@@ -14,7 +14,7 @@ import numpy as np
 import xarray as xr
 
 # Script-level constants
-FLOWERING_BANDS = ["b03", "b08", "b05", "b06"]   # green, NIR, RE1, RE2
+FLOWERING_BANDS = ["green", "nir", "rededge1", "rededge2"]   # green, NIR, RE1, RE2
 GREEN_NIR_RATIO_NODATA = -9999.0
 NDRE_NODATA = -9999.0
 DASK_CHUNK_SPATIAL = 2048
@@ -72,8 +72,8 @@ def main() -> None:
         stack = stack.sel(band=FLOWERING_BANDS)
         stack = apply_scl_mask(stack, scl)
 
-        green = stack.sel(band="b03").astype(np.float32)
-        nir   = stack.sel(band="b08").astype(np.float32)
+        green = stack.sel(band="green").astype(np.float32)
+        nir   = stack.sel(band="nir").astype(np.float32)
 
         # Green/NIR ratio — elevated during Parkinsonia flowering
         ratio = green / (nir + 1e-10)

@@ -44,7 +44,7 @@ COMPOSITE_END: str = os.environ.get("COMPOSITE_END", "10-31")
 TARGET_CRS: str = "EPSG:7855"
 TARGET_RESOLUTION: int = 10
 CLOUD_COVER_MAX: int = 20
-COMPOSITE_BANDS: list = ["b02", "b03", "b04", "b08", "b8a", "b11", "b12"]
+COMPOSITE_BANDS: list = ["blue", "green", "red", "nir", "nir08", "swir16", "swir22"]
 
 FLOWERING_WINDOW_START: str = "08-01"
 FLOWERING_WINDOW_END: str = "10-31"
