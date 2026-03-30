@@ -14,7 +14,7 @@ import numpy as np
 import xarray as xr
 
 # Script-level constants
-FLOWERING_BANDS = ["B03", "B08", "B05", "B06"]   # green, NIR, RE1, RE2
+FLOWERING_BANDS = ["b03", "b08", "b05", "b06"]   # green, NIR, RE1, RE2
 GREEN_NIR_RATIO_NODATA = -9999.0
 NDRE_NODATA = -9999.0
 DASK_CHUNK_SPATIAL = 2048
@@ -55,7 +55,7 @@ def main() -> None:
     if not items:
         raise RuntimeError(f"No Sentinel-2 items found for flowering window {config.YEAR}")
 
-    load_bands = FLOWERING_BANDS + ["SCL"]
+    load_bands = FLOWERING_BANDS + ["scl"]
     logger.info("Loading %d scenes for flowering index", len(items))
 
     with dask.config.set(scheduler="synchronous"):
@@ -68,12 +68,12 @@ def main() -> None:
             chunk_spatial=DASK_CHUNK_SPATIAL,
         )
 
-        scl   = stack.sel(band="SCL")
+        scl   = stack.sel(band="scl")
         stack = stack.sel(band=FLOWERING_BANDS)
         stack = apply_scl_mask(stack, scl)
 
-        green = stack.sel(band="B03").astype(np.float32)
-        nir   = stack.sel(band="B08").astype(np.float32)
+        green = stack.sel(band="b03").astype(np.float32)
+        nir   = stack.sel(band="b08").astype(np.float32)
 
         # Green/NIR ratio — elevated during Parkinsonia flowering
         ratio = green / (nir + 1e-10)

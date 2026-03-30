@@ -55,7 +55,7 @@ def main() -> None:
         raise RuntimeError(f"No Sentinel-2 items found for {config.YEAR}")
 
     # Load all bands + SCL
-    load_bands = config.COMPOSITE_BANDS + ["SCL"]
+    load_bands = config.COMPOSITE_BANDS + ["scl"]
     logger.info("Loading %d scenes, bands: %s", len(items), load_bands)
 
     with dask.config.set(scheduler="synchronous"):
@@ -69,15 +69,15 @@ def main() -> None:
         )
 
         # Separate SCL from optical bands
-        scl   = stack.sel(band="SCL")
+        scl   = stack.sel(band="scl")
         stack = stack.sel(band=config.COMPOSITE_BANDS)
 
         # Apply cloud mask per scene
         stack = apply_scl_mask(stack, scl)
 
         # Compute NDVI per scene: (B08 - B04) / (B08 + B04)
-        nir = stack.sel(band="B08").astype(np.float32)
-        red = stack.sel(band="B04").astype(np.float32)
+        nir = stack.sel(band="b08").astype(np.float32)
+        red = stack.sel(band="b04").astype(np.float32)
         ndvi = (nir - red) / (nir + red + 1e-10)
         ndvi = ndvi.clip(-1.0, 1.0)
 
