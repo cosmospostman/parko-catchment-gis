@@ -27,8 +27,8 @@ def _make_synthetic_stack(n_scenes=3, height=2, width=2, bands=None):
 
     rng = np.random.default_rng(1)
     data = rng.uniform(0.05, 0.5, size=(n_scenes, len(bands), height, width)).astype(np.float32)
-    scl_idx = bands.index("scl")
-    data[:, scl_idx, :, :] = 4.0  # clear
+    if "scl" in bands:
+        data[:, bands.index("scl"), :, :] = 4.0  # clear
 
     times = np.array([
         np.datetime64("2025-08-01"),

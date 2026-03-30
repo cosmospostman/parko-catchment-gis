@@ -27,9 +27,9 @@ def _make_synthetic_stack(n_scenes=3, height=2, width=2, bands=None):
 
     rng = np.random.default_rng(0)
     data = rng.uniform(0.05, 0.5, size=(n_scenes, len(bands), height, width)).astype(np.float32)
-    # Make scl band = 4 (clear vegetation) everywhere
-    scl_idx = bands.index("scl")
-    data[:, scl_idx, :, :] = 4.0
+    # Make scl band = 4 (clear vegetation) everywhere, if present
+    if "scl" in bands:
+        data[:, bands.index("scl"), :, :] = 4.0
 
     times = np.array([
         np.datetime64("2025-06-01"),

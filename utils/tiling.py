@@ -44,20 +44,35 @@ def make_tile_bboxes(
     n_cols = max(n_cols, 1)
     n_rows = max(n_rows, 1)
 
+    # Pre-compute all projected grid-line positions and back-project them in a
+    # single batch call.  Because each shared edge is represented by exactly one
+    # value in the batch, adjacent tiles receive the *same* geographic coordinate
+    # for that edge, eliminating floating-point overlap between neighbours.
+    col_edges_proj = [proj_minx + i * tile_m for i in range(n_cols)] + [proj_maxx]
+    row_edges_proj = [proj_miny + i * tile_m for i in range(n_rows)] + [proj_maxy]
+
+    # Back-project along the left column (constant x = proj_minx representative)
+    # and the bottom row to get y-edges and x-edges respectively.
+    # We only need the scalar back-projection of each edge at a reference point
+    # on the opposite axis (the midpoint), which gives a good geographic
+    # approximation for the grid lines.
+    mid_y_proj = (proj_miny + proj_maxy) / 2
+    mid_x_proj = (proj_minx + proj_maxx) / 2
+
+    col_edges_geo_x, _ = to_geo.transform(col_edges_proj,
+                                           [mid_y_proj] * len(col_edges_proj))
+    _, row_edges_geo_y  = to_geo.transform([mid_x_proj] * len(row_edges_proj),
+                                            row_edges_proj)
+
     bboxes = []
     for row in range(n_rows):
         for col in range(n_cols):
-            t_minx = proj_minx + col * tile_m
-            t_miny = proj_miny + row * tile_m
-            t_maxx = min(t_minx + tile_m, proj_maxx)
-            t_maxy = min(t_miny + tile_m, proj_maxy)
+            g_minx = col_edges_geo_x[col]
+            g_maxx = col_edges_geo_x[col + 1]
+            g_miny = row_edges_geo_y[row]
+            g_maxy = row_edges_geo_y[row + 1]
 
-            # Back-project to EPSG:4326
-            (g_minx, g_maxx), (g_miny, g_maxy) = to_geo.transform(
-                [t_minx, t_maxx], [t_miny, t_maxy]
-            )
-
-            # Clip to full_bbox (guard against floating-point overshoot)
+            # Clip to full_bbox (guard against floating-point overshoot at edges)
             g_minx = max(g_minx, minx_geo)
             g_miny = max(g_miny, miny_geo)
             g_maxx = min(g_maxx, maxx_geo)

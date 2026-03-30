@@ -96,10 +96,11 @@ def test_make_tile_bboxes_tiles_within_full_bbox():
 
 def _write_tile(path: Path, values: np.ndarray, x_start: float, x_end: float,
                 y_start: float, y_end: float, crs: str = "EPSG:7855"):
-    """Write a tiny synthetic tile GeoTIFF."""
+    """Write a tiny synthetic tile GeoTIFF (north-up: y decreasing)."""
     H, W = values.shape
     x = np.linspace(x_start, x_end, W)
-    y = np.linspace(y_start, y_end, H)
+    # y must be north-up (high → low) so pixel height is negative
+    y = np.linspace(max(y_start, y_end), min(y_start, y_end), H)
     da = xr.DataArray(values, dims=["y", "x"], coords={"y": y, "x": x})
     da = da.rio.write_crs(crs)
     da = da.rio.set_spatial_dims(x_dim="x", y_dim="y")
