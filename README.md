@@ -90,6 +90,8 @@ Optional flags:
 | `--rebuild-baseline` | Recompute the NDVI baseline (Landsat 1986–present) |
 | `--force` | Clear step sentinels and re-run all steps for the year |
 | `--dry-run` | Print steps that would run without executing anything |
+| `--tile-size N` | Spatial tile size in pixels (default `256`; lower values reduce peak RAM at the cost of more tiles and merge overhead) |
+| `--tile-workers N` | Number of concurrent tiles (default `4`; tune for available CPU and network bandwidth) |
 
 The pipeline runs 7 steps in sequence. Completed steps are recorded as
 sentinels in `$WORKING_DIR` and skipped on re-runs unless `--force` is passed.
@@ -98,6 +100,8 @@ Logs are written to `$BASE_DIR/logs/`.
 ## Run pipeline steps 1–3 on DigitalOcean
 
 Steps 1–3 download several terabytes of COG tiles from `sentinel-cogs.s3.us-west-2.amazonaws.com`. Running them on a DigitalOcean droplet in San Francisco (SFO3) avoids routing that traffic over a local internet connection.
+
+Steps 1–3 use spatial tiling: the catchment is split into ~256 px × 256 px tiles, and up to 4 tiles are processed concurrently. Each concurrent tile issues many simultaneous S3 range requests, so the full network pipe is utilised without any single tile exceeding the memory budget (~5 GB peak per tile on a 32 GB machine).
 
 **Droplet spec:** Ubuntu 24.04 LTS, `c2-8vcpu-16gb` (CPU-optimised), region SFO3. Add your SSH key during creation.
 

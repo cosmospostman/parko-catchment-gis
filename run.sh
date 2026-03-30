@@ -22,6 +22,7 @@ if [[ $# -lt 1 ]]; then
     echo "Usage: $0 YEAR [--composite-start MM-DD] [--composite-end MM-DD]" >&2
     echo "            [--from-step N] [--to-step N] [--only-step N] [--dry-run]" >&2
     echo "            [--rebuild-baseline] [--force]" >&2
+    echo "            [--tile-size N] [--tile-workers N]" >&2
     exit 3
 fi
 
@@ -52,6 +53,8 @@ while [[ $# -gt 0 ]]; do
         --dry-run)         DRY_RUN=true;          shift   ;;
         --rebuild-baseline) REBUILD_BASELINE=true; shift  ;;
         --force)           FORCE=true;            shift   ;;
+        --tile-size)       TILE_SIZE_PX="$2";     shift 2 ;;
+        --tile-workers)    TILE_WORKERS="$2";     shift 2 ;;
         *) echo "ERROR: Unknown argument: $1" >&2; exit 3 ;;
     esac
 done
@@ -66,6 +69,8 @@ export REBUILD_BASELINE
 export CODE_DIR
 export PIPELINE_RUN=1
 export PYTHONPATH="${CODE_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+export TILE_SIZE_PX="${TILE_SIZE_PX:-256}"
+export TILE_WORKERS="${TILE_WORKERS:-4}"
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
 mkdir -p "${LOG_DIR}" 2>/dev/null || true
@@ -83,6 +88,8 @@ printf "${BOLD}${CYAN}═══════════════════�
 echo "  Log:              ${LOG_FILE}"
 echo "  Composite window: ${COMPOSITE_START} → ${COMPOSITE_END}"
 echo "  Rebuild baseline: ${REBUILD_BASELINE}"
+echo "  Tile size (px):   ${TILE_SIZE_PX}"
+echo "  Tile workers:     ${TILE_WORKERS}"
 echo "  Dry run:          ${DRY_RUN}"
 [[ -n "${ONLY_STEP}" ]] && echo "  Only step:        ${ONLY_STEP}"
 [[ "${FROM_STEP}" != "1" ]] && echo "  From step:        ${FROM_STEP}"

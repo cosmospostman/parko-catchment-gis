@@ -6,9 +6,9 @@ Produces: ndvi_anomaly_{year}.tif  (COG, EPSG:7844, 30 m resampled to 10 m)
 import logging
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-import dask
 import geopandas as gpd
 import numpy as np
 import rasterio
@@ -20,56 +20,101 @@ FC_PV_BAND = "pv"
 RESAMPLING_METHOD = "bilinear"
 BASELINE_CACHE_FILENAME = "ndvi_baseline_median.tif"
 
-logger = logging.getLogger(__name__)
+# Baseline tiles can be larger: only 2 bands at 30 m
+BASELINE_TILE_SIZE_PX = int(os.environ.get("TILE_SIZE_PX", "1024"))
+BASELINE_TILE_WORKERS  = int(os.environ.get("TILE_WORKERS",  "4"))
 
-PIPELINE_RUN = os.environ.get("PIPELINE_RUN") == "1"
+logger = logging.getLogger(__name__)
 
 
 def _build_baseline(bbox, config) -> xr.DataArray:
     """Download and compute the Landsat NDVI baseline median (1986 to year-1)."""
     from utils.stac import load_dea_landsat
-    from utils.progress import LogProgressCallback
+    from utils.tiling import make_tile_bboxes, merge_tile_rasters
 
     start = f"{config.BASELINE_START_YEAR}-01-01"
     end   = f"{config.YEAR - 1}-12-31"
     logger.info("Building Landsat baseline %s → %s", start, end)
 
-    ds = load_dea_landsat(
-        bbox=bbox,
-        start=start,
-        end=end,
-        bands=DEA_BANDS,
-        collection=config.DEA_COLLECTION,
-        resolution=30,
-        crs=config.TARGET_CRS,
+    # Set GDAL env vars before ThreadPoolExecutor so all worker threads inherit them
+    gdal_env = {
+        "GDAL_HTTP_MAX_RETRY": "3",
+        "GDAL_HTTP_RETRY_DELAY": "0.5",
+        "GDAL_HTTP_MERGE_CONSECUTIVE_RANGES": "YES",
+        "CPL_VSIL_CURL_CHUNK_SIZE": "10485760",
+        "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
+        "AWS_NO_SIGN_REQUEST": "YES",
+    }
+    for k, v in gdal_env.items():
+        os.environ.setdefault(k, v)
+
+    tile_bboxes = make_tile_bboxes(bbox, 30, BASELINE_TILE_SIZE_PX)
+    logger.info(
+        "Processing %d spatial tiles for baseline (%d px, %d concurrent)",
+        len(tile_bboxes), BASELINE_TILE_SIZE_PX, BASELINE_TILE_WORKERS,
     )
-    nir = ds["nbart_nir"].astype(np.float32)
-    red = ds["nbart_red"].astype(np.float32)
-    ndvi = (nir - red) / (nir + red + 1e-10)
-    ndvi = ndvi.clip(-1.0, 1.0)
 
-    if PIPELINE_RUN:
-        from dask.distributed import LocalCluster, Client
-        cluster = LocalCluster(n_workers=4, threads_per_worker=2, memory_limit="3GiB")
-        client = Client(cluster)
-        logger.info("Dask dashboard: %s", client.dashboard_link)
-        scheduler_label = "distributed"
-    else:
-        client = None
-        cluster = None
-        scheduler_label = "synchronous"
+    scratch_dir = Path(config.WORKING_DIR) / f"tiles_baseline_{config.YEAR}"
+    scratch_dir.mkdir(exist_ok=True)
 
-    logger.info("Computing baseline median (scheduler=%s)...", scheduler_label)
-    try:
-        with dask.config.set(scheduler="synchronous"), \
-             LogProgressCallback(label="baseline median", log_every=200):
-            baseline = ndvi.median(dim="time", skipna=True).compute()
-    finally:
-        if client is not None:
-            client.close()
-        if cluster is not None:
-            cluster.close()
+    def process_tile(args):
+        tile_idx, tile_bbox = args
+        import dask
+        try:
+            ds = load_dea_landsat(
+                bbox=tile_bbox,
+                start=start,
+                end=end,
+                bands=DEA_BANDS,
+                collection=config.DEA_COLLECTION,
+                resolution=30,
+                crs=config.TARGET_CRS,
+            )
+            nir = ds["nbart_nir"].astype(np.float32)
+            red = ds["nbart_red"].astype(np.float32)
+            ndvi = (nir - red) / (nir + red + 1e-10)
+            ndvi = ndvi.clip(-1.0, 1.0)
+
+            with dask.config.set(scheduler="threads"):
+                baseline_tile = ndvi.median(dim="time", skipna=True).compute()
+
+            baseline_tile = baseline_tile.rio.write_crs(config.TARGET_CRS)
+
+            tile_path = scratch_dir / f"tile_{tile_idx:05d}.tif"
+            baseline_tile.rio.to_raster(
+                str(tile_path), driver="GTiff", dtype="float32",
+                compress="deflate",
+            )
+            return tile_path
+        except Exception as exc:
+            logger.warning("Baseline tile %d failed: %s", tile_idx, exc)
+            return None
+
+    with ThreadPoolExecutor(max_workers=BASELINE_TILE_WORKERS) as pool:
+        tile_paths = list(pool.map(process_tile, enumerate(tile_bboxes)))
+
+    valid_paths = [p for p in tile_paths if p is not None]
+    if not valid_paths:
+        raise RuntimeError("All baseline tiles failed — no output produced")
+
+    # Merge tiles into a temporary path, then load as DataArray
+    merged_path = scratch_dir / "baseline_merged.tif"
+    merge_tile_rasters(valid_paths, merged_path, nodata=np.nan, crs=config.TARGET_CRS)
+
+    baseline = xr.open_dataarray(str(merged_path)).load()
+    if baseline.ndim == 3:
+        baseline = baseline.squeeze()
     baseline = baseline.rio.write_crs(config.TARGET_CRS)
+
+    # Clean up scratch
+    for p in valid_paths:
+        p.unlink(missing_ok=True)
+    merged_path.unlink(missing_ok=True)
+    try:
+        scratch_dir.rmdir()
+    except OSError:
+        pass
+
     return baseline
 
 

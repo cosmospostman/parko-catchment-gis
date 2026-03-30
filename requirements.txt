@@ -19,7 +19,7 @@ pystac-client>=0.7,<0.9
 scikit-learn>=1.4,<2
 
 # Parallel computation
-dask[array]>=2024.1,<2024.10
+dask[array,distributed]>=2024.1,<2024.10
 
 # HTTP
 requests>=2.31,<3
