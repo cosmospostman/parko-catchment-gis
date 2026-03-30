@@ -28,7 +28,6 @@ def search_sentinel2(
         bbox=bbox,
         datetime=f"{start}/{end}",
         query={"eo:cloud_cover": {"lt": cloud_cover_max}},
-        max_items=500,
     )
     items = list(search.items())
     logger.info("S2 STAC search: %d items found", len(items))
@@ -50,7 +49,6 @@ def search_sentinel1(
         collections=[collection],
         bbox=bbox,
         datetime=f"{start}/{end}",
-        max_items=500,
     )
     items = list(search.items())
     logger.info("S1 STAC search: %d items found", len(items))
