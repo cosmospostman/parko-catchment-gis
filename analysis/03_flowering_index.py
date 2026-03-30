@@ -17,7 +17,7 @@ import xarray as xr
 FLOWERING_BANDS = ["green", "nir", "rededge1", "rededge2"]   # green, NIR, RE1, RE2
 GREEN_NIR_RATIO_NODATA = -9999.0
 NDRE_NODATA = -9999.0
-DASK_CHUNK_SPATIAL = 2048
+DASK_CHUNK_SPATIAL = 512
 
 logger = logging.getLogger(__name__)
 
@@ -57,33 +57,68 @@ def main() -> None:
     load_bands = FLOWERING_BANDS + ["scl"]
     logger.info("Loading %d scenes for flowering index", len(items))
 
-    dask_scheduler = "threads" if PIPELINE_RUN else "synchronous"
+    if PIPELINE_RUN:
+        from dask.distributed import LocalCluster, Client
+        cluster = LocalCluster(n_workers=4, threads_per_worker=2, memory_limit="3GiB")
+        client = Client(cluster)
+        logger.info("Dask dashboard: %s", client.dashboard_link)
+        dask_ctx = dask.config.set(scheduler="synchronous")  # client takes over
+    else:
+        client = None
+        cluster = None
+        dask_ctx = dask.config.set(scheduler="synchronous")
 
-    with dask.config.set(scheduler=dask_scheduler):
-        stack = load_stackstac(
-            items=items,
-            bands=load_bands,
-            resolution=config.TARGET_RESOLUTION,
-            bbox=bbox,
-            crs=config.TARGET_CRS,
-            chunk_spatial=DASK_CHUNK_SPATIAL,
-        )
+    gdal_env = {
+        "GDAL_HTTP_MAX_RETRY": "3",
+        "GDAL_HTTP_RETRY_DELAY": "0.5",
+        "GDAL_HTTP_MERGE_CONSECUTIVE_RANGES": "YES",
+        "CPL_VSIL_CURL_CHUNK_SIZE": "10485760",
+        "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
+        "AWS_NO_SIGN_REQUEST": "YES",
+    }
 
-        scl   = stack.sel(band="scl")
-        stack = stack.sel(band=FLOWERING_BANDS)
-        stack = apply_scl_mask(stack, scl)
+    try:
+        import rasterio
+        from rasterio.env import Env as RasterioEnv
+        rio_env = RasterioEnv(**gdal_env)
+        rio_env.__enter__()
+    except Exception:
+        rio_env = None
 
-        green = stack.sel(band="green").astype(np.float32)
-        nir   = stack.sel(band="nir").astype(np.float32)
+    try:
+        with dask_ctx:
+            stack = load_stackstac(
+                items=items,
+                bands=load_bands,
+                resolution=config.TARGET_RESOLUTION,
+                bbox=bbox,
+                crs=config.TARGET_CRS,
+                chunk_spatial=DASK_CHUNK_SPATIAL,
+            )
 
-        # Green/NIR ratio — elevated during Parkinsonia flowering
-        ratio = green / (nir + 1e-10)
-        ratio = ratio.where(nir > 0)
+            scl   = stack.sel(band="scl")
+            stack = stack.sel(band=FLOWERING_BANDS)
+            stack = apply_scl_mask(stack, scl)
 
-        # Median over flowering window
-        logger.info("Computing flowering index median (scheduler=%s)...", dask_scheduler)
-        with LogProgressCallback(label="flowering index median", log_every=200):
-            flowering_index = ratio.median(dim="time", skipna=True).compute()
+            green = stack.sel(band="green").astype(np.float32)
+            nir   = stack.sel(band="nir").astype(np.float32)
+
+            # Green/NIR ratio — elevated during Parkinsonia flowering
+            ratio = green / (nir + 1e-10)
+            ratio = ratio.where(nir > 0)
+
+            # Median over flowering window
+            scheduler_label = "distributed" if client else "synchronous"
+            logger.info("Computing flowering index median (scheduler=%s)...", scheduler_label)
+            with LogProgressCallback(label="flowering index median", log_every=200):
+                flowering_index = ratio.median(dim="time", skipna=True).compute()
+    finally:
+        if rio_env is not None:
+            rio_env.__exit__(None, None, None)
+        if client is not None:
+            client.close()
+        if cluster is not None:
+            cluster.close()
 
     flowering_index = flowering_index.rio.write_crs(config.TARGET_CRS)
 

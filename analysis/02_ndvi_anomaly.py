@@ -47,11 +47,28 @@ def _build_baseline(bbox, config) -> xr.DataArray:
     red = ds["nbart_red"].astype(np.float32)
     ndvi = (nir - red) / (nir + red + 1e-10)
     ndvi = ndvi.clip(-1.0, 1.0)
-    dask_scheduler = "threads" if PIPELINE_RUN else "synchronous"
-    logger.info("Computing baseline median (scheduler=%s)...", dask_scheduler)
-    with dask.config.set(scheduler=dask_scheduler), \
-         LogProgressCallback(label="baseline median", log_every=200):
-        baseline = ndvi.median(dim="time", skipna=True).compute()
+
+    if PIPELINE_RUN:
+        from dask.distributed import LocalCluster, Client
+        cluster = LocalCluster(n_workers=4, threads_per_worker=2, memory_limit="3GiB")
+        client = Client(cluster)
+        logger.info("Dask dashboard: %s", client.dashboard_link)
+        scheduler_label = "distributed"
+    else:
+        client = None
+        cluster = None
+        scheduler_label = "synchronous"
+
+    logger.info("Computing baseline median (scheduler=%s)...", scheduler_label)
+    try:
+        with dask.config.set(scheduler="synchronous"), \
+             LogProgressCallback(label="baseline median", log_every=200):
+            baseline = ndvi.median(dim="time", skipna=True).compute()
+    finally:
+        if client is not None:
+            client.close()
+        if cluster is not None:
+            cluster.close()
     baseline = baseline.rio.write_crs(config.TARGET_CRS)
     return baseline
 

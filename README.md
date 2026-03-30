@@ -38,7 +38,7 @@ All operational data lives outside the repo under a single `BASE_DIR`. Edit
 [config.sh](config.sh) to set its location (defaults to `/data/mrc-parko`):
 
 ```bash
-export BASE_DIR="${HOME}/parko-data"   # change this line
+export BASE_DIR="/data/mrc-parko"   # change this line
 ```
 
 You must also place the catchment boundary file at:
