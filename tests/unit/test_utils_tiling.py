@@ -108,17 +108,20 @@ def _write_tile(path: Path, values: np.ndarray, x_start: float, x_end: float,
 
 
 def test_merge_tile_rasters_values(tmp_path):
-    """Merge of two side-by-side tiles produces correct pixel values."""
-    left = np.full((4, 4), 0.3, dtype=np.float32)
+    """Merge of two non-overlapping side-by-side tiles produces correct pixel values."""
+    # Use pixel-centre coordinates with a 1000 m pixel spacing so tiles don't
+    # share a boundary sample.  Left: centres 700500…703500 (4 px, x 700000–704000)
+    # Right: centres 704500…707500 (4 px, x 704000–708000).  No shared column.
+    left  = np.full((4, 4), 0.3, dtype=np.float32)
     right = np.full((4, 4), 0.7, dtype=np.float32)
 
-    left_path = tmp_path / "tile_left.tif"
+    left_path  = tmp_path / "tile_left.tif"
     right_path = tmp_path / "tile_right.tif"
 
-    _write_tile(left_path,  left,  x_start=700000, x_end=710000,
-                y_start=-1610000, y_end=-1600000)
-    _write_tile(right_path, right, x_start=710000, x_end=720000,
-                y_start=-1610000, y_end=-1600000)
+    _write_tile(left_path,  left,  x_start=700500, x_end=703500,
+                y_start=-1609500, y_end=-1600500)
+    _write_tile(right_path, right, x_start=704500, x_end=707500,
+                y_start=-1609500, y_end=-1600500)
 
     out_path = tmp_path / "merged.tif"
     merge_tile_rasters([left_path, right_path], out_path,
@@ -128,9 +131,13 @@ def test_merge_tile_rasters_values(tmp_path):
     result = xr.open_dataarray(str(out_path))
     data = result.values.squeeze()
 
-    # Left half should be ~0.3, right half ~0.7
-    assert np.nanmean(data[:, :data.shape[1] // 2]) == pytest.approx(0.3, abs=0.01)
-    assert np.nanmean(data[:, data.shape[1] // 2:]) == pytest.approx(0.7, abs=0.01)
+    # Left columns (non-NaN) should average ~0.3; right columns ~0.7.
+    # The gap between tiles will be NaN — exclude it.
+    col_means = np.nanmean(data, axis=0)
+    valid_cols = col_means[~np.isnan(col_means)]
+    assert len(valid_cols) >= 2
+    assert valid_cols[0]  == pytest.approx(0.3, abs=0.01)
+    assert valid_cols[-1] == pytest.approx(0.7, abs=0.01)
 
 
 def test_merge_tile_rasters_crs_preserved(tmp_path):
