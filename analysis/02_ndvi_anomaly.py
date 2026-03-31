@@ -154,6 +154,11 @@ def _build_baseline(bbox, config) -> xr.DataArray:
             # hitting a per-request item cap that would truncate recent years.
             # Items returned chronologically would otherwise leave 2009–present
             # absent when max_items is reached.
+            # Sample evenly across the dry season for each year.
+            # pystac_client's max_items controls page size, not total returned,
+            # so we fetch all scenes for the window then subsample by stride to
+            # avoid front-loading May scenes and missing August–October.
+            max_items_per_year = 12
             tile_items = []
             for yr in range(start_year, end_year + 1):
                 yr_start = f"{yr}-{dry_start_mm_dd}"
@@ -162,8 +167,10 @@ def _build_baseline(bbox, config) -> xr.DataArray:
                     collections=DEA_LANDSAT_COLLECTIONS,
                     bbox=tile_bbox,
                     datetime=f"{yr_start}/{yr_end}",
-                    max_items=50,
                 ).items())
+                if len(yr_items) > max_items_per_year:
+                    step = len(yr_items) / max_items_per_year
+                    yr_items = [yr_items[round(i * step)] for i in range(max_items_per_year)]
                 tile_items.extend(yr_items)
             logger.info(
                 "Tile %d/%d  STAC: %d items across %d years",
