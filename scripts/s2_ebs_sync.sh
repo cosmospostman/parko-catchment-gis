@@ -67,19 +67,19 @@ fi
 
 mkdir -p "$(dirname "$LOCAL_PATH")"
 
-# Get file size from S3 before copying
-BUCKET="${URI#s3://}"; BUCKET="${BUCKET%%/*}"
-KEY_PATH="${URI#s3://${BUCKET}/}"
-SIZE_BYTES=$(aws s3api head-object --bucket "$BUCKET" --key "$KEY_PATH" \
-    --query ContentLength --output text 2>/dev/null || echo "")
-if [[ -n "$SIZE_BYTES" && "$SIZE_BYTES" != "None" ]]; then
+# Convert s3:// URI to HTTPS — no auth required for sentinel-cogs public bucket
+HTTPS_URL="https://sentinel-cogs.s3.us-west-2.amazonaws.com/${KEY#sentinel-cogs/}"
+
+# Get file size via HEAD request
+SIZE_BYTES=$(curl -sI "$HTTPS_URL" | awk 'tolower($1)=="content-length:" {print $2}' | tr -d '\r')
+if [[ -n "$SIZE_BYTES" ]]; then
     SIZE_MB=$(awk "BEGIN {printf \"%.0f\", $SIZE_BYTES / 1048576}")
-    echo "download: $URI (${SIZE_MB} MB)"
+    echo "download: $KEY (${SIZE_MB} MB)"
 else
-    echo "download: $URI"
+    echo "download: $KEY"
 fi
 
-aws s3 cp "$URI" "$LOCAL_PATH" --quiet
+curl -fsSL --retry 5 --retry-delay 2 "$HTTPS_URL" -o "$LOCAL_PATH"
 echo "sync:$LOCAL_PATH" >> "${COUNTS_DIR}/synced"
 COPY_EOF
 
