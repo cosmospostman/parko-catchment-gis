@@ -90,7 +90,7 @@ def main() -> None:
         scl   = stack.sel(band="scl")
         stack = stack.sel(band=["red", "nir"])
         stack = apply_scl_mask(stack, scl)
-        return stack.astype(np.float32).compute(scheduler="threads")
+        return stack.astype(np.float32).compute(scheduler="synchronous")
 
     def compute_fn(tile_idx, raw, tile_path):
         try:
