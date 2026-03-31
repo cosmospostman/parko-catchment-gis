@@ -30,3 +30,6 @@ if [[ -n "${_PYTHON}" ]] && "${_PYTHON}" -c "import rasterio" 2>/dev/null; then
     fi
 fi
 unset _PYTHON _RASTERIO_PROJ_DATA _PYPROJ_DATA
+
+# Set this when the S2 COG EBS volume is mounted at /mnt/s2cache
+export LOCAL_S2_ROOT="${LOCAL_S2_ROOT:-}"

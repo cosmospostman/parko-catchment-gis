@@ -16,7 +16,7 @@ FLOWERING_BANDS = ["green", "nir", "rededge1", "rededge2"]   # green, NIR, RE1, 
 DASK_CHUNK_SPATIAL = 1024
 
 TILE_SIZE_PX    = int(os.environ.get("TILE_SIZE_PX",    "512"))
-FETCH_WORKERS   = int(os.environ.get("FETCH_WORKERS",   "16"))
+FETCH_WORKERS   = int(os.environ.get("FETCH_WORKERS",   "4" if os.environ.get("LOCAL_S2_ROOT") else "16"))
 COMPUTE_WORKERS = int(os.environ.get("COMPUTE_WORKERS", str(os.cpu_count() or 4)))
 
 logger = logging.getLogger(__name__)
@@ -53,6 +53,12 @@ def main() -> None:
         raise RuntimeError(f"No Sentinel-2 items found for flowering window {config.YEAR}")
 
     load_bands = FLOWERING_BANDS + ["scl"]
+
+    if local_root := os.environ.get("LOCAL_S2_ROOT"):
+        from utils.stac import rewrite_hrefs_to_local
+        items = rewrite_hrefs_to_local(items, local_root, load_bands)
+        logger.info("LOCAL_S2_ROOT set — hrefs rewritten to local paths")
+
     logger.info("Loading %d scenes for flowering index", len(items))
 
     setup_gdal_env()

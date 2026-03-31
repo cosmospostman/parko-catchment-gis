@@ -94,6 +94,27 @@ def filter_items_by_bbox(items: List[Any], bbox: List[float]) -> List[Any]:
     return result
 
 
+def rewrite_hrefs_to_local(items, local_root, bands):
+    """Replace S3/HTTPS asset hrefs with local file paths where files exist."""
+    import copy
+    import urllib.parse
+    from pathlib import Path
+
+    patched = []
+    for item in items:
+        item = copy.deepcopy(item)
+        for band, asset in item.assets.items():
+            if band not in bands:
+                continue
+            parsed = urllib.parse.urlparse(asset.href)
+            # s3://sentinel-cogs/a/b/c.tif → /mnt/s2cache/sentinel-cogs/a/b/c.tif
+            local_path = Path(local_root) / parsed.netloc / parsed.path.lstrip("/")
+            if local_path.exists():
+                asset.href = str(local_path)
+        patched.append(item)
+    return patched
+
+
 def load_dea_landsat(
     bbox: List[float],
     start: str,

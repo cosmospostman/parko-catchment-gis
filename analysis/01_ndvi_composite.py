@@ -16,7 +16,7 @@ S2CLOUDLESS_PROB_MAX = 0.4
 DASK_CHUNK_SPATIAL = 1024
 
 TILE_SIZE_PX    = int(os.environ.get("TILE_SIZE_PX",    "512"))
-FETCH_WORKERS   = int(os.environ.get("FETCH_WORKERS",   "32"))
+FETCH_WORKERS   = int(os.environ.get("FETCH_WORKERS",   "4" if os.environ.get("LOCAL_S2_ROOT") else "32"))
 COMPUTE_WORKERS = int(os.environ.get("COMPUTE_WORKERS", str(os.cpu_count() or 4)))
 
 logger = logging.getLogger(__name__)
@@ -53,6 +53,12 @@ def main() -> None:
         raise RuntimeError(f"No Sentinel-2 items found for {config.YEAR}")
 
     load_bands = ["red", "nir", "scl"]
+
+    if local_root := os.environ.get("LOCAL_S2_ROOT"):
+        from utils.stac import rewrite_hrefs_to_local
+        items = rewrite_hrefs_to_local(items, local_root, load_bands)
+        logger.info("LOCAL_S2_ROOT set — hrefs rewritten to local paths")
+
     logger.info("Loading %d scenes, bands: %s", len(items), load_bands)
 
     setup_gdal_env()

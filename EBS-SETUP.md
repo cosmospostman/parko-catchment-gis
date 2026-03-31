@@ -20,37 +20,46 @@ volume when done, restore in minutes next year.
 
 ## First-time setup
 
-### 1. Find your instance's availability zone
+### 1. Set variables
+
+```bash
+INSTANCE_ID=i-0your-instance
+VOLUME_ID=vol-0abc123   # set after step 2
+```
+
+### 2. Find your instance's availability zone
 
 EBS volumes must be in the same AZ as the EC2 instance.
 
 ```bash
 curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone
-# e.g. ap-southeast-2a
+# e.g. us-west-2a
 ```
 
-### 2. Create the volume
+### 3. Create the volume
 
 ```bash
 aws ec2 create-volume \
-  --availability-zone ap-southeast-2a \
+  --region us-west-2 \
+  --availability-zone us-west-2a \
   --size 500 \
   --volume-type gp3 \
   --tag-specifications 'ResourceType=volume,Tags=[{Key=Name,Value=s2-cache}]'
 ```
 
-Note the `VolumeId` in the output (e.g. `vol-0abc123`).
+Set `VOLUME_ID` to the `VolumeId` in the output, then continue.
 
-### 3. Attach to your running instance
+### 4. Attach to your running instance
 
 ```bash
 aws ec2 attach-volume \
-  --volume-id vol-0abc123 \
-  --instance-id i-0your-instance \
+  --region us-west-2 \
+  --volume-id $VOLUME_ID \
+  --instance-id $INSTANCE_ID \
   --device /dev/sdf
 ```
 
-### 4. Format (first time only)
+### 5. Format (first time only)
 
 ```bash
 # Check what device name the OS assigned — usually /dev/nvme1n1 on modern instances
@@ -59,7 +68,7 @@ lsblk
 sudo mkfs -t xfs /dev/nvme1n1
 ```
 
-### 5. Mount
+### 6. Mount
 
 ```bash
 sudo mkdir -p /mnt/s2cache
@@ -72,16 +81,19 @@ sudo chown $(whoami) /mnt/s2cache
 ## After the pipeline run — snapshot and delete
 
 ```bash
+VOLUME_ID=vol-0abc123   # set to your volume
+
 # 1. Snapshot (retained cheaply for next year)
 aws ec2 create-snapshot \
-  --volume-id vol-0abc123 \
-  --description "s2-cache-2025"
+  --region us-west-2 \
+  --volume-id $VOLUME_ID \
+  --description "s2-cache-2026"
 
 # 2. Detach
-aws ec2 detach-volume --volume-id vol-0abc123
+aws ec2 detach-volume --region us-west-2 --volume-id $VOLUME_ID
 
 # 3. Delete
-aws ec2 delete-volume --volume-id vol-0abc123
+aws ec2 delete-volume --region us-west-2 --volume-id $VOLUME_ID
 ```
 
 ---
@@ -89,13 +101,18 @@ aws ec2 delete-volume --volume-id vol-0abc123
 ## Subsequent years — restore from snapshot
 
 ```bash
+INSTANCE_ID=i-0your-instance
+
 # 1. Create a new volume from last year's snapshot
 aws ec2 create-volume \
-  --availability-zone ap-southeast-2a \
+  --region us-west-2 \
+  --availability-zone us-west-2a \
   --snapshot-id snap-0abc123 \
   --volume-type gp3
 
-# 2. Attach and mount as above (steps 3 and 5 — skip mkfs, data is already there)
+VOLUME_ID=vol-0new-volume   # set from output above
+
+# 2. Attach and mount as above (steps 4 and 6 — skip mkfs, data is already there)
 ```
 
 Only new scenes for the current year need syncing — the snapshot already contains prior
