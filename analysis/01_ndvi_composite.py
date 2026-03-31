@@ -79,6 +79,7 @@ def main() -> None:
         if not tile_items:
             logger.warning("Tile %d: no items intersect bbox, skipping", tile_idx)
             return None
+        t0 = time.monotonic()
         stack = load_stackstac(
             items=tile_items,
             bands=load_bands,
@@ -87,10 +88,14 @@ def main() -> None:
             crs=config.TARGET_CRS,
             chunk_spatial=DASK_CHUNK_SPATIAL,
         )
+        logger.info("Tile %d: stack=%.2fs", tile_idx, time.monotonic() - t0)
         scl   = stack.sel(band="scl")
         stack = stack.sel(band=["red", "nir"])
         stack = apply_scl_mask(stack, scl)
-        return stack.astype(np.float32).compute(scheduler="synchronous")
+        t1 = time.monotonic()
+        result = stack.astype(np.float32).compute(scheduler="synchronous")
+        logger.info("Tile %d: compute=%.2fs", tile_idx, time.monotonic() - t1)
+        return result
 
     def compute_fn(tile_idx, raw, tile_path):
         try:
