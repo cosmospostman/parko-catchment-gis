@@ -23,8 +23,9 @@ volume when done, restore in minutes next year.
 ### 1. Set variables
 
 ```bash
-INSTANCE_ID=i-0your-instance
-VOLUME_ID=vol-0abc123   # set after step 2
+INSTANCE_ID=i-068fc9ec12b1c044e
+AZ=us-west-2b
+VOLUME_ID=vol-0bbe5d41b37159d7e   # set after step 3
 ```
 
 ### 2. Find your instance's availability zone
@@ -33,7 +34,7 @@ EBS volumes must be in the same AZ as the EC2 instance.
 
 ```bash
 curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone
-# e.g. us-west-2a
+# e.g. us-west-2b
 ```
 
 ### 3. Create the volume
@@ -41,7 +42,7 @@ curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone
 ```bash
 aws ec2 create-volume \
   --region us-west-2 \
-  --availability-zone us-west-2a \
+  --availability-zone $AZ \
   --size 500 \
   --volume-type gp3 \
   --tag-specifications 'ResourceType=volume,Tags=[{Key=Name,Value=s2-cache}]'
@@ -106,7 +107,7 @@ INSTANCE_ID=i-0your-instance
 # 1. Create a new volume from last year's snapshot
 aws ec2 create-volume \
   --region us-west-2 \
-  --availability-zone us-west-2a \
+  --availability-zone $AZ \
   --snapshot-id snap-0abc123 \
   --volume-type gp3
 

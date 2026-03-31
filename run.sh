@@ -215,7 +215,16 @@ else
     printf "  ${YELLOW}⚠${RESET} STAC endpoint unreachable (%s) — Steps 01–04 will fail if network is unavailable\n" "${_stac_url}"
 fi
 
-# 8. Prior year probability raster (only for year > baseline)
+# 8. LOCAL_S2_ROOT — if set, confirm mount is present and manifest exists
+if [[ -n "${LOCAL_S2_ROOT}" ]]; then
+    if [[ -d "${LOCAL_S2_ROOT}" ]]; then
+        preflight_check "LOCAL_S2_ROOT mounted and accessible (${LOCAL_S2_ROOT})" "true"
+    else
+        preflight_check "LOCAL_S2_ROOT set but directory not found: ${LOCAL_S2_ROOT}" "false"
+    fi
+fi
+
+# 10. Prior year probability raster (only for year > baseline)
 PRIOR_YEAR=$(( YEAR - 1 ))
 if [[ ${YEAR} -gt 2020 ]]; then
     PRIOR_PROB="$(python -c "
@@ -251,6 +260,7 @@ fi
 if [[ "${DRY_RUN}" == "true" ]]; then
     echo "Dry run — no scripts will be executed."
     echo "Steps that would run:"
+    [[ -n "${LOCAL_S2_ROOT}" ]] && printf "  Step 00  s2_ebs_sync (LOCAL_S2_ROOT=%s)\n" "${LOCAL_S2_ROOT}"
     for step_num in 1 2 3 4 5 6 7; do
         printf "  Step %02d\n" "${step_num}"
     done
@@ -261,6 +271,7 @@ fi
 declare -a STEP_NAMES
 declare -a STEP_DURATIONS
 declare -a STEP_STATUSES
+declare -a STEP_NUMS
 
 # ── Step runner ───────────────────────────────────────────────────────────────
 # run_step STEP_NUM ANALYSIS_NAME VERIFY_NAME
@@ -272,6 +283,7 @@ run_step() {
     step_nn="$(printf '%02d' "${step_num}")"
 
     STEP_NAMES+=("${analysis_name}")
+    STEP_NUMS+=("${step_num}")
 
     # Apply --only-step filter
     if [[ -n "${ONLY_STEP}" && "${step_num}" != "${ONLY_STEP}" ]]; then
@@ -383,8 +395,7 @@ print_summary() {
         status="${STEP_STATUSES[$i]}"
         name="${STEP_NAMES[$i]}"
         dur="${STEP_DURATIONS[$i]}"
-        step_n=$(( i + 1 ))
-        nn="$(printf '%02d' "${step_n}")"
+        nn="$(printf '%02d' "${STEP_NUMS[$i]}")"
         case "${status}" in
             PASS)        colour="${GREEN}" ;;
             FAIL|VERIFY_FAIL) colour="${RED}" ;;
@@ -419,6 +430,60 @@ run_step_or_abort() {
         exit "${OVERALL_EXIT}"
     fi
 }
+
+# ── Stage 0: EBS sync (only when LOCAL_S2_ROOT is set) ───────────────────────
+if [[ -n "${LOCAL_S2_ROOT}" ]]; then
+    STEP_NUMS+=(0)
+    STEP_NAMES+=("s2_ebs_sync")
+
+    _skip_stage0=false
+    [[ -n "${ONLY_STEP}" && "${ONLY_STEP}" != "0" ]] && _skip_stage0=true
+    [[ "${FROM_STEP}" -gt 0 ]] && _skip_stage0=true
+
+    _sentinel_00="${WORKING_DIR}/.step_00_complete_${YEAR}_${GIT_SHA}"
+    if [[ "${_skip_stage0}" == "true" ]]; then
+        printf "${CYAN}[SKIP]${RESET} Step 00 — s2_ebs_sync (filtered)\n"
+        STEP_STATUSES+=("SKIP")
+        STEP_DURATIONS+=("—")
+    elif [[ -f "${_sentinel_00}" && "${FROM_STEP}" == "1" && -z "${ONLY_STEP}" ]]; then
+        printf "${CYAN}[SKIP]${RESET} Step 00 — s2_ebs_sync (already complete, sentinel found)\n"
+        STEP_STATUSES+=("SKIP")
+        STEP_DURATIONS+=("cached")
+    else
+        printf "\n${BOLD}${CYAN}── Step 00: s2_ebs_sync ─────────────────────────────────────${RESET}\n"
+        _manifest="${WORKING_DIR}/manifest_${YEAR}.txt"
+        printf "Generating manifest → %s\n" "${_manifest}"
+        _t0="$(date +%s)"
+
+        _manifest_exit=0
+        python "${CODE_DIR}/scripts/s2_sync_manifest.py" "${YEAR}" --out "${_manifest}" || _manifest_exit=$?
+        if [[ ${_manifest_exit} -ne 0 ]]; then
+            printf "${RED}${BOLD}FAILED: s2_sync_manifest.py (exit ${_manifest_exit})${RESET}\n"
+            OVERALL_EXIT=1
+            STEP_STATUSES+=("FAIL")
+            _t1="$(date +%s)"; STEP_DURATIONS+=("$(( _t1 - _t0 ))s")
+            print_summary
+            exit "${OVERALL_EXIT}"
+        fi
+
+        _sync_exit=0
+        "${CODE_DIR}/scripts/s2_ebs_sync.sh" --manifest "${_manifest}" --dest "${LOCAL_S2_ROOT}" || _sync_exit=$?
+        if [[ ${_sync_exit} -ne 0 ]]; then
+            printf "${RED}${BOLD}FAILED: s2_ebs_sync.sh (exit ${_sync_exit})${RESET}\n"
+            OVERALL_EXIT=1
+            STEP_STATUSES+=("FAIL")
+            _t1="$(date +%s)"; STEP_DURATIONS+=("$(( _t1 - _t0 ))s")
+            print_summary
+            exit "${OVERALL_EXIT}"
+        fi
+
+        touch "${_sentinel_00}"
+        _t1="$(date +%s)"
+        STEP_DURATIONS+=("$(( _t1 - _t0 ))s")
+        STEP_STATUSES+=("PASS")
+        printf "${GREEN}[PASS]${RESET} Step 00 completed in %ds\n" "$(( _t1 - _t0 ))"
+    fi
+fi
 
 run_step_or_abort 1 "01_ndvi_composite"    "01_verify_ndvi_composite"
 run_step_or_abort 2 "02_ndvi_anomaly"      "02_verify_ndvi_anomaly"

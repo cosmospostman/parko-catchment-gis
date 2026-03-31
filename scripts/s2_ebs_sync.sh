@@ -66,6 +66,19 @@ if [[ -f "$LOCAL_PATH" ]]; then
 fi
 
 mkdir -p "$(dirname "$LOCAL_PATH")"
+
+# Get file size from S3 before copying
+BUCKET="${URI#s3://}"; BUCKET="${BUCKET%%/*}"
+KEY_PATH="${URI#s3://${BUCKET}/}"
+SIZE_BYTES=$(aws s3api head-object --bucket "$BUCKET" --key "$KEY_PATH" \
+    --query ContentLength --output text 2>/dev/null || echo "")
+if [[ -n "$SIZE_BYTES" && "$SIZE_BYTES" != "None" ]]; then
+    SIZE_MB=$(awk "BEGIN {printf \"%.0f\", $SIZE_BYTES / 1048576}")
+    echo "download: $URI (${SIZE_MB} MB)"
+else
+    echo "download: $URI"
+fi
+
 aws s3 cp "$URI" "$LOCAL_PATH" --quiet
 echo "sync:$LOCAL_PATH" >> "${COUNTS_DIR}/synced"
 COPY_EOF
