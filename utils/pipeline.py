@@ -203,8 +203,14 @@ def run_tiled_pipeline(
             else:
                 stat["fetch_ok"] = True
                 try:
-                    stat["array_shape"] = "x".join(str(d) for d in raw.shape)
-                    stat["array_bytes"] = int(raw.nbytes)
+                    import xarray as xr
+                    if isinstance(raw, xr.Dataset):
+                        dims = next(iter(raw.data_vars.values())).shape
+                        stat["array_shape"] = "x".join(str(d) for d in dims)
+                        stat["array_bytes"] = int(sum(v.nbytes for v in raw.data_vars.values()))
+                    else:
+                        stat["array_shape"] = "x".join(str(d) for d in raw.shape)
+                        stat["array_bytes"] = int(raw.nbytes)
                 except Exception:
                     pass
                 q.put((tile_idx, raw, None, stat))
