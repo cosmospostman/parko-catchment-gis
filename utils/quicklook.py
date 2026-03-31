@@ -10,14 +10,19 @@ logger = logging.getLogger(__name__)
 
 
 def save_quicklook(
-    da: xr.DataArray,
+    src: "xr.DataArray | Path | str",
     path: Path,
     vmin: float = 0.0,
     vmax: float = 1.0,
     cmap: str = "RdYlGn",
     title: str = "",
+    max_px: int = 2048,
 ) -> None:
-    """Save a PNG thumbnail of a DataArray.
+    """Save a PNG thumbnail of a raster.
+
+    src may be an xr.DataArray or a file path. When a path is given the raster
+    is read at reduced resolution (max_px on the longest side) so the full array
+    is never loaded into RAM.
 
     Works with 2-D (y, x) or 3-band (3, y, x) arrays.
     """
@@ -28,9 +33,26 @@ def save_quicklook(
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    fig, ax = plt.subplots(figsize=(8, 6), dpi=100)
+    if not isinstance(src, xr.DataArray):
+        import rasterio
+        from rasterio.enums import Resampling
+        with rasterio.open(str(src)) as ds:
+            scale = min(max_px / ds.width, max_px / ds.height, 1.0)
+            out_h = max(1, int(ds.height * scale))
+            out_w = max(1, int(ds.width * scale))
+            arr = ds.read(
+                out_shape=(ds.count, out_h, out_w),
+                resampling=Resampling.average,
+            ).astype(np.float32)
+            nodata = ds.nodata
+        if nodata is not None:
+            arr[arr == nodata] = np.nan
+        if arr.shape[0] == 1:
+            arr = arr[0]
+    else:
+        arr = src.values
 
-    arr = da.values
+    fig, ax = plt.subplots(figsize=(8, 6), dpi=100)
     if arr.ndim == 3:
         if arr.shape[0] == 1:
             arr = arr[0]

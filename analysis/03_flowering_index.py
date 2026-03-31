@@ -128,11 +128,9 @@ def main() -> None:
         compute_workers=COMPUTE_WORKERS,
     )
 
-    import xarray as xr
-    flowering_full = xr.open_dataarray(str(out_path))
     ql_path = Path(str(out_path).replace(".tif", "_quicklook.png"))
     save_quicklook(
-        flowering_full,
+        out_path,
         ql_path,
         vmin=0.0,
         vmax=1.5,

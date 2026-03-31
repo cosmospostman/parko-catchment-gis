@@ -128,11 +128,9 @@ def main() -> None:
         compute_workers=COMPUTE_WORKERS,
     )
 
-    import xarray as xr
-    ndvi_median_full = xr.open_dataarray(str(out_path))
     ql_path = Path(str(out_path).replace(".tif", "_quicklook.png"))
     save_quicklook(
-        ndvi_median_full,
+        out_path,
         ql_path,
         vmin=-0.1,
         vmax=0.8,
