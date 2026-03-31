@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 def main() -> None:
     import config
     from utils.io import configure_logging, ensure_output_dirs
-    from utils.stac import search_sentinel2, load_stackstac
+    from utils.stac import search_sentinel2, load_stackstac, filter_items_by_bbox
     from utils.mask import apply_scl_mask
     from utils.quicklook import save_quicklook
     from utils.tiling import make_tile_bboxes, merge_tile_rasters
@@ -70,8 +70,12 @@ def main() -> None:
 
     def fetch_fn(tile_idx, tile_bbox, tile_path):
         import dask
+        tile_items = filter_items_by_bbox(items, tile_bbox)
+        if not tile_items:
+            logger.warning("Tile %d: no items intersect bbox, skipping", tile_idx)
+            return None
         stack = load_stackstac(
-            items=items,
+            items=tile_items,
             bands=load_bands,
             resolution=config.TARGET_RESOLUTION,
             bbox=tile_bbox,

@@ -78,6 +78,22 @@ def load_stackstac(
     return da
 
 
+def filter_items_by_bbox(items: List[Any], bbox: List[float]) -> List[Any]:
+    """Return only those items whose bbox intersects the given bbox.
+
+    Both item.bbox and bbox are [minx, miny, maxx, maxy] in EPSG:4326.
+    Filters out scenes that don't overlap the tile, eliminating the COG
+    header round-trip overhead for non-intersecting scenes.
+    """
+    minx, miny, maxx, maxy = bbox
+    result = []
+    for item in items:
+        ib = item.bbox  # [minx, miny, maxx, maxy]
+        if ib[0] <= maxx and ib[2] >= minx and ib[1] <= maxy and ib[3] >= miny:
+            result.append(item)
+    return result
+
+
 def load_dea_landsat(
     bbox: List[float],
     start: str,
