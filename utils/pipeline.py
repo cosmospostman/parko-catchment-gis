@@ -36,6 +36,7 @@ def setup_gdal_env() -> None:
     Must be called before any ThreadPoolExecutor so worker threads inherit
     the environment. Uses setdefault so caller-supplied values are respected.
     """
+    logging.getLogger("rasterio.session").setLevel(logging.WARNING)
     os.environ["AWS_NO_SIGN_REQUEST"] = "YES"
     os.environ["AWS_DEFAULT_REGION"] = "us-west-2"
     gdal_env = {
