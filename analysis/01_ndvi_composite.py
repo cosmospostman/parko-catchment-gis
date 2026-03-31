@@ -94,7 +94,7 @@ def main() -> None:
         stack = stack.sel(band=["red", "nir"])
         stack = apply_scl_mask(stack, scl)
         t1 = time.monotonic()
-        result = stack.astype(np.float32).compute(scheduler="threads", num_workers=4)
+        result = stack.astype(np.float32).compute(scheduler="threads", num_workers=8)
         logger.info("Tile %d: compute=%.2fs", tile_idx, time.monotonic() - t1)
         return result
 
