@@ -107,8 +107,15 @@ def rewrite_hrefs_to_local(items, local_root, bands):
             if band not in bands:
                 continue
             parsed = urllib.parse.urlparse(asset.href)
-            # s3://sentinel-cogs/a/b/c.tif → /mnt/s2cache/sentinel-cogs/a/b/c.tif
-            local_path = Path(local_root) / parsed.netloc / parsed.path.lstrip("/")
+            if parsed.scheme == "s3":
+                # s3://sentinel-cogs/a/b/c.tif → /mnt/s2cache/sentinel-cogs/a/b/c.tif
+                local_path = Path(local_root) / parsed.netloc / parsed.path.lstrip("/")
+            elif "sentinel-cogs" in parsed.netloc:
+                # https://sentinel-cogs.s3.us-west-2.amazonaws.com/a/b/c.tif
+                #   → /mnt/s2cache/sentinel-cogs/a/b/c.tif
+                local_path = Path(local_root) / "sentinel-cogs" / parsed.path.lstrip("/")
+            else:
+                continue
             if local_path.exists():
                 asset.href = str(local_path)
         patched.append(item)
