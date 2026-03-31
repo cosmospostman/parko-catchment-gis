@@ -20,6 +20,9 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# Module-level worker state, populated by the pool initializer.
+_WORKER_STATE: dict = {}
+
 _STAT_FIELDS = [
     "tile_idx", "fetch_s", "fetch_ok", "cached", "array_shape",
     "array_bytes", "chunk_size", "fetch_workers", "compute_workers",
@@ -78,6 +81,79 @@ def setup_proj() -> None:
         pass
 
 
+def _worker_init(fetch_fn, compute_fn, scratch_dir, fetch_workers, compute_workers):
+    """Pool initializer: store callables in module-level state so _run_tile can reach them."""
+    _WORKER_STATE["fetch_fn"] = fetch_fn
+    _WORKER_STATE["compute_fn"] = compute_fn
+    _WORKER_STATE["scratch_dir"] = scratch_dir
+    _WORKER_STATE["fetch_workers"] = fetch_workers
+    _WORKER_STATE["compute_workers"] = compute_workers
+
+
+def _run_tile(args):
+    """Module-level worker: runs fetch + compute in a forked process. Returns (tile_idx, path, stat)."""
+    tile_idx, tile_bbox = args
+    fetch_fn     = _WORKER_STATE["fetch_fn"]
+    compute_fn   = _WORKER_STATE["compute_fn"]
+    scratch_dir  = _WORKER_STATE["scratch_dir"]
+    fetch_workers  = _WORKER_STATE["fetch_workers"]
+    compute_workers = _WORKER_STATE["compute_workers"]
+
+    tile_path = scratch_dir / f"tile_{tile_idx:05d}.tif"
+    stat = {
+        "tile_idx": tile_idx,
+        "fetch_s": 0.0,
+        "fetch_ok": False,
+        "cached": False,
+        "array_shape": "",
+        "array_bytes": 0,
+        "chunk_size": os.environ.get("CPL_VSIL_CURL_CHUNK_SIZE", ""),
+        "fetch_workers": fetch_workers,
+        "compute_workers": compute_workers,
+        "compute_s": 0.0,
+        "compute_ok": False,
+    }
+    if tile_path.exists() and tile_path.stat().st_size > 0:
+        stat["cached"] = True
+        stat["fetch_ok"] = True
+        stat["compute_ok"] = True
+        return (tile_idx, tile_path, stat)
+
+    t0 = time.monotonic()
+    try:
+        raw = fetch_fn(tile_idx, tile_bbox, tile_path)
+        stat["fetch_s"] = round(time.monotonic() - t0, 3)
+        if raw is None:
+            return (tile_idx, None, stat)
+        stat["fetch_ok"] = True
+        try:
+            import xarray as xr
+            if isinstance(raw, xr.Dataset):
+                dims = next(iter(raw.data_vars.values())).shape
+                stat["array_shape"] = "x".join(str(d) for d in dims)
+                stat["array_bytes"] = int(sum(v.nbytes for v in raw.data_vars.values()))
+            else:
+                stat["array_shape"] = "x".join(str(d) for d in raw.shape)
+                stat["array_bytes"] = int(raw.nbytes)
+        except Exception:
+            pass
+    except Exception as exc:
+        stat["fetch_s"] = round(time.monotonic() - t0, 3)
+        logger.warning("Fetch tile %d failed: %s", tile_idx, exc)
+        return (tile_idx, None, stat)
+
+    t1 = time.monotonic()
+    try:
+        path = compute_fn(tile_idx, raw, tile_path)
+        stat["compute_s"] = round(time.monotonic() - t1, 3)
+        stat["compute_ok"] = path is not None
+        return (tile_idx, path, stat)
+    except Exception as exc:
+        stat["compute_s"] = round(time.monotonic() - t1, 3)
+        logger.warning("Compute tile %d failed: %s", tile_idx, exc)
+        return (tile_idx, None, stat)
+
+
 def run_tiled_pipeline(
     *,
     tile_bboxes: List,
@@ -130,65 +206,13 @@ def run_tiled_pipeline(
     stats_thread = threading.Thread(target=_stats_writer, daemon=True)
     stats_thread.start()
 
-    def _run_tile(args):
-        """Runs fetch + compute in a forked worker process. Returns (tile_idx, path_or_None, stat)."""
-        tile_idx, tile_bbox = args
-        tile_path = scratch_dir / f"tile_{tile_idx:05d}.tif"
-        stat = {
-            "tile_idx": tile_idx,
-            "fetch_s": 0.0,
-            "fetch_ok": False,
-            "cached": False,
-            "array_shape": "",
-            "array_bytes": 0,
-            "chunk_size": os.environ.get("CPL_VSIL_CURL_CHUNK_SIZE", ""),
-            "fetch_workers": fetch_workers,
-            "compute_workers": compute_workers,
-            "compute_s": 0.0,
-            "compute_ok": False,
-        }
-        if tile_path.exists() and tile_path.stat().st_size > 0:
-            stat["cached"] = True
-            stat["fetch_ok"] = True
-            stat["compute_ok"] = True
-            return (tile_idx, tile_path, stat)
-
-        t0 = time.monotonic()
-        try:
-            raw = fetch_fn(tile_idx, tile_bbox, tile_path)
-            stat["fetch_s"] = round(time.monotonic() - t0, 3)
-            if raw is None:
-                return (tile_idx, None, stat)
-            stat["fetch_ok"] = True
-            try:
-                import xarray as xr
-                if isinstance(raw, xr.Dataset):
-                    dims = next(iter(raw.data_vars.values())).shape
-                    stat["array_shape"] = "x".join(str(d) for d in dims)
-                    stat["array_bytes"] = int(sum(v.nbytes for v in raw.data_vars.values()))
-                else:
-                    stat["array_shape"] = "x".join(str(d) for d in raw.shape)
-                    stat["array_bytes"] = int(raw.nbytes)
-            except Exception:
-                pass
-        except Exception as exc:
-            stat["fetch_s"] = round(time.monotonic() - t0, 3)
-            logger.warning("Fetch tile %d failed: %s", tile_idx, exc)
-            return (tile_idx, None, stat)
-
-        t1 = time.monotonic()
-        try:
-            path = compute_fn(tile_idx, raw, tile_path)
-            stat["compute_s"] = round(time.monotonic() - t1, 3)
-            stat["compute_ok"] = path is not None
-            return (tile_idx, path, stat)
-        except Exception as exc:
-            stat["compute_s"] = round(time.monotonic() - t1, 3)
-            logger.warning("Compute tile %d failed: %s", tile_idx, exc)
-            return (tile_idx, None, stat)
-
     mp_ctx = multiprocessing.get_context("fork")
-    with ProcessPoolExecutor(max_workers=fetch_workers, mp_context=mp_ctx) as pool:
+    with ProcessPoolExecutor(
+        max_workers=fetch_workers,
+        mp_context=mp_ctx,
+        initializer=_worker_init,
+        initargs=(fetch_fn, compute_fn, scratch_dir, fetch_workers, compute_workers),
+    ) as pool:
         futures = {
             pool.submit(_run_tile, args): args[0]
             for args in enumerate(tile_bboxes)
