@@ -28,8 +28,9 @@ DEA_BANDS = ["nbart_red", "nbart_nir"]
 RESAMPLING_METHOD = Resampling.bilinear
 BASELINE_CACHE_FILENAME = "ndvi_baseline_median.tif"
 
-# Baseline tiles can be larger: only 2 bands at 30 m
-BASELINE_TILE_SIZE_PX = int(os.environ.get("TILE_SIZE_PX",    "1024"))
+# Baseline tiles can be larger: only 2 bands at 30 m.
+# Use BASELINE_TILE_SIZE_PX to avoid inheriting the S2 TILE_SIZE_PX=512 from run.sh.
+BASELINE_TILE_SIZE_PX = int(os.environ.get("BASELINE_TILE_SIZE_PX", "1024"))
 FETCH_WORKERS         = int(os.environ.get("FETCH_WORKERS",   "16"))
 COMPUTE_WORKERS       = int(os.environ.get("COMPUTE_WORKERS", str(os.cpu_count() or 4)))
 
@@ -38,9 +39,10 @@ logger = logging.getLogger(__name__)
 
 def _build_baseline(bbox, config) -> xr.DataArray:
     """Download and compute the Landsat NDVI baseline median (1986 to year-1)."""
-    from utils.stac import load_dea_landsat
+    from utils.stac import DEA_LANDSAT_COLLECTIONS
     from utils.tiling import make_tile_bboxes, merge_tile_rasters
     from utils.pipeline import setup_gdal_env, setup_proj
+    import pystac_client
 
     start = f"{config.BASELINE_START_YEAR}-01-01"
     end   = f"{config.YEAR - 1}-12-31"
@@ -58,6 +60,16 @@ def _build_baseline(bbox, config) -> xr.DataArray:
         "Baseline: %d tiles  tile_size=%dpx  fetch_workers=%d  compute_workers=%d",
         n_tiles, BASELINE_TILE_SIZE_PX, FETCH_WORKERS, COMPUTE_WORKERS,
     )
+
+    logger.info("Searching DEA STAC for all Landsat items (%s → %s)…", start, end)
+    catalog = pystac_client.Client.open("https://explorer.dea.ga.gov.au/stac")
+    all_items = list(catalog.search(
+        collections=DEA_LANDSAT_COLLECTIONS,
+        bbox=bbox,
+        datetime=f"{start}/{end}",
+        max_items=10000,
+    ).items())
+    logger.info("DEA Landsat search: %d items found", len(all_items))
 
     baseline_t0 = time.monotonic()
 
@@ -134,16 +146,21 @@ def _build_baseline(bbox, config) -> xr.DataArray:
             q.put((tile_idx, None, 0.0, tile_path))
             return
         import dask
+        import odc.stac
+        from utils.stac import filter_items_by_bbox
         t_fetch = time.monotonic()
         try:
-            ds = load_dea_landsat(
-                bbox=tile_bbox,
-                start=start,
-                end=end,
+            tile_items = filter_items_by_bbox(all_items, tile_bbox)
+            if not tile_items:
+                q.put((tile_idx, None, 0.0, None))
+                return
+            ds = odc.stac.load(
+                tile_items,
                 bands=DEA_BANDS,
-                collection=config.DEA_COLLECTION,
                 resolution=30,
+                bbox=tile_bbox,
                 crs=config.TARGET_CRS,
+                chunks={"x": 2048, "y": 2048},
             )
             with dask.config.set(scheduler="threads"):
                 raw_ds = ds.compute()
