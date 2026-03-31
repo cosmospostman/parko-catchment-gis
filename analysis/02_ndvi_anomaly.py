@@ -61,16 +61,6 @@ def _build_baseline(bbox, config) -> xr.DataArray:
         n_tiles, BASELINE_TILE_SIZE_PX, FETCH_WORKERS, COMPUTE_WORKERS,
     )
 
-    logger.info("Searching DEA STAC for all Landsat items (%s → %s)…", start, end)
-    catalog = pystac_client.Client.open("https://explorer.dea.ga.gov.au/stac")
-    all_items = list(catalog.search(
-        collections=DEA_LANDSAT_COLLECTIONS,
-        bbox=bbox,
-        datetime=f"{start}/{end}",
-        max_items=10000,
-    ).items())
-    logger.info("DEA Landsat search: %d items found", len(all_items))
-
     baseline_t0 = time.monotonic()
 
     scratch_dir = Path(config.WORKING_DIR) / f"tiles_baseline_{config.YEAR}"
@@ -147,10 +137,15 @@ def _build_baseline(bbox, config) -> xr.DataArray:
             return
         import dask
         import odc.stac
-        from utils.stac import filter_items_by_bbox
         t_fetch = time.monotonic()
         try:
-            tile_items = filter_items_by_bbox(all_items, tile_bbox)
+            tile_catalog = pystac_client.Client.open("https://explorer.dea.ga.gov.au/stac")
+            tile_items = list(tile_catalog.search(
+                collections=DEA_LANDSAT_COLLECTIONS,
+                bbox=tile_bbox,
+                datetime=f"{start}/{end}",
+                max_items=1000,
+            ).items())
             if not tile_items:
                 q.put((tile_idx, None, 0.0, None))
                 return
