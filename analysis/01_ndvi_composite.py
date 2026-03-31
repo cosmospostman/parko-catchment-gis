@@ -74,18 +74,35 @@ def main() -> None:
     scratch_dir = Path(config.WORKING_DIR) / f"tiles_ndvi_{config.YEAR}"
     scratch_dir.mkdir(exist_ok=True)
 
+    # Pre-stack all items over the full catchment bbox once so COG headers are
+    # read only once rather than once per tile.  fetch_fn slices x/y per tile.
+    full_stack = load_stackstac(
+        items=items,
+        bands=load_bands,
+        resolution=config.TARGET_RESOLUTION,
+        bbox=bbox,
+        crs=config.TARGET_CRS,
+        chunk_spatial=DASK_CHUNK_SPATIAL,
+    )
+
+    from pyproj import Transformer
+    _to_proj = Transformer.from_crs("EPSG:4326", config.TARGET_CRS, always_xy=True)
+
     def fetch_fn(tile_idx, tile_bbox, tile_path):
         tile_items = filter_items_by_bbox(items, tile_bbox)
         if not tile_items:
             logger.warning("Tile %d: no items intersect bbox, skipping", tile_idx)
             return None
-        stack = load_stackstac(
-            items=tile_items,
-            bands=load_bands,
-            resolution=config.TARGET_RESOLUTION,
-            bbox=tile_bbox,
-            crs=config.TARGET_CRS,
-            chunk_spatial=DASK_CHUNK_SPATIAL,
+        # Reproject tile bbox to projected CRS for x/y slicing
+        minx_geo, miny_geo, maxx_geo, maxy_geo = tile_bbox
+        (proj_minx, proj_maxx), (proj_miny, proj_maxy) = _to_proj.transform(
+            [minx_geo, maxx_geo], [miny_geo, maxy_geo]
+        )
+        # Slice full_stack spatially to this tile.
+        # stackstac: x increases left→right, y decreases top→bottom.
+        stack = full_stack.sel(
+            x=slice(proj_minx, proj_maxx),
+            y=slice(proj_maxy, proj_miny),
         )
         scl   = stack.sel(band="scl")
         stack = stack.sel(band=["red", "nir"])
