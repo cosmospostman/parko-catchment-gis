@@ -59,6 +59,10 @@ def main() -> None:
         items = rewrite_hrefs_to_local(items, local_root, load_bands)
         logger.info("LOCAL_S2_ROOT set — hrefs rewritten to local paths")
 
+    # Strip root catalog links — forked workers must not re-fetch the STAC endpoint.
+    for item in items:
+        item.clear_links()
+
     logger.info("Loading %d scenes for flowering index", len(items))
 
     setup_gdal_env()
@@ -75,7 +79,6 @@ def main() -> None:
     scratch_dir.mkdir(exist_ok=True)
 
     def fetch_fn(tile_idx, tile_bbox, tile_path):
-        import dask
         tile_items = filter_items_by_bbox(items, tile_bbox)
         if not tile_items:
             logger.warning("Tile %d: no items intersect bbox, skipping", tile_idx)
@@ -91,8 +94,7 @@ def main() -> None:
         scl   = stack.sel(band="scl")
         stack = stack.sel(band=FLOWERING_BANDS)
         stack = apply_scl_mask(stack, scl)
-        with dask.config.set(scheduler="threads"):
-            return stack.astype(np.float32).compute()
+        return stack.astype(np.float32).compute(scheduler="synchronous")
 
     def compute_fn(tile_idx, raw, tile_path):
         try:

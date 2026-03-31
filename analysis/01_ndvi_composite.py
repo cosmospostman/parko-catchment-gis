@@ -59,6 +59,10 @@ def main() -> None:
         items = rewrite_hrefs_to_local(items, local_root, load_bands)
         logger.info("LOCAL_S2_ROOT set — hrefs rewritten to local paths")
 
+    # Strip root catalog links — forked workers must not re-fetch the STAC endpoint.
+    for item in items:
+        item.clear_links()
+
     logger.info("Loading %d scenes, bands: %s", len(items), load_bands)
 
     setup_gdal_env()
