@@ -146,6 +146,7 @@ def _build_baseline(bbox, config) -> xr.DataArray:
                 datetime=f"{start}/{end}",
                 max_items=1000,
             ).items())
+            logger.info("Tile %d/%d  STAC: %d items found", tile_idx + 1, n_tiles, len(tile_items))
             if not tile_items:
                 q.put((tile_idx, None, 0.0, None))
                 return
