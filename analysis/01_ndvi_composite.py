@@ -16,7 +16,7 @@ S2CLOUDLESS_PROB_MAX = 0.4
 DASK_CHUNK_SPATIAL = 1024
 
 TILE_SIZE_PX    = int(os.environ.get("TILE_SIZE_PX",    "512"))
-FETCH_WORKERS   = int(os.environ.get("FETCH_WORKERS",   "16"))
+FETCH_WORKERS   = int(os.environ.get("FETCH_WORKERS",   "32"))
 COMPUTE_WORKERS = int(os.environ.get("COMPUTE_WORKERS", str(os.cpu_count() or 4)))
 
 logger = logging.getLogger(__name__)
@@ -52,7 +52,7 @@ def main() -> None:
     if not items:
         raise RuntimeError(f"No Sentinel-2 items found for {config.YEAR}")
 
-    load_bands = config.COMPOSITE_BANDS + ["scl"]
+    load_bands = ["red", "nir", "scl"]
     logger.info("Loading %d scenes, bands: %s", len(items), load_bands)
 
     setup_gdal_env()
@@ -83,7 +83,7 @@ def main() -> None:
             chunk_spatial=DASK_CHUNK_SPATIAL,
         )
         scl   = stack.sel(band="scl")
-        stack = stack.sel(band=config.COMPOSITE_BANDS)
+        stack = stack.sel(band=["red", "nir"])
         stack = apply_scl_mask(stack, scl)
         with dask.config.set(scheduler="threads"):
             return stack.astype(np.float32).compute()
