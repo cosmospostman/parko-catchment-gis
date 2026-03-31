@@ -32,6 +32,8 @@ def setup_gdal_env() -> None:
         "GDAL_HTTP_RETRY_DELAY": "2",
         "GDAL_HTTP_RETRY_ON_HTTP_ERROR": "429,500,502,503,504",
         "GDAL_HTTP_PERSISTENT": "YES",
+        "GDAL_HTTP_VERSION": "2",
+        "GDAL_HTTP_MULTIPLEX": "YES",
         "CPL_VSIL_CURL_CACHE_SIZE": "67108864",  # 64 MB connection cache
         "CPL_VSIL_CURL_CHUNK_SIZE": "10485760",  # 10 MB
         "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
