@@ -69,7 +69,6 @@ def main() -> None:
     scratch_dir.mkdir(exist_ok=True)
 
     def fetch_fn(tile_idx, tile_bbox, tile_path):
-        import dask
         tile_items = filter_items_by_bbox(items, tile_bbox)
         if not tile_items:
             logger.warning("Tile %d: no items intersect bbox, skipping", tile_idx)
@@ -85,8 +84,7 @@ def main() -> None:
         scl   = stack.sel(band="scl")
         stack = stack.sel(band=["red", "nir"])
         stack = apply_scl_mask(stack, scl)
-        with dask.config.set(scheduler="threads"):
-            return stack.astype(np.float32).compute()
+        return stack.astype(np.float32).compute(scheduler="threads")
 
     def compute_fn(tile_idx, raw, tile_path):
         try:
