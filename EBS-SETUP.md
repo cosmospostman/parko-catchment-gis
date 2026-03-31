@@ -1,7 +1,7 @@
 # EBS volume setup
 
 The S2 cache volume is created once per year, used for 1–2 days, snapshotted, then deleted.
-The snapshot persists cheaply (~$2.50/month for 500 GB) and is restored next year — at which
+The snapshot persists cheaply (~$10/month for 2 TB) and is restored next year — at which
 point only new scenes need syncing.
 
 ## Why EBS rather than local disk
@@ -43,7 +43,7 @@ curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone
 aws ec2 create-volume \
   --region us-west-2 \
   --availability-zone $AZ \
-  --size 500 \
+  --size 2000 \
   --volume-type gp3 \
   --tag-specifications 'ResourceType=volume,Tags=[{Key=Name,Value=s2-cache}]'
 ```
@@ -121,15 +121,48 @@ years' data.
 
 ---
 
+## EBS throughput
+
+The default gp3 throughput is 125 MB/s, which will be the bottleneck — not the network.
+Before starting the sync, increase throughput to the gp3 maximum. The constraint is
+`throughput / IOPS ≤ 0.25 MiBps per IOPS`, so 1000 MB/s requires at least 4000 IOPS:
+
+```bash
+aws ec2 modify-volume --volume-id $VOLUME_ID --throughput 1000 --iops 4000
+```
+
+Takes effect within ~1 minute without unmounting. At 1000 MB/s the sync runs in ~5–10 min
+instead of ~40 min. There is no extra cost for gp3 throughput up to 1000 MB/s or IOPS up
+to 16000.
+
+You can confirm the volume is no longer the bottleneck with:
+
+```bash
+iostat -xm 2 5 /dev/nvme1n1   # wMB/s should be well below %util 100
+sar -n DEV 2 5                 # rxkB/s shows actual network throughput
+```
+
+---
+
 ## Storage sizing
 
-| Band | Resolution | ~Size/file | Files (30 granules × 10 dates) | Total |
-|---|---|---|---|---|
-| red, nir, green | 10 m | ~300 MB | 900 | ~270 GB |
-| rededge1, rededge2 | 20 m | ~80 MB | 600 | ~48 GB |
-| scl | 20 m | ~30 MB | 300 | ~9 GB |
-| **Total** | | | | **~330 GB** |
+The actual 2025 sync produced 6774 files. The original estimate of ~330 GB (30 granules ×
+10 dates) significantly underestimated scene count — actual usage exceeded 500 GB.
 
-A 500 GB gp3 volume provides ~170 GB headroom. If cloud cover is low and scene count
-reaches 15–20 dates per granule the total can approach 450–500 GB — size up to 600 GB
-if in doubt.
+Use a **2 TB gp3 volume**. It provides ample headroom for multiple years of data as the
+snapshot accumulates scenes year over year.
+
+To resize an existing volume (e.g. if you started with 500 GB):
+
+```bash
+# Wait for any in-progress modification to complete first
+aws ec2 describe-volumes-modifications --volume-id $VOLUME_ID \
+  --query 'VolumesModifications[0].{State:ModificationState,Progress:Progress}'
+
+# Resize (only works when ModificationState is "completed")
+aws ec2 modify-volume --volume-id $VOLUME_ID --size 2000
+
+# Expand the filesystem without unmounting
+sudo growpart /dev/nvme1n1 1
+sudo xfs_growfs /mnt/s2cache
+```

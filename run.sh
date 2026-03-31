@@ -73,7 +73,7 @@ export CODE_DIR
 export PIPELINE_RUN=1
 export PYTHONPATH="${CODE_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 export TILE_SIZE_PX="${TILE_SIZE_PX:-512}"
-export FETCH_WORKERS="${FETCH_WORKERS:-16}"
+export FETCH_WORKERS="${FETCH_WORKERS:-$([ -n "${LOCAL_S2_ROOT}" ] && echo 4 || echo 16)}"
 export COMPUTE_WORKERS="${COMPUTE_WORKERS:-$(python -c 'import os; print(os.cpu_count() or 4)')}"
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
