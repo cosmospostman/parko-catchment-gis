@@ -118,7 +118,7 @@ ssh ubuntu@<instance-ip>
 
 ```bash
 sudo apt-get update && sudo apt-get install -y python3-pip python3-venv git gdal-bin libgdal-dev
-git clone <your-repo-url> parko-catchment-gis
+git clone https://github.com/cosmospostman/parko-catchment-gis.git parko-catchment-gis
 cd parko-catchment-gis
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
@@ -159,7 +159,7 @@ ssh root@<droplet-ip>
 
 ```bash
 sudo apt-get update && sudo apt-get install -y python3-pip python3-venv git gdal-bin libgdal-dev
-git clone <your-repo-url> parko-catchment-gis
+git clone https://github.com/cosmospostman/parko-catchment-gis.git parko-catchment-gis
 cd parko-catchment-gis
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
