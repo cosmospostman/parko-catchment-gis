@@ -5,6 +5,7 @@ Produces: ndvi_median_{year}.tif  (COG, EPSG:7855, 10 m)
 """
 import logging
 import os
+import time
 from pathlib import Path
 
 import geopandas as gpd
