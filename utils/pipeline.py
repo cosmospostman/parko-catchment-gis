@@ -4,15 +4,15 @@ Shared pipeline utilities for tiled analysis scripts.
 Provides:
   setup_gdal_env()       — GDAL HTTP settings and AWS env vars
   setup_proj()           — PROJ_DATA bootstrap + pyproj set_data_dir()
-  run_tiled_pipeline()   — Two-pool fetch/compute orchestration for steps 01 and 03
+  run_tiled_pipeline()   — Process-pool tiled pipeline for steps 01 and 03
 """
 import csv
 import logging
+import multiprocessing
 import os
-import queue
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, List, Optional
 
@@ -91,35 +91,21 @@ def run_tiled_pipeline(
     fetch_workers: int,
     compute_workers: int,
 ) -> None:
-    """Two-pool fetch/compute pipeline for tiled raster processing.
+    """Process-pool tiled pipeline for raster processing.
+
+    Each tile is processed in a forked worker process (fetch + compute),
+    giving each worker its own GIL for true CPU parallelism.
 
     fetch_fn(tile_idx, tile_bbox, tile_path) -> xarray.DataArray or None
-        Called in the fetch pool. Should materialise the raw band array
-        (e.g. via stackstac + .compute()). Returns None on failure.
-        If tile_path already exists with non-zero size, returns the sentinel
-        string "cached" to signal the compute worker to use the on-disk tile.
-
     compute_fn(tile_idx, raw, tile_path) -> Path or None
-        Called in the compute pool. Receives the materialised DataArray from
-        fetch_fn, applies index math, writes tile_path, returns it. Returns
-        None on failure.
-
     merge_fn(valid_paths, out_path, nodata, crs)
-        Called once after all tiles complete.
-
-    Queue convention — items on q are 4-tuples:
-        (tile_idx, raw_or_None, existing_path_or_None, fetch_stat)
-        - (idx, DataArray, None, stat)  — fetched OK, needs compute
-        - (idx, None, Path, stat)       — cached on disk, skip compute
-        - (idx, None, None, stat)       — fetch failed
     """
     n_tiles = len(tile_bboxes)
-    q: queue.Queue = queue.Queue(maxsize=compute_workers * 2)
     results: List[Optional[Path]] = [None] * n_tiles
     results_lock = threading.Lock()
 
-    # Stats writer thread — receives completed stat dicts and appends to CSV immediately.
-    stats_q: queue.Queue = queue.Queue()
+    # Stats writer thread
+    stats_q: "multiprocessing.Queue" = multiprocessing.Queue()
 
     def _stats_writer():
         try:
@@ -137,44 +123,15 @@ def run_tiled_pipeline(
             logger.info("Tile stats written: %s", csv_path)
         except Exception as exc:
             logger.warning("Could not write tile stats CSV: %s", exc)
-            # Drain the queue so the pipeline isn't blocked
             while True:
-                row = stats_q.get()
-                if row is None:
+                if stats_q.get() is None:
                     break
 
     stats_thread = threading.Thread(target=_stats_writer, daemon=True)
     stats_thread.start()
 
-    def _compute_worker():
-        while True:
-            item = q.get()
-            if item is None:
-                break
-            tile_idx, raw, existing_path, fetch_stat = item
-            if existing_path is not None:
-                with results_lock:
-                    results[tile_idx] = existing_path
-                stats_q.put({**fetch_stat, "compute_s": 0.0, "compute_ok": True})
-                continue
-            if raw is None:
-                stats_q.put({**fetch_stat, "compute_s": 0.0, "compute_ok": False})
-                continue  # fetch failed; results[tile_idx] stays None
-            t0 = time.monotonic()
-            path = compute_fn(tile_idx, raw, scratch_dir / f"tile_{tile_idx:05d}.tif")
-            compute_s = time.monotonic() - t0
-            with results_lock:
-                results[tile_idx] = path
-            stats_q.put({**fetch_stat, "compute_s": round(compute_s, 3), "compute_ok": path is not None})
-
-    compute_threads = [
-        threading.Thread(target=_compute_worker, daemon=True)
-        for _ in range(compute_workers)
-    ]
-    for t in compute_threads:
-        t.start()
-
-    def _fetch_tile(args):
+    def _run_tile(args):
+        """Runs fetch + compute in a forked worker process. Returns (tile_idx, path_or_None, stat)."""
         tile_idx, tile_bbox = args
         tile_path = scratch_dir / f"tile_{tile_idx:05d}.tif"
         stat = {
@@ -187,47 +144,74 @@ def run_tiled_pipeline(
             "chunk_size": os.environ.get("CPL_VSIL_CURL_CHUNK_SIZE", ""),
             "fetch_workers": fetch_workers,
             "compute_workers": compute_workers,
+            "compute_s": 0.0,
+            "compute_ok": False,
         }
         if tile_path.exists() and tile_path.stat().st_size > 0:
-            logger.info("Tile %d/%d skipped (cached)", tile_idx + 1, n_tiles)
             stat["cached"] = True
             stat["fetch_ok"] = True
-            q.put((tile_idx, None, tile_path, stat))
-            return
+            stat["compute_ok"] = True
+            return (tile_idx, tile_path, stat)
+
         t0 = time.monotonic()
         try:
             raw = fetch_fn(tile_idx, tile_bbox, tile_path)
             stat["fetch_s"] = round(time.monotonic() - t0, 3)
             if raw is None:
-                q.put((tile_idx, None, None, stat))
-            else:
-                stat["fetch_ok"] = True
-                try:
-                    import xarray as xr
-                    if isinstance(raw, xr.Dataset):
-                        dims = next(iter(raw.data_vars.values())).shape
-                        stat["array_shape"] = "x".join(str(d) for d in dims)
-                        stat["array_bytes"] = int(sum(v.nbytes for v in raw.data_vars.values()))
-                    else:
-                        stat["array_shape"] = "x".join(str(d) for d in raw.shape)
-                        stat["array_bytes"] = int(raw.nbytes)
-                except Exception:
-                    pass
-                q.put((tile_idx, raw, None, stat))
+                return (tile_idx, None, stat)
+            stat["fetch_ok"] = True
+            try:
+                import xarray as xr
+                if isinstance(raw, xr.Dataset):
+                    dims = next(iter(raw.data_vars.values())).shape
+                    stat["array_shape"] = "x".join(str(d) for d in dims)
+                    stat["array_bytes"] = int(sum(v.nbytes for v in raw.data_vars.values()))
+                else:
+                    stat["array_shape"] = "x".join(str(d) for d in raw.shape)
+                    stat["array_bytes"] = int(raw.nbytes)
+            except Exception:
+                pass
         except Exception as exc:
             stat["fetch_s"] = round(time.monotonic() - t0, 3)
             logger.warning("Fetch tile %d failed: %s", tile_idx, exc)
-            q.put((tile_idx, None, None, stat))
+            return (tile_idx, None, stat)
 
-    with ThreadPoolExecutor(max_workers=fetch_workers) as fetch_pool:
-        futures = [fetch_pool.submit(_fetch_tile, args) for args in enumerate(tile_bboxes)]
-        for f in futures:
-            f.result()  # re-raise any uncaught exception
+        t1 = time.monotonic()
+        try:
+            path = compute_fn(tile_idx, raw, tile_path)
+            stat["compute_s"] = round(time.monotonic() - t1, 3)
+            stat["compute_ok"] = path is not None
+            return (tile_idx, path, stat)
+        except Exception as exc:
+            stat["compute_s"] = round(time.monotonic() - t1, 3)
+            logger.warning("Compute tile %d failed: %s", tile_idx, exc)
+            return (tile_idx, None, stat)
 
-    for _ in range(compute_workers):
-        q.put(None)
-    for t in compute_threads:
-        t.join()
+    mp_ctx = multiprocessing.get_context("fork")
+    with ProcessPoolExecutor(max_workers=fetch_workers, mp_context=mp_ctx) as pool:
+        futures = {
+            pool.submit(_run_tile, args): args[0]
+            for args in enumerate(tile_bboxes)
+        }
+        for future in as_completed(futures):
+            try:
+                tile_idx, path, stat = future.result()
+            except Exception as exc:
+                tile_idx = futures[future]
+                logger.warning("Tile %d failed: %s", tile_idx, exc)
+                stats_q.put({
+                    "tile_idx": tile_idx, "fetch_s": 0.0, "fetch_ok": False,
+                    "cached": False, "array_shape": "", "array_bytes": 0,
+                    "chunk_size": "", "fetch_workers": fetch_workers,
+                    "compute_workers": compute_workers, "compute_s": 0.0,
+                    "compute_ok": False,
+                })
+                continue
+            if stat.get("cached"):
+                logger.info("Tile %d/%d skipped (cached)", tile_idx + 1, n_tiles)
+            with results_lock:
+                results[tile_idx] = path
+            stats_q.put(stat)
 
     stats_q.put(None)
     stats_thread.join()
