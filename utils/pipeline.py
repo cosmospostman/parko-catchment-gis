@@ -6,10 +6,12 @@ Provides:
   setup_proj()           — PROJ_DATA bootstrap + pyproj set_data_dir()
   run_tiled_pipeline()   — Two-pool fetch/compute orchestration for steps 01 and 03
 """
+import csv
 import logging
 import os
 import queue
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -17,6 +19,12 @@ from typing import Callable, List, Optional
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+_STAT_FIELDS = [
+    "tile_idx", "fetch_s", "fetch_ok", "cached", "array_shape",
+    "array_bytes", "chunk_size", "fetch_workers", "compute_workers",
+    "compute_s", "compute_ok",
+]
 
 
 def setup_gdal_env() -> None:
@@ -99,32 +107,65 @@ def run_tiled_pipeline(
     merge_fn(valid_paths, out_path, nodata, crs)
         Called once after all tiles complete.
 
-    Queue convention — items on q are 3-tuples:
-        (tile_idx, raw_or_None, existing_path_or_None)
-        - (idx, DataArray, None)  — fetched OK, needs compute
-        - (idx, None, Path)       — cached on disk, skip compute
-        - (idx, None, None)       — fetch failed
+    Queue convention — items on q are 4-tuples:
+        (tile_idx, raw_or_None, existing_path_or_None, fetch_stat)
+        - (idx, DataArray, None, stat)  — fetched OK, needs compute
+        - (idx, None, Path, stat)       — cached on disk, skip compute
+        - (idx, None, None, stat)       — fetch failed
     """
     n_tiles = len(tile_bboxes)
     q: queue.Queue = queue.Queue(maxsize=compute_workers * 2)
     results: List[Optional[Path]] = [None] * n_tiles
     results_lock = threading.Lock()
 
+    # Stats writer thread — receives completed stat dicts and appends to CSV immediately.
+    stats_q: queue.Queue = queue.Queue()
+
+    def _stats_writer():
+        try:
+            import config as _config
+            csv_path = Path(_config.LOG_DIR) / f"tile_stats_{out_path.stem}.csv"
+            with open(csv_path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=_STAT_FIELDS)
+                writer.writeheader()
+                while True:
+                    row = stats_q.get()
+                    if row is None:
+                        break
+                    writer.writerow(row)
+                    f.flush()
+            logger.info("Tile stats written: %s", csv_path)
+        except Exception as exc:
+            logger.warning("Could not write tile stats CSV: %s", exc)
+            # Drain the queue so the pipeline isn't blocked
+            while True:
+                row = stats_q.get()
+                if row is None:
+                    break
+
+    stats_thread = threading.Thread(target=_stats_writer, daemon=True)
+    stats_thread.start()
+
     def _compute_worker():
         while True:
             item = q.get()
             if item is None:
                 break
-            tile_idx, raw, existing_path = item
+            tile_idx, raw, existing_path, fetch_stat = item
             if existing_path is not None:
                 with results_lock:
                     results[tile_idx] = existing_path
+                stats_q.put({**fetch_stat, "compute_s": 0.0, "compute_ok": True})
                 continue
             if raw is None:
+                stats_q.put({**fetch_stat, "compute_s": 0.0, "compute_ok": False})
                 continue  # fetch failed; results[tile_idx] stays None
+            t0 = time.monotonic()
             path = compute_fn(tile_idx, raw, scratch_dir / f"tile_{tile_idx:05d}.tif")
+            compute_s = time.monotonic() - t0
             with results_lock:
                 results[tile_idx] = path
+            stats_q.put({**fetch_stat, "compute_s": round(compute_s, 3), "compute_ok": path is not None})
 
     compute_threads = [
         threading.Thread(target=_compute_worker, daemon=True)
@@ -136,19 +177,41 @@ def run_tiled_pipeline(
     def _fetch_tile(args):
         tile_idx, tile_bbox = args
         tile_path = scratch_dir / f"tile_{tile_idx:05d}.tif"
+        stat = {
+            "tile_idx": tile_idx,
+            "fetch_s": 0.0,
+            "fetch_ok": False,
+            "cached": False,
+            "array_shape": "",
+            "array_bytes": 0,
+            "chunk_size": os.environ.get("CPL_VSIL_CURL_CHUNK_SIZE", ""),
+            "fetch_workers": fetch_workers,
+            "compute_workers": compute_workers,
+        }
         if tile_path.exists() and tile_path.stat().st_size > 0:
             logger.info("Tile %d/%d skipped (cached)", tile_idx + 1, n_tiles)
-            q.put((tile_idx, None, tile_path))
+            stat["cached"] = True
+            stat["fetch_ok"] = True
+            q.put((tile_idx, None, tile_path, stat))
             return
+        t0 = time.monotonic()
         try:
             raw = fetch_fn(tile_idx, tile_bbox, tile_path)
+            stat["fetch_s"] = round(time.monotonic() - t0, 3)
             if raw is None:
-                q.put((tile_idx, None, None))
+                q.put((tile_idx, None, None, stat))
             else:
-                q.put((tile_idx, raw, None))
+                stat["fetch_ok"] = True
+                try:
+                    stat["array_shape"] = "x".join(str(d) for d in raw.shape)
+                    stat["array_bytes"] = int(raw.nbytes)
+                except Exception:
+                    pass
+                q.put((tile_idx, raw, None, stat))
         except Exception as exc:
+            stat["fetch_s"] = round(time.monotonic() - t0, 3)
             logger.warning("Fetch tile %d failed: %s", tile_idx, exc)
-            q.put((tile_idx, None, None))
+            q.put((tile_idx, None, None, stat))
 
     with ThreadPoolExecutor(max_workers=fetch_workers) as fetch_pool:
         futures = [fetch_pool.submit(_fetch_tile, args) for args in enumerate(tile_bboxes)]
@@ -159,6 +222,9 @@ def run_tiled_pipeline(
         q.put(None)
     for t in compute_threads:
         t.join()
+
+    stats_q.put(None)
+    stats_thread.join()
 
     valid_paths = [p for p in results if p is not None]
     if not valid_paths:
