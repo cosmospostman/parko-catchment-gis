@@ -44,7 +44,7 @@ def _build_baseline(bbox, config) -> xr.DataArray:
     are used, matching the phenology of the current-year Step 01 composite and
     avoiding wet-season bias in the long-term median.
     """
-    from utils.stac import DEA_LANDSAT_COLLECTIONS
+    from utils.stac import DEA_LANDSAT_COLLECTIONS, rewrite_dea_hrefs_to_s3
     from utils.tiling import make_tile_bboxes, merge_tile_rasters
     from utils.pipeline import setup_gdal_env, setup_proj
     import pystac_client
@@ -55,9 +55,10 @@ def _build_baseline(bbox, config) -> xr.DataArray:
 
     start_year = config.BASELINE_START_YEAR
     end_year   = config.YEAR - 1
+    use_dea_s3 = os.environ.get("USE_DEA_S3", "false").lower() == "true"
     logger.info(
-        "── Step 02 baseline  DEA Landsat %d → %d  dry-season window: %s → %s ──",
-        start_year, end_year, dry_start_mm_dd, dry_end_mm_dd,
+        "── Step 02 baseline  DEA Landsat %d → %d  dry-season window: %s → %s  s3=%s ──",
+        start_year, end_year, dry_start_mm_dd, dry_end_mm_dd, use_dea_s3,
     )
 
     setup_gdal_env()
@@ -179,6 +180,8 @@ def _build_baseline(bbox, config) -> xr.DataArray:
             if not tile_items:
                 q.put((tile_idx, None, 0.0, None))
                 return
+            if use_dea_s3:
+                tile_items = rewrite_dea_hrefs_to_s3(tile_items, DEA_BANDS)
             ds = odc.stac.load(
                 tile_items,
                 bands=DEA_BANDS,

@@ -122,6 +122,33 @@ def rewrite_hrefs_to_local(items, local_root, bands):
     return patched
 
 
+def rewrite_dea_hrefs_to_s3(items, bands):
+    """Rewrite DEA HTTPS asset hrefs to s3:// URIs for same-region S3 access.
+
+    DEA STAC items return hrefs as:
+        https://data.dea.ga.gov.au/<path>
+    which maps directly to:
+        s3://dea-public-data/<path>
+
+    On an ap-southeast-2 instance this eliminates cross-internet latency and
+    uses free same-region S3 transfer instead of HTTPS egress.
+    """
+    import copy
+    import urllib.parse
+
+    patched = []
+    for item in items:
+        item = copy.deepcopy(item)
+        for band, asset in item.assets.items():
+            if band not in bands:
+                continue
+            parsed = urllib.parse.urlparse(asset.href)
+            if parsed.netloc == "data.dea.ga.gov.au":
+                asset.href = f"s3://dea-public-data{parsed.path}"
+        patched.append(item)
+    return patched
+
+
 DEA_LANDSAT_COLLECTIONS = [
     "ga_ls5t_ard_3",
     "ga_ls7e_ard_3",
