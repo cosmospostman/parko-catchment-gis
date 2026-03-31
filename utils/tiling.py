@@ -86,34 +86,43 @@ def merge_tile_rasters(
     nodata: float,
     crs: str,
 ) -> None:
-    """Mosaic tile GeoTIFFs into a single COG using rioxarray.merge_arrays."""
-    import numpy as np
-    import rioxarray  # noqa: F401
-    import xarray as xr
-    from rioxarray.merge import merge_arrays
+    """Mosaic tile GeoTIFFs into a single COG using gdalbuildvrt + gdal_translate.
 
-    arrays = []
-    for p in tile_paths:
-        if p is None:
-            continue
-        da = xr.open_dataarray(str(p))
-        da = da.rio.write_crs(crs)
-        arrays.append(da)
+    Uses GDAL command-line tools so pixel data is never fully loaded into RAM —
+    gdalbuildvrt writes an XML index and gdal_translate streams tiles to the output.
+    """
+    import subprocess
+    import tempfile
 
-    if not arrays:
+    valid = [str(p) for p in tile_paths if p is not None]
+    if not valid:
         raise ValueError("merge_tile_rasters: no valid tile paths provided")
 
-    merged = merge_arrays(arrays, nodata=nodata)
-    merged = merged.rio.write_crs(crs)
-    merged = merged.rio.write_nodata(nodata)
+    nodata_str = str(nodata) if nodata == nodata else "nan"  # handle float nan
 
-    merged.rio.to_raster(
-        str(out_path),
-        driver="GTiff",
-        compress="deflate",
-        tiled=True,
-        blockxsize=512,
-        blockysize=512,
-        dtype="float32",
-    )
-    logger.info("merge_tile_rasters: written %s (%d tiles)", out_path, len(arrays))
+    with tempfile.NamedTemporaryFile(suffix=".vrt", delete=False) as vrt_file:
+        vrt_path = vrt_file.name
+
+    try:
+        subprocess.run(
+            ["gdalbuildvrt", "-vrtnodata", nodata_str, vrt_path] + valid,
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            [
+                "gdal_translate",
+                "-of", "GTiff",
+                "-co", "COMPRESS=DEFLATE",
+                "-co", "TILED=YES",
+                "-co", "BLOCKXSIZE=512",
+                "-co", "BLOCKYSIZE=512",
+                "-ot", "Float32",
+                "-a_nodata", nodata_str,
+                vrt_path, str(out_path),
+            ],
+            check=True, capture_output=True,
+        )
+    finally:
+        Path(vrt_path).unlink(missing_ok=True)
+
+    logger.info("merge_tile_rasters: written %s (%d tiles)", out_path, len(valid))

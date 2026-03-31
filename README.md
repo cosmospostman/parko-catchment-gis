@@ -90,8 +90,8 @@ Optional flags:
 | `--rebuild-baseline` | Recompute the NDVI baseline (Landsat 1986–present) |
 | `--force` | Clear step sentinels and re-run all steps for the year |
 | `--dry-run` | Print steps that would run without executing anything |
-| `--tile-size N` | Spatial tile size in pixels (default `256`; lower values reduce peak RAM at the cost of more tiles and merge overhead) |
-| `--tile-workers N` | Number of concurrent tiles (default `32`; tune for available CPU and network bandwidth) |
+| `--tile-size N` | Spatial tile size in pixels (default `512`) |
+| `--fetch-workers N` | Number of concurrent tile workers (default `16`) |
 
 The pipeline runs 7 steps in sequence. Completed steps are recorded as
 sentinels in `$WORKING_DIR` and skipped on re-runs unless `--force` is passed.
@@ -99,15 +99,9 @@ Logs are written to `$BASE_DIR/logs/`.
 
 ## Run pipeline steps 1–3 on a cloud instance
 
-Steps 1–3 download several terabytes of COG tiles from `sentinel-cogs.s3.us-west-2.amazonaws.com`. Running them on a cloud instance avoids routing that traffic over a local internet connection.
+Steps 1–3 are CPU and I/O intensive. Run them on an EC2 instance with an EBS-cached copy of the Sentinel-2 COGs.
 
-Steps 1–3 use spatial tiling: the catchment is split into ~256 px × 256 px tiles, and up to 32 tiles are processed concurrently. Each concurrent tile issues many simultaneous S3 range requests, so the full network pipe is utilised without any single tile exceeding the memory budget (~5 GB peak per tile on a 32 GB machine).
-
-### Option A — AWS EC2 (recommended)
-
-The Sentinel-2 COGs are hosted in `us-west-2`. An EC2 instance in the same region transfers data over AWS's internal network — significantly faster and with no egress charges.
-
-**Instance spec:** Ubuntu 24.04 LTS, `c6a.4xlarge` (16 vCPU, 32 GB), region `us-west-2`. Add your SSH key during creation. 100 GiB `gp3` root volume.
+**Instance spec:** Ubuntu 24.04 LTS, `c7gn.4xlarge` (16 vCPU ARM64/Graviton3, 32 GB), region `us-west-2`. Add your SSH key during creation. 100 GiB `gp3` root volume.
 
 **First-time setup:**
 
@@ -128,12 +122,19 @@ sudo mkdir -p /data/mrc-parko && sudo chown $USER /data/mrc-parko
 
 > **Note:** install GDAL 3.8.4 via pip after `requirements.txt` to ensure the Python bindings match the system library version. Do not add any GDAL PPAs — use the version from the standard Ubuntu 24.04 repos only.
 
-**Each run** — use `tmux` so the pipeline survives SSH disconnection:
+**Each run** — attach the EBS cache volume, sync new scenes, then run the pipeline. See [EBS-SETUP.md](EBS-SETUP.md) for volume setup. Use `tmux` so the pipeline survives SSH disconnection:
 
 ```bash
 ssh ubuntu@<instance-ip>
 cd parko-catchment-gis && source .venv/bin/activate
 tmux new -s pipeline
+
+# Sync new scenes for the year
+python scripts/s2_sync_manifest.py 2025 --out manifest_2025.txt
+./scripts/s2_ebs_sync.sh --manifest manifest_2025.txt --dest /mnt/s2cache
+
+# Run steps 1–3 with local cache
+export LOCAL_S2_ROOT=/mnt/s2cache
 ./run.sh 2025 --to-step 3
 # Ctrl+B then D to detach; tmux attach -t pipeline to return
 ```
@@ -144,46 +145,7 @@ tmux new -s pipeline
 scp -r ubuntu@<instance-ip>:/data/mrc-parko/outputs/2025 ./outputs/
 ```
 
-Then stop or terminate the instance.
-
-### Option B — DigitalOcean (alternative)
-
-**Droplet spec:** Ubuntu 24.04 LTS, `c2-8vcpu-16gb` (CPU-optimised), region SFO3. Add your SSH key during creation.
-
-**First-time setup:**
-
-```bash
-scp $BASE_DIR/mitchell_catchment.geojson root@<droplet-ip>:/data/mrc-parko/
-ssh root@<droplet-ip>
-```
-
-```bash
-sudo apt-get update && sudo apt-get install -y python3-pip python3-venv git gdal-bin libgdal-dev
-git clone https://github.com/cosmospostman/parko-catchment-gis.git parko-catchment-gis
-cd parko-catchment-gis
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-pip install GDAL==3.8.4
-sudo mkdir -p /data/mrc-parko && sudo chown $USER /data/mrc-parko
-```
-
-**Each run:**
-
-```bash
-ssh root@<droplet-ip>
-cd parko-catchment-gis && source .venv/bin/activate
-tmux new -s pipeline
-./run.sh 2025 --to-step 3
-# Ctrl+B then D to detach; tmux attach -t pipeline to return
-```
-
-**Copy outputs back:**
-
-```bash
-scp -r root@<droplet-ip>:/data/mrc-parko/outputs/2025 ./outputs/
-```
-
-Then power off or destroy the droplet.
+Then snapshot the EBS volume, detach, and delete it (see [EBS-SETUP.md](EBS-SETUP.md)). Stop or terminate the instance.
 
 ## Run the remainder of the pipeline
 

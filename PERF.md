@@ -1,47 +1,30 @@
 # Performance Notes
 
-## Instance & Network
+## Instance
 
-- **`c6a.4xlarge`**: 6.25 Gbit/s baseline, 12.5 Gbit/s burst. Sustained ~5 Gbit/s observed.
-- **Network is the bottleneck** — CPU at ~23%, memory comfortable, network saturated at 16 fetch workers.
-- Adding workers beyond 16 gives no throughput gain and introduces connection errors.
-- **`c7gn.4xlarge`** ($0.998/hr vs $0.612/hr) has 50 Gbit/s network — likely 3-4x faster per run, cheaper overall for network-bound jobs.
-- **DO droplet**: ~2.5 Gbit/s sustained — half the EC2 throughput due to leaving the AWS network.
+- **`c7gn.4xlarge`** (16 vCPU ARM64/Graviton3, 32 GB, 50 Gbit/s network), `us-west-2`.
+- Pipeline is **CPU-bound** with the EBS local cache — 94–96% CPU utilisation observed, disk at 15–36% util.
 
-## S3 & Routing
+## Worker configuration
 
-- EC2 in `us-west-2` (same region as Sentinel-2 COGs) ✅
-- **S3 Gateway Endpoint** added — S3 traffic routes via AWS backbone, bypassing the internet gateway. Was not configured initially.
-- Gateway endpoint doesn't change DNS resolution (still shows public IPs) but traffic takes the private path.
-- Single TCP connection to S3 caps at ~1-2 Gbit/s — parallel connections required to saturate bandwidth.
+- **16 fetch workers** is the current setting (`--fetch-workers 16`).
+- Workers run in a `ProcessPoolExecutor` with `fork` context — each worker has its own GIL, giving true CPU parallelism.
+- `dask scheduler="synchronous"` inside each worker — no thread spawning per tile.
+- `fetch_s` p50 ~7s, p90 ~11s (dominated by stackstac COG header reads and numpy compute).
 
-## Worker Configuration
+## Tile size
 
-- **16 fetch workers, 16 compute workers** is the sweet spot for `c6a.4xlarge`.
-- 24-32 fetch workers causes `getaddrinfo() thread failed to start` (OS DNS thread exhaustion).
-- **nscd** installed on EC2 to cache DNS responses — reduces DNS thread pressure.
-- **HTTP/2 multiplexing** enabled (`GDAL_HTTP_VERSION=2`, `GDAL_HTTP_MULTIPLEX=YES`) — multiple range requests share one connection.
+- **512px** tiles at 10 m resolution = 5.12 km × 5.12 km.
+- 1024px tiles OOM on 32 GB with 16 workers — avoid.
 
-## Tile Size
+## EBS local cache
 
-- **512px** is the right balance for `c6a.4xlarge` — 1024px causes OOM.
-- Larger tiles = fewer requests = better overhead ratio, but doesn't increase throughput once network-saturated.
-- Tile size affects efficiency and memory, not raw Gbit/s.
+- Sentinel-2 COGs are synced to `/mnt/s2cache` before running the pipeline.
+- `LOCAL_S2_ROOT=/mnt/s2cache` rewrites asset hrefs to local paths.
+- EBS read latency ~1.2 ms vs ~30 ms per range request over S3 — eliminates network as bottleneck.
+- Without the cache, fetch_s would return to 63–128s (network-bound), even with more workers.
 
-## EBS
+## ARM64 / Graviton notes
 
-- `c6a.4xlarge` EBS baseline is 4,750 Mbps — potential hidden bottleneck if scratch tiles are on EBS.
-- Writing compressed tiles (deflate) reduces EBS pressure.
-
-## COG Request Overhead
-
-- Each tile triggers ~20-50 range requests (header + data per scene per band).
-- 512px gives 4x better payload-to-overhead ratio vs 256px.
-- `GDAL_HTTP_PERSISTENT=YES` keeps connections warm — amortises TLS/TCP handshake cost.
-- Sequential header→data dependency within each COG limits per-connection parallelism.
-
-## Migrating to c7gn (ARM64/Graviton3)
-
-- `rasterio==1.5.0` was a pre-release with no ARM64 wheel on PyPI — pinned to `1.4.4` which has ARM64 wheels.
-- All other dependencies (`numpy`, `xarray`, `geopandas`, `shapely`, `pyproj`, `stackstac`, `odc-stac`, `dask`, `scikit-learn`, `matplotlib`) have ARM64 wheels available.
-- Rebuild `.venv` from scratch on the new instance — cannot copy an x86 venv to ARM64.
+- `rasterio==1.4.4` — use this version; `1.5.0` had no ARM64 wheel on PyPI at time of setup.
+- Rebuild `.venv` from scratch on ARM64 — cannot copy an x86 venv.

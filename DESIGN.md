@@ -143,34 +143,28 @@ numpy
 fsspec              # Filesystem abstraction + local COG tile cache
 ```
 
-### 6.1 Why a single workstation is sufficient
+### 6.1 Execution environment
 
-Sentinel-2 data is served as Cloud Optimised GeoTIFFs (COGs), which support HTTP range requests. Only the specific bands and spatial tiles intersecting the catchment boundary are fetched — not full 800 MB scenes. `stackstac` builds a lazy Dask computation graph that processes the data in chunks, never loading the full time-stack into RAM simultaneously. Estimated peak RAM for the Mitchell catchment analysis: 4–8 GB. A workstation with 16 GB RAM and a 100 Mbps connection handles the full pipeline in 2–4 hours per annual run.
+Steps 1–3 run on an EC2 `c7gn.4xlarge` (16 vCPU ARM64/Graviton3, 32 GB) in `us-west-2`, co-located with the Sentinel-2 COG bucket. Steps 4–7 work entirely from the GeoTIFFs written by steps 1–3 and can be run locally.
+
+The pipeline processes the catchment in 512 px spatial tiles via `ProcessPoolExecutor` with 16 worker processes. Each worker runs fetch + compute for one tile independently, giving true CPU parallelism (each worker has its own GIL). Peak memory: ~86 MB per tile × 16 workers ≈ 1.4 GB arrays in flight, well within the 32 GB budget.
 
 ### 6.2 Storage layout
 
 ```
-/mnt/parkinsonia-ssd/          # 300 GB SSD — fast I/O for cache and working files
-├── code/                       # Git repository (also pushed to remote — SSD is not canonical)
-├── cache/
-│   ├── sentinel2/              # fsspec COG tile cache (~25 GB active)
-│   ├── sentinel1/              # (~8 GB active)
-│   └── dea-landsat/            # DEA Collection 3 ARD tile cache (~15 GB active)
-└── outputs/
-    ├── working/                # Intermediate rasters (overwritten each run)
-    └── products/               # Final outputs (versioned annually)
+/data/mrc-parko/               # BASE_DIR — all operational data
+├── mitchell_catchment.geojson
+├── cache/                      # (unused — no fsspec tile cache)
+├── working/                    # Intermediate tile scratch files (cleaned up after each step)
+├── outputs/YYYY/               # Final GeoTIFFs and quicklooks
+└── logs/                       # Per-run logs and tile stats CSVs
 
-/mnt/parkinsonia-hdd/          # 500 GB HDD — archive only
-└── archive/
-    ├── 2025/
-    └── 2026/
+/mnt/s2cache/                  # EBS volume (2 TB gp3) — Sentinel-2 COG local cache
+└── sentinel-cogs/
+    └── sentinel-s2-l2a-cogs/  # Mirrors s3://sentinel-cogs key structure
 ```
 
-Mount the HDD with `noatime` in `/etc/fstab` to avoid unnecessary write overhead on spinning disk.
-
-Cache expiry is set to 90 days via `fsspec`. Estimated active cache: ~50 GB (Sentinel-2 ~25 GB, Sentinel-1 ~8 GB, DEA Landsat ~15 GB, working headroom ~2 GB). Comfortably within the 300 GB SSD budget.
-
-The Git repository under `code/` must be pushed to a remote host. The SSD is a working cache, not a canonical code store.
+The EBS volume is created once, snapshotted after the pipeline run, and restored the following year. Only new scenes need syncing each year. See [EBS-SETUP.md](EBS-SETUP.md) for full lifecycle instructions.
 
 ---
 
