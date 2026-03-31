@@ -38,17 +38,26 @@ logger = logging.getLogger(__name__)
 
 
 def _build_baseline(bbox, config) -> xr.DataArray:
-    """Download and compute the Landsat NDVI baseline median (1986 to year-1)."""
+    """Download and compute the Landsat NDVI baseline median (1986 to year-1).
+
+    Only scenes within the dry-season window (COMPOSITE_START–COMPOSITE_END)
+    are used, matching the phenology of the current-year Step 01 composite and
+    avoiding wet-season bias in the long-term median.
+    """
     from utils.stac import DEA_LANDSAT_COLLECTIONS
     from utils.tiling import make_tile_bboxes, merge_tile_rasters
     from utils.pipeline import setup_gdal_env, setup_proj
     import pystac_client
 
-    start = f"{config.BASELINE_START_YEAR}-01-01"
-    end   = f"{config.YEAR - 1}-12-31"
+    # Dry-season month range — same window as the Step 01 composite.
+    dry_start_mm_dd = config.COMPOSITE_START   # e.g. "05-01"
+    dry_end_mm_dd   = config.COMPOSITE_END     # e.g. "10-31"
+
+    start_year = config.BASELINE_START_YEAR
+    end_year   = config.YEAR - 1
     logger.info(
-        "── Step 02 baseline  DEA Landsat %s → %s ──────────────────────────",
-        start, end,
+        "── Step 02 baseline  DEA Landsat %d → %d  dry-season window: %s → %s ──",
+        start_year, end_year, dry_start_mm_dd, dry_end_mm_dd,
     )
 
     setup_gdal_env()
@@ -140,13 +149,26 @@ def _build_baseline(bbox, config) -> xr.DataArray:
         t_fetch = time.monotonic()
         try:
             tile_catalog = pystac_client.Client.open("https://explorer.dea.ga.gov.au/stac")
-            tile_items = list(tile_catalog.search(
-                collections=DEA_LANDSAT_COLLECTIONS,
-                bbox=tile_bbox,
-                datetime=f"{start}/{end}",
-                max_items=1000,
-            ).items())
-            logger.info("Tile %d/%d  STAC: %d items found", tile_idx + 1, n_tiles, len(tile_items))
+            # Search dry-season window for each year separately so we get even
+            # temporal coverage across all Landsat missions (LS5→LS9) without
+            # hitting a per-request item cap that would truncate recent years.
+            # Items returned chronologically would otherwise leave 2009–present
+            # absent when max_items is reached.
+            tile_items = []
+            for yr in range(start_year, end_year + 1):
+                yr_start = f"{yr}-{dry_start_mm_dd}"
+                yr_end   = f"{yr}-{dry_end_mm_dd}"
+                yr_items = list(tile_catalog.search(
+                    collections=DEA_LANDSAT_COLLECTIONS,
+                    bbox=tile_bbox,
+                    datetime=f"{yr_start}/{yr_end}",
+                    max_items=50,
+                ).items())
+                tile_items.extend(yr_items)
+            logger.info(
+                "Tile %d/%d  STAC: %d items across %d years",
+                tile_idx + 1, n_tiles, len(tile_items), end_year - start_year + 1,
+            )
             if not tile_items:
                 q.put((tile_idx, None, 0.0, None))
                 return

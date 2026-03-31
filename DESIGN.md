@@ -196,7 +196,7 @@ Note: B05, B06, B07 are at 20 m native resolution. Resample to 10 m when combini
 # (fallback: Element84 STAC Landsat scenes, requires manual inter-sensor calibration)
 # DEA provides atmospherically corrected, BRDF-normalised surface reflectance
 # validated for Australian conditions — Landsat 5/7/8/9, 1986–present
-# Build per-pixel long-term median NDVI for May–Oct window
+# Build per-pixel long-term median NDVI for dry-season window only (COMPOSITE_START–COMPOSITE_END)
 # Also load DEA Fractional Cover product (green fraction) as supplementary baseline
 # Anomaly = current year NDVI - long-term median
 # Persistent positive anomaly = primary Parkinsonia detection signal
@@ -204,6 +204,8 @@ Note: B05, B06, B07 are at 20 m native resolution. Resample to 10 m when combini
 ```
 
 The long-term baseline is computed once and cached; only the current-year composite changes annually. Using DEA Collection 3 ARD eliminates inter-sensor calibration work across five Landsat missions — this is technically the most complex step in the pipeline and DEA has already solved it for Australian conditions.
+
+**Baseline temporal sampling:** The STAC search is performed per-year (one query per calendar year, 1986–YEAR-1) restricted to the dry-season window (`COMPOSITE_START`–`COMPOSITE_END`, typically May–October). This ensures two things. First, the baseline phenology matches the current-year composite: comparing a dry-season current NDVI against a full-year baseline would embed a seasonal bias rather than a vegetation-change signal. Second, per-year queries with a per-year item cap (50 items/year) guarantee even temporal representation across all four Landsat missions — a single wide query with a total item cap would return items in chronological order and truncate LS8/LS9 data (2013–present) entirely once the cap is reached, leaving the most recent and highest-quality mission absent from the baseline.
 
 **Back-analysis performance note:** The cache invalidation logic keys the baseline on `1986–YEAR-1`, so each year of a back-analysis (e.g. 2017–2025) triggers a full baseline rebuild — approximately 8× redundant Landsat fetches and compute across a 9-year run. Before running a multi-year back-analysis, the baseline end year should be decoupled from `YEAR` and built once to the full extent (e.g. 1986–2024), then reused across all years. This is not yet implemented.
 
