@@ -122,6 +122,14 @@ def rewrite_hrefs_to_local(items, local_root, bands):
     return patched
 
 
+DEA_LANDSAT_COLLECTIONS = [
+    "ga_ls5t_ard_3",
+    "ga_ls7e_ard_3",
+    "ga_ls8c_ard_3",
+    "ga_ls9c_ard_3",
+]
+
+
 def load_dea_landsat(
     bbox: List[float],
     start: str,
@@ -131,19 +139,24 @@ def load_dea_landsat(
     resolution: int,
     crs: str,
 ) -> xr.Dataset:
-    """Load DEA Landsat ARD data via odc-stac."""
+    """Load DEA Landsat ARD data via odc-stac.
+
+    The `collection` parameter is ignored — DEA split the former `ga_ls_ard_3`
+    collection into per-sensor collections (ls5/ls7/ls8/ls9). All four are
+    searched and combined.
+    """
     import odc.stac
     import pystac_client
 
     catalog = pystac_client.Client.open("https://explorer.dea.ga.gov.au/stac")
     search = catalog.search(
-        collections=[collection],
+        collections=DEA_LANDSAT_COLLECTIONS,
         bbox=bbox,
         datetime=f"{start}/{end}",
         max_items=1000,
     )
     items = list(search.items())
-    logger.info("DEA Landsat search: %d items found", len(items))
+    logger.info("DEA Landsat search: %d items found (collections: %s)", len(items), DEA_LANDSAT_COLLECTIONS)
     ds = odc.stac.load(
         items,
         bands=bands,
