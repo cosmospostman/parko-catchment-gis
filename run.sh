@@ -437,8 +437,11 @@ if [[ -n "${LOCAL_S2_ROOT}" ]]; then
     STEP_NAMES+=("s2_ebs_sync")
 
     _skip_stage0=false
-    [[ -n "${ONLY_STEP}" && "${ONLY_STEP}" != "0" ]] && _skip_stage0=true
-    [[ "${FROM_STEP}" -gt 0 ]] && _skip_stage0=true
+    if [[ -n "${ONLY_STEP}" && "${ONLY_STEP}" != "0" ]]; then
+        _skip_stage0=true
+    elif [[ -z "${ONLY_STEP}" && "${FROM_STEP}" -gt 0 ]]; then
+        _skip_stage0=true
+    fi
 
     _sentinel_00="${WORKING_DIR}/.step_00_complete_${YEAR}_${GIT_SHA}"
     if [[ "${_skip_stage0}" == "true" ]]; then
