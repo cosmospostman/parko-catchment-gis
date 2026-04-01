@@ -140,14 +140,6 @@ def flood_mask_from_scene(
     if reference_mask is not None and reference_mask.shape == water.shape:
         water = water & ~reference_mask
 
-    # Dilate water mask by 1 pixel to absorb sub-pixel GCP registration offsets
-    # between passes.  Without this, a real water body that warps to (x,y) in
-    # one pass and (x+1,y) in the next never accumulates enough hits to exceed
-    # the frequency threshold.  Dilation is applied before the frequency count
-    # so only the core (multi-pass confirmed) pixels survive thresholding.
-    from scipy.ndimage import binary_dilation
-    water = binary_dilation(water, iterations=1)
-
     logger.info("Water pixels %s: %d / %d observed (%.1f%%)",
                 item.id, water.sum(), observed.sum(), 100 * water.sum() / max(observed.sum(), 1))
 
