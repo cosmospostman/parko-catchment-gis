@@ -147,14 +147,32 @@ def main() -> None:
     combined_coords = None
     completed = 0
     mask_path_str = str(dry_mask_cache) if dry_mask_cache.exists() else ""
+
+    # Submit at most (flood_workers + 1) futures at a time so the executor queue
+    # never holds more than one prefetched scene per worker.  Submitting all 109
+    # futures upfront causes the pool to begin reading the next scene's raster
+    # data before the current result has been consumed, doubling peak memory.
+    item_iter = iter(items)
+    in_flight: dict = {}
+
+    def _submit_next() -> None:
+        item = next(item_iter, None)
+        if item is not None:
+            f = executor.submit(_process_scene_worker, item, bbox_wgs84, S1_RESOLUTION, mask_path_str)
+            in_flight[f] = item
+
     with ProcessPoolExecutor(max_workers=flood_workers) as executor:
-        futures = {
-            executor.submit(_process_scene_worker, item, bbox_wgs84, S1_RESOLUTION, mask_path_str): item
-            for item in items
-        }
-        for future in as_completed(futures):
-            item = futures[future]
+        # Seed the pool — one job per worker, no prefetch queue
+        for _ in range(flood_workers):
+            _submit_next()
+
+        while in_flight:
+            future = next(as_completed(in_flight))
+            item = in_flight.pop(future)
             completed += 1
+            # Submit the next item before processing the result so the worker
+            # that just freed up starts immediately, but only one at a time.
+            _submit_next()
             try:
                 scene = future.result()
                 if scene is None:
@@ -165,6 +183,8 @@ def main() -> None:
                 observed = scene["observed"].values.view(np.uint8)
                 if flood_count is None:
                     combined_coords = scene["water"]
+                del scene
+                if flood_count is None:
                     flood_count = water.astype(np.uint16)
                     obs_count   = observed.astype(np.uint16)
                 else:
