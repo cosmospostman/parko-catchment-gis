@@ -28,7 +28,8 @@ from shapely.ops import unary_union
 # Script-level constants
 FLOOD_UNION_SIMPLIFY_TOLERANCE = 100        # metres — coarser than pixel size (50 m) is fine
 DASK_CHUNK_SPATIAL = 2048
-S1_MAX_WORKERS = int(os.environ.get("FETCH_WORKERS", 2))  # override with --fetch-workers
+S1_DRY_WORKERS   = int(os.environ.get("DRY_WORKERS",   4))   # override with --dry-workers
+S1_FLOOD_WORKERS = int(os.environ.get("FETCH_WORKERS", 4))  # override with --fetch-workers
 S1_RESOLUTION = 50                          # metres — flood mapping doesn't need 10 m
 FLOOD_MIN_FREQUENCY = 0.10                  # pixel must be water in ≥10% of scenes
 
@@ -59,35 +60,45 @@ def main() -> None:
 
     flood_start = f"{config.YEAR}-{config.FLOOD_SEASON_START}"
     flood_end   = f"{config.YEAR}-{config.FLOOD_SEASON_END}"
-    n_workers = S1_MAX_WORKERS if PIPELINE_RUN else 1
+    dry_workers   = S1_DRY_WORKERS   if PIPELINE_RUN else 1
+    flood_workers = S1_FLOOD_WORKERS if PIPELINE_RUN else 1
 
-    # --- Dry-season reference mask (Oct–Nov of prior year) -------------------
-    dry_start = f"{config.YEAR}-10-01"
-    dry_end   = f"{config.YEAR}-11-30"
-    logger.info("Searching dry-season S1 reference items: %s → %s", dry_start, dry_end)
-    dry_items = search_sentinel1(
-        bbox=bbox_wgs84,
-        start=dry_start,
-        end=dry_end,
-        endpoint=config.STAC_ENDPOINT_ELEMENT84,
-        collection=config.S1_COLLECTION,
-    )
-    if LOCAL_S1_ROOT and dry_items:
-        from utils.stac import rewrite_hrefs_to_local
-        dry_items = rewrite_hrefs_to_local(dry_items, LOCAL_S1_ROOT)
-
+    # --- Dry-season reference mask (Oct–Nov of same year) --------------------
+    dry_mask_cache = config.dry_season_mask_path(config.YEAR)
     reference_mask = None
-    if dry_items:
-        logger.info("Building dry-season reference mask from %d scenes (workers=%d)",
-                    len(dry_items), n_workers)
-        reference_mask = build_dry_season_reference_mask(
-            dry_items,
-            bbox=bbox_wgs84,
-            resolution=S1_RESOLUTION,
-            max_workers=n_workers,
-        )
+    if dry_mask_cache.exists():
+        logger.info("Loading cached dry-season reference mask: %s", dry_mask_cache)
+        reference_mask = np.load(str(dry_mask_cache))
     else:
-        logger.warning("No dry-season S1 items found; sodic-scald masking will be skipped")
+        dry_start = f"{config.YEAR}-10-01"
+        dry_end   = f"{config.YEAR}-11-30"
+        logger.info("Searching dry-season S1 reference items: %s → %s", dry_start, dry_end)
+        dry_items = search_sentinel1(
+            bbox=bbox_wgs84,
+            start=dry_start,
+            end=dry_end,
+            endpoint=config.STAC_ENDPOINT_ELEMENT84,
+            collection=config.S1_COLLECTION,
+        )
+        if LOCAL_S1_ROOT and dry_items:
+            from utils.stac import rewrite_hrefs_to_local
+            dry_items = rewrite_hrefs_to_local(dry_items, LOCAL_S1_ROOT)
+
+        if dry_items:
+            logger.info("Building dry-season reference mask from %d scenes (workers=%d)",
+                        len(dry_items), dry_workers)
+            reference_mask = build_dry_season_reference_mask(
+                dry_items,
+                bbox=bbox_wgs84,
+                resolution=S1_RESOLUTION,
+                max_workers=dry_workers,
+            )
+            if reference_mask is not None:
+                dry_mask_cache.parent.mkdir(parents=True, exist_ok=True)
+                np.save(str(dry_mask_cache), reference_mask)
+                logger.info("Cached dry-season reference mask: %s", dry_mask_cache)
+        else:
+            logger.warning("No dry-season S1 items found; sodic-scald masking will be skipped")
 
     # --- Flood-season scenes --------------------------------------------------
     logger.info("Searching Sentinel-1 items: %s → %s", flood_start, flood_end)
@@ -106,7 +117,7 @@ def main() -> None:
         logger.info("Rewriting S1 asset hrefs to local cache: %s", LOCAL_S1_ROOT)
         items = rewrite_hrefs_to_local(items, LOCAL_S1_ROOT)
 
-    logger.info("Processing %d S1 scenes (workers=%d)", len(items), n_workers)
+    logger.info("Processing %d S1 scenes (workers=%d)", len(items), flood_workers)
 
     def _process_scene(item):
         return flood_mask_from_scene(
@@ -120,7 +131,7 @@ def main() -> None:
     obs_count   = None   # uint16 count of scenes observing each pixel (footprint)
     combined_coords = None
     completed = 0
-    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+    with ThreadPoolExecutor(max_workers=flood_workers) as executor:
         futures = {executor.submit(_process_scene, item): item for item in items}
         for future in as_completed(futures):
             item = futures[future]

@@ -136,3 +136,8 @@ def verification_report_path(year: int) -> Path:
 def ndvi_baseline_path() -> Path:
     """Return the path for the cached NDVI baseline median raster."""
     return CACHE_DIR / "ndvi_baseline_median.tif"
+
+
+def dry_season_mask_path(year: int) -> Path:
+    """Return the path for the cached dry-season SAR reference mask for the given year."""
+    return CACHE_DIR / f"dry_season_mask_{year}.npy"

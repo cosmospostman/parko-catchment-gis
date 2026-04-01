@@ -22,7 +22,7 @@ if [[ $# -lt 1 ]]; then
     echo "Usage: $0 YEAR [--composite-start MM-DD] [--composite-end MM-DD]" >&2
     echo "            [--from-step N] [--to-step N] [--only-step N] [--dry-run]" >&2
     echo "            [--rebuild-baseline] [--force]" >&2
-    echo "            [--tile-size N] [--fetch-workers N] [--compute-workers N]" >&2
+    echo "            [--tile-size N] [--fetch-workers N] [--dry-workers N] [--compute-workers N]" >&2
     echo "            [--tile-workers N]  (deprecated: sets both fetch and compute workers)" >&2
     exit 3
 fi
@@ -57,6 +57,7 @@ while [[ $# -gt 0 ]]; do
         --tile-size)        TILE_SIZE_PX="$2";      shift 2 ;;
         --fetch-workers)    FETCH_WORKERS="$2";    shift 2 ;;
         --compute-workers)  COMPUTE_WORKERS="$2";  shift 2 ;;
+        --dry-workers)      DRY_WORKERS="$2";      shift 2 ;;
         --tile-workers)     FETCH_WORKERS="$2"; COMPUTE_WORKERS="$2"; shift 2 ;;  # deprecated
         *) echo "ERROR: Unknown argument: $1" >&2; exit 3 ;;
     esac
@@ -78,6 +79,7 @@ export LOCAL_DEM_PATH="${LOCAL_DEM_PATH:-}"
 export TILE_SIZE_PX="${TILE_SIZE_PX:-512}"
 export FETCH_WORKERS="${FETCH_WORKERS:-$([ -n "${LOCAL_S2_ROOT}" ] && echo 4 || echo 16)}"
 export COMPUTE_WORKERS="${COMPUTE_WORKERS:-$(python -c 'import os; print(os.cpu_count() or 4)')}"
+export DRY_WORKERS="${DRY_WORKERS:-4}"
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
 mkdir -p "${LOG_DIR}" 2>/dev/null || true
@@ -97,6 +99,7 @@ echo "  Composite window: ${COMPOSITE_START} → ${COMPOSITE_END}"
 echo "  Rebuild baseline: ${REBUILD_BASELINE}"
 echo "  Tile size (px):   ${TILE_SIZE_PX}"
 echo "  Fetch workers:    ${FETCH_WORKERS}"
+echo "  Dry workers:      ${DRY_WORKERS}"
 echo "  Compute workers:  ${COMPUTE_WORKERS}"
 echo "  Dry run:          ${DRY_RUN}"
 [[ -n "${ONLY_STEP}" ]] && echo "  Only step:        ${ONLY_STEP}"
