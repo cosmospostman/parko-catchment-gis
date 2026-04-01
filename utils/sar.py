@@ -83,6 +83,9 @@ def _preprocess_with_sarsen(item: Any, bbox: list, resolution: int) -> xr.Datase
     """Terrain-corrected preprocessing using sarsen."""
     import sarsen
 
+    import tempfile
+    import rioxarray  # noqa: F401 — required for .rio accessor in sarsen
+
     safe_root = _safe_root_from_item(item)
     logger.debug("sarsen SAFE root: %s", safe_root)
     dem = _dem_urlpath()
@@ -93,12 +96,25 @@ def _preprocess_with_sarsen(item: Any, bbox: list, resolution: int) -> xr.Datase
             product_urlpath=safe_root,
             measurement_group=f"IW/{pol}",
         )
-        da = sarsen.terrain_correction(
-            product,
-            dem_urlpath=dem,
-            output_urlpath=None,
-            correct_radiometry="gamma_nearest",
-        )
+        with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            sarsen.terrain_correction(
+                product,
+                dem_urlpath=dem,
+                output_urlpath=tmp_path,
+                correct_radiometry="gamma_nearest",
+            )
+            import rasterio
+            with rasterio.open(tmp_path) as src:
+                data = src.read(1)
+                transform = src.transform
+                crs = src.crs
+            da = xr.DataArray(data, dims=["y", "x"])
+            da.attrs["crs"] = str(crs)
+            da.attrs["transform"] = transform
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
         bands[pol] = da
 
     ds = xr.Dataset(bands)
