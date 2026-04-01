@@ -103,21 +103,17 @@ def _preprocess_gcp_warp(item: Any, bbox: list, resolution: int) -> xr.Dataset:
         with rasterio.open(meas_asset.href) as src:
             src_data = src.read(1).astype(np.float32)
             src_height, src_width = src_data.shape
-            src_profile = src.profile
 
-        # Write to an in-memory dataset with GCPs set, then warp from it
+        # Write to an in-memory GeoTIFF with GCPs, then reproject
         import rasterio.io
-        mem_profile = src_profile.copy()
-        mem_profile.update(count=1, dtype="float32", driver="GTiff",
-                           crs=None, transform=rasterio.transform.IDENTITY)
         dst_data = np.full((dst_height, dst_width), np.nan, dtype=np.float32)
         with rasterio.io.MemoryFile() as memfile:
-            with memfile.open(**mem_profile) as mem_ds:
+            with memfile.open(driver="GTiff", count=1, dtype="float32",
+                              width=src_width, height=src_height) as mem_ds:
                 mem_ds.write(src_data, 1)
                 mem_ds.gcps = (gcps, src_crs)
-            with memfile.open() as mem_ds:
                 rasterio.warp.reproject(
-                    source=mem_ds,
+                    source=rasterio.band(mem_ds, 1),
                     destination=dst_data,
                     dst_crs=target_crs,
                     dst_transform=dst_transform,
