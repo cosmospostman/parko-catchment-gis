@@ -126,13 +126,20 @@ def _preprocess_stackstac_fallback(item: Any, bbox: list, resolution: int) -> xr
     """Basic S1 loading via stackstac without terrain correction."""
     import stackstac
 
-    da = stackstac.stack(
-        [item],
-        assets=["vv", "vh"],
-        resolution=resolution,
-        bounds_latlon=bbox,
-        epsg=4326,
-    )
+    try:
+        da = stackstac.stack(
+            [item],
+            assets=["vv", "vh"],
+            resolution=resolution,
+            bounds_latlon=bbox,
+            epsg=4326,
+        )
+    except ValueError as exc:
+        if "zero-size" in str(exc) or "no identity" in str(exc):
+            raise ValueError(f"Scene does not overlap bbox (no valid pixels): {item.id}") from exc
+        raise
+    if da.sizes.get("x", 0) == 0 or da.sizes.get("y", 0) == 0:
+        raise ValueError(f"Scene has no spatial overlap with bbox: {item.id}")
     ds = da.to_dataset(dim="band")
     # Normalise band names to uppercase to match downstream expectations
     ds = ds.rename({k: k.upper() for k in ds.data_vars if k in ("vv", "vh")})
