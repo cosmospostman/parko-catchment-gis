@@ -31,6 +31,15 @@ PSEUDO_ABSENCE_BUFFER_KM = 2.0
 RF_CLASS_WEIGHT = "balanced"
 MODEL_CACHE_PATH_TEMPLATE = "rf_model_{year}.pkl"
 
+# Ecological bootstrapping: thresholds for high-confidence synthetic training samples.
+# Parkinsonia is an obligate riparian weed with a strong dry-season green signal.
+SYNTH_PRESENCE_MAX_DIST_WATER_M = 500.0   # rarely establishes beyond 500m from water
+SYNTH_ABSENCE_MIN_DIST_WATER_M  = 2000.0  # very unlikely beyond 2km
+SYNTH_NDVI_MEDIAN_MIN = 0.15              # not bare ground / sparse grass
+SYNTH_NDVI_MEDIAN_MAX = 0.65              # not dense closed-canopy rainforest
+SYNTH_TARGET_PRESENCES = 300              # synthetic presences to generate
+SYNTH_SAMPLE_WEIGHT = 0.3                 # down-weight vs real ALA records (weight=1.0)
+
 logger = logging.getLogger(__name__)
 
 
@@ -88,6 +97,72 @@ def _compute_glcm_features(ndvi: np.ndarray, kernel: int = 7) -> Tuple[np.ndarra
     contrast = generic_filter(ndvi, contrast_fn, size=kernel, mode="nearest")
     homogeneity = generic_filter(ndvi, homogeneity_fn, size=kernel, mode="nearest")
     return contrast, homogeneity
+
+
+def _generate_ecological_samples(
+    feat_stack: np.ndarray,
+    dist_to_water: np.ndarray,
+    ndvi_anomaly: np.ndarray,
+    flowering: np.ndarray,
+    ndvi_median: np.ndarray,
+    rng: np.random.Generator,
+) -> Tuple[list, list]:
+    """Generate high-confidence synthetic presence and absence pixels from ecological priors.
+
+    Presence criteria (all required):
+      - Within 500m of watercourse (obligate riparian)
+      - ndvi_anomaly in top quartile (stays green while natives senesce)
+      - flowering_index above scene median (Aug-Oct phenological signal)
+      - ndvi_median in moderate range (not bare ground, not closed-canopy rainforest)
+
+    Absence criteria (any one sufficient):
+      - Beyond 2km from watercourse
+      - Very low ndvi_median (bare ground / sparse grass)
+      - Low ndvi_anomaly AND low flowering_index AND beyond 500m from water
+    """
+    H, W = ndvi_anomaly.shape
+    valid = ~np.isnan(ndvi_anomaly) & ~np.isnan(flowering) & ~np.isnan(ndvi_median)
+
+    ndvi_anom_q75 = float(np.nanpercentile(ndvi_anomaly, 75))
+    flower_median = float(np.nanpercentile(flowering, 50))
+    ndvi_anom_q25 = float(np.nanpercentile(ndvi_anomaly, 25))
+    flower_q25    = float(np.nanpercentile(flowering, 25))
+
+    # High-confidence presence mask
+    pres_mask = (
+        valid
+        & (dist_to_water <= SYNTH_PRESENCE_MAX_DIST_WATER_M)
+        & (ndvi_anomaly >= ndvi_anom_q75)
+        & (flowering >= flower_median)
+        & (ndvi_median >= SYNTH_NDVI_MEDIAN_MIN)
+        & (ndvi_median <= SYNTH_NDVI_MEDIAN_MAX)
+    )
+
+    # High-confidence absence mask
+    abs_mask = valid & (
+        (dist_to_water >= SYNTH_ABSENCE_MIN_DIST_WATER_M)
+        | (ndvi_median < SYNTH_NDVI_MEDIAN_MIN)
+        | (
+            (ndvi_anomaly <= ndvi_anom_q25)
+            & (flowering <= flower_q25)
+            & (dist_to_water > SYNTH_PRESENCE_MAX_DIST_WATER_M)
+        )
+    )
+
+    pres_idx = np.argwhere(pres_mask)
+    abs_idx  = np.argwhere(abs_mask)
+
+    n_pres = min(len(pres_idx), SYNTH_TARGET_PRESENCES)
+    n_abs  = min(len(abs_idx), n_pres)  # balanced
+
+    synth_presences = [tuple(pres_idx[i]) for i in rng.choice(len(pres_idx), size=n_pres, replace=False)]
+    synth_absences  = [tuple(abs_idx[i])  for i in rng.choice(len(abs_idx),  size=n_abs,  replace=False)]
+
+    logger.info(
+        "Ecological bootstrap: %d synthetic presences, %d synthetic absences (weight=%.1f)",
+        len(synth_presences), len(synth_absences), SYNTH_SAMPLE_WEIGHT,
+    )
+    return synth_presences, synth_absences
 
 
 def main() -> None:
@@ -196,16 +271,37 @@ def main() -> None:
     chosen = rng.choice(len(absence_indices), size=n_absence, replace=False)
     absence_pixels = [tuple(absence_indices[i]) for i in chosen]
 
-    # Build X, y arrays
-    X_pres = np.array([feat_stack[r, c] for r, c in presence_pixels])
-    X_abs  = np.array([feat_stack[r, c] for r, c in absence_pixels])
-    X = np.vstack([X_pres, X_abs])
-    y = np.array([1] * len(X_pres) + [0] * len(X_abs))
+    # Ecological bootstrap: supplement sparse ALA records with high-confidence
+    # synthetic samples derived from ecological priors
+    synth_pres_pixels, synth_abs_pixels = _generate_ecological_samples(
+        feat_stack, dist_to_water, ndvi_arr, flower_arr, ndvi_med_arr, rng,
+    )
+
+    # Build X, y, sample_weight arrays
+    # Real ALA records: weight=1.0 — synthetic ecological samples: weight=SYNTH_SAMPLE_WEIGHT
+    X_pres       = np.array([feat_stack[r, c] for r, c in presence_pixels])
+    X_abs        = np.array([feat_stack[r, c] for r, c in absence_pixels])
+    X_synth_pres = np.array([feat_stack[r, c] for r, c in synth_pres_pixels])
+    X_synth_abs  = np.array([feat_stack[r, c] for r, c in synth_abs_pixels])
+
+    X = np.vstack([X_pres, X_abs, X_synth_pres, X_synth_abs])
+    y = np.array(
+        [1] * len(X_pres) + [0] * len(X_abs)
+        + [1] * len(X_synth_pres) + [0] * len(X_synth_abs)
+    )
+    sample_weight = np.array(
+        [1.0] * (len(X_pres) + len(X_abs))
+        + [SYNTH_SAMPLE_WEIGHT] * (len(X_synth_pres) + len(X_synth_abs))
+    )
 
     # Remove rows with NaN
     valid = ~np.isnan(X).any(axis=1)
-    X, y = X[valid], y[valid]
-    logger.info("Training samples: %d presence, %d absence", int(y.sum()), int((y == 0).sum()))
+    X, y, sample_weight = X[valid], y[valid], sample_weight[valid]
+    logger.info(
+        "Training samples: %d presence (%d ALA + %d synthetic), %d absence (%d ALA + %d synthetic)",
+        int(y.sum()), len(presence_pixels), len(synth_pres_pixels),
+        int((y == 0).sum()), len(absence_pixels), len(synth_abs_pixels),
+    )
 
     # ── Spatial block cross-validation and training ───────────────────────────
     from sklearn.ensemble import RandomForestClassifier
@@ -217,10 +313,10 @@ def main() -> None:
         random_state=42,
         n_jobs=-1,
     )
-    cv_scores = cross_val_score(clf, X, y, cv=5, scoring="accuracy")
+    cv_scores = cross_val_score(clf, X, y, cv=5, scoring="accuracy", fit_params={"sample_weight": sample_weight})
     logger.info("CV accuracy: %.3f ± %.3f", cv_scores.mean(), cv_scores.std())
 
-    clf.fit(X, y)
+    clf.fit(X, y, sample_weight=sample_weight)
 
     # Cache model
     model_cache = Path(config.CACHE_DIR) / MODEL_CACHE_PATH_TEMPLATE.format(year=config.YEAR)

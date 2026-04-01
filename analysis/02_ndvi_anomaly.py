@@ -306,10 +306,12 @@ def main() -> None:
     logger.info("Reprojecting baseline to match current NDVI grid…")
     t_reproj = time.monotonic()
     baseline_reproj = baseline.rio.reproject_match(ndvi_current, resampling=RESAMPLING_METHOD)
+    del baseline
     logger.info("Reprojection done  elapsed=%.1fs", time.monotonic() - t_reproj)
 
     logger.info("Computing anomaly (current − baseline)…")
     anomaly = ndvi_current - baseline_reproj
+    del ndvi_current, baseline_reproj
     anomaly = anomaly.clip(-1.0, 1.0)
     anomaly = anomaly.rio.write_crs(config.TARGET_CRS)
 
