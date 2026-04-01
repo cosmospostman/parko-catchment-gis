@@ -20,7 +20,7 @@ S1_POLARISATIONS = ["VV", "VH"]
 VV_OPEN_WATER_THRESHOLD_DB = -14.0          # dB — below this = open water
 FLOOD_UNION_SIMPLIFY_TOLERANCE = 100        # metres — coarser than pixel size (50 m) is fine
 DASK_CHUNK_SPATIAL = 2048
-S1_MAX_WORKERS = 4                          # concurrent S1 scene downloads
+S1_MAX_WORKERS = 2                          # concurrent S1 scene downloads
 S1_RESOLUTION = 50                          # metres — flood mapping doesn't need 10 m
 FLOOD_MIN_FREQUENCY = 0.10                  # pixel must be water in ≥10% of scenes
 
@@ -93,15 +93,14 @@ def main() -> None:
                 if scene is None:
                     continue
                 logger.info("S1 scene processed (%d/%d, %.1f%%): %s", completed, len(items), 100 * completed / len(items), item.id)
-                m = scene.values  # float32: 1.0=water, 0.0=land, nan=outside footprint
-                observed = np.isfinite(m).astype(np.uint16)
-                water    = (m == 1.0).astype(np.uint16)
+                water    = scene["water"].values.view(np.uint8)
+                observed = scene["observed"].values.view(np.uint8)
                 if flood_count is None:
-                    combined_coords = scene
-                    flood_count = water
-                    obs_count   = observed
+                    combined_coords = scene["water"]
+                    flood_count = water.astype(np.uint16)
+                    obs_count   = observed.astype(np.uint16)
                 else:
-                    if m.shape == flood_count.shape:
+                    if water.shape == flood_count.shape:
                         flood_count += water
                         obs_count   += observed
                     else:

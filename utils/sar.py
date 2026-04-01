@@ -171,17 +171,17 @@ def flood_mask_from_scene(
         return None
     otsu_threshold = _otsu_threshold(valid)
     logger.info("Otsu threshold %s VV: %.1f DN", item.id, otsu_threshold)
-    # observed=True where dst_data is finite and > 0 (valid scene pixels)
     observed = np.isfinite(dst_data) & (dst_data > 0)
-    water = observed & (dst_data < otsu_threshold)
-    # Return float: 1.0=water, 0.0=observed land, nan=outside footprint
-    result = np.where(observed, water.astype(np.float32), np.nan)
+    water    = observed & (dst_data < otsu_threshold)
     del dst_data
 
     x_coords = np.linspace(dst_bounds[0], dst_bounds[2], dst_width)
     y_coords = np.linspace(dst_bounds[3], dst_bounds[1], dst_height)
-    return xr.DataArray(result, dims=["y", "x"],
-                        coords={"x": x_coords, "y": y_coords})
+    # Return two bool arrays as a Dataset: water and observed footprint
+    return xr.Dataset({
+        "water":    xr.DataArray(water,    dims=["y", "x"], coords={"x": x_coords, "y": y_coords}),
+        "observed": xr.DataArray(observed, dims=["y", "x"], coords={"x": x_coords, "y": y_coords}),
+    })
 
 
 def _safe_root_from_item(item: Any) -> str:
