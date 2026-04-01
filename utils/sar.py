@@ -57,7 +57,6 @@ def _read_gcps_from_annotation(annotation_path: Path):
 
 def _preprocess_gcp_warp(item: Any, bbox: list, resolution: int) -> xr.Dataset:
     """Warp a Sentinel-1 GRD scene to EPSG:7855 using GCPs from the annotation XML."""
-    import tempfile
     import rasterio
     import rasterio.crs
     import rasterio.warp
@@ -102,23 +101,30 @@ def _preprocess_gcp_warp(item: Any, bbox: list, resolution: int) -> xr.Dataset:
         src_crs = rasterio.crs.CRS.from_epsg(4326)
 
         with rasterio.open(meas_asset.href) as src:
-            # Assign GCPs so rasterio knows the georeferencing
             src_data = src.read(1).astype(np.float32)
             src_height, src_width = src_data.shape
+            src_profile = src.profile
 
-        # Warp using GCPs
+        # Write to an in-memory dataset with GCPs set, then warp from it
+        import rasterio.io
+        mem_profile = src_profile.copy()
+        mem_profile.update(count=1, dtype="float32", driver="GTiff",
+                           crs=None, transform=rasterio.transform.IDENTITY)
         dst_data = np.full((dst_height, dst_width), np.nan, dtype=np.float32)
-        rasterio.warp.reproject(
-            source=src_data,
-            destination=dst_data,
-            gcps=gcps,
-            src_crs=src_crs,
-            dst_crs=target_crs,
-            dst_transform=dst_transform,
-            resampling=rasterio.warp.Resampling.bilinear,
-            src_nodata=0,
-            dst_nodata=np.nan,
-        )
+        with rasterio.io.MemoryFile() as memfile:
+            with memfile.open(**mem_profile) as mem_ds:
+                mem_ds.write(src_data, 1)
+                mem_ds.gcps = (gcps, src_crs)
+            with memfile.open() as mem_ds:
+                rasterio.warp.reproject(
+                    source=mem_ds,
+                    destination=dst_data,
+                    dst_crs=target_crs,
+                    dst_transform=dst_transform,
+                    resampling=rasterio.warp.Resampling.bilinear,
+                    src_nodata=0,
+                    dst_nodata=np.nan,
+                )
 
         # Convert DN to sigma-naught linear scale (S1 GRD: sigma0 = (DN^2) / cal_factor)
         # Without calibration LUT use DN^2 as a proxy — sufficient for flood thresholding
