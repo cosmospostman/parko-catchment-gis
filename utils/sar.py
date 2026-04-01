@@ -137,7 +137,13 @@ def flood_mask_from_scene(
                     item.id, 100 * water_fraction)
         return None
 
-    # VH guard — require VH also below its Otsu threshold
+    # VH guard — require VH also below a fixed -20 dB threshold.
+    # Open water returns very low VH backscatter (typically -22 to -25 dB);
+    # land surfaces (even smooth dry scalds) are generally above -20 dB.
+    # A fixed threshold is more reliable than Otsu here because on dry scenes
+    # the VH histogram is unimodal and Otsu would split within the land
+    # distribution, eliminating the few real water pixels VV correctly found.
+    VH_WATER_THRESHOLD_DB = -20.0
     if vh_lin is not None:
         vh_nan = ~observed
         vh_lin[vh_nan] = np.nan
@@ -148,11 +154,8 @@ def flood_mask_from_scene(
             vh_lin *= 10
         vh_db = vh_lin
         del vh_lin
-        vh_valid = vh_db[observed]
-        if vh_valid.size >= 100:
-            otsu_vh = _otsu_threshold(vh_valid)
-            logger.info("Otsu VH threshold for %s: %.1f dB", item.id, otsu_vh)
-            water = water & (vh_db < otsu_vh)
+        logger.info("VH guard threshold for %s: %.1f dB (fixed)", item.id, VH_WATER_THRESHOLD_DB)
+        water = water & (vh_db < VH_WATER_THRESHOLD_DB)
         del vh_db
 
     # Exclude pixels that are persistently low-backscatter in the dry season
