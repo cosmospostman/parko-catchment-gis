@@ -141,7 +141,7 @@ def flood_mask_from_scene(
         for g in gcps
     ]
 
-    dst_data = np.empty((dst_height, dst_width), dtype=np.float32)
+    dst_data = np.full((dst_height, dst_width), np.nan, dtype=np.float32)
 
     with rasterio.io.MemoryFile() as memfile:
         with memfile.open(driver="GTiff", count=1, dtype="float32",
