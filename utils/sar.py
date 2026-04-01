@@ -53,137 +53,139 @@ def _otsu_threshold(values: np.ndarray, n_bins: int = 512) -> float:
     return float(best_t)
 
 
+def _focal_median(arr: np.ndarray, radius: int = 1) -> np.ndarray:
+    """Apply a (2*radius+1) × (2*radius+1) median speckle filter, ignoring NaNs."""
+    from scipy.ndimage import generic_filter
+    size = 2 * radius + 1
+    return generic_filter(arr, lambda x: np.nanmedian(x), size=size, mode="reflect").astype(np.float32)
+
+
 def flood_mask_from_scene(
     item: Any,
     bbox: list,
     resolution: int,
-    threshold_db: float,
-) -> xr.DataArray | None:
-    """Return a boolean flood mask DataArray for a single S1 scene.
+    reference_mask: np.ndarray | None = None,
+) -> xr.Dataset | None:
+    """Return a flood/observed Dataset for a single S1 scene.
 
-    Warps VV band to EPSG:7855, converts to dB, applies threshold.
-    Large intermediate arrays are freed before returning — only the boolean
-    mask (1 bit per pixel) is kept in memory.
+    Warps VV and VH to EPSG:7855, applies a 3×3 median speckle filter, then
+    classifies water using per-scene Otsu thresholding on VV with a VH guard
+    (pixel must fall below the Otsu threshold in *both* bands).  This reduces
+    false positives from wind-roughened open water (VH stays high) and smooth
+    dry scalds (VH mimics VV less reliably than true water).
+
+    If reference_mask is provided (True = persistent low-backscatter non-water),
+    those pixels are excluded from the water classification.
     """
-    import rasterio
-    import rasterio.control
-    import rasterio.crs
-    import rasterio.warp
-    import rasterio.transform
-    import rasterio.io
-    import rasterio.windows
+    ds = _preprocess_gcp_warp(item, bbox, resolution)
 
-    safe_root = Path(_safe_root_from_item(item))
-    anno_path = safe_root / "annotation" / "iw-vv.xml"
-    meas_asset = item.assets.get("vv")
-
-    if not anno_path.exists() or meas_asset is None:
-        raise ValueError(f"Missing VV data for {item.id}")
-
-    gcps = _read_gcps_from_annotation(anno_path)
-    if not gcps:
-        raise ValueError(f"No GCPs in annotation for {item.id}")
-
-    target_crs = rasterio.crs.CRS.from_epsg(7855)
-    src_crs = rasterio.crs.CRS.from_epsg(4326)
-    minx, miny, maxx, maxy = bbox
-
-    dst_bounds = rasterio.warp.transform_bounds("EPSG:4326", target_crs, minx, miny, maxx, maxy)
-    dst_width  = max(1, int((dst_bounds[2] - dst_bounds[0]) / resolution))
-    dst_height = max(1, int((dst_bounds[3] - dst_bounds[1]) / resolution))
-    dst_transform = rasterio.transform.from_bounds(*dst_bounds, dst_width, dst_height)
-
-    # Use GCPs to find the source pixel window covering the bbox — avoids reading
-    # the full ~16k×26k swath (~1.6 GB float32) when only a subset is needed.
-    gcp_lons = np.array([g.x for g in gcps])
-    gcp_lats = np.array([g.y for g in gcps])
-    gcp_cols = np.array([g.col for g in gcps])
-    gcp_rows = np.array([g.row for g in gcps])
-
-    margin = 0.5  # degrees
-    mask_near = (
-        (gcp_lons >= minx - margin) & (gcp_lons <= maxx + margin) &
-        (gcp_lats >= miny - margin) & (gcp_lats <= maxy + margin)
-    )
-
-    with rasterio.open(meas_asset.href) as src:
-        full_width, full_height = src.width, src.height
-
-    if mask_near.any():
-        col_min = max(0, int(gcp_cols[mask_near].min()) - 100)
-        col_max = min(full_width,  int(gcp_cols[mask_near].max()) + 100)
-        row_min = max(0, int(gcp_rows[mask_near].min()) - 100)
-        row_max = min(full_height, int(gcp_rows[mask_near].max()) + 100)
-    else:
-        col_min, row_min = 0, 0
-        col_max, row_max = full_width, full_height
-
-    window = rasterio.windows.Window(
-        col_off=col_min, row_off=row_min,
-        width=col_max - col_min, height=row_max - row_min,
-    )
-    with rasterio.open(meas_asset.href) as src:
-        window = window.intersection(rasterio.windows.Window(0, 0, src.width, src.height))
-        src_data = src.read(1, window=window).astype(np.float32)
-        win_col_off = int(window.col_off)
-        win_row_off = int(window.row_off)
-
-    win_height, win_width = src_data.shape
-    logger.info("Windowed read %s VV: %dx%d px (%.1f MB)",
-                item.id, win_width, win_height, win_width * win_height * 4 / 1e6)
-
-    # Adjust GCP coordinates to be relative to the window
-    windowed_gcps = [
-        rasterio.control.GroundControlPoint(
-            row=g.row - win_row_off, col=g.col - win_col_off,
-            x=g.x, y=g.y, z=g.z,
-        )
-        for g in gcps
-    ]
-
-    dst_data = np.full((dst_height, dst_width), np.nan, dtype=np.float32)
-
-    with rasterio.io.MemoryFile() as memfile:
-        with memfile.open(driver="GTiff", count=1, dtype="float32",
-                          width=win_width, height=win_height) as mem_ds:
-            mem_ds.write(src_data, 1)
-            mem_ds.gcps = (windowed_gcps, src_crs)
-            del src_data
-            rasterio.warp.reproject(
-                source=rasterio.band(mem_ds, 1),
-                destination=dst_data,
-                dst_crs=target_crs,
-                dst_transform=dst_transform,
-                resampling=rasterio.warp.Resampling.bilinear,
-                src_nodata=0,
-                dst_nodata=np.nan,
-                num_threads=1,
-            )
-
-    logger.info("Warped %s VV: %dx%d px (%.0f MB)",
-                item.id, dst_width, dst_height, dst_width * dst_height * 4 / 1e6)
-
-    # Otsu threshold on valid (non-nan) DN values — finds the natural land/water
-    # break without requiring calibrated sigma-naught.
-    valid = dst_data[np.isfinite(dst_data) & (dst_data > 0)]
-    if valid.size == 0:
-        del dst_data
+    if "VV" not in ds:
         return None
-    observed = np.isfinite(dst_data) & (dst_data > 0)
+
+    vv_lin = ds["VV"].values  # linear sigma-naught proxy
+    observed = np.isfinite(vv_lin) & (vv_lin > 0)
+
+    if observed.sum() == 0:
+        return None
+
+    # Speckle filter (3×3 median) on linear values before dB conversion
+    vv_filt = _focal_median(np.where(observed, vv_lin, np.nan), radius=1)
+
     with np.errstate(divide="ignore", invalid="ignore"):
-        vv_db = 10 * np.log10((dst_data ** 2) / 1e6 + 1e-12)
-    water = observed & (vv_db < threshold_db)
-    del dst_data, vv_db
+        vv_db = 10 * np.log10(vv_filt + 1e-12)
+
+    # Per-scene Otsu threshold on VV dB values within the observed footprint
+    vv_valid = vv_db[observed]
+    if vv_valid.size < 100:
+        return None
+    otsu_vv = _otsu_threshold(vv_valid)
+    logger.info("Otsu VV threshold for %s: %.1f dB", item.id, otsu_vv)
+
+    water = observed & (vv_db < otsu_vv)
+
+    # VH guard — require VH also below its Otsu threshold
+    if "VH" in ds:
+        vh_lin = ds["VH"].values
+        vh_filt = _focal_median(np.where(observed, vh_lin, np.nan), radius=1)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            vh_db = 10 * np.log10(vh_filt + 1e-12)
+        vh_valid = vh_db[observed]
+        if vh_valid.size >= 100:
+            otsu_vh = _otsu_threshold(vh_valid)
+            logger.info("Otsu VH threshold for %s: %.1f dB", item.id, otsu_vh)
+            water = water & (vh_db < otsu_vh)
+        del vh_lin, vh_filt, vh_db
+
+    # Exclude pixels that are persistently low-backscatter in the dry season
+    if reference_mask is not None and reference_mask.shape == water.shape:
+        water = water & ~reference_mask
+
+    del vv_lin, vv_filt, vv_db
+
     logger.info("Water pixels %s: %d / %d observed (%.1f%%)",
                 item.id, water.sum(), observed.sum(), 100 * water.sum() / max(observed.sum(), 1))
 
-    x_coords = np.linspace(dst_bounds[0], dst_bounds[2], dst_width)
-    y_coords = np.linspace(dst_bounds[3], dst_bounds[1], dst_height)
-    # Return two bool arrays as a Dataset: water and observed footprint
+    x_coords = ds["VV"].coords["x"].values
+    y_coords = ds["VV"].coords["y"].values
     return xr.Dataset({
         "water":    xr.DataArray(water,    dims=["y", "x"], coords={"x": x_coords, "y": y_coords}),
         "observed": xr.DataArray(observed, dims=["y", "x"], coords={"x": x_coords, "y": y_coords}),
     })
+
+
+def build_dry_season_reference_mask(
+    items: list,
+    bbox: list,
+    resolution: int,
+    low_backscatter_threshold_db: float = -16.0,
+) -> np.ndarray | None:
+    """Build a boolean mask of persistently low-backscatter pixels from dry-season scenes.
+
+    Takes the per-pixel median VV backscatter across all provided scenes.  Pixels
+    whose median falls below low_backscatter_threshold_db are flagged as
+    non-water low-backscatter surfaces (e.g. sodic scalds, smooth gully floors)
+    and should be excluded from flood classification.
+
+    Returns a 2-D bool array (True = exclude), or None if no scenes could be
+    processed.  The array is in the same grid as the flood-season outputs
+    (EPSG:7855 at the requested resolution over bbox).
+    """
+    vv_stack = []
+    shape = None
+
+    for item in items:
+        try:
+            ds = _preprocess_gcp_warp(item, bbox, resolution)
+        except Exception as exc:
+            logger.warning("Dry-season scene %s failed: %s", item.id, exc)
+            continue
+
+        if "VV" not in ds:
+            continue
+
+        vv_lin = ds["VV"].values
+        observed = np.isfinite(vv_lin) & (vv_lin > 0)
+        if observed.sum() == 0:
+            continue
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            vv_db = np.where(observed, 10 * np.log10(vv_lin + 1e-12), np.nan)
+
+        if shape is None:
+            shape = vv_db.shape
+        if vv_db.shape == shape:
+            vv_stack.append(vv_db)
+            logger.info("Dry-season reference: added %s (%d valid px)", item.id, observed.sum())
+
+    if not vv_stack:
+        logger.warning("No dry-season scenes processed — reference mask unavailable")
+        return None
+
+    median_vv = np.nanmedian(np.stack(vv_stack, axis=0), axis=0)
+    mask = (median_vv < low_backscatter_threshold_db) & np.isfinite(median_vv)
+    logger.info("Dry-season reference mask: %d / %d pixels flagged (%.1f%%)",
+                mask.sum(), mask.size, 100 * mask.sum() / mask.size)
+    return mask
 
 
 def _safe_root_from_item(item: Any) -> str:

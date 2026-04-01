@@ -1,7 +1,17 @@
 """
 Step 04 — Wet-season flood extent mapping (Sentinel-1 SAR).
 
-Produces: flood_extent_{year}.gpkg  (GeoPackage, EPSG:7844 geometries)
+Produces: flood_extent_{year}.gpkg  (GeoPackage, EPSG:7855 geometries)
+
+Approach
+--------
+1. Build a dry-season reference mask from Oct–Nov of the prior year.
+   Pixels with persistently low VV backscatter in the dry season are sodic
+   scalds / smooth gully floors — not water — and are excluded from flood
+   classification.
+2. For each wet-season S1 scene, apply a 3×3 median speckle filter then
+   classify water using per-scene Otsu thresholding on VV with a VH guard.
+3. Accumulate per-pixel flood frequency; threshold at FLOOD_MIN_FREQUENCY.
 """
 import logging
 import os
@@ -16,8 +26,6 @@ from shapely.geometry import shape
 from shapely.ops import unary_union
 
 # Script-level constants
-S1_POLARISATIONS = ["VV", "VH"]
-VV_OPEN_WATER_THRESHOLD_DB = -16.0          # dB — below this = open water (DN²/1e6 scale)
 FLOOD_UNION_SIMPLIFY_TOLERANCE = 100        # metres — coarser than pixel size (50 m) is fine
 DASK_CHUNK_SPATIAL = 2048
 S1_MAX_WORKERS = 2                          # concurrent S1 scene downloads
@@ -39,7 +47,7 @@ def main() -> None:
     import config
     from utils.io import configure_logging, ensure_output_dirs
     from utils.stac import search_sentinel1
-    from utils.sar import flood_mask_from_scene
+    from utils.sar import flood_mask_from_scene, build_dry_season_reference_mask
     from utils.quicklook import save_quicklook
 
     configure_logging()
@@ -52,6 +60,33 @@ def main() -> None:
     flood_start = f"{config.YEAR}-{config.FLOOD_SEASON_START}"
     flood_end   = f"{config.YEAR}-{config.FLOOD_SEASON_END}"
 
+    # --- Dry-season reference mask (Oct–Nov of prior year) -------------------
+    dry_start = f"{config.YEAR - 1}-10-01"
+    dry_end   = f"{config.YEAR - 1}-11-30"
+    logger.info("Searching dry-season S1 reference items: %s → %s", dry_start, dry_end)
+    dry_items = search_sentinel1(
+        bbox=bbox_wgs84,
+        start=dry_start,
+        end=dry_end,
+        endpoint=config.STAC_ENDPOINT_ELEMENT84,
+        collection=config.S1_COLLECTION,
+    )
+    if LOCAL_S1_ROOT and dry_items:
+        from utils.stac import rewrite_hrefs_to_local
+        dry_items = rewrite_hrefs_to_local(dry_items, LOCAL_S1_ROOT)
+
+    reference_mask = None
+    if dry_items:
+        logger.info("Building dry-season reference mask from %d scenes", len(dry_items))
+        reference_mask = build_dry_season_reference_mask(
+            dry_items,
+            bbox=bbox_wgs84,
+            resolution=S1_RESOLUTION,
+        )
+    else:
+        logger.warning("No dry-season S1 items found; sodic-scald masking will be skipped")
+
+    # --- Flood-season scenes --------------------------------------------------
     logger.info("Searching Sentinel-1 items: %s → %s", flood_start, flood_end)
     items = search_sentinel1(
         bbox=bbox_wgs84,
@@ -76,7 +111,7 @@ def main() -> None:
             item,
             bbox=bbox_wgs84,
             resolution=S1_RESOLUTION,
-            threshold_db=VV_OPEN_WATER_THRESHOLD_DB,
+            reference_mask=reference_mask,
         )
 
     flood_count = None   # uint16 count of scenes flagging each pixel as water

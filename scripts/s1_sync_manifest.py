@@ -1,8 +1,11 @@
 """
 scripts/s1_sync_manifest.py — STAC search → manifest of S3 keys to sync for Sentinel-1.
 
-Searches for Sentinel-1 GRD scenes covering the flood season (Jan–May) and writes
-one S3 URI per line (vv and vh assets only).
+Searches for Sentinel-1 GRD scenes covering:
+  - the flood season (Jan–May of YEAR), and
+  - the dry-season reference window (Oct–Nov of YEAR-1)
+
+Writes one S3 URI per line (vv and vh assets only).
 
 Usage:
     python scripts/s1_sync_manifest.py YEAR [--out manifest_s1.txt]
@@ -48,6 +51,23 @@ def main() -> None:
     if not items:
         print(f"ERROR: No Sentinel-1 items found for {args.year}", file=sys.stderr)
         sys.exit(1)
+
+    # Dry-season reference: Oct–Nov of the prior year
+    dry_start = f"{args.year - 1}-10-01"
+    dry_end   = f"{args.year - 1}-11-30"
+    logger.info("Searching Sentinel-1 dry-season reference items: %s → %s", dry_start, dry_end)
+    dry_items = search_sentinel1(
+        bbox=bbox,
+        start=dry_start,
+        end=dry_end,
+        endpoint=config.STAC_ENDPOINT_ELEMENT84,
+        collection=config.S1_COLLECTION,
+    )
+    if not dry_items:
+        logger.warning("No dry-season S1 items found for %s–%s; reference mask will be skipped", dry_start, dry_end)
+    else:
+        logger.info("Found %d dry-season items", len(dry_items))
+        items = items + dry_items
 
     logger.info("Found %d items; extracting asset hrefs", len(items))
 
