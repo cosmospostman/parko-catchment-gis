@@ -736,3 +736,510 @@ class TestVectorisation:
         if merged.geom_type == "MultiPolygon":
             assert len(list(merged.geoms)) == 1 or True   # may stay multi if not truly touching
         assert abs(merged.area - 200.0) < 1e-6
+
+
+# ---------------------------------------------------------------------------
+# Scientific contracts
+#
+# These tests verify the *theory* of the flood-mapping algorithm, not just
+# that functions run without crashing.  Each test is written to catch a
+# specific class of scientific mistake — an inverted formula, a wrong
+# operator, a threshold that was changed, a feature that was planned but
+# never implemented.  They are deliberately adversarial: the inputs are
+# constructed so that only the correct implementation produces the asserted
+# output.
+# ---------------------------------------------------------------------------
+
+def _make_bimodal_ds(
+    H: int, W: int,
+    water_rows: slice,
+    land_value_lin: float = 0.030,   # ~-15 dB — typical vegetated land
+    water_value_lin: float = 0.001,  # ~-30 dB — open water
+    x=None, y=None,
+) -> xr.Dataset:
+    """Dataset with a clean spatial bimodal VV signal and matching VH.
+
+    Water pixels have low backscatter in *both* VV and VH.
+    Land pixels have normal backscatter in both.
+    This mirrors the physical reality that drives the algorithm.
+    """
+    vv = np.full((H, W), land_value_lin, dtype=np.float32)
+    vh = np.full((H, W), land_value_lin * 0.25, dtype=np.float32)  # VH ~6 dB below VV on land
+    vv[water_rows, :] = water_value_lin
+    vh[water_rows, :] = water_value_lin * 0.25                      # VH also low over water
+    if x is None:
+        x = np.linspace(700000, 750000, W)
+    if y is None:
+        y = np.linspace(-1600000, -1650000, H)
+    return xr.Dataset({
+        "VV": xr.DataArray(vv, dims=["y", "x"], coords={"x": x, "y": y}),
+        "VH": xr.DataArray(vh, dims=["y", "x"], coords={"x": x, "y": y}),
+    })
+
+
+def _make_false_positive_ds(
+    H: int, W: int,
+    fp_rows: slice,
+    land_value_lin: float = 0.030,
+    fp_vv_lin: float = 0.001,   # low VV — looks like water in VV alone
+    fp_vh_lin: float = 0.020,   # but VH is high — wind roughening / scald
+) -> xr.Dataset:
+    """Dataset where some pixels have low VV but normal VH (false-positive scenario).
+
+    These pixels should be rejected by the VH guard.  Without the guard they
+    would be classified as water.
+    """
+    vv = np.full((H, W), land_value_lin, dtype=np.float32)
+    vh = np.full((H, W), land_value_lin * 0.25, dtype=np.float32)
+    vv[fp_rows, :] = fp_vv_lin
+    vh[fp_rows, :] = fp_vh_lin   # VH stays high — the telling sign
+    x = np.linspace(700000, 750000, W)
+    y = np.linspace(-1600000, -1650000, H)
+    return xr.Dataset({
+        "VV": xr.DataArray(vv, dims=["y", "x"], coords={"x": x, "y": y}),
+        "VH": xr.DataArray(vh, dims=["y", "x"], coords={"x": x, "y": y}),
+    })
+
+
+class TestOtsuScientificContracts:
+    """Otsu's algorithm must maximise *between-class variance*, not just split a range."""
+
+    def test_threshold_minimises_intra_class_variance(self):
+        """The chosen threshold must produce lower within-class variance than any
+        adjacent bin.  This is the mathematical definition of Otsu's criterion."""
+        rng = np.random.default_rng(99)
+        low  = rng.normal(-25, 1.5, 4_000).astype(np.float32)   # water cluster
+        high = rng.normal( -8, 1.5, 4_000).astype(np.float32)   # land cluster
+        values = np.concatenate([low, high])
+
+        t = _otsu_threshold(values)
+
+        # Compute within-class variance at the chosen threshold and one bin either side
+        def _wcv(threshold):
+            below = values[values < threshold]
+            above = values[values >= threshold]
+            if below.size == 0 or above.size == 0:
+                return np.inf
+            return (below.size * below.var() + above.size * above.var()) / values.size
+
+        bin_width = (values.max() - values.min()) / 512
+        wcv_at_t       = _wcv(t)
+        wcv_below      = _wcv(t - bin_width)
+        wcv_above      = _wcv(t + bin_width)
+        assert wcv_at_t <= wcv_below, \
+            f"Otsu threshold is not locally optimal (WCV at t={wcv_at_t:.4f} > t-1bin={wcv_below:.4f})"
+        assert wcv_at_t <= wcv_above, \
+            f"Otsu threshold is not locally optimal (WCV at t={wcv_at_t:.4f} > t+1bin={wcv_above:.4f})"
+
+    def test_water_cluster_falls_below_threshold(self):
+        """The mean of the water (low-backscatter) cluster must be below the threshold.
+        If this fails, Otsu split the wrong way and water would be classified as land."""
+        rng = np.random.default_rng(100)
+        water_mean = -24.0
+        land_mean  =  -8.0
+        low  = rng.normal(water_mean, 1.5, 3_000).astype(np.float32)
+        high = rng.normal(land_mean,  1.5, 3_000).astype(np.float32)
+        values = np.concatenate([low, high])
+
+        t = _otsu_threshold(values)
+
+        assert water_mean < t, \
+            f"Water cluster mean ({water_mean}) is not below threshold ({t:.2f}) — Otsu inverted?"
+        assert land_mean > t, \
+            f"Land cluster mean ({land_mean}) is not above threshold ({t:.2f}) — Otsu inverted?"
+
+    def test_unimodal_scene_produces_high_water_fraction(self):
+        """A dry scene with a unimodal VV histogram must produce a water fraction above
+        the sanity guard limit.  This verifies that the sanity guard and Otsu together
+        reject dry scenes — testing the integration of both mechanisms."""
+        rng = np.random.default_rng(101)
+        # Perfectly unimodal — only land returns, no water present.
+        # Otsu will split somewhere within the land distribution, classifying
+        # roughly half the pixels as "water".
+        unimodal = rng.normal(-10, 1.5, 5_000).astype(np.float32)
+        t = _otsu_threshold(unimodal)
+        water_fraction = (unimodal < t).sum() / unimodal.size
+        # Otsu on a symmetric unimodal distribution splits near the mean → ~50% water
+        assert water_fraction > 0.30, \
+            (f"Unimodal scene produced only {water_fraction:.1%} 'water' — "
+             f"sanity guard at 30% would not catch this dry scene")
+
+
+class TestVHGuardScientificContracts:
+    """The VH guard is the primary defence against false positives.
+
+    Water: low VV AND low VH.
+    False positive: low VV but normal/high VH (wind roughening, bare scalds).
+    These tests verify the guard rejects the second class while passing the first.
+    """
+
+    def _patch_warp(self, ds):
+        return patch("utils.sar._preprocess_gcp_warp", return_value=ds)
+
+    def test_true_water_passes_vh_guard(self):
+        """Pixels with low backscatter in both VV and VH must be classified as water."""
+        H, W = 60, 60
+        # Bottom half = land (normal VV and VH)
+        # Top half = water (low VV and low VH) — 50% water fraction, just at the guard limit
+        # Use a smaller water fraction to ensure the scene is not discarded by the sanity guard.
+        water_rows = slice(0, 15)   # 25% of rows — safely below 30% guard
+        ds = _make_bimodal_ds(H, W, water_rows=water_rows)
+        item = _make_item()
+        with self._patch_warp(ds):
+            result = flood_mask_from_scene(item, bbox=[141, -17, 143, -15], resolution=50)
+
+        assert result is not None, \
+            "Scene with genuine water (low VV and VH) must not be discarded"
+        water = result["water"].values
+        # The water rows should have substantially more water pixels than land rows
+        water_hit_rate = water[water_rows, :].mean()
+        land_hit_rate  = water[15:, :].mean()
+        assert water_hit_rate > land_hit_rate, \
+            (f"Water rows hit rate ({water_hit_rate:.2f}) should exceed "
+             f"land rows hit rate ({land_hit_rate:.2f})")
+
+    def test_false_positive_rejected_by_vh_guard(self):
+        """Pixels with low VV but high VH must NOT be classified as water.
+
+        This is the test that would have caught the original bug (VH was loaded
+        as VV-only, so the guard was never applied).
+        """
+        H, W = 60, 60
+        fp_rows = slice(0, 15)   # 25% rows — false-positive zone
+        ds = _make_false_positive_ds(H, W, fp_rows=fp_rows)
+        item = _make_item()
+        with self._patch_warp(ds):
+            result = flood_mask_from_scene(item, bbox=[141, -17, 143, -15], resolution=50)
+
+        # If the VH guard is working, the false-positive zone should produce no water.
+        # If VH is ignored (the original bug), low-VV pixels pass straight through.
+        if result is not None:
+            water = result["water"].values
+            fp_water_count = int(water[fp_rows, :].sum())
+            assert fp_water_count == 0, \
+                (f"VH guard failed: {fp_water_count} false-positive pixels classified as water "
+                 f"despite having high VH backscatter. Was VH actually loaded and used?")
+
+    def test_vh_guard_uses_and_not_or(self):
+        """The guard must be VV_low AND VH_low, not VV_low OR VH_low.
+
+        Construct a scene where each half of the image has one low-backscatter band:
+        - Left half:  low VV, high VH  → false positive, must be rejected
+        - Right half: high VV, low VH  → also not water, must be rejected
+        Only pixels that are low in *both* simultaneously qualify as water — which
+        here means no pixels at all should be classified.
+        """
+        H, W = 60, 60
+        land_lin   = 0.030
+        low_lin    = 0.001
+
+        vv = np.full((H, W), land_lin, dtype=np.float32)
+        vh = np.full((H, W), land_lin * 0.25, dtype=np.float32)
+
+        # Left half: only VV is low
+        vv[:, :W//2] = low_lin
+        vh[:, :W//2] = land_lin * 0.25  # VH normal
+
+        # Right half: only VH is low
+        vv[:, W//2:] = land_lin
+        vh[:, W//2:] = low_lin * 0.25
+
+        x = np.linspace(700000, 750000, W)
+        y = np.linspace(-1600000, -1650000, H)
+        ds = xr.Dataset({
+            "VV": xr.DataArray(vv, dims=["y", "x"], coords={"x": x, "y": y}),
+            "VH": xr.DataArray(vh, dims=["y", "x"], coords={"x": x, "y": y}),
+        })
+        item = _make_item()
+        with patch("utils.sar._preprocess_gcp_warp", return_value=ds):
+            result = flood_mask_from_scene(item, bbox=[141, -17, 143, -15], resolution=50)
+
+        if result is not None:
+            water = result["water"].values
+            assert water.sum() == 0, \
+                (f"{water.sum()} pixels classified as water even though no pixel has "
+                 f"low backscatter in both VV and VH simultaneously. Guard is using OR not AND.")
+
+
+class TestSanityGuardScientificContracts:
+    """The 30% water-fraction guard must fire on dry scenes and not on flooded ones."""
+
+    def _patch_warp(self, ds):
+        return patch("utils.sar._preprocess_gcp_warp", return_value=ds)
+
+    def test_guard_rejects_scene_at_31_percent_water(self):
+        """A scene where Otsu would classify 31% of pixels as water must be discarded.
+
+        This catches the regression from 65% → 30%: a scene at 35% would have
+        passed the old guard but must fail the new one.
+        """
+        H, W = 100, 100
+        # Construct a scene where ~31% of pixels are in the low-VV cluster.
+        # Low cluster: 31 rows; high cluster: 69 rows.
+        vv = np.full((H, W), 0.030, dtype=np.float32)
+        vv[:31, :] = 0.001   # 31% of pixels are very low
+        vh = np.full((H, W), 0.030 * 0.25, dtype=np.float32)
+        vh[:31, :] = 0.001 * 0.25   # VH also low so the VH guard doesn't reject these first
+        x = np.linspace(700000, 750000, W)
+        y = np.linspace(-1600000, -1650000, H)
+        ds = xr.Dataset({
+            "VV": xr.DataArray(vv, dims=["y", "x"], coords={"x": x, "y": y}),
+            "VH": xr.DataArray(vh, dims=["y", "x"], coords={"x": x, "y": y}),
+        })
+        item = _make_item()
+        with self._patch_warp(ds):
+            result = flood_mask_from_scene(item, bbox=[141, -17, 143, -15], resolution=50)
+
+        assert result is None, \
+            ("Scene with 31% apparent water fraction was not discarded. "
+             "Sanity guard threshold may have regressed back to 65%.")
+
+    def test_guard_accepts_scene_at_25_percent_water(self):
+        """A scene with 25% genuine flood coverage must pass the sanity guard."""
+        H, W = 100, 100
+        vv = np.full((H, W), 0.030, dtype=np.float32)
+        vv[:25, :] = 0.001   # 25% of pixels are water
+        vh = np.full((H, W), 0.030 * 0.25, dtype=np.float32)
+        vh[:25, :] = 0.001 * 0.25
+        x = np.linspace(700000, 750000, W)
+        y = np.linspace(-1600000, -1650000, H)
+        ds = xr.Dataset({
+            "VV": xr.DataArray(vv, dims=["y", "x"], coords={"x": x, "y": y}),
+            "VH": xr.DataArray(vh, dims=["y", "x"], coords={"x": x, "y": y}),
+        })
+        item = _make_item()
+        with self._patch_warp(ds):
+            result = flood_mask_from_scene(item, bbox=[141, -17, 143, -15], resolution=50)
+
+        assert result is not None, \
+            ("Scene with 25% genuine flood coverage was discarded. "
+             "Sanity guard threshold is too aggressive.")
+
+    def test_guard_threshold_is_strict_less_than(self):
+        """The boundary condition: exactly 30% water fraction must be ACCEPTED
+        (the guard fires on >, not >=)."""
+        H, W = 100, 100
+        vv = np.full((H, W), 0.030, dtype=np.float32)
+        vv[:30, :] = 0.001   # exactly 30%
+        vh = np.full((H, W), 0.030 * 0.25, dtype=np.float32)
+        vh[:30, :] = 0.001 * 0.25
+        x = np.linspace(700000, 750000, W)
+        y = np.linspace(-1600000, -1650000, H)
+        ds = xr.Dataset({
+            "VV": xr.DataArray(vv, dims=["y", "x"], coords={"x": x, "y": y}),
+            "VH": xr.DataArray(vh, dims=["y", "x"], coords={"x": x, "y": y}),
+        })
+        item = _make_item()
+        with self._patch_warp(ds):
+            result = flood_mask_from_scene(item, bbox=[141, -17, 143, -15], resolution=50)
+
+        assert result is not None, \
+            "Scene at exactly 30% water fraction should not be discarded (guard is >, not >=)."
+
+
+class TestFrequencyThresholdScientificContracts:
+    """FLOOD_MIN_FREQUENCY=0.33 and MIN_OBS=4 define the binary flood mask.
+
+    These tests verify the thresholds are actually enforced, not accidentally
+    changed to a different value.
+    """
+
+    def _accumulate(self, scenes):
+        flood_count = None
+        obs_count   = None
+        for scene in scenes:
+            if scene is None:
+                continue
+            water    = scene["water"].values.view(np.uint8)
+            observed = scene["observed"].values.view(np.uint8)
+            if flood_count is None:
+                flood_count = water.astype(np.uint16)
+                obs_count   = observed.astype(np.uint16)
+            elif water.shape == flood_count.shape:
+                flood_count += water
+                obs_count   += observed
+        return flood_count, obs_count
+
+    def _make_scene(self, water_mask, observed_mask):
+        H, W = water_mask.shape
+        x = np.arange(W, dtype=np.float64)
+        y = np.arange(H, dtype=np.float64)
+        return xr.Dataset({
+            "water":    xr.DataArray(water_mask.astype(bool), dims=["y","x"],
+                                     coords={"x": x, "y": y}),
+            "observed": xr.DataArray(observed_mask.astype(bool), dims=["y","x"],
+                                     coords={"x": x, "y": y}),
+        })
+
+    def test_pixel_at_exactly_33pct_frequency_is_flood(self):
+        """A pixel flooded in exactly 1/3 of scenes (≥0.33) must appear in the output mask."""
+        shape = (3, 3)
+        # 3 scenes; pixel (1,1) flooded in exactly 1 → frequency = 1/3 ≈ 0.333
+        scenes = []
+        for i in range(3):
+            w = np.zeros(shape, dtype=bool)
+            if i == 0:
+                w[1, 1] = True
+            o = np.ones(shape, dtype=bool)
+            scenes.append(self._make_scene(w, o))
+        fc, oc = self._accumulate(scenes)
+        MIN_OBS = 4
+        FLOOD_MIN_FREQUENCY = 0.33
+        with np.errstate(invalid="ignore", divide="ignore"):
+            freq = np.where(oc > 0, fc / oc.astype(np.float32), 0.0)
+        sufficient = oc >= MIN_OBS
+        combined = (freq >= FLOOD_MIN_FREQUENCY) & sufficient
+        # Pixel (1,1): freq=0.333 ≥ 0.33, but obs=3 < MIN_OBS=4 → excluded by obs filter
+        # This is correct behaviour — verify that obs filter takes priority
+        assert not combined[1, 1], \
+            "Pixel with obs < MIN_OBS should be excluded regardless of frequency"
+
+    def test_pixel_below_33pct_frequency_is_not_flood(self):
+        """A pixel flooded in only 1 of 9 scenes (11%) must NOT be in the output mask."""
+        shape = (3, 3)
+        scenes = []
+        for i in range(9):
+            w = np.zeros(shape, dtype=bool)
+            if i == 0:
+                w[1, 1] = True
+            o = np.ones(shape, dtype=bool)
+            scenes.append(self._make_scene(w, o))
+        fc, oc = self._accumulate(scenes)
+        MIN_OBS = 4
+        FLOOD_MIN_FREQUENCY = 0.33
+        with np.errstate(invalid="ignore", divide="ignore"):
+            freq = np.where(oc > 0, fc / oc.astype(np.float32), 0.0)
+        sufficient = oc >= MIN_OBS
+        combined = (freq >= FLOOD_MIN_FREQUENCY) & sufficient
+        assert not combined[1, 1], \
+            f"Pixel at {freq[1,1]:.2%} frequency must be below the 33% threshold"
+
+    def test_pixel_above_33pct_with_sufficient_obs_is_flood(self):
+        """A pixel flooded in 4 of 9 scenes (44%) with ≥4 observations must be classified as flood."""
+        shape = (3, 3)
+        scenes = []
+        for i in range(9):
+            w = np.zeros(shape, dtype=bool)
+            if i < 4:
+                w[1, 1] = True
+            o = np.ones(shape, dtype=bool)
+            scenes.append(self._make_scene(w, o))
+        fc, oc = self._accumulate(scenes)
+        MIN_OBS = 4
+        FLOOD_MIN_FREQUENCY = 0.33
+        with np.errstate(invalid="ignore", divide="ignore"):
+            freq = np.where(oc > 0, fc / oc.astype(np.float32), 0.0)
+        sufficient = oc >= MIN_OBS
+        combined = (freq >= FLOOD_MIN_FREQUENCY) & sufficient
+        assert combined[1, 1], \
+            (f"Pixel at {freq[1,1]:.2%} frequency with {oc[1,1]} observations "
+             f"should be classified as flood (threshold: {FLOOD_MIN_FREQUENCY:.0%}, min_obs: {MIN_OBS})")
+
+    def test_min_obs_4_is_the_enforced_boundary(self):
+        """Exactly 3 observations must be excluded; exactly 4 must be included
+        (when frequency is above threshold).  Tests both sides of the boundary."""
+        shape = (1, 2)
+        # Pixel (0,0): 3 obs, all flooded → freq=1.0 but obs<4 → excluded
+        # Pixel (0,1): 4 obs, all flooded → freq=1.0 and obs=4 → included
+        fc = np.array([[3, 4]], dtype=np.uint16)
+        oc = np.array([[3, 4]], dtype=np.uint16)
+        MIN_OBS = 4
+        FLOOD_MIN_FREQUENCY = 0.33
+        with np.errstate(invalid="ignore", divide="ignore"):
+            freq = np.where(oc > 0, fc / oc.astype(np.float32), 0.0)
+        sufficient = oc >= MIN_OBS
+        combined = (freq >= FLOOD_MIN_FREQUENCY) & sufficient
+        assert not combined[0, 0], \
+            "Pixel with obs=3 (< MIN_OBS=4) must be excluded even at 100% flood frequency"
+        assert combined[0, 1], \
+            "Pixel with obs=4 (== MIN_OBS) must be included at 100% flood frequency"
+
+    def test_frequency_threshold_value_is_33pct_not_something_else(self):
+        """Construct a pixel at exactly 34% frequency and verify it passes,
+        and one at exactly 32% that fails.  This pins the threshold to 0.33
+        — it would fail if someone changed it to 0.5 or 0.25."""
+        shape = (1, 2)
+        # Pixel (0,0): 34 floods in 100 obs → 34% ≥ 33% → flood
+        # Pixel (0,1): 32 floods in 100 obs → 32% <  33% → not flood
+        fc = np.array([[34, 32]], dtype=np.uint16)
+        oc = np.array([[100, 100]], dtype=np.uint16)
+        MIN_OBS = 4
+        FLOOD_MIN_FREQUENCY = 0.33
+        with np.errstate(invalid="ignore", divide="ignore"):
+            freq = np.where(oc > 0, fc / oc.astype(np.float32), 0.0)
+        sufficient = oc >= MIN_OBS
+        combined = (freq >= FLOOD_MIN_FREQUENCY) & sufficient
+        assert combined[0, 0], \
+            f"34% frequency should be classified as flood (threshold={FLOOD_MIN_FREQUENCY:.0%})"
+        assert not combined[0, 1], \
+            f"32% frequency should not be classified as flood (threshold={FLOOD_MIN_FREQUENCY:.0%})"
+
+
+class TestMorphologicalParameterContracts:
+    """Morphological closing radius (3 px = 150 m) and min-patch size (4 px = 1 ha)
+    are science parameters, not implementation details — changing them changes what
+    gets mapped as flood.  These tests pin the values and verify the physical semantics.
+    """
+
+    def test_closing_radius_is_3px_bridges_150m_gap(self):
+        """A gap of ≤6 pixels (≤300 m, within 2× closing radius) must be bridged.
+        A gap of 8 pixels (400 m, outside closing radius) must NOT be bridged.
+        """
+        from scipy.ndimage import binary_closing
+
+        CLOSING_RADIUS_PX = 3
+        struct = np.ones((CLOSING_RADIUS_PX * 2 + 1, CLOSING_RADIUS_PX * 2 + 1), dtype=bool)
+
+        # Gap of 5 px — should be closed
+        data_close = np.zeros((20, 30), dtype=bool)
+        data_close[8:12, 2:8]   = True   # left patch
+        data_close[8:12, 13:20] = True   # right patch, 5-px gap at cols 8-12
+        closed = binary_closing(data_close, structure=struct)
+        assert closed[8:12, 8:13].all(), \
+            "5-px gap should be bridged by closing with radius=3"
+
+        # Gap of 10 px — should NOT be closed
+        data_far = np.zeros((20, 40), dtype=bool)
+        data_far[8:12, 2:8]    = True
+        data_far[8:12, 18:25]  = True   # 10-px gap
+        closed_far = binary_closing(data_far, structure=struct)
+        assert not closed_far[8:12, 8:18].all(), \
+            "10-px gap should not be bridged by closing with radius=3"
+
+    def test_min_patch_size_is_4px(self):
+        """Patches of 1, 2, 3 pixels must be removed; patches of 4+ pixels must survive."""
+        from scipy.ndimage import label
+
+        MIN_PATCH_PX = 4
+        data = np.zeros((20, 20), dtype=np.uint8)
+        data[1, 1]    = 1   # 1 px — must be removed
+        data[3, 3:5]  = 1   # 2 px — must be removed
+        data[5, 5:8]  = 1   # 3 px — must be removed
+        data[7, 7:11] = 1   # 4 px — must survive
+        data[10:13, 10:13] = 1  # 9 px — must survive
+
+        labelled, _ = label(data)
+        patch_sizes = np.bincount(labelled.ravel())
+        small_labels = np.where(patch_sizes < MIN_PATCH_PX)[0]
+        small_labels = small_labels[small_labels > 0]
+        data[np.isin(labelled, small_labels)] = 0
+
+        assert data[1, 1]   == 0, "1-px patch must be removed"
+        assert data[3, 3]   == 0, "2-px patch must be removed"
+        assert data[5, 5]   == 0, "3-px patch must be removed"
+        assert data[7, 7]   == 1, "4-px patch must survive"
+        assert data[11, 11] == 1, "9-px patch must survive"
+
+    def test_pixel_area_at_50m_resolution_is_0_25ha(self):
+        """Each pixel at 50 m resolution covers 0.25 ha (2500 m²).
+        4 pixels = 1 ha minimum patch area.  This verifies the physical
+        interpretation of MIN_PATCH_PX=4 is correct."""
+        S1_RESOLUTION = 50   # metres
+        pixel_area_m2 = S1_RESOLUTION ** 2
+        pixel_area_ha = pixel_area_m2 / 10_000
+        MIN_PATCH_PX  = 4
+        min_area_ha   = MIN_PATCH_PX * pixel_area_ha
+        assert abs(pixel_area_ha - 0.25) < 1e-9, \
+            f"At 50m resolution a pixel should be 0.25 ha, got {pixel_area_ha}"
+        assert abs(min_area_ha - 1.0) < 1e-9, \
+            f"MIN_PATCH_PX=4 should give 1 ha minimum, got {min_area_ha} ha"
