@@ -175,27 +175,26 @@ def main() -> None:
                 if scene is None:
                     logger.info("Flood scene skipped — no valid pixels [%d/%d]: %s",
                                 completed, len(items), item.id)
-                    continue
-                water    = scene["water"].values.view(np.uint8)
-                observed = scene["observed"].values.view(np.uint8)
-                if flood_count is None:
-                    combined_coords = scene["water"]
-                del scene
-                if flood_count is None:
-                    flood_count = water.astype(np.uint16)
-                    obs_count   = observed.astype(np.uint16)
                 else:
-                    if water.shape == flood_count.shape:
+                    water    = scene["water"].values.view(np.uint8)
+                    observed = scene["observed"].values.view(np.uint8)
+                    if flood_count is None:
+                        combined_coords = scene["water"]
+                    del scene
+                    if flood_count is None:
+                        flood_count = water.astype(np.uint16)
+                        obs_count   = observed.astype(np.uint16)
+                    elif water.shape == flood_count.shape:
                         flood_count += water
                         obs_count   += observed
                     else:
                         logger.info("Flood scene skipped — shape mismatch [%d/%d]: %s",
                                     completed, len(items), item.id)
-                        continue
-                logger.info("Flood scene accumulated [%d/%d, %.0f%%]: %s  "
-                            "(water=%d obs=%d)",
-                            completed, len(items), 100 * completed / len(items),
-                            item.id, water.sum(), observed.sum())
+                    if flood_count is not None:
+                        logger.info("Flood scene accumulated [%d/%d, %.0f%%]: %s  "
+                                    "(water=%d obs=%d)",
+                                    completed, len(items), 100 * completed / len(items),
+                                    item.id, water.sum(), observed.sum())
             except Exception as exc:
                 msg = str(exc)
                 if "no spatial overlap" in msg or "no valid pixels" in msg or "zero-size" in msg:
@@ -204,8 +203,7 @@ def main() -> None:
                 else:
                     logger.warning("Flood scene failed [%d/%d]: %s: %s",
                                    completed, len(items), item.id, exc)
-            # Submit the next job only after the result has been consumed and
-            # its arrays freed — ensures at most flood_workers scenes in memory.
+            # Always submit next — even after skips/failures — to keep the pool full.
             _submit_next()
 
     if flood_count is None:
@@ -255,8 +253,11 @@ def main() -> None:
     logger.info("Pixels excluded by min_obs filter: %d (%.1f%%)",
                 (~sufficient_obs & (obs_count > 0)).sum(),
                 100 * (~sufficient_obs & (obs_count > 0)).sum() / max((obs_count > 0).sum(), 1))
-    for pct in [50, 75, 90, 95, 99]:
-        logger.info("  freq p%d = %.1f%%", pct, np.percentile(freq[sufficient_obs], pct) * 100)
+    freq_valid = freq[sufficient_obs]
+    if freq_valid.size > 0:
+        for pct in [50, 75, 90, 95, 99]:
+            logger.info("  freq p%d = %.1f%%", pct, np.percentile(freq_valid, pct) * 100)
+    del freq_valid
     combined = (freq >= FLOOD_MIN_FREQUENCY) & sufficient_obs
     del flood_count, obs_count, freq, sufficient_obs
 
