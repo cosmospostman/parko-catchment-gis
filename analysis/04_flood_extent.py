@@ -229,10 +229,21 @@ def main() -> None:
     gdf.to_file(str(out_path), driver="GPKG")
     logger.info("Written: %s  (%d features)", out_path, len(gdf))
 
-    # Quicklook
+    # Quicklook — rasterise the clipped GeoDataFrame so the image matches the .gpkg
     ql_path = out_path.with_name(out_path.stem + "_quicklook.png")
+    if len(gdf) > 0:
+        ql_data = rasterio.features.rasterize(
+            gdf.geometry,
+            out_shape=data.shape,
+            transform=transform,
+            fill=0,
+            default_value=1,
+            dtype=np.uint8,
+        ).astype(np.float32)
+    else:
+        ql_data = np.zeros(data.shape, dtype=np.float32)
     flood_da = xr.DataArray(
-        data.astype(np.float32),
+        ql_data,
         dims=["y", "x"],
         coords={"x": x, "y": y},
     )
