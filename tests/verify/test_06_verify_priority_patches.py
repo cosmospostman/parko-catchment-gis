@@ -57,6 +57,32 @@ def test_valid_patches_pass(tmp_dirs, synthetic_patches_gdf):
     mod.main()  # should not raise
 
 
+def test_below_min_area_fails(tmp_dirs):
+    """Patches with area_ha below MIN_PATCH_AREA_HA (0.25 ha) must fail."""
+    if "config" in sys.modules:
+        del sys.modules["config"]
+    import config
+
+    poly_a = Polygon([(700000, -1600000), (700500, -1600000),
+                      (700500, -1600500), (700000, -1600500)])
+    poly_b = Polygon([(701000, -1600000), (701500, -1600000),
+                      (701500, -1600500), (701000, -1600500)])
+    gdf = gpd.GeoDataFrame({
+        "tier": ["A", "B"],
+        "area_ha": [0.50, 0.10],  # second patch is below 0.25 ha threshold
+        "prob_mean": [0.90, 0.75], "prob_max": [0.95, 0.82],
+        "dist_to_kowanyama_km": [100.0, 110.0],
+        "seed_flux_score": [0.8, 0.5], "stream_order": [3, 2],
+    }, geometry=[poly_a, poly_b], crs="EPSG:7844")
+    _write_patches(config.priority_patches_path(config.YEAR), gdf)
+
+    script = PROJECT_ROOT / "verify" / "06_verify_priority_patches.py"
+    mod = _load_module(script, "verify06_min_area")
+    with pytest.raises(SystemExit) as exc_info:
+        mod.main()
+    assert exc_info.value.code == 2
+
+
 def test_wrong_crs_fails(tmp_dirs):
     """Patches with wrong CRS must fail."""
     if "config" in sys.modules:

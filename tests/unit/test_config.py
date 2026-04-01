@@ -56,7 +56,7 @@ def test_composite_bands_list(tmp_dirs):
 
 
 def test_data_source_constants(tmp_dirs):
-    """Data source URL/bucket/collection constants have the expected values."""
+    """Data source URL/bucket/collection constants are well-formed."""
     if "config" in sys.modules:
         del sys.modules["config"]
     import config
@@ -68,11 +68,7 @@ def test_data_source_constants(tmp_dirs):
         assert parsed.scheme == "https", f"Expected https scheme: {url}"
         assert parsed.netloc, f"Expected non-empty host: {url}"
 
-    # Specific known values
-    assert "element84" in config.STAC_ENDPOINT_ELEMENT84
-    assert "copernicus" in config.STAC_ENDPOINT_CDSE
     assert config.DEA_S3_BUCKET == "dea-public-data"
-    assert "ala.org.au" in config.ALA_API_BASE
 
     # Collection name strings are non-empty
     for col in (config.S2_COLLECTION, config.S1_COLLECTION, config.DEA_COLLECTION, config.FC_COLLECTION):

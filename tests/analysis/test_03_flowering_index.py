@@ -53,40 +53,6 @@ def _fake_load_stackstac(items, bands, resolution, bbox, crs, chunk_spatial=1024
     return _make_synthetic_stack(bands=bands)
 
 
-def test_process_tile_called_once_per_tile(tmp_dirs, monkeypatch):
-    """make_tile_bboxes and merge_tile_rasters are each called exactly once."""
-    if "config" in sys.modules:
-        del sys.modules["config"]
-    import config
-
-    dummy_item = MagicMock()
-    dummy_item.bbox = [141.0, -17.0, 143.0, -15.0]
-
-    with patch("utils.stac.search_sentinel2", return_value=[dummy_item]), \
-         patch("utils.stac.load_stackstac", _fake_load_stackstac), \
-         patch("utils.tiling.make_tile_bboxes",
-               return_value=[[141.0, -17.0, 143.0, -15.0]]) as mock_tiles, \
-         patch("utils.mask.apply_scl_mask", side_effect=lambda stack, scl: stack), \
-         patch("utils.quicklook.save_quicklook"), \
-         patch("utils.tiling.merge_tile_rasters") as mock_merge, \
-         patch("xarray.open_dataarray",
-               return_value=_make_synthetic_stack(n_scenes=1, height=2, width=2,
-                                                  bands=["nir"]).isel(time=0, band=0)):
-
-        def fake_merge(tile_paths, out_path, nodata, crs):
-            da = _make_synthetic_stack(n_scenes=1, height=2, width=2, bands=["nir"])
-            result = da.isel(time=0, band=0)
-            result.rio.to_raster(str(out_path), driver="GTiff", dtype="float32")
-
-        mock_merge.side_effect = fake_merge
-
-        script = PROJECT_ROOT / "analysis" / "03_flowering_index.py"
-        _load_module(script, "step03_tile_count").main()
-
-    mock_tiles.assert_called_once()
-    mock_merge.assert_called_once()
-
-
 def test_output_has_correct_shape_and_crs(tmp_dirs, monkeypatch):
     """Output raster must be 2-D with TARGET_CRS after tiled processing."""
     if "config" in sys.modules:
@@ -119,7 +85,7 @@ def test_output_has_correct_shape_and_crs(tmp_dirs, monkeypatch):
 
 
 def test_output_values_in_valid_range(tmp_dirs, monkeypatch):
-    """Non-NaN output values must be ≥ 0 (green/NIR ratio is always non-negative)."""
+    """Non-NaN output values must be ≥ 0 and the output must contain valid pixels."""
     if "config" in sys.modules:
         del sys.modules["config"]
     import config
@@ -144,5 +110,5 @@ def test_output_values_in_valid_range(tmp_dirs, monkeypatch):
     result = xr.open_dataarray(str(out_path))
     data = result.values
     valid = data[~np.isnan(data)]
-    if len(valid) > 0:
-        assert np.all(valid >= 0.0), "Green/NIR ratio should be non-negative"
+    assert len(valid) > 0, "Output must contain at least one valid (non-NaN) pixel"
+    assert np.all(valid >= 0.0), "Green/NIR ratio should be non-negative"

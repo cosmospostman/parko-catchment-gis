@@ -95,3 +95,25 @@ def test_good_top_feature_passes(tmp_dirs):
     script = PROJECT_ROOT / "verify" / "05_verify_classifier.py"
     mod = _load_module(script, "verify05_good")
     mod.main()  # should not raise SystemExit(2)
+
+
+def test_low_cv_accuracy_fails(tmp_dirs):
+    """CV accuracy below TARGET_OVERALL_ACCURACY must fail with exit 2."""
+    if "config" in sys.modules:
+        del sys.modules["config"]
+    import config
+
+    prob_path = config.probability_raster_path(config.YEAR)
+    prob_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_prob_raster(prob_path, np.full((10, 10), 0.5, dtype=np.float32))
+
+    cache_path = Path(config.CACHE_DIR) / f"rf_model_{config.YEAR}.pkl"
+    # cv_mean=0.60 is well below TARGET_OVERALL_ACCURACY=0.85
+    _write_model_cache(cache_path, top_feature="ndvi_anomaly", cv_mean=0.60)
+
+    script = PROJECT_ROOT / "verify" / "05_verify_classifier.py"
+    mod = _load_module(script, "verify05_low_cv")
+
+    with pytest.raises(SystemExit) as exc_info:
+        mod.main()
+    assert exc_info.value.code == 2

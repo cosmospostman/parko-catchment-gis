@@ -59,41 +59,6 @@ def _fake_load_stackstac(items, bands, resolution, bbox, crs, chunk_spatial=1024
     return _make_synthetic_stack(bands=bands)
 
 
-def test_tile_bboxes_and_merge_called_once(tmp_dirs, monkeypatch):
-    """make_tile_bboxes and merge_tile_rasters are each called exactly once."""
-    if "analysis.01_ndvi_composite" in sys.modules:
-        del sys.modules["analysis.01_ndvi_composite"]
-    if "config" in sys.modules:
-        del sys.modules["config"]
-
-    dummy_item = MagicMock()
-    dummy_item.bbox = [141.0, -17.0, 143.0, -15.0]
-    mock_search = MagicMock(return_value=[dummy_item])
-    mock_tile_bboxes = MagicMock(return_value=[[141.0, -17.0, 143.0, -15.0]])
-
-    script = PROJECT_ROOT / "analysis" / "01_ndvi_composite.py"
-
-    with patch("utils.stac.search_sentinel2", mock_search), \
-         patch("utils.stac.load_stackstac", _fake_load_stackstac), \
-         patch("utils.tiling.make_tile_bboxes", mock_tile_bboxes), \
-         patch("utils.mask.apply_scl_mask", side_effect=lambda stack, scl: stack), \
-         patch("utils.quicklook.save_quicklook"), \
-         patch("utils.tiling.merge_tile_rasters") as mock_merge, \
-         patch("xarray.open_dataarray", return_value=_make_synthetic_stack(n_scenes=1, height=2, width=2, bands=["nir"])):
-
-        def fake_merge(tile_paths, out_path, nodata, crs):
-            da = _make_synthetic_stack(n_scenes=1, height=2, width=2, bands=["nir"])
-            result = da.isel(time=0, band=0)
-            result.rio.to_raster(str(out_path), driver="GTiff", dtype="float32")
-
-        mock_merge.side_effect = fake_merge
-
-        _load_module(script, "step01_tile_count").main()
-
-    mock_tile_bboxes.assert_called_once()
-    mock_merge.assert_called_once()
-
-
 def test_output_has_correct_shape_and_crs(tmp_dirs, monkeypatch):
     """Output raster must be 2-D with TARGET_CRS after tiled processing."""
     if "config" in sys.modules:

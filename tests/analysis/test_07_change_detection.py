@@ -71,3 +71,84 @@ def test_crs_mismatch_raises(tmp_dirs):
     mod = _load_module(script, "step07_crs")
     with pytest.raises(ValueError, match="CRS mismatch"):
         mod.main()
+
+
+def test_normal_run_produces_output(tmp_dirs):
+    """When both years exist with matching CRS, output file must be created."""
+    if "config" in sys.modules:
+        del sys.modules["config"]
+    import config
+    import xarray as xr
+    from unittest.mock import patch
+
+    cur_path = config.probability_raster_path(config.YEAR)
+    cur_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_prob_raster(cur_path, np.full((10, 10), 0.7, dtype=np.float32))
+
+    prior_path = config.probability_raster_path(config.YEAR - 1)
+    prior_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_prob_raster(prior_path, np.full((10, 10), 0.4, dtype=np.float32))
+
+    script = PROJECT_ROOT / "analysis" / "07_change_detection.py"
+    with patch("utils.quicklook.save_quicklook"):
+        _load_module(script, "step07_normal").main()
+
+    out_path = config.change_detection_path(config.YEAR)
+    assert out_path.exists(), f"Expected output at {out_path}"
+
+    result = xr.open_dataarray(str(out_path))
+    assert result.rio.crs is not None
+
+
+def test_output_values_reflect_change_direction(tmp_dirs):
+    """Pixels with higher current probability than prior must have positive change."""
+    if "config" in sys.modules:
+        del sys.modules["config"]
+    import config
+    import xarray as xr
+    from unittest.mock import patch
+
+    cur_path = config.probability_raster_path(config.YEAR)
+    cur_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_prob_raster(cur_path, np.full((10, 10), 0.8, dtype=np.float32))
+
+    prior_path = config.probability_raster_path(config.YEAR - 1)
+    prior_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_prob_raster(prior_path, np.full((10, 10), 0.3, dtype=np.float32))
+
+    script = PROJECT_ROOT / "analysis" / "07_change_detection.py"
+    with patch("utils.quicklook.save_quicklook"):
+        _load_module(script, "step07_direction").main()
+
+    out_path = config.change_detection_path(config.YEAR)
+    result = xr.open_dataarray(str(out_path))
+    valid = result.values[~np.isnan(result.values)]
+    assert len(valid) > 0
+    assert np.all(valid > 0), "Increase from 0.3→0.8 must yield positive change"
+
+
+def test_output_values_clipped_to_minus1_plus1(tmp_dirs):
+    """Change values must be clipped to [-1, 1] even when raw difference exceeds bounds."""
+    if "config" in sys.modules:
+        del sys.modules["config"]
+    import config
+    import xarray as xr
+    from unittest.mock import patch
+
+    cur_path = config.probability_raster_path(config.YEAR)
+    cur_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_prob_raster(cur_path, np.full((10, 10), 1.0, dtype=np.float32))
+
+    prior_path = config.probability_raster_path(config.YEAR - 1)
+    prior_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_prob_raster(prior_path, np.full((10, 10), 0.0, dtype=np.float32))
+
+    script = PROJECT_ROOT / "analysis" / "07_change_detection.py"
+    with patch("utils.quicklook.save_quicklook"):
+        _load_module(script, "step07_clip").main()
+
+    out_path = config.change_detection_path(config.YEAR)
+    result = xr.open_dataarray(str(out_path))
+    valid = result.values[~np.isnan(result.values)]
+    assert len(valid) > 0
+    assert np.all(valid >= -1.0) and np.all(valid <= 1.0), "Change must be clipped to [-1, 1]"
