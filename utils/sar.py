@@ -227,44 +227,58 @@ def build_dry_season_reference_mask(
         logger.info("Dry-season reference: added %s (%d valid px) [%d/%d]",
                     item_id, n_valid, completed, total)
 
+    item_iter = iter(items)
+    in_flight: dict = {}
+
+    def _dry_submit_next() -> None:
+        item = next(item_iter, None)
+        if item is not None:
+            f = executor.submit(_process_dry_worker, item, bbox, resolution)
+            in_flight[f] = item
+
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_process_dry_worker, item, bbox, resolution): item for item in items}
-        for future in as_completed(futures):
-            item = futures[future]
+        for _ in range(max_workers):
+            _dry_submit_next()
+
+        while in_flight:
+            future = next(as_completed(in_flight))
+            item = in_flight.pop(future)
             completed += 1
             try:
                 result = future.result()
                 if result is None:
                     logger.debug("Dry-season scene %s: no valid pixels — skipped (%d/%d)",
                                  item.id, completed, total)
-                    continue
-                vv_db, n_valid = result
-
-                if ref_shape is None:
-                    # First good scene — now we know the grid shape.
-                    # Allocate a memory-mapped array for all scenes (worst case = total).
-                    ref_shape = vv_db.shape
-                    mmap_file = tempfile.NamedTemporaryFile(suffix=".npy", delete=False)
-                    mmap_arr = np.lib.format.open_memmap(
-                        mmap_file.name, mode="w+", dtype=np.float16,
-                        shape=(total, ref_shape[0], ref_shape[1]),
-                    )
-                    logger.info("Allocated dry-season mmap: %d × %dx%d float16 (%.0f MB)",
-                                total, ref_shape[0], ref_shape[1],
-                                total * ref_shape[0] * ref_shape[1] * 2 / 1e6)
-                    # Flush any results that arrived before shape was known
-                    for pv, pn in pending:
-                        _write_to_mmap(pv, pn, "buffered")
-                    pending.clear()
-                    _write_to_mmap(vv_db, n_valid, item.id)
-                elif mmap_arr is None:
-                    pending.append((vv_db.astype(np.float16), n_valid))
                 else:
-                    _write_to_mmap(vv_db, n_valid, item.id)
+                    vv_db, n_valid = result
+
+                    if ref_shape is None:
+                        # First good scene — now we know the grid shape.
+                        # Allocate a memory-mapped array for all scenes (worst case = total).
+                        ref_shape = vv_db.shape
+                        mmap_file = tempfile.NamedTemporaryFile(suffix=".npy", delete=False)
+                        mmap_arr = np.lib.format.open_memmap(
+                            mmap_file.name, mode="w+", dtype=np.float16,
+                            shape=(total, ref_shape[0], ref_shape[1]),
+                        )
+                        logger.info("Allocated dry-season mmap: %d × %dx%d float16 (%.0f MB)",
+                                    total, ref_shape[0], ref_shape[1],
+                                    total * ref_shape[0] * ref_shape[1] * 2 / 1e6)
+                        # Flush any results that arrived before shape was known
+                        for pv, pn in pending:
+                            _write_to_mmap(pv, pn, "buffered")
+                        pending.clear()
+                        _write_to_mmap(vv_db, n_valid, item.id)
+                    elif mmap_arr is None:
+                        pending.append((vv_db.astype(np.float16), n_valid))
+                    else:
+                        _write_to_mmap(vv_db, n_valid, item.id)
 
             except Exception as exc:
                 logger.warning("Dry-season scene %s failed (%d/%d): %s",
                                item.id, completed, total, exc)
+            # Always submit next after result is consumed
+            _dry_submit_next()
 
     if mmap_arr is None or mmap_idx == 0:
         logger.warning("No dry-season scenes processed — reference mask unavailable")
