@@ -66,7 +66,8 @@ def _focal_mean_inplace(arr: np.ndarray, nan_mask: np.ndarray, radius: int = 1) 
     from scipy.ndimage import uniform_filter
     size = 2 * radius + 1
     if nan_mask.any():
-        arr[nan_mask] = float(np.nanmean(arr))
+        fill = float(np.nanmean(arr)) if not np.all(nan_mask) else 0.0
+        arr[nan_mask] = fill
     uniform_filter(arr, size=size, mode="reflect", output=arr)
     arr[nan_mask] = np.nan
     return arr
