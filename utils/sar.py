@@ -429,7 +429,7 @@ def _preprocess_gcp_warp(
             # but no finer than needed.  S1 GRD native pixel ≈ 10 m; output is
             # `resolution` metres.  Decimate during the read to cap memory use.
             native_m = 10  # S1 GRD IW native ground resolution (metres)
-            out_factor = max(1, resolution // (native_m * 2))  # e.g. 50 m → factor 2
+            out_factor = max(1, resolution // native_m)  # e.g. 50 m → factor 5
             win_h = max(1, round(window.height / out_factor))
             win_w = max(1, round(window.width  / out_factor))
             src_data = src.read(
