@@ -40,6 +40,10 @@ def main() -> None:
 
     tile_dir = Path(args.tile_dir)
 
+    # Ensure project root is on the path when the script is run from any directory
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+
     import config
     import geopandas as gpd
     from utils.dem import download_dem_tiles

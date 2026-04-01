@@ -249,6 +249,10 @@ def main() -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)-8s %(message)s")
 
+    # Ensure project root is on the path
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+
     tile_dir = Path(args.tile_dir)
     tile_paths = sorted(tile_dir.glob("*.tif"))
 
