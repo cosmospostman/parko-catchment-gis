@@ -28,6 +28,89 @@ def preprocess_s1_scene(
     return _preprocess_gcp_warp(item, bbox, resolution)
 
 
+def flood_mask_from_scene(
+    item: Any,
+    bbox: list,
+    resolution: int,
+    threshold_db: float,
+) -> xr.DataArray | None:
+    """Return a boolean flood mask DataArray for a single S1 scene.
+
+    Warps VV band to EPSG:7855, converts to dB, applies threshold.
+    Large intermediate arrays are freed before returning — only the boolean
+    mask (1 bit per pixel) is kept in memory.
+    """
+    import rasterio
+    import rasterio.control
+    import rasterio.crs
+    import rasterio.warp
+    import rasterio.transform
+    import rasterio.io
+    import rasterio.windows
+
+    safe_root = Path(_safe_root_from_item(item))
+    anno_path = safe_root / "annotation" / "iw-vv.xml"
+    meas_asset = item.assets.get("vv")
+
+    if not anno_path.exists() or meas_asset is None:
+        raise ValueError(f"Missing VV data for {item.id}")
+
+    gcps = _read_gcps_from_annotation(anno_path)
+    if not gcps:
+        raise ValueError(f"No GCPs in annotation for {item.id}")
+
+    target_crs = rasterio.crs.CRS.from_epsg(7855)
+    src_crs = rasterio.crs.CRS.from_epsg(4326)
+    minx, miny, maxx, maxy = bbox
+
+    dst_bounds = rasterio.warp.transform_bounds("EPSG:4326", target_crs, minx, miny, maxx, maxy)
+    dst_width  = max(1, int((dst_bounds[2] - dst_bounds[0]) / resolution))
+    dst_height = max(1, int((dst_bounds[3] - dst_bounds[1]) / resolution))
+    dst_transform = rasterio.transform.from_bounds(*dst_bounds, dst_width, dst_height)
+
+    # Read source in chunks, warp to temp file on disk to avoid holding two
+    # large float32 arrays in memory simultaneously.
+    import tempfile
+    with rasterio.open(meas_asset.href) as src:
+        src_width, src_height = src.width, src.height
+
+    dst_data = np.empty((dst_height, dst_width), dtype=np.float32)
+
+    with rasterio.io.MemoryFile() as memfile:
+        # Read and immediately write into MemoryFile; src array freed after block
+        with rasterio.open(meas_asset.href) as src:
+            src_data = src.read(1).astype(np.float32)
+        with memfile.open(driver="GTiff", count=1, dtype="float32",
+                          width=src_width, height=src_height) as mem_ds:
+            mem_ds.write(src_data, 1)
+            mem_ds.gcps = (gcps, src_crs)
+            del src_data  # free before warp allocates dst
+            rasterio.warp.reproject(
+                source=rasterio.band(mem_ds, 1),
+                destination=dst_data,
+                dst_crs=target_crs,
+                dst_transform=dst_transform,
+                resampling=rasterio.warp.Resampling.bilinear,
+                src_nodata=0,
+                dst_nodata=np.nan,
+            )
+
+    logger.info("Warped %s VV: %dx%d px (%.0f MB)",
+                item.id, dst_width, dst_height, dst_width * dst_height * 4 / 1e6)
+
+    # Convert DN² to dB and threshold — result is bool (1 byte/pixel)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        vv_db = 10 * np.log10((dst_data ** 2) / 1e8 + 1e-12)
+    del dst_data
+    mask = vv_db < threshold_db
+    del vv_db
+
+    x_coords = np.linspace(dst_bounds[0], dst_bounds[2], dst_width)
+    y_coords = np.linspace(dst_bounds[3], dst_bounds[1], dst_height)
+    return xr.DataArray(mask, dims=["y", "x"],
+                        coords={"x": x_coords, "y": y_coords})
+
+
 def _safe_root_from_item(item: Any) -> str:
     vv_asset = item.assets.get("vv")
     if vv_asset:

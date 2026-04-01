@@ -37,7 +37,7 @@ def main() -> None:
     import config
     from utils.io import configure_logging, ensure_output_dirs
     from utils.stac import search_sentinel1
-    from utils.sar import preprocess_s1_scene
+    from utils.sar import flood_mask_from_scene
     from utils.quicklook import save_quicklook
 
     configure_logging()
@@ -70,15 +70,12 @@ def main() -> None:
     logger.info("Processing %d S1 scenes (workers=%d)", len(items), n_workers)
 
     def _process_scene(item):
-        ds = preprocess_s1_scene(item, bbox=bbox_wgs84, resolution=config.TARGET_RESOLUTION)
-        if "VV" not in ds:
-            logger.warning("VV band missing in item %s — skipping", item.id)
-            return None
-        vv = ds["VV"]
-        if vv.size == 0 or 0 in vv.shape:
-            raise ValueError(f"VV band is zero-size for {item.id}")
-        vv_db = _sigma_to_db(vv)
-        return (vv_db < VV_OPEN_WATER_THRESHOLD_DB)
+        return flood_mask_from_scene(
+            item,
+            bbox=bbox_wgs84,
+            resolution=config.TARGET_RESOLUTION,
+            threshold_db=VV_OPEN_WATER_THRESHOLD_DB,
+        )
 
     combined = None
     combined_coords = None
