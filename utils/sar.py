@@ -90,12 +90,13 @@ def flood_mask_from_scene(
     If reference_mask is provided (True = persistent low-backscatter non-water),
     those pixels are excluded from the water classification.
     """
-    ds = _preprocess_gcp_warp(item, bbox, resolution, polarisations=("VV",))
+    ds = _preprocess_gcp_warp(item, bbox, resolution, polarisations=("VV", "VH"))
 
     if "VV" not in ds:
         return None
 
     vv_lin = ds["VV"].values  # linear sigma-naught proxy
+    vh_lin = ds["VH"].values if "VH" in ds else None
     x_coords = ds["VV"].coords["x"].values
     y_coords = ds["VV"].coords["y"].values
     del ds  # release the xr.Dataset before allocating filter/dB arrays
@@ -126,13 +127,35 @@ def flood_mask_from_scene(
     water = observed & (vv_db < otsu_vv)
     del vv_db
 
+    # VH guard: true water has low backscatter in both VV and VH.
+    # Wind-roughened surfaces and dry scalds often have anomalously low VV
+    # but retain higher VH, so requiring VH < Otsu(VH) suppresses those
+    # false positives.
+    if vh_lin is not None:
+        vh_observed = np.isfinite(vh_lin) & (vh_lin > 0)
+        vh_nan = ~vh_observed
+        vh_lin[vh_nan] = np.nan
+        _focal_mean_inplace(vh_lin, vh_nan, radius=1)
+        del vh_nan
+        with np.errstate(divide="ignore", invalid="ignore"):
+            np.log10(vh_lin + 1e-12, out=vh_lin)
+            vh_lin *= 10
+        vh_db = vh_lin
+        del vh_lin
+        vh_valid = vh_db[vh_observed & observed]
+        if vh_valid.size >= 100:
+            otsu_vh = _otsu_threshold(vh_valid)
+            logger.info("Otsu VH threshold for %s: %.1f dB", item.id, otsu_vh)
+            water = water & (vh_db < otsu_vh)
+        del vh_db, vh_observed
+
     # Sanity check: if Otsu classified an implausibly large fraction of the
     # scene as water the histogram was likely unimodal (dry scene) and Otsu
     # split within the land distribution.  Discard the scene in that case.
-    # 65% allows for large inundation events on the Mitchell megafan while
-    # still catching unimodal-histogram failures (which typically push >80%).
+    # 30% is the upper bound for a realistic large flood event on the Mitchell
+    # megafan; scenes above this are almost certainly unimodal-histogram failures.
     water_fraction = water.sum() / max(observed.sum(), 1)
-    if water_fraction > 0.65:
+    if water_fraction > 0.30:
         logger.info("Scene %s discarded — water fraction %.1f%% exceeds sanity limit",
                     item.id, 100 * water_fraction)
         return None
