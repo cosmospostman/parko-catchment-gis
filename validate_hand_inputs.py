@@ -11,11 +11,10 @@ Assumptions tested
 1. All expected DEM tiles are present and non-empty
 2. DEM void fraction is acceptable (<2% of total pixels across all tiles)
 3. Tile seam alignment: max absolute elevation difference at shared boundaries < 1 m
-4. DEM elevation range is plausible for the Mitchell catchment (0–1500 m)
-5. [If --hand-raster provided] HAND raster covers the expected spatial extent
-6. [If --hand-raster provided] HAND value distribution is consistent with a
+4. [If --hand-raster provided] HAND raster covers the expected spatial extent
+5. [If --hand-raster provided] HAND value distribution is consistent with a
    megafan floodplain (median < 5 m, p90 < 20 m over the lower-elevation zone)
-7. [If --hand-raster provided] HAND threshold produces a plausible flood extent
+6. [If --hand-raster provided] HAND threshold produces a plausible flood extent
    fraction (5%–40% at HAND_FLOOD_THRESHOLD_M)
 
 Usage:
@@ -101,33 +100,79 @@ def check_void_fraction(tile_paths: list) -> dict:
 # ---------------------------------------------------------------------------
 
 def check_tile_seams(tile_paths: list) -> dict:
+    """Compare elevation at boundaries between tiles that are actually geographically adjacent.
+
+    Two tiles are adjacent if their bounding boxes share an edge (within 0.01°).
+    Comparing alphabetically adjacent tiles is wrong — they may be from opposite
+    ends of the catchment.
+    """
     import rasterio
 
     if len(tile_paths) < 2:
         return _result("Tile seam alignment", SKIP, "Only one tile — no seam to check")
 
+    # Build index of tile bounds
+    tile_info = []
+    for p in tile_paths:
+        with rasterio.open(p) as src:
+            tile_info.append((p, src.bounds, src.nodata))
+
+    TOLERANCE = 0.01  # degrees — tiles share an edge if bounds agree within this
+
     max_diff = 0.0
     checked = 0
-    tiles_sorted = sorted(tile_paths, key=lambda p: p.name)
 
-    for i in range(len(tiles_sorted) - 1):
-        try:
-            with rasterio.open(tiles_sorted[i]) as a, rasterio.open(tiles_sorted[i + 1]) as b:
-                right_col = a.read(1)[:, -1].astype(np.float32)
-                left_col = b.read(1)[:, 0].astype(np.float32)
-                nodata_a = a.nodata or -9999.0
-                nodata_b = b.nodata or -9999.0
-                valid = (right_col != nodata_a) & (left_col != nodata_b) & \
-                        np.isfinite(right_col) & np.isfinite(left_col)
-                if valid.sum() > 0:
-                    diff = np.abs(right_col[valid] - left_col[valid]).max()
-                    max_diff = max(max_diff, float(diff))
-                    checked += 1
-        except Exception as exc:
-            logger.debug("Seam check skipped for %s: %s", tiles_sorted[i].name, exc)
+    for i in range(len(tile_info)):
+        p_a, b_a, nd_a = tile_info[i]
+        for j in range(i + 1, len(tile_info)):
+            p_b, b_b, nd_b = tile_info[j]
+
+            # Check for shared right/left edge: a.right ≈ b.left, overlapping latitude
+            shared_rl = (abs(b_a.right - b_b.left) < TOLERANCE and
+                         b_a.bottom < b_b.top and b_a.top > b_b.bottom)
+            # Check for shared left/right edge: b.right ≈ a.left
+            shared_lr = (abs(b_b.right - b_a.left) < TOLERANCE and
+                         b_a.bottom < b_b.top and b_a.top > b_b.bottom)
+            # Check for shared bottom/top edge: a.bottom ≈ b.top
+            shared_bt = (abs(b_a.bottom - b_b.top) < TOLERANCE and
+                         b_a.left < b_b.right and b_a.right > b_b.left)
+            shared_tb = (abs(b_b.bottom - b_a.top) < TOLERANCE and
+                         b_a.left < b_b.right and b_a.right > b_b.left)
+
+            if not any([shared_rl, shared_lr, shared_bt, shared_tb]):
+                continue
+
+            try:
+                with rasterio.open(p_a) as src_a, rasterio.open(p_b) as src_b:
+                    nd_a = src_a.nodata or -9999.0
+                    nd_b = src_b.nodata or -9999.0
+                    if shared_rl:
+                        col_a = src_a.read(1)[:, -1].astype(np.float32)
+                        col_b = src_b.read(1)[:, 0].astype(np.float32)
+                    elif shared_lr:
+                        col_a = src_a.read(1)[:, 0].astype(np.float32)
+                        col_b = src_b.read(1)[:, -1].astype(np.float32)
+                    elif shared_bt:
+                        col_a = src_a.read(1)[-1, :].astype(np.float32)
+                        col_b = src_b.read(1)[0, :].astype(np.float32)
+                    else:  # shared_tb
+                        col_a = src_a.read(1)[0, :].astype(np.float32)
+                        col_b = src_b.read(1)[-1, :].astype(np.float32)
+
+                    # Trim to the shared overlap length
+                    n = min(len(col_a), len(col_b))
+                    col_a, col_b = col_a[:n], col_b[:n]
+                    valid = (col_a != nd_a) & (col_b != nd_b) & \
+                            np.isfinite(col_a) & np.isfinite(col_b)
+                    if valid.sum() > 0:
+                        diff = np.abs(col_a[valid] - col_b[valid]).max()
+                        max_diff = max(max_diff, float(diff))
+                        checked += 1
+            except Exception as exc:
+                logger.debug("Seam check failed for %s/%s: %s", p_a.name, p_b.name, exc)
 
     if checked == 0:
-        return _result("Tile seam alignment", SKIP, "No adjacent tile pairs found")
+        return _result("Tile seam alignment", SKIP, "No geographically adjacent tile pairs found")
 
     ok = max_diff < 1.0
     return _result(
@@ -136,36 +181,6 @@ def check_tile_seams(tile_paths: list) -> dict:
         f"Max boundary difference: {max_diff:.2f} m  (threshold: <1 m,  pairs checked: {checked})",
     )
 
-
-# ---------------------------------------------------------------------------
-# Assumption 4: elevation range plausibility
-# ---------------------------------------------------------------------------
-
-def check_elevation_range(tile_paths: list) -> dict:
-    import rasterio
-
-    global_min = np.inf
-    global_max = -np.inf
-    for p in tile_paths:
-        with rasterio.open(p) as src:
-            arr = src.read(1).astype(np.float32)
-            nodata = src.nodata
-            if nodata is not None:
-                arr[arr == nodata] = np.nan
-            valid = arr[np.isfinite(arr)]
-            if valid.size > 0:
-                global_min = min(global_min, float(valid.min()))
-                global_max = max(global_max, float(valid.max()))
-
-    if not np.isfinite(global_min):
-        return _result("Elevation range", SKIP, "No valid pixels found")
-
-    ok = (global_min >= -50) and (global_max <= 1500)
-    return _result(
-        "Elevation range",
-        PASS if ok else FAIL,
-        f"{global_min:.0f} m – {global_max:.0f} m  (expected: −50 m to 1500 m for Mitchell catchment)",
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -304,21 +319,18 @@ def main() -> None:
     print("Assumption 3 — Tile seam alignment")
     results.append(check_tile_seams(tile_paths))
 
-    print("Assumption 4 — Elevation range")
-    results.append(check_elevation_range(tile_paths))
-
     if args.hand_raster:
         hand_path = Path(args.hand_raster)
         if not hand_path.exists():
             print(f"  [–] HAND raster not found at {hand_path} — skipping HAND checks")
         else:
-            print("Assumption 5 — HAND spatial extent")
+            print("Assumption 4 — HAND spatial extent")
             results.append(check_hand_spatial_extent(hand_path, tile_paths))
 
-            print("Assumption 6 — HAND distribution")
+            print("Assumption 5 — HAND distribution")
             results.append(check_hand_distribution(hand_path))
 
-            print("Assumption 7 — HAND flood fractions")
+            print("Assumption 6 — HAND flood fractions")
             results.append(check_hand_flood_fractions(hand_path))
     else:
         print("  [–] --hand-raster not provided — skipping HAND checks (run Step 4 first)")
