@@ -366,6 +366,8 @@ def _preprocess_gcp_warp(
             logger.debug("No GCPs in annotation for %s %s", item.id, pol)
             continue
 
+        src_crs = rasterio.crs.CRS.from_epsg(4326)
+
         # Use GCPs to find the source pixel window covering the bbox,
         # so we only read the relevant subset of the ~16k×26k array.
         gcp_lons = np.array([g.x for g in gcps])
