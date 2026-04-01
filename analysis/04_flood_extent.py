@@ -90,11 +90,7 @@ def main() -> None:
                     flood_masks.append(mask)
                     logger.info("S1 scene processed (%d/%d, %.1f%%): %s", completed, len(items), 100 * completed / len(items), item.id)
             except Exception as exc:
-                msg = str(exc)
-                if "zero-size" in msg or "no identity" in msg or "no valid pixels" in msg or "no spatial overlap" in msg:
-                    logger.debug("Skipped S1 scene %s (no overlap): %s", item.id, exc)
-                else:
-                    logger.warning("Failed to process S1 scene %s: %s", item.id, exc)
+                logger.warning("Failed to process S1 scene %s: %s [type=%s]", item.id, exc, type(exc).__name__)
 
     if not flood_masks:
         raise RuntimeError("No valid S1 scenes processed")
