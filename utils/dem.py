@@ -322,8 +322,12 @@ def compute_hand(
     fdir = grid.flowdir(inflated)
     accum = grid.accumulation(fdir)
 
-    # Build stream mask from accumulation threshold
-    stream_mask = (np.array(accum) >= min_upstream_px)
+    # Build stream mask from accumulation threshold – must be a pysheds Raster
+    from pysheds.raster import Raster as PyshedsRaster
+    stream_mask = PyshedsRaster(
+        (np.array(accum) >= min_upstream_px),
+        viewfinder=accum.viewfinder,
+    )
 
     hand_arr = grid.compute_hand(fdir, dem_raster, stream_mask)
     result = np.array(hand_arr).astype(np.float32)
