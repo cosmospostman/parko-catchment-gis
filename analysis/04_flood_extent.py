@@ -25,6 +25,7 @@ S1_MAX_WORKERS = 8                          # concurrent S1 scene downloads
 logger = logging.getLogger(__name__)
 
 PIPELINE_RUN = os.environ.get("PIPELINE_RUN") == "1"
+LOCAL_S1_ROOT = os.environ.get("LOCAL_S1_ROOT", "")
 
 
 def _sigma_to_db(arr: xr.DataArray) -> xr.DataArray:
@@ -59,6 +60,11 @@ def main() -> None:
     )
     if not items:
         raise RuntimeError(f"No Sentinel-1 items found for flood season {config.YEAR}")
+
+    if LOCAL_S1_ROOT:
+        from utils.stac import rewrite_hrefs_to_local
+        logger.info("Rewriting S1 asset hrefs to local cache: %s", LOCAL_S1_ROOT)
+        items = rewrite_hrefs_to_local(items, LOCAL_S1_ROOT, bands=["vv", "vh"])
 
     n_workers = S1_MAX_WORKERS if PIPELINE_RUN else 1
     logger.info("Processing %d S1 scenes (workers=%d)", len(items), n_workers)

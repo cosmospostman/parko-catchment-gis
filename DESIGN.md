@@ -145,7 +145,9 @@ fsspec              # Filesystem abstraction + local COG tile cache
 
 ### 6.1 Execution environment
 
-Steps 1–3 run on an EC2 `c7gn.4xlarge` (16 vCPU ARM64/Graviton3, 32 GB) in `us-west-2`, co-located with the Sentinel-2 COG bucket. Steps 4–7 work entirely from the GeoTIFFs written by steps 1–3 and can be run locally.
+Steps 1–4 run on an EC2 `c7gn.4xlarge` (16 vCPU ARM64/Graviton3, 32 GB) in `us-west-2`, co-located with the Sentinel-2 COG bucket. Steps 5–7 work entirely from the GeoTIFFs and GeoPackages written by steps 1–4 and can be run locally.
+
+Step 4 (Sentinel-1 flood extent) was originally designed to run locally, but the S1 GRD scenes for the Mitchell catchment flood season total ~128 GB from `s3://sentinel-s1-l1c` (us-east-1). Streaming this volume locally is impractical; caching to EBS on the EC2 instance keeps all S3 transfer within AWS and makes annual re-runs fast (only new scenes need syncing). The pipeline's step 0 handles S1 EBS sync automatically when `LOCAL_S1_ROOT` is set, alongside the existing S2 sync.
 
 The pipeline processes the catchment in 512 px spatial tiles via `ProcessPoolExecutor` with 16 worker processes. Each worker runs fetch + compute for one tile independently, giving true CPU parallelism (each worker has its own GIL). Peak memory: ~86 MB per tile × 16 workers ≈ 1.4 GB arrays in flight, well within the 32 GB budget.
 
@@ -159,12 +161,16 @@ The pipeline processes the catchment in 512 px spatial tiles via `ProcessPoolExe
 ├── outputs/YYYY/               # Final GeoTIFFs and quicklooks
 └── logs/                       # Per-run logs and tile stats CSVs
 
-/mnt/s2cache/                  # EBS volume (2 TB gp3) — Sentinel-2 COG local cache
+/mnt/ebs/s2cache/                  # EBS volume (2 TB gp3) — Sentinel-2 COG local cache
 └── sentinel-cogs/
     └── sentinel-s2-l2a-cogs/  # Mirrors s3://sentinel-cogs key structure
+
+/mnt/ebs/s1cache/                  # EBS volume (500 GiB gp3) — Sentinel-1 GRD local cache
+└── sentinel-s1-l1c/
+    └── GRD/                   # Mirrors s3://sentinel-s1-l1c key structure
 ```
 
-The EBS volume is created once, snapshotted after the pipeline run, and restored the following year. Only new scenes need syncing each year. See [EBS-SETUP.md](EBS-SETUP.md) for full lifecycle instructions.
+Both EBS volumes are created once, snapshotted after the pipeline run, and restored the following year. Only new scenes need syncing each year. See [EBS-SETUP.md](EBS-SETUP.md) for full lifecycle instructions.
 
 ---
 

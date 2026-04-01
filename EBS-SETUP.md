@@ -1,7 +1,8 @@
 # EBS volume setup
 
-The S2 cache volume is created once per year, used for 1–2 days, snapshotted, then deleted.
-The snapshot persists cheaply (~$10/month for 2 TB) and is restored next year — at which
+A single EBS volume mounted at `/mnt/ebs` holds both the Sentinel-2 COG cache (`s2cache/`)
+and the Sentinel-1 GRD cache (`s1cache/`). It is created once per year, used for 1–2 days,
+snapshotted, then deleted. The snapshot persists cheaply and is restored next year — at which
 point only new scenes need syncing.
 
 ## Why EBS rather than local disk
@@ -72,9 +73,10 @@ sudo mkfs -t xfs /dev/nvme1n1
 ### 6. Mount
 
 ```bash
-sudo mkdir -p /mnt/s2cache
-sudo mount /dev/nvme1n1 /mnt/s2cache
-sudo chown $(whoami) /mnt/s2cache
+sudo mkdir -p /mnt/ebs
+sudo mount /dev/nvme1n1 /mnt/ebs
+sudo chown $(whoami) /mnt/ebs
+mkdir -p /mnt/ebs/s2cache /mnt/ebs/s1cache
 ```
 
 ---
@@ -164,5 +166,5 @@ aws ec2 modify-volume --volume-id $VOLUME_ID --size 2000
 
 # Expand the filesystem without unmounting
 sudo growpart /dev/nvme1n1 1
-sudo xfs_growfs /mnt/s2cache
+sudo xfs_growfs /mnt/ebs
 ```

@@ -97,9 +97,11 @@ The pipeline runs 7 steps in sequence. Completed steps are recorded as
 sentinels in `$WORKING_DIR` and skipped on re-runs unless `--force` is passed.
 Logs are written to `$BASE_DIR/logs/`.
 
-## Run pipeline steps 1–3 on a cloud instance
+## Run pipeline steps 1–4 on a cloud instance
 
-Steps 1–3 are CPU and I/O intensive. Run them on an EC2 instance with an EBS-cached copy of the Sentinel-2 COGs.
+Steps 1–4 are CPU and I/O intensive and require large remote datasets. Run them on an EC2 instance with EBS-cached copies of the Sentinel-2 COGs and Sentinel-1 GRD scenes.
+
+**Why step 4 runs on EC2:** The Sentinel-1 flood extent step fetches ~128 GB of GRD scenes from `s3://sentinel-s1-l1c` (us-east-1). Streaming this locally is impractical; caching to EBS makes re-runs fast and keeps all remote data transfer within AWS.
 
 **Instance spec:** Ubuntu 24.04 LTS, `c7gn.4xlarge` (16 vCPU ARM64/Graviton3, 32 GB), region `us-west-2`. Add your SSH key during creation. 100 GiB `gp3` root volume.
 
@@ -122,38 +124,35 @@ sudo mkdir -p /data/mrc-parko && sudo chown $USER /data/mrc-parko
 
 > **Note:** install GDAL 3.8.4 via pip after `requirements.txt` to ensure the Python bindings match the system library version. Do not add any GDAL PPAs — use the version from the standard Ubuntu 24.04 repos only.
 
-**Each run** — attach the EBS cache volume, sync new scenes, then run the pipeline. See [EBS-SETUP.md](EBS-SETUP.md) for volume setup. Use `tmux` so the pipeline survives SSH disconnection:
+**Each run** — attach both EBS cache volumes, then run the pipeline. The pipeline's step 0 generates manifests and syncs both S2 and S1 scenes automatically. See [EBS-SETUP.md](EBS-SETUP.md) for volume setup. Use `tmux` so the pipeline survives SSH disconnection:
 
 ```bash
 ssh ubuntu@<instance-ip>
 cd parko-catchment-gis && source .venv/bin/activate
 tmux new -s pipeline
 
-# Sync new scenes for the year
-python scripts/s2_sync_manifest.py 2025 --out manifest_2025.txt
-./scripts/s2_ebs_sync.sh --manifest manifest_2025.txt --dest /mnt/s2cache
-
-# Run steps 1–3 with local cache
-export LOCAL_S2_ROOT=/mnt/s2cache
-./run.sh 2025 --to-step 3
+# Run steps 1–4 with local caches (step 0 syncs S2 and S1 automatically)
+export LOCAL_S2_ROOT=/mnt/ebs/s2cache
+export LOCAL_S1_ROOT=/mnt/ebs/s1cache
+./run.sh 2025 --to-step 4
 # Ctrl+B then D to detach; tmux attach -t pipeline to return
 ```
 
-**Copy outputs back** once all three steps complete:
+**Copy outputs back** once all four steps complete:
 
 ```bash
 scp -r ubuntu@<instance-ip>:/data/mrc-parko/outputs/2025 ./outputs/
 ```
 
-Then snapshot the EBS volume, detach, and delete it (see [EBS-SETUP.md](EBS-SETUP.md)). Stop or terminate the instance.
+Then snapshot the EBS volumes, detach, and delete them (see [EBS-SETUP.md](EBS-SETUP.md)). Stop or terminate the instance.
 
 ## Run the remainder of the pipeline
 
-Steps 4–7 work entirely from the GeoTIFFs written by steps 1–3 and can be run locally. With the outputs copied back from DO:
+Steps 5–7 work entirely from the GeoTIFFs and GeoPackages written by steps 1–4 and can be run locally. With the outputs copied back:
 
 ```bash
 source config.sh
-./run.sh 2025 --from-step 4
+./run.sh 2025 --from-step 5
 ```
 
 ## Running tests

@@ -72,6 +72,8 @@ export REBUILD_BASELINE
 export CODE_DIR
 export PIPELINE_RUN=1
 export PYTHONPATH="${CODE_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+export LOCAL_S2_ROOT="${LOCAL_S2_ROOT:-}"
+export LOCAL_S1_ROOT="${LOCAL_S1_ROOT:-}"
 export TILE_SIZE_PX="${TILE_SIZE_PX:-512}"
 export FETCH_WORKERS="${FETCH_WORKERS:-$([ -n "${LOCAL_S2_ROOT}" ] && echo 4 || echo 16)}"
 export COMPUTE_WORKERS="${COMPUTE_WORKERS:-$(python -c 'import os; print(os.cpu_count() or 4)')}"
@@ -431,10 +433,10 @@ run_step_or_abort() {
     fi
 }
 
-# ── Stage 0: EBS sync (only when LOCAL_S2_ROOT is set) ───────────────────────
-if [[ -n "${LOCAL_S2_ROOT}" ]]; then
+# ── Stage 0: EBS sync (S2 and/or S1, only when LOCAL_*_ROOT is set) ──────────
+if [[ -n "${LOCAL_S2_ROOT}" || -n "${LOCAL_S1_ROOT}" ]]; then
     STEP_NUMS+=(0)
-    STEP_NAMES+=("s2_ebs_sync")
+    STEP_NAMES+=("ebs_sync")
 
     _skip_stage0=false
     if [[ -n "${ONLY_STEP}" && "${ONLY_STEP}" != "0" ]]; then
@@ -445,39 +447,63 @@ if [[ -n "${LOCAL_S2_ROOT}" ]]; then
 
     _sentinel_00="${WORKING_DIR}/.step_00_complete_${YEAR}_${GIT_SHA}"
     if [[ "${_skip_stage0}" == "true" ]]; then
-        printf "${CYAN}[SKIP]${RESET} Step 00 — s2_ebs_sync (filtered)\n"
+        printf "${CYAN}[SKIP]${RESET} Step 00 — ebs_sync (filtered)\n"
         STEP_STATUSES+=("SKIP")
         STEP_DURATIONS+=("—")
     elif [[ -f "${_sentinel_00}" && "${FROM_STEP}" == "1" && -z "${ONLY_STEP}" ]]; then
-        printf "${CYAN}[SKIP]${RESET} Step 00 — s2_ebs_sync (already complete, sentinel found)\n"
+        printf "${CYAN}[SKIP]${RESET} Step 00 — ebs_sync (already complete, sentinel found)\n"
         STEP_STATUSES+=("SKIP")
         STEP_DURATIONS+=("cached")
     else
-        printf "\n${BOLD}${CYAN}── Step 00: s2_ebs_sync ─────────────────────────────────────${RESET}\n"
-        _manifest="${WORKING_DIR}/manifest_${YEAR}.txt"
-        printf "Generating manifest → %s\n" "${_manifest}"
+        printf "\n${BOLD}${CYAN}── Step 00: ebs_sync ────────────────────────────────────────${RESET}\n"
         _t0="$(date +%s)"
 
-        _manifest_exit=0
-        python "${CODE_DIR}/scripts/s2_sync_manifest.py" "${YEAR}" --out "${_manifest}" || _manifest_exit=$?
-        if [[ ${_manifest_exit} -ne 0 ]]; then
-            printf "${RED}${BOLD}FAILED: s2_sync_manifest.py (exit ${_manifest_exit})${RESET}\n"
-            OVERALL_EXIT=1
-            STEP_STATUSES+=("FAIL")
-            _t1="$(date +%s)"; STEP_DURATIONS+=("$(( _t1 - _t0 ))s")
-            print_summary
-            exit "${OVERALL_EXIT}"
+        # ── S2 sync ──────────────────────────────────────────────────────────
+        if [[ -n "${LOCAL_S2_ROOT}" ]]; then
+            _manifest_s2="${WORKING_DIR}/manifest_s2_${YEAR}.txt"
+            printf "Generating S2 manifest → %s\n" "${_manifest_s2}"
+
+            _manifest_exit=0
+            python "${CODE_DIR}/scripts/s2_sync_manifest.py" "${YEAR}" --out "${_manifest_s2}" || _manifest_exit=$?
+            if [[ ${_manifest_exit} -ne 0 ]]; then
+                printf "${RED}${BOLD}FAILED: s2_sync_manifest.py (exit ${_manifest_exit})${RESET}\n"
+                OVERALL_EXIT=1; STEP_STATUSES+=("FAIL")
+                _t1="$(date +%s)"; STEP_DURATIONS+=("$(( _t1 - _t0 ))s")
+                print_summary; exit "${OVERALL_EXIT}"
+            fi
+
+            _sync_exit=0
+            "${CODE_DIR}/scripts/s2_ebs_sync.sh" --manifest "${_manifest_s2}" --dest "${LOCAL_S2_ROOT}" || _sync_exit=$?
+            if [[ ${_sync_exit} -ne 0 ]]; then
+                printf "${RED}${BOLD}FAILED: s2_ebs_sync.sh (exit ${_sync_exit})${RESET}\n"
+                OVERALL_EXIT=1; STEP_STATUSES+=("FAIL")
+                _t1="$(date +%s)"; STEP_DURATIONS+=("$(( _t1 - _t0 ))s")
+                print_summary; exit "${OVERALL_EXIT}"
+            fi
         fi
 
-        _sync_exit=0
-        "${CODE_DIR}/scripts/s2_ebs_sync.sh" --manifest "${_manifest}" --dest "${LOCAL_S2_ROOT}" || _sync_exit=$?
-        if [[ ${_sync_exit} -ne 0 ]]; then
-            printf "${RED}${BOLD}FAILED: s2_ebs_sync.sh (exit ${_sync_exit})${RESET}\n"
-            OVERALL_EXIT=1
-            STEP_STATUSES+=("FAIL")
-            _t1="$(date +%s)"; STEP_DURATIONS+=("$(( _t1 - _t0 ))s")
-            print_summary
-            exit "${OVERALL_EXIT}"
+        # ── S1 sync ──────────────────────────────────────────────────────────
+        if [[ -n "${LOCAL_S1_ROOT}" ]]; then
+            _manifest_s1="${WORKING_DIR}/manifest_s1_${YEAR}.txt"
+            printf "Generating S1 manifest → %s\n" "${_manifest_s1}"
+
+            _manifest_exit=0
+            python "${CODE_DIR}/scripts/s1_sync_manifest.py" "${YEAR}" --out "${_manifest_s1}" || _manifest_exit=$?
+            if [[ ${_manifest_exit} -ne 0 ]]; then
+                printf "${RED}${BOLD}FAILED: s1_sync_manifest.py (exit ${_manifest_exit})${RESET}\n"
+                OVERALL_EXIT=1; STEP_STATUSES+=("FAIL")
+                _t1="$(date +%s)"; STEP_DURATIONS+=("$(( _t1 - _t0 ))s")
+                print_summary; exit "${OVERALL_EXIT}"
+            fi
+
+            _sync_exit=0
+            "${CODE_DIR}/scripts/s1_ebs_sync.sh" --manifest "${_manifest_s1}" --dest "${LOCAL_S1_ROOT}" || _sync_exit=$?
+            if [[ ${_sync_exit} -ne 0 ]]; then
+                printf "${RED}${BOLD}FAILED: s1_ebs_sync.sh (exit ${_sync_exit})${RESET}\n"
+                OVERALL_EXIT=1; STEP_STATUSES+=("FAIL")
+                _t1="$(date +%s)"; STEP_DURATIONS+=("$(( _t1 - _t0 ))s")
+                print_summary; exit "${OVERALL_EXIT}"
+            fi
         fi
 
         touch "${_sentinel_00}"

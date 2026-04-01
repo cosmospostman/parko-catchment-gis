@@ -116,6 +116,7 @@ def merge_tile_rasters(
                 "-co", "TILED=YES",
                 "-co", "BLOCKXSIZE=512",
                 "-co", "BLOCKYSIZE=512",
+                "-co", "BIGTIFF=IF_SAFER",
                 "-ot", "Float32",
                 "-a_nodata", nodata_str,
                 vrt_path, str(out_path),
