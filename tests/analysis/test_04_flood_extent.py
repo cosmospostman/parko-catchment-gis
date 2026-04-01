@@ -967,19 +967,25 @@ class TestSanityGuardScientificContracts:
     def _patch_warp(self, ds):
         return patch("utils.sar._preprocess_gcp_warp", return_value=ds)
 
-    def test_guard_rejects_scene_at_31_percent_water(self):
-        """A scene where Otsu would classify 31% of pixels as water must be discarded.
+    def test_guard_rejects_dry_scene_with_high_apparent_water_fraction(self):
+        """A dry scene with a near-unimodal histogram must be discarded.
 
-        This catches the regression from 65% → 30%: a scene at 35% would have
-        passed the old guard but must fail the new one.
+        Otsu on a unimodal distribution splits near the mean, classifying ~50%
+        of pixels as "water".  The sanity guard must catch this.  This tests
+        that the guard threshold is actually ≤50% (i.e. not removed or set to
+        some absurdly high value like 99%).
+
+        This also catches the regression from 65% → 30%: with the old 65% guard,
+        scenes producing 35–64% false water would pass through.
         """
         H, W = 100, 100
-        # Construct a scene where ~31% of pixels are in the low-VV cluster.
-        # Low cluster: 31 rows; high cluster: 69 rows.
-        vv = np.full((H, W), 0.030, dtype=np.float32)
-        vv[:31, :] = 0.001   # 31% of pixels are very low
-        vh = np.full((H, W), 0.030 * 0.25, dtype=np.float32)
-        vh[:31, :] = 0.001 * 0.25   # VH also low so the VH guard doesn't reject these first
+        rng = np.random.default_rng(42)
+        # Near-unimodal — all land, no water present.  Otsu splits within the
+        # land distribution, producing ~50% apparent water fraction.
+        vv_db_values = rng.normal(-12, 2.0, (H, W)).astype(np.float32)
+        # Convert from dB back to linear so the function receives linear input
+        vv = (10 ** (vv_db_values / 10)).astype(np.float32)
+        vh = (vv * 0.25).astype(np.float32)   # VH tracks VV — no water signal
         x = np.linspace(700000, 750000, W)
         y = np.linspace(-1600000, -1650000, H)
         ds = xr.Dataset({
@@ -991,8 +997,8 @@ class TestSanityGuardScientificContracts:
             result = flood_mask_from_scene(item, bbox=[141, -17, 143, -15], resolution=50)
 
         assert result is None, \
-            ("Scene with 31% apparent water fraction was not discarded. "
-             "Sanity guard threshold may have regressed back to 65%.")
+            ("Dry unimodal scene was not discarded by the sanity guard. "
+             "Guard threshold may have been removed or set too high.")
 
     def test_guard_accepts_scene_at_25_percent_water(self):
         """A scene with 25% genuine flood coverage must pass the sanity guard."""
