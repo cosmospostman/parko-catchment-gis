@@ -14,9 +14,14 @@ Approach
 3. Accumulate per-pixel flood frequency; threshold at FLOOD_MIN_FREQUENCY.
 """
 import logging
+import multiprocessing
 import os
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
+
+# Use forkserver so worker processes start clean without inheriting the
+# parent's memory (which can be 10+ GB after the dry-season phase).
+multiprocessing.set_start_method("forkserver", force=True)
 
 import geopandas as gpd
 import numpy as np
