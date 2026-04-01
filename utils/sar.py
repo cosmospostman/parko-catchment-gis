@@ -58,6 +58,7 @@ def _read_gcps_from_annotation(annotation_path: Path):
 def _preprocess_gcp_warp(item: Any, bbox: list, resolution: int) -> xr.Dataset:
     """Warp a Sentinel-1 GRD scene to EPSG:7855 using GCPs from the annotation XML."""
     import rasterio
+    import rasterio.control
     import rasterio.crs
     import rasterio.warp
     import rasterio.transform
@@ -100,18 +101,63 @@ def _preprocess_gcp_warp(item: Any, bbox: list, resolution: int) -> xr.Dataset:
 
         src_crs = rasterio.crs.CRS.from_epsg(4326)
 
-        with rasterio.open(meas_asset.href) as src:
-            src_data = src.read(1).astype(np.float32)
-            src_height, src_width = src_data.shape
+        # Use GCPs to find the source pixel window covering the bbox,
+        # so we only read the relevant subset of the ~16k×26k array.
+        gcp_lons = np.array([g.x for g in gcps])
+        gcp_lats = np.array([g.y for g in gcps])
+        gcp_cols = np.array([g.col for g in gcps])
+        gcp_rows = np.array([g.row for g in gcps])
 
-        # Write to an in-memory GeoTIFF with GCPs, then reproject
+        # Find GCPs inside (or near) the bbox with a small margin
+        margin = 0.5  # degrees
+        mask_near = (
+            (gcp_lons >= minx - margin) & (gcp_lons <= maxx + margin) &
+            (gcp_lats >= miny - margin) & (gcp_lats <= maxy + margin)
+        )
+        if mask_near.any():
+            col_min = max(0, int(gcp_cols[mask_near].min()) - 100)
+            col_max = int(gcp_cols[mask_near].max()) + 100
+            row_min = max(0, int(gcp_rows[mask_near].min()) - 100)
+            row_max = int(gcp_rows[mask_near].max()) + 100
+        else:
+            # bbox may not overlap this scene — fall back to full read and let
+            # the warp produce an empty result
+            col_min, row_min = 0, 0
+            with rasterio.open(meas_asset.href) as src:
+                col_max, row_max = src.width, src.height
+
+        import rasterio.windows
         import rasterio.io
+        window = rasterio.windows.Window(
+            col_off=col_min, row_off=row_min,
+            width=col_max - col_min, height=row_max - row_min,
+        )
+        with rasterio.open(meas_asset.href) as src:
+            # Clamp window to actual dataset bounds
+            window = window.intersection(rasterio.windows.Window(0, 0, src.width, src.height))
+            src_data = src.read(1, window=window).astype(np.float32)
+            win_col_off = int(window.col_off)
+            win_row_off = int(window.row_off)
+
+        # Adjust GCP pixel/line coordinates to be relative to the window
+        windowed_gcps = [
+            rasterio.control.GroundControlPoint(
+                row=g.row - win_row_off, col=g.col - win_col_off,
+                x=g.x, y=g.y, z=g.z,
+            )
+            for g in gcps
+        ]
+        win_height, win_width = src_data.shape
+        logger.info("Windowed read %s %s: %dx%d px (%.1f MB)",
+                    item.id, pol, win_width, win_height,
+                    win_width * win_height * 4 / 1e6)
+
         dst_data = np.full((dst_height, dst_width), np.nan, dtype=np.float32)
         with rasterio.io.MemoryFile() as memfile:
             with memfile.open(driver="GTiff", count=1, dtype="float32",
-                              width=src_width, height=src_height) as mem_ds:
+                              width=win_width, height=win_height) as mem_ds:
                 mem_ds.write(src_data, 1)
-                mem_ds.gcps = (gcps, src_crs)
+                mem_ds.gcps = (windowed_gcps, src_crs)
                 rasterio.warp.reproject(
                     source=rasterio.band(mem_ds, 1),
                     destination=dst_data,
