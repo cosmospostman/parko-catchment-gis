@@ -123,28 +123,30 @@ def _preprocess_with_sarsen(item: Any, bbox: list, resolution: int) -> xr.Datase
 
 
 def _preprocess_stackstac_fallback(item: Any, bbox: list, resolution: int) -> xr.Dataset:
-    """Basic S1 loading via stackstac without terrain correction."""
-    import stackstac
+    """Basic S1 loading via odc-stac without terrain correction.
 
-    try:
-        da = stackstac.stack(
-            [item],
-            assets=["vv", "vh"],
-            resolution=resolution,
-            bounds_latlon=bbox,
-            epsg=4326,
-        )
-    except ValueError as exc:
-        if "zero-size" in str(exc) or "no identity" in str(exc):
-            raise ValueError(f"Scene does not overlap bbox (no valid pixels): {item.id}") from exc
-        raise
-    if da.sizes.get("x", 0) == 0 or da.sizes.get("y", 0) == 0:
+    stackstac fails on sentinel-1-grd items from Element84 earth-search v1
+    because those items lack proj:shape/proj:transform metadata, causing a
+    zero-size bounds computation. odc-stac handles this correctly.
+    """
+    import odc.stac
+
+    ds = odc.stac.load(
+        [item],
+        bands=["vv", "vh"],
+        resolution=resolution,
+        bbox=bbox,
+        crs="EPSG:4326",
+        chunks={"x": 2048, "y": 2048},
+    )
+    if ds.sizes.get("x", 0) == 0 or ds.sizes.get("y", 0) == 0:
         raise ValueError(f"Scene has no spatial overlap with bbox: {item.id}")
-    ds = da.to_dataset(dim="band")
     # Normalise band names to uppercase to match downstream expectations
     ds = ds.rename({k: k.upper() for k in ds.data_vars if k in ("vv", "vh")})
     # Convert from dB to linear scale if needed
     for var in ds.data_vars:
-        ds[var] = 10 ** (ds[var] / 10)
-    logger.info("Stackstac S1 fallback loaded: %s", list(ds.data_vars))
+        ds[var] = (10 ** (ds[var] / 10)).compute()
+    if all(ds[var].size == 0 for var in ds.data_vars):
+        raise ValueError(f"Scene has no valid pixels after compute: {item.id}")
+    logger.info("odc-stac S1 fallback loaded: %s", list(ds.data_vars))
     return ds
