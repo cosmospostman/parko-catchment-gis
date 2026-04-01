@@ -154,6 +154,7 @@ def _build_baseline(bbox, config) -> xr.DataArray:
             # evenly within each year — avoids 39 sequential round-trips to DEA
             # while still guaranteeing even temporal coverage across all missions.
             max_items_per_year = 12
+            tile_catalog = pystac_client.Client.open("https://explorer.dea.ga.gov.au/stac")
             all_items = list(tile_catalog.search(
                 collections=DEA_LANDSAT_COLLECTIONS,
                 bbox=tile_bbox,
