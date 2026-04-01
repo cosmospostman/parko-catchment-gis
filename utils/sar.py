@@ -140,7 +140,7 @@ def flood_mask_from_scene(
 
     # Convert DN² to dB and threshold — result is bool (1 byte/pixel)
     with np.errstate(divide="ignore", invalid="ignore"):
-        vv_db = 10 * np.log10((dst_data ** 2) / 1e8 + 1e-12)
+        vv_db = 10 * np.log10((dst_data ** 2) / 1e6 + 1e-12)
     del dst_data
     mask = vv_db < threshold_db
     del vv_db
@@ -295,7 +295,7 @@ def _preprocess_gcp_warp(item: Any, bbox: list, resolution: int) -> xr.Dataset:
         # Convert DN to sigma-naught linear scale (S1 GRD: sigma0 = (DN^2) / cal_factor)
         # Without calibration LUT use DN^2 as a proxy — sufficient for flood thresholding
         with np.errstate(invalid="ignore"):
-            sigma = (dst_data ** 2) / 1e8  # normalise to roughly linear scale
+            sigma = (dst_data ** 2) / 1e6  # normalise to roughly linear scale
 
         x_coords = np.linspace(dst_bounds[0], dst_bounds[2], dst_width)
         y_coords = np.linspace(dst_bounds[3], dst_bounds[1], dst_height)

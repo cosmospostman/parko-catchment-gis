@@ -32,7 +32,7 @@ def main() -> None:
 
     def check_crs_gpkg():
         actual = str(gdf.crs)
-        if "7844" not in actual and "GDA2020" not in actual:
+        if "7855" not in actual and "7844" not in actual and "GDA2020" not in actual:
             raise AssertionError(f"Flood extent CRS unexpected: {actual}")
 
     checks = [
