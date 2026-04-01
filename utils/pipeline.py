@@ -212,35 +212,46 @@ def run_tiled_pipeline(
     stats_thread.start()
 
     _populate_worker_state(fetch_fn, compute_fn, scratch_dir, fetch_workers, compute_workers)
-    mp_ctx = multiprocessing.get_context("fork")
-    with ProcessPoolExecutor(
-        max_workers=fetch_workers,
-        mp_context=mp_ctx,
-        initializer=_worker_init,
-    ) as pool:
-        futures = {
-            pool.submit(_run_tile, args): args[0]
-            for args in enumerate(tile_bboxes)
-        }
-        for future in as_completed(futures):
-            try:
-                tile_idx, path, stat = future.result()
-            except Exception as exc:
-                tile_idx = futures[future]
-                logger.warning("Tile %d failed: %s", tile_idx, exc)
-                stats_q.put({
-                    "tile_idx": tile_idx, "fetch_s": 0.0, "fetch_ok": False,
-                    "cached": False, "array_shape": "", "array_bytes": 0,
-                    "chunk_size": "", "fetch_workers": fetch_workers,
-                    "compute_workers": compute_workers, "compute_s": 0.0,
-                    "compute_ok": False,
-                })
-                continue
-            if stat.get("cached"):
-                logger.info("Tile %d/%d skipped (cached)", tile_idx + 1, n_tiles)
-            with results_lock:
-                results[tile_idx] = path
-            stats_q.put(stat)
+
+    def _collect(tile_idx, path, stat):
+        if stat.get("cached"):
+            logger.info("Tile %d/%d skipped (cached)", tile_idx + 1, n_tiles)
+        with results_lock:
+            results[tile_idx] = path
+        stats_q.put(stat)
+
+    if fetch_workers <= 1:
+        # Run tiles inline — no forking. Required for correctness when callables
+        # are not picklable (e.g. during unit tests with mocked functions).
+        for args in enumerate(tile_bboxes):
+            tile_idx, path, stat = _run_tile(args)
+            _collect(tile_idx, path, stat)
+    else:
+        mp_ctx = multiprocessing.get_context("fork")
+        with ProcessPoolExecutor(
+            max_workers=fetch_workers,
+            mp_context=mp_ctx,
+            initializer=_worker_init,
+        ) as pool:
+            futures = {
+                pool.submit(_run_tile, args): args[0]
+                for args in enumerate(tile_bboxes)
+            }
+            for future in as_completed(futures):
+                try:
+                    tile_idx, path, stat = future.result()
+                except Exception as exc:
+                    tile_idx = futures[future]
+                    logger.warning("Tile %d failed: %s", tile_idx, exc)
+                    stats_q.put({
+                        "tile_idx": tile_idx, "fetch_s": 0.0, "fetch_ok": False,
+                        "cached": False, "array_shape": "", "array_bytes": 0,
+                        "chunk_size": "", "fetch_workers": fetch_workers,
+                        "compute_workers": compute_workers, "compute_s": 0.0,
+                        "compute_ok": False,
+                    })
+                    continue
+                _collect(tile_idx, path, stat)
 
     stats_q.put(None)
     stats_thread.join()

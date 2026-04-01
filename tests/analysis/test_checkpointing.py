@@ -96,7 +96,8 @@ class TestCheckpointing01:
              patch("utils.quicklook.save_quicklook"), \
              patch("utils.tiling.merge_tile_rasters", side_effect=fake_merge), \
              patch("xarray.open_dataarray",
-                   return_value=_make_synthetic_stack(bands=["nir"]).isel(time=0, band=0)):
+                   return_value=_make_synthetic_stack(bands=["nir"]).isel(time=0, band=0)), \
+             patch.dict("os.environ", {"FETCH_WORKERS": "1"}):
             _load_module(self.SCRIPT, f"step01_ckpt_{tile_exists}_{tile_size}").main()
 
         return load_mock
@@ -157,7 +158,8 @@ class TestCheckpointing03:
              patch("utils.quicklook.save_quicklook"), \
              patch("utils.tiling.merge_tile_rasters", side_effect=fake_merge), \
              patch("xarray.open_dataarray",
-                   return_value=_make_synthetic_stack(bands=["nir"]).isel(time=0, band=0)):
+                   return_value=_make_synthetic_stack(bands=["nir"]).isel(time=0, band=0)), \
+             patch.dict("os.environ", {"FETCH_WORKERS": "1"}):
             _load_module(self.SCRIPT, f"step03_ckpt_{tile_exists}_{tile_size}").main()
 
         return load_mock
