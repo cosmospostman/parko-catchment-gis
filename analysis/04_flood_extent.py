@@ -35,7 +35,7 @@ DASK_CHUNK_SPATIAL = 2048
 S1_DRY_WORKERS   = int(os.environ.get("DRY_WORKERS",   4))   # override with --dry-workers
 S1_FLOOD_WORKERS = int(os.environ.get("FETCH_WORKERS", 4))  # override with --fetch-workers
 S1_RESOLUTION = 50                          # metres — flood mapping doesn't need 10 m
-FLOOD_MIN_FREQUENCY = 0.10                  # pixel must be water in ≥10% of scenes
+FLOOD_MIN_FREQUENCY = 0.33                  # pixel must be water in ≥33% of scenes
 
 logger = logging.getLogger(__name__)
 
