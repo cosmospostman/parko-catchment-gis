@@ -20,7 +20,7 @@ S1_POLARISATIONS = ["VV", "VH"]
 VV_OPEN_WATER_THRESHOLD_DB = -14.0          # dB — below this = open water
 FLOOD_UNION_SIMPLIFY_TOLERANCE = 20         # metres
 DASK_CHUNK_SPATIAL = 2048
-S1_MAX_WORKERS = 8                          # concurrent S1 scene downloads
+S1_MAX_WORKERS = 4                          # concurrent S1 scene downloads
 S1_RESOLUTION = 50                          # metres — flood mapping doesn't need 10 m
 
 logger = logging.getLogger(__name__)
