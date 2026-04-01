@@ -34,10 +34,16 @@ MODEL_CACHE_PATH_TEMPLATE = "rf_model_{year}.pkl"
 logger = logging.getLogger(__name__)
 
 
-def _fetch_ala_occurrences(bbox: list, species: str, api_base: str) -> gpd.GeoDataFrame:
-    """Fetch georeferenced occurrence records from ALA API."""
+def _fetch_ala_occurrences(bbox: list, species: str, api_base: str, cache_path: Path = None) -> gpd.GeoDataFrame:
+    """Fetch georeferenced occurrence records from ALA API, or load from cache if present."""
+    if cache_path is not None and cache_path.exists():
+        logger.info("Loading ALA occurrences from cache: %s", cache_path)
+        return gpd.read_file(str(cache_path))
+
     import requests
-    url = f"{api_base}/occurrences/search"
+    import pandas as pd
+    from shapely.geometry import Point
+    url = "https://biocache.ala.org.au/ws/occurrences/search"
     params = {
         "q": f'taxon_name:"{species}"',
         "bbox": f"{bbox[1]},{bbox[0]},{bbox[3]},{bbox[2]}",  # miny,minx,maxy,maxx
@@ -50,8 +56,6 @@ def _fetch_ala_occurrences(bbox: list, species: str, api_base: str) -> gpd.GeoDa
     if not records:
         logger.warning("No ALA occurrences returned")
         return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
-    import pandas as pd
-    from shapely.geometry import Point
     df = pd.DataFrame(records)
     df = df.dropna(subset=["decimalLongitude", "decimalLatitude"])
     gdf = gpd.GeoDataFrame(
@@ -147,7 +151,8 @@ def main() -> None:
 
     # ── Training data: ALA occurrences + pseudo-absences ─────────────────────
     logger.info("Fetching ALA occurrences...")
-    occurrences = _fetch_ala_occurrences(bbox_wgs84, config.ALA_SPECIES_QUERY, config.ALA_API_BASE)
+    ala_cache = Path(config.CACHE_DIR) / "ala_occurrences.gpkg"
+    occurrences = _fetch_ala_occurrences(bbox_wgs84, config.ALA_SPECIES_QUERY, config.ALA_API_BASE, cache_path=ala_cache)
     occurrences = occurrences.to_crs(config.TARGET_CRS)
     occurrences = gpd.clip(occurrences, catchment)
     logger.info("ALA occurrences in catchment: %d", len(occurrences))
