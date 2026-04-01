@@ -80,7 +80,7 @@ def main() -> None:
         )
 
     flood_count = None   # uint16 count of scenes flagging each pixel as water
-    scene_count = 0      # number of scenes successfully contributing
+    obs_count   = None   # uint16 count of scenes observing each pixel (footprint)
     combined_coords = None
     completed = 0
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
@@ -89,20 +89,23 @@ def main() -> None:
             item = futures[future]
             completed += 1
             try:
-                mask = future.result()
-                if mask is None:
+                scene = future.result()
+                if scene is None:
                     continue
                 logger.info("S1 scene processed (%d/%d, %.1f%%): %s", completed, len(items), 100 * completed / len(items), item.id)
+                m = scene.values  # float32: 1.0=water, 0.0=land, nan=outside footprint
+                observed = np.isfinite(m).astype(np.uint16)
+                water    = (m == 1.0).astype(np.uint16)
                 if flood_count is None:
-                    combined_coords = mask
-                    flood_count = mask.values.astype(np.uint16)
+                    combined_coords = scene
+                    flood_count = water
+                    obs_count   = observed
                 else:
-                    m = mask.values
                     if m.shape == flood_count.shape:
-                        flood_count += m.astype(np.uint16)
+                        flood_count += water
+                        obs_count   += observed
                     else:
                         logger.debug("Shape mismatch for %s — skipping", item.id)
-                scene_count += 1
             except Exception as exc:
                 msg = str(exc)
                 if "no spatial overlap" in msg or "no valid pixels" in msg or "zero-size" in msg:
@@ -113,15 +116,15 @@ def main() -> None:
     if flood_count is None:
         raise RuntimeError("No valid S1 scenes processed")
 
-    # Pixels must be flooded in at least FLOOD_MIN_FREQUENCY fraction of scenes
-    min_scenes = max(1, int(scene_count * FLOOD_MIN_FREQUENCY))
-    logger.info("Flood frequency threshold: %d/%d scenes (%.0f%%)",
-                min_scenes, scene_count, FLOOD_MIN_FREQUENCY * 100)
+    # Flood frequency = flood_count / obs_count per pixel (ignore unobserved pixels)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        freq = np.where(obs_count > 0, flood_count / obs_count.astype(np.float32), 0.0)
+    logger.info("Flood frequency threshold: %.0f%%  obs_count median: %d",
+                FLOOD_MIN_FREQUENCY * 100, int(np.median(obs_count[obs_count > 0])))
     for pct in [50, 75, 90, 95, 99]:
-        logger.info("  flood_count p%d = %d scenes", pct, np.percentile(flood_count, pct))
-    logger.info("  flood_count max = %d, pixels > 0: %d", flood_count.max(), (flood_count > 0).sum())
-    combined = flood_count >= min_scenes
-    del flood_count
+        logger.info("  freq p%d = %.1f%%", pct, np.percentile(freq[obs_count > 0], pct) * 100)
+    combined = freq >= FLOOD_MIN_FREQUENCY
+    del flood_count, obs_count, freq
 
     # Vectorise flood mask to polygons
     logger.info("Vectorising flood extent...")
@@ -170,8 +173,15 @@ def main() -> None:
     logger.info("Written: %s  (%d features)", out_path, len(gdf))
 
     ql_path = out_path.with_name(out_path.stem + "_quicklook.png")
+    x = combined_coords.coords["x"].values
+    y = combined_coords.coords["y"].values
+    flood_da = xr.DataArray(
+        combined.astype(np.float32),
+        dims=["y", "x"],
+        coords={"x": x, "y": y},
+    )
     save_quicklook(
-        combined_coords.squeeze(drop=True).astype(np.float32),
+        flood_da,
         ql_path,
         vmin=0.0,
         vmax=1.0,
