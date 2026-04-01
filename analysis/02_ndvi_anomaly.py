@@ -149,32 +149,34 @@ def _build_baseline(bbox, config) -> xr.DataArray:
         import odc.stac
         t_fetch = time.monotonic()
         try:
-            # Per-year STAC queries are independent — run them in a small
-            # inner thread pool to parallelise the ~39 round-trips.
-            # Inner pool size is capped at 5 to avoid hammering the DEA endpoint
-            # (8 outer workers × 5 inner = 40 max concurrent STAC connections).
+            # Single wide STAC query for the full baseline period, restricted to
+            # dry-season months. Group results by year in Python, then subsample
+            # evenly within each year — avoids 39 sequential round-trips to DEA
+            # while still guaranteeing even temporal coverage across all missions.
             max_items_per_year = 12
-            stac_workers = int(os.environ.get("STAC_WORKERS_PER_TILE", "5"))
+            all_items = list(tile_catalog.search(
+                collections=DEA_LANDSAT_COLLECTIONS,
+                bbox=tile_bbox,
+                datetime=f"{start_year}-{dry_start_mm_dd}/{end_year}-{dry_end_mm_dd}",
+            ).items())
 
-            def _query_year(yr):
-                yr_start = f"{yr}-{dry_start_mm_dd}"
-                yr_end   = f"{yr}-{dry_end_mm_dd}"
-                catalog  = pystac_client.Client.open("https://explorer.dea.ga.gov.au/stac")
-                yr_items = list(catalog.search(
-                    collections=DEA_LANDSAT_COLLECTIONS,
-                    bbox=tile_bbox,
-                    datetime=f"{yr_start}/{yr_end}",
-                ).items())
+            # Group by year, filter to dry-season months, subsample evenly.
+            dry_start_month = int(dry_start_mm_dd.split("-")[0])
+            dry_end_month   = int(dry_end_mm_dd.split("-")[0])
+            by_year: dict = {}
+            for it in all_items:
+                dt = it.datetime or it.properties.get("datetime", "")
+                yr = int(str(dt)[:4])
+                mo = int(str(dt)[5:7])
+                if dry_start_month <= mo <= dry_end_month and start_year <= yr <= end_year:
+                    by_year.setdefault(yr, []).append(it)
+
+            tile_items = []
+            for yr_items in by_year.values():
                 if len(yr_items) > max_items_per_year:
                     step = len(yr_items) / max_items_per_year
                     yr_items = [yr_items[round(i * step)] for i in range(max_items_per_year)]
-                return yr_items
-
-            years = range(start_year, end_year + 1)
-            tile_items = []
-            with ThreadPoolExecutor(max_workers=stac_workers) as stac_pool:
-                for yr_items in stac_pool.map(_query_year, years):
-                    tile_items.extend(yr_items)
+                tile_items.extend(yr_items)
             logger.info(
                 "Tile %d/%d  STAC: %d items across %d years",
                 tile_idx + 1, n_tiles, len(tile_items), end_year - start_year + 1,
