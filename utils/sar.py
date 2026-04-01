@@ -136,7 +136,7 @@ def _preprocess_stackstac_fallback(item: Any, bbox: list, resolution: int) -> xr
         bands=["vv", "vh"],
         resolution=resolution,
         bbox=bbox,
-        crs="EPSG:4326",
+        crs="EPSG:7855",
         chunks={"x": 2048, "y": 2048},
     )
     if ds.sizes.get("x", 0) == 0 or ds.sizes.get("y", 0) == 0:
