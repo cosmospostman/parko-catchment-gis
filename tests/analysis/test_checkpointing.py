@@ -204,7 +204,7 @@ class TestCheckpointing02:
         # Synthetic single-band DataArray for baseline and current NDVI
         da_2d = _make_synthetic_stack(bands=["nir"]).isel(time=0, band=0)
 
-        def fake_load_dea(**kw):
+        def fake_odc_load(items, **kw):
             data = np.random.default_rng(0).uniform(0.1, 0.4, size=(1, 2, 2)).astype(np.float32)
             times = np.array([np.datetime64("2000-01-01")])
             x = np.linspace(700000.0, 700020.0, 2)
@@ -214,9 +214,12 @@ class TestCheckpointing02:
             red = nir.copy()
             ds = xr.Dataset({"nbart_nir": nir, "nbart_red": red})
             ds = ds.rio.write_crs("EPSG:7855")
-            return ds
+            # odc.stac.load returns a lazy Dataset; _build_baseline calls .compute()
+            ds_mock = MagicMock()
+            ds_mock.compute.return_value = ds
+            return ds_mock
 
-        load_mock = MagicMock(side_effect=fake_load_dea)
+        load_mock = MagicMock(side_effect=fake_odc_load)
 
         def fake_merge(tile_paths, out_path, nodata, crs):
             da_2d.rio.to_raster(str(out_path), driver="GTiff", dtype="float32")
@@ -226,7 +229,12 @@ class TestCheckpointing02:
         ndvi_path.parent.mkdir(parents=True, exist_ok=True)
         da_2d.rio.to_raster(str(ndvi_path), driver="GTiff", dtype="float32")
 
-        with patch("utils.stac.load_dea_landsat", load_mock), \
+        fake_stac_item = MagicMock()
+        fake_stac_item.datetime = "2000-07-15T00:00:00Z"
+        fake_catalog = MagicMock()
+        fake_catalog.search.return_value.items.return_value = iter([fake_stac_item])
+
+        with patch("odc.stac.load", load_mock), \
              patch("utils.tiling.make_tile_bboxes",
                    return_value=[[141.0, -17.0, 143.0, -15.0]]), \
              patch("utils.tiling.merge_tile_rasters", side_effect=fake_merge), \
@@ -234,7 +242,8 @@ class TestCheckpointing02:
              patch("utils.io.write_cog", side_effect=lambda da, path: da.rio.to_raster(
                  str(path), driver="GTiff", dtype="float32")), \
              patch("rioxarray.raster_array.RasterArray.reproject_match",
-                   return_value=da_2d):
+                   return_value=da_2d), \
+             patch("pystac_client.Client.open", return_value=fake_catalog):
             mod = _load_module(self.SCRIPT, f"step02_ckpt_{tile_exists}_{tile_size}")
             # Force baseline rebuild so _build_baseline is always invoked
             with patch.dict("os.environ", {"REBUILD_BASELINE": "true"}):

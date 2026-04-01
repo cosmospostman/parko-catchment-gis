@@ -368,8 +368,11 @@ class TestFloodMaskFromScene:
     def test_negative_vv_values_treated_as_unobserved(self):
         """Negative DN values (rasterio nodata artifacts) must not enter Otsu."""
         H, W = 20, 20
+        # Give the valid portion a bimodal distribution so Otsu doesn't fail on
+        # a zero-range histogram (all-identical values → too many bins error).
         vv_lin = np.full((H, W), 0.1, dtype=np.float32)
-        vv_lin[15:, :] = -1.0   # negative — should be unobserved
+        vv_lin[0:8, :] = 0.001   # low-backscatter patch (water-like)
+        vv_lin[15:, :] = -1.0    # negative — should be unobserved
         ds = _make_ds(vv_lin)
         item = _make_item()
         with self._patch_warp(ds):
@@ -383,6 +386,18 @@ class TestFloodMaskFromScene:
 # ---------------------------------------------------------------------------
 # build_dry_season_reference_mask
 # ---------------------------------------------------------------------------
+
+def _thread_pool_executor_patch():
+    """Patch ProcessPoolExecutor with ThreadPoolExecutor so workers run in-process.
+
+    build_dry_season_reference_mask uses ProcessPoolExecutor; the worker function
+    and item objects must be picklable to cross the process boundary.  In tests we
+    substitute ThreadPoolExecutor so that patched callables and MagicMock items
+    are accessible without pickling.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    return patch("utils.sar.ProcessPoolExecutor", ThreadPoolExecutor)
+
 
 class TestBuildDrySeasonReferenceMask:
     """Tests for build_dry_season_reference_mask(), patching _process_dry_worker."""
@@ -404,7 +419,8 @@ class TestBuildDrySeasonReferenceMask:
     def test_returns_none_when_all_workers_return_none(self):
         """If every worker yields None, function must return None."""
         items = self._make_items(3)
-        with patch("utils.sar._process_dry_worker", return_value=None):
+        with _thread_pool_executor_patch(), \
+             patch("utils.sar._process_dry_worker", return_value=None):
             result = build_dry_season_reference_mask(
                 items, bbox=[141, -17, 143, -15], resolution=50, max_workers=1,
             )
@@ -424,7 +440,8 @@ class TestBuildDrySeasonReferenceMask:
             call_count[0] += 1
             return arr_low.copy(), 80
 
-        with patch("utils.sar._process_dry_worker", side_effect=_worker):
+        with _thread_pool_executor_patch(), \
+             patch("utils.sar._process_dry_worker", side_effect=_worker):
             result = build_dry_season_reference_mask(
                 items, bbox=[141, -17, 143, -15], resolution=50,
                 low_backscatter_threshold_db=-16.0, max_workers=1,
@@ -448,7 +465,8 @@ class TestBuildDrySeasonReferenceMask:
         def _worker(item, bbox, resolution):
             return results_queue.pop(0).copy(), 50
 
-        with patch("utils.sar._process_dry_worker", side_effect=_worker):
+        with _thread_pool_executor_patch(), \
+             patch("utils.sar._process_dry_worker", side_effect=_worker):
             # Should not raise; the bad scene is quietly dropped
             result = build_dry_season_reference_mask(
                 items, bbox=[141, -17, 143, -15], resolution=50, max_workers=1,
@@ -464,7 +482,8 @@ class TestBuildDrySeasonReferenceMask:
         def _worker(item, bbox, resolution):
             return arr.copy(), 36
 
-        with patch("utils.sar._process_dry_worker", side_effect=_worker):
+        with _thread_pool_executor_patch(), \
+             patch("utils.sar._process_dry_worker", side_effect=_worker):
             result = build_dry_season_reference_mask(
                 items, bbox=[141, -17, 143, -15], resolution=50, max_workers=1,
             )
@@ -481,7 +500,8 @@ class TestBuildDrySeasonReferenceMask:
         def _worker(item, bbox, resolution):
             return arr.copy(), 25
 
-        with patch("utils.sar._process_dry_worker", side_effect=_worker):
+        with _thread_pool_executor_patch(), \
+             patch("utils.sar._process_dry_worker", side_effect=_worker):
             result = build_dry_season_reference_mask(
                 items, bbox=[141, -17, 143, -15], resolution=50,
                 low_backscatter_threshold_db=-16.0, max_workers=1,
@@ -510,7 +530,8 @@ class TestBuildDrySeasonReferenceMask:
                 raise RuntimeError("Simulated worker failure")
             return arr_ok.copy(), 36
 
-        with patch("utils.sar._process_dry_worker", side_effect=_worker):
+        with _thread_pool_executor_patch(), \
+             patch("utils.sar._process_dry_worker", side_effect=_worker):
             result = build_dry_season_reference_mask(
                 items, bbox=[141, -17, 143, -15], resolution=50, max_workers=1,
             )
@@ -548,9 +569,10 @@ class TestAccumulation:
         return flood_count, obs_count
 
     def _make_scene(self, water_mask: np.ndarray, observed_mask: np.ndarray,
-                    shape=(10, 10)):
-        x = np.arange(shape[1], dtype=np.float64)
-        y = np.arange(shape[0], dtype=np.float64)
+                    shape=None):
+        H, W = water_mask.shape
+        x = np.arange(W, dtype=np.float64)
+        y = np.arange(H, dtype=np.float64)
         return xr.Dataset({
             "water":    xr.DataArray(water_mask.astype(bool),    dims=["y","x"],
                                      coords={"x": x, "y": y}),
