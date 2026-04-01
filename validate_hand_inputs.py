@@ -121,6 +121,7 @@ def check_tile_seams(tile_paths: list) -> dict:
 
     max_diff = 0.0
     checked = 0
+    worst_pair = ("", "")
 
     for i in range(len(tile_info)):
         p_a, b_a, nd_a = tile_info[i]
@@ -166,7 +167,9 @@ def check_tile_seams(tile_paths: list) -> dict:
                             np.isfinite(col_a) & np.isfinite(col_b)
                     if valid.sum() > 0:
                         diff = np.abs(col_a[valid] - col_b[valid]).max()
-                        max_diff = max(max_diff, float(diff))
+                        if diff > max_diff:
+                            max_diff = float(diff)
+                            worst_pair = (p_a.name, p_b.name)
                         checked += 1
             except Exception as exc:
                 logger.debug("Seam check failed for %s/%s: %s", p_a.name, p_b.name, exc)
@@ -175,11 +178,10 @@ def check_tile_seams(tile_paths: list) -> dict:
         return _result("Tile seam alignment", SKIP, "No geographically adjacent tile pairs found")
 
     ok = max_diff < 1.0
-    return _result(
-        "Tile seam alignment",
-        PASS if ok else FAIL,
-        f"Max boundary difference: {max_diff:.2f} m  (threshold: <1 m,  pairs checked: {checked})",
-    )
+    detail = f"Max boundary difference: {max_diff:.2f} m  (threshold: <1 m,  pairs checked: {checked})"
+    if not ok:
+        detail += f"  worst pair: {worst_pair[0]} / {worst_pair[1]}"
+    return _result("Tile seam alignment", PASS if ok else FAIL, detail)
 
 
 
