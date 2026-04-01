@@ -11,7 +11,8 @@ import argparse
 import sys
 from pathlib import Path
 
-REQUIRED_ASSETS = ["vv", "vh"]
+REQUIRED_ASSETS = ["vv", "vh", "safe-manifest", "schema-product-vv", "schema-product-vh",
+                   "schema-calibration-vv", "schema-calibration-vh", "schema-noise-vv", "schema-noise-vh"]
 
 
 def main() -> None:

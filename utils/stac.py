@@ -94,8 +94,11 @@ def filter_items_by_bbox(items: List[Any], bbox: List[float]) -> List[Any]:
     return result
 
 
-def rewrite_hrefs_to_local(items, local_root, bands):
-    """Replace S3/HTTPS asset hrefs with local file paths where files exist."""
+def rewrite_hrefs_to_local(items, local_root, bands=None):
+    """Replace S3/HTTPS asset hrefs with local file paths where files exist.
+
+    If bands is None, all assets are considered for rewriting.
+    """
     import copy
     import urllib.parse
     from pathlib import Path
@@ -104,7 +107,7 @@ def rewrite_hrefs_to_local(items, local_root, bands):
     for item in items:
         item = copy.deepcopy(item)
         for band, asset in item.assets.items():
-            if band not in bands:
+            if bands is not None and band not in bands:
                 continue
             parsed = urllib.parse.urlparse(asset.href)
             if parsed.scheme == "s3":

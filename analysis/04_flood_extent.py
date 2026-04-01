@@ -64,7 +64,7 @@ def main() -> None:
     if LOCAL_S1_ROOT:
         from utils.stac import rewrite_hrefs_to_local
         logger.info("Rewriting S1 asset hrefs to local cache: %s", LOCAL_S1_ROOT)
-        items = rewrite_hrefs_to_local(items, LOCAL_S1_ROOT, bands=["vv", "vh"])
+        items = rewrite_hrefs_to_local(items, LOCAL_S1_ROOT)
 
     n_workers = S1_MAX_WORKERS if PIPELINE_RUN else 1
     logger.info("Processing %d S1 scenes (workers=%d)", len(items), n_workers)
