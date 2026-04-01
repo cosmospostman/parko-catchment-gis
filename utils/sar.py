@@ -79,6 +79,37 @@ def _safe_root_from_item(item: Any) -> str:
     raise ValueError(f"Cannot determine SAFE root for item {item.id}")
 
 
+def _symlink_annotation_files(safe_root: str) -> None:
+    """Create symlinks from ESA long annotation names to S3 short names.
+
+    S3 stores annotation files as iw-vv.xml / iw-vh.xml, but sarsen resolves
+    filenames from manifest.safe which references the full ESA names like
+    s1a-iw-grd-vv-...-001.xml.  Create symlinks so sarsen can find them.
+    Only acts on local paths where manifest.safe exists.
+    """
+    import re
+    manifest_path = Path(safe_root) / "manifest.safe"
+    if not manifest_path.exists():
+        return
+    anno_dir = Path(safe_root) / "annotation"
+    manifest_text = manifest_path.read_text()
+    # Find all annotation XML hrefs that are direct children (not in subdirs)
+    for long_name in re.findall(r'href="\./annotation/([^/\"]+\.xml)"', manifest_text):
+        long_path = anno_dir / long_name
+        if long_path.exists():
+            continue
+        # Map to short S3 name: anything containing -vv- → iw-vv.xml, -vh- → iw-vh.xml
+        if "-vv-" in long_name:
+            short_path = anno_dir / "iw-vv.xml"
+        elif "-vh-" in long_name:
+            short_path = anno_dir / "iw-vh.xml"
+        else:
+            continue
+        if short_path.exists():
+            long_path.symlink_to(short_path.name)
+            logger.debug("Symlinked %s → %s", long_name, short_path.name)
+
+
 def _preprocess_with_sarsen(item: Any, bbox: list, resolution: int) -> xr.Dataset:
     """Terrain-corrected preprocessing using sarsen."""
     import sarsen
@@ -88,6 +119,7 @@ def _preprocess_with_sarsen(item: Any, bbox: list, resolution: int) -> xr.Datase
 
     safe_root = _safe_root_from_item(item)
     logger.debug("sarsen SAFE root: %s", safe_root)
+    _symlink_annotation_files(safe_root)
     dem = _dem_urlpath()
 
     bands = {}

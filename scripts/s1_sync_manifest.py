@@ -60,20 +60,12 @@ def main() -> None:
             if href.startswith("s3://"):
                 uris.append(href)
 
-        # Main annotation XMLs required by sarsen — not exposed as STAC assets.
-        # Filename is derived from the scene ID (all lowercase) with fixed slice
-        # numbers: VV=001, VH=002 for IW GRD dual-pol scenes.
+        # Main annotation XMLs required by sarsen.
         vv_asset = item.assets.get("vv")
         if vv_asset and vv_asset.href.startswith("s3://"):
             scene_root = vv_asset.href.rsplit("/measurement/", 1)[0]
-            # S1A_IW_GRDH_1SDV_20250527T195239_20250527T195304_059384_075EF7
-            # → s1a-iw-grd-{pol}-20250527t195239-20250527t195304-059384-075ef7-{slice}.xml
-            parts = item.id.lower().split("_")
-            # parts: [s1a, iw, grdh, 1sdv, start, stop, orbit, datatake]
-            sat, _, _, _, start, stop, orbit, datatake = parts[:8]
-            base = f"{sat}-iw-grd-{{pol}}-{start}-{stop}-{orbit}-{datatake}"
-            uris.append(f"{scene_root}/annotation/{base.format(pol='vv')}-001.xml")
-            uris.append(f"{scene_root}/annotation/{base.format(pol='vh')}-002.xml")
+            uris.append(f"{scene_root}/annotation/iw-vv.xml")
+            uris.append(f"{scene_root}/annotation/iw-vh.xml")
 
     # Deduplicate while preserving order
     seen: set[str] = set()
