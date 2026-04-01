@@ -16,9 +16,8 @@ Approach
 import logging
 import os
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
-import dask
 import geopandas as gpd
 import numpy as np
 import xarray as xr
@@ -37,6 +36,23 @@ logger = logging.getLogger(__name__)
 
 PIPELINE_RUN = os.environ.get("PIPELINE_RUN") == "1"
 LOCAL_S1_ROOT = os.environ.get("LOCAL_S1_ROOT", "")
+
+# Module-level cache so each worker process loads the mask at most once.
+_worker_reference_mask: np.ndarray | None = None
+_worker_mask_path: str = ""
+
+
+def _process_scene_worker(item, bbox, resolution, mask_path: str):
+    """Top-level worker function (picklable) for ProcessPoolExecutor."""
+    global _worker_reference_mask, _worker_mask_path
+    from utils.sar import flood_mask_from_scene
+    from utils.io import configure_logging
+    configure_logging()
+    if mask_path and mask_path != _worker_mask_path:
+        _worker_reference_mask = np.load(mask_path)
+        _worker_mask_path = mask_path
+    return flood_mask_from_scene(item, bbox=bbox, resolution=resolution,
+                                 reference_mask=_worker_reference_mask)
 
 
 def _sigma_to_db(arr: xr.DataArray) -> xr.DataArray:
@@ -119,20 +135,18 @@ def main() -> None:
 
     logger.info("Processing %d S1 scenes (workers=%d)", len(items), flood_workers)
 
-    def _process_scene(item):
-        return flood_mask_from_scene(
-            item,
-            bbox=bbox_wgs84,
-            resolution=S1_RESOLUTION,
-            reference_mask=reference_mask,
-        )
-
+    # Pass mask path rather than the array — avoids pickling 67 MB per worker.
+    # Workers load it once on first use via _process_scene_worker.
     flood_count = None   # uint16 count of scenes flagging each pixel as water
     obs_count   = None   # uint16 count of scenes observing each pixel (footprint)
     combined_coords = None
     completed = 0
-    with ThreadPoolExecutor(max_workers=flood_workers) as executor:
-        futures = {executor.submit(_process_scene, item): item for item in items}
+    mask_path_str = str(dry_mask_cache) if dry_mask_cache.exists() else ""
+    with ProcessPoolExecutor(max_workers=flood_workers) as executor:
+        futures = {
+            executor.submit(_process_scene_worker, item, bbox_wgs84, S1_RESOLUTION, mask_path_str): item
+            for item in items
+        }
         for future in as_completed(futures):
             item = futures[future]
             completed += 1

@@ -6,7 +6,7 @@ Isolated so tests can mock preprocess_s1_scene() without importing sarsen.
 import logging
 import os
 import tempfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -135,6 +135,22 @@ def flood_mask_from_scene(
     })
 
 
+def _process_dry_worker(item, bbox, resolution):
+    """Top-level worker function (picklable) for ProcessPoolExecutor."""
+    from utils.io import configure_logging
+    configure_logging()
+    ds = _preprocess_gcp_warp(item, bbox, resolution, polarisations=("VV",))
+    if "VV" not in ds:
+        return None
+    vv_lin = ds["VV"].values
+    observed = np.isfinite(vv_lin) & (vv_lin > 0)
+    if observed.sum() == 0:
+        return None
+    with np.errstate(divide="ignore", invalid="ignore"):
+        vv_db = np.where(observed, 10 * np.log10(vv_lin + 1e-12), np.nan)
+    return vv_db, int(observed.sum())
+
+
 def build_dry_season_reference_mask(
     items: list,
     bbox: list,
@@ -154,19 +170,6 @@ def build_dry_season_reference_mask(
     (EPSG:7855 at the requested resolution over bbox).
     """
     total = len(items)
-
-    def _process_dry(item):
-        ds = _preprocess_gcp_warp(item, bbox, resolution, polarisations=("VV",))
-        if "VV" not in ds:
-            return None
-        vv_lin = ds["VV"].values
-        observed = np.isfinite(vv_lin) & (vv_lin > 0)
-        if observed.sum() == 0:
-            return None
-        with np.errstate(divide="ignore", invalid="ignore"):
-            vv_db = np.where(observed, 10 * np.log10(vv_lin + 1e-12), np.nan)
-        return vv_db, observed.sum()
-
     ref_shape = None
     completed = 0
     # scene results buffered as (vv_db_float16, n_valid) until shape is known
@@ -188,8 +191,8 @@ def build_dry_season_reference_mask(
         logger.info("Dry-season reference: added %s (%d valid px) [%d/%d]",
                     item_id, n_valid, completed, total)
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_process_dry, item): item for item in items}
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_process_dry_worker, item, bbox, resolution): item for item in items}
         for future in as_completed(futures):
             item = futures[future]
             completed += 1
