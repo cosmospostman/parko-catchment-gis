@@ -22,6 +22,7 @@ FLOOD_UNION_SIMPLIFY_TOLERANCE = 100        # metres — coarser than pixel size
 DASK_CHUNK_SPATIAL = 2048
 S1_MAX_WORKERS = 4                          # concurrent S1 scene downloads
 S1_RESOLUTION = 50                          # metres — flood mapping doesn't need 10 m
+FLOOD_MIN_FREQUENCY = 0.10                  # pixel must be water in ≥10% of scenes
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +79,8 @@ def main() -> None:
             threshold_db=VV_OPEN_WATER_THRESHOLD_DB,
         )
 
-    combined = None
+    flood_count = None   # uint16 count of scenes flagging each pixel as water
+    scene_count = 0      # number of scenes successfully contributing
     combined_coords = None
     completed = 0
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
@@ -91,15 +93,16 @@ def main() -> None:
                 if mask is None:
                     continue
                 logger.info("S1 scene processed (%d/%d, %.1f%%): %s", completed, len(items), 100 * completed / len(items), item.id)
-                if combined is None:
-                    combined_coords = mask  # keep first DataArray for coords/quicklook
-                    combined = mask.values
+                if flood_count is None:
+                    combined_coords = mask
+                    flood_count = mask.values.astype(np.uint16)
                 else:
                     m = mask.values
-                    if m.shape == combined.shape:
-                        combined |= m
+                    if m.shape == flood_count.shape:
+                        flood_count += m.astype(np.uint16)
                     else:
                         logger.debug("Shape mismatch for %s — skipping", item.id)
+                scene_count += 1
             except Exception as exc:
                 msg = str(exc)
                 if "no spatial overlap" in msg or "no valid pixels" in msg or "zero-size" in msg:
@@ -107,8 +110,15 @@ def main() -> None:
                 else:
                     logger.warning("Failed to process S1 scene %s: %s", item.id, exc)
 
-    if combined is None:
+    if flood_count is None:
         raise RuntimeError("No valid S1 scenes processed")
+
+    # Pixels must be flooded in at least FLOOD_MIN_FREQUENCY fraction of scenes
+    min_scenes = max(1, int(scene_count * FLOOD_MIN_FREQUENCY))
+    logger.info("Flood frequency threshold: %d/%d scenes (%.0f%%)",
+                min_scenes, scene_count, FLOOD_MIN_FREQUENCY * 100)
+    combined = flood_count >= min_scenes
+    del flood_count
 
     # Vectorise flood mask to polygons
     logger.info("Vectorising flood extent...")
