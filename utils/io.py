@@ -43,27 +43,65 @@ def ensure_output_dirs(year: int) -> None:
 
 
 def write_cog(da: xr.DataArray, path: Path, nodata: float = np.nan) -> None:
-    """Write an xarray DataArray as a Cloud-Optimised GeoTIFF."""
+    """Write an xarray DataArray as a Cloud-Optimised GeoTIFF.
+
+    Uses windowed block writes so memory usage is bounded by block size
+    regardless of raster dimensions.
+    """
     import rasterio
+    from rasterio.transform import from_bounds
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    if nodata is not None:
-        da.attrs.pop("_FillValue", None)
-        da.encoding.pop("_FillValue", None)
-        da = da.rio.write_nodata(nodata)
-    da.rio.to_raster(
-        str(path),
+
+    # Normalise to 2-D (y, x)
+    arr = da
+    if arr.ndim == 3:
+        arr = arr.squeeze()
+
+    crs = da.rio.crs
+    left, bottom, right, top = da.rio.bounds()
+    height, width = arr.shape[-2], arr.shape[-1]
+    transform = from_bounds(left, bottom, right, top, width, height)
+    _nodata = nodata
+
+    BLOCK = 2048
+    profile = dict(
         driver="GTiff",
+        dtype="float32",
+        width=width,
+        height=height,
+        count=1,
+        crs=crs,
+        transform=transform,
         compress="deflate",
         predictor=2,
         tiled=True,
-        blockxsize=512,
-        blockysize=512,
+        blockxsize=BLOCK,
+        blockysize=BLOCK,
         BIGTIFF="YES",
+        nodata=_nodata,
     )
+
+    with rasterio.open(str(path), "w", **profile) as dst:
+        for row_off in range(0, height, BLOCK):
+            row_end = min(row_off + BLOCK, height)
+            for col_off in range(0, width, BLOCK):
+                col_end = min(col_off + BLOCK, width)
+                window = rasterio.windows.Window(col_off, row_off,
+                                                 col_end - col_off,
+                                                 row_end - row_off)
+                chunk = arr[..., row_off:row_end, col_off:col_end]
+                # Materialise dask chunk if needed
+                if hasattr(chunk, "compute"):
+                    chunk = chunk.compute()
+                data = np.asarray(chunk, dtype="float32")
+                if data.ndim == 2:
+                    data = data[np.newaxis]
+                dst.write(data, window=window)
+
     with rasterio.open(str(path), "r+") as dst:
         min_dim = min(dst.width, dst.height)
-        levels = [l for l in [2, 4, 8, 16, 32] if l < min_dim]
+        levels = [lv for lv in [2, 4, 8, 16, 32] if lv < min_dim]
         if levels:
             dst.build_overviews(levels, rasterio.enums.Resampling.average)
         dst.update_tags(ns="rio_overview", resampling="average")
