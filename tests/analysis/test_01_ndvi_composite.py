@@ -67,6 +67,7 @@ def test_tile_bboxes_and_merge_called_once(tmp_dirs, monkeypatch):
         del sys.modules["config"]
 
     dummy_item = MagicMock()
+    dummy_item.bbox = [141.0, -17.0, 143.0, -15.0]
     mock_search = MagicMock(return_value=[dummy_item])
     mock_tile_bboxes = MagicMock(return_value=[[141.0, -17.0, 143.0, -15.0]])
 
@@ -100,6 +101,7 @@ def test_output_has_correct_shape_and_crs(tmp_dirs, monkeypatch):
     import config
 
     dummy_item = MagicMock()
+    dummy_item.bbox = [141.0, -17.0, 143.0, -15.0]
 
     with patch("utils.stac.search_sentinel2", return_value=[dummy_item]), \
          patch("utils.stac.load_stackstac", _fake_load_stackstac), \

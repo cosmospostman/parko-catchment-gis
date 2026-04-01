@@ -60,6 +60,7 @@ def test_process_tile_called_once_per_tile(tmp_dirs, monkeypatch):
     import config
 
     dummy_item = MagicMock()
+    dummy_item.bbox = [141.0, -17.0, 143.0, -15.0]
 
     with patch("utils.stac.search_sentinel2", return_value=[dummy_item]), \
          patch("utils.stac.load_stackstac", _fake_load_stackstac), \
@@ -93,6 +94,7 @@ def test_output_has_correct_shape_and_crs(tmp_dirs, monkeypatch):
     import config
 
     dummy_item = MagicMock()
+    dummy_item.bbox = [141.0, -17.0, 143.0, -15.0]
 
     with patch("utils.stac.search_sentinel2", return_value=[dummy_item]), \
          patch("utils.stac.load_stackstac", _fake_load_stackstac), \
@@ -123,6 +125,7 @@ def test_output_values_in_valid_range(tmp_dirs, monkeypatch):
     import config
 
     dummy_item = MagicMock()
+    dummy_item.bbox = [141.0, -17.0, 143.0, -15.0]
 
     with patch("utils.stac.search_sentinel2", return_value=[dummy_item]), \
          patch("utils.stac.load_stackstac", _fake_load_stackstac), \
