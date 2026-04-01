@@ -5,6 +5,7 @@ Isolated so tests can mock preprocess_s1_scene() without importing sarsen.
 
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -138,6 +139,7 @@ def build_dry_season_reference_mask(
     bbox: list,
     resolution: int,
     low_backscatter_threshold_db: float = -16.0,
+    max_workers: int = 1,
 ) -> np.ndarray | None:
     """Build a boolean mask of persistently low-backscatter pixels from dry-season scenes.
 
@@ -150,37 +152,54 @@ def build_dry_season_reference_mask(
     processed.  The array is in the same grid as the flood-season outputs
     (EPSG:7855 at the requested resolution over bbox).
     """
-    vv_stack = []
-    shape = None
+    total = len(items)
 
-    for item in items:
-        try:
-            ds = _preprocess_gcp_warp(item, bbox, resolution)
-        except Exception as exc:
-            logger.warning("Dry-season scene %s failed: %s", item.id, exc)
-            continue
-
+    def _process_dry(item):
+        ds = _preprocess_gcp_warp(item, bbox, resolution)
         if "VV" not in ds:
-            continue
-
+            return None
         vv_lin = ds["VV"].values
         observed = np.isfinite(vv_lin) & (vv_lin > 0)
         if observed.sum() == 0:
-            continue
-
+            return None
         with np.errstate(divide="ignore", invalid="ignore"):
             vv_db = np.where(observed, 10 * np.log10(vv_lin + 1e-12), np.nan)
+        return vv_db, observed.sum()
 
-        if shape is None:
-            shape = vv_db.shape
-        if vv_db.shape == shape:
-            vv_stack.append(vv_db)
-            logger.info("Dry-season reference: added %s (%d valid px)", item.id, observed.sum())
+    vv_stack = []
+    ref_shape = None
+    completed = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_process_dry, item): item for item in items}
+        for future in as_completed(futures):
+            item = futures[future]
+            completed += 1
+            try:
+                result = future.result()
+                if result is None:
+                    logger.debug("Dry-season scene %s: no valid pixels — skipped (%d/%d)",
+                                 item.id, completed, total)
+                    continue
+                vv_db, n_valid = result
+                if ref_shape is None:
+                    ref_shape = vv_db.shape
+                if vv_db.shape == ref_shape:
+                    vv_stack.append(vv_db)
+                    logger.info("Dry-season reference: added %s (%d valid px) [%d/%d]",
+                                item.id, n_valid, completed, total)
+                else:
+                    logger.debug("Dry-season scene %s: shape mismatch — skipped (%d/%d)",
+                                 item.id, completed, total)
+            except Exception as exc:
+                logger.warning("Dry-season scene %s failed (%d/%d): %s",
+                               item.id, completed, total, exc)
 
     if not vv_stack:
         logger.warning("No dry-season scenes processed — reference mask unavailable")
         return None
 
+    logger.info("Computing reference mask median from %d scenes...", len(vv_stack))
     median_vv = np.nanmedian(np.stack(vv_stack, axis=0), axis=0)
     mask = (median_vv < low_backscatter_threshold_db) & np.isfinite(median_vv)
     logger.info("Dry-season reference mask: %d / %d pixels flagged (%.1f%%)",
@@ -268,17 +287,24 @@ def _preprocess_gcp_warp(item: Any, bbox: list, resolution: int) -> xr.Dataset:
         gcp_cols = np.array([g.col for g in gcps])
         gcp_rows = np.array([g.row for g in gcps])
 
-        # Find GCPs inside (or near) the bbox with a small margin
-        margin = 0.5  # degrees
-        mask_near = (
+        # Find GCPs strictly inside the bbox first; if none, widen to a small margin.
+        # Using a tight window first minimises the read size for large scenes that
+        # only partially overlap the catchment.
+        mask_strict = (
+            (gcp_lons >= minx) & (gcp_lons <= maxx) &
+            (gcp_lats >= miny) & (gcp_lats <= maxy)
+        )
+        margin = 0.5  # degrees — fallback search radius
+        mask_near = mask_strict | (
             (gcp_lons >= minx - margin) & (gcp_lons <= maxx + margin) &
             (gcp_lats >= miny - margin) & (gcp_lats <= maxy + margin)
         )
         if mask_near.any():
-            col_min = max(0, int(gcp_cols[mask_near].min()) - 100)
-            col_max = int(gcp_cols[mask_near].max()) + 100
-            row_min = max(0, int(gcp_rows[mask_near].min()) - 100)
-            row_max = int(gcp_rows[mask_near].max()) + 100
+            # Pad by 200 px to avoid clipping edge pixels after GCP reprojection
+            col_min = max(0, int(gcp_cols[mask_near].min()) - 200)
+            col_max = int(gcp_cols[mask_near].max()) + 200
+            row_min = max(0, int(gcp_rows[mask_near].min()) - 200)
+            row_max = int(gcp_rows[mask_near].max()) + 200
         else:
             # bbox may not overlap this scene — fall back to full read and let
             # the warp produce an empty result

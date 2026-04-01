@@ -59,6 +59,7 @@ def main() -> None:
 
     flood_start = f"{config.YEAR}-{config.FLOOD_SEASON_START}"
     flood_end   = f"{config.YEAR}-{config.FLOOD_SEASON_END}"
+    n_workers = S1_MAX_WORKERS if PIPELINE_RUN else 1
 
     # --- Dry-season reference mask (Oct–Nov of prior year) -------------------
     dry_start = f"{config.YEAR}-10-01"
@@ -77,11 +78,13 @@ def main() -> None:
 
     reference_mask = None
     if dry_items:
-        logger.info("Building dry-season reference mask from %d scenes", len(dry_items))
+        logger.info("Building dry-season reference mask from %d scenes (workers=%d)",
+                    len(dry_items), n_workers)
         reference_mask = build_dry_season_reference_mask(
             dry_items,
             bbox=bbox_wgs84,
             resolution=S1_RESOLUTION,
+            max_workers=n_workers,
         )
     else:
         logger.warning("No dry-season S1 items found; sodic-scald masking will be skipped")
@@ -103,7 +106,6 @@ def main() -> None:
         logger.info("Rewriting S1 asset hrefs to local cache: %s", LOCAL_S1_ROOT)
         items = rewrite_hrefs_to_local(items, LOCAL_S1_ROOT)
 
-    n_workers = S1_MAX_WORKERS if PIPELINE_RUN else 1
     logger.info("Processing %d S1 scenes (workers=%d)", len(items), n_workers)
 
     def _process_scene(item):
