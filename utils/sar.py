@@ -128,19 +128,13 @@ def flood_mask_from_scene(
     # Sanity check: if Otsu classified an implausibly large fraction of the
     # scene as water the histogram was likely unimodal (dry scene) and Otsu
     # split within the land distribution.  Discard the scene in that case.
-    # 40% is generous — the Mitchell megafan at peak flood is ~15–20% water.
+    # 65% allows for large inundation events on the Mitchell megafan while
+    # still catching unimodal-histogram failures (which typically push >80%).
     water_fraction = water.sum() / max(observed.sum(), 1)
-    if water_fraction > 0.40:
+    if water_fraction > 0.65:
         logger.info("Scene %s discarded — water fraction %.1f%% exceeds sanity limit",
                     item.id, 100 * water_fraction)
         return None
-
-    # VH is not used for thresholding — in this dataset the DN²/1e6
-    # normalisation compresses the VH dynamic range so that water and land
-    # have nearly identical dB values, making any VH threshold unreliable.
-    # Water classification relies solely on VV Otsu + the water-fraction guard.
-    if vh_lin is not None:
-        del vh_lin
 
     # Exclude pixels that are persistently low-backscatter in the dry season
     if reference_mask is not None and reference_mask.shape == water.shape:
