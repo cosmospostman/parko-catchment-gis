@@ -29,11 +29,16 @@ logger = logging.getLogger(__name__)
 
 
 def fetch_all(species: str, bbox: list) -> gpd.GeoDataFrame:
-    """Fetch all occurrence records within bbox, paginating through results."""
+    """Fetch all occurrence records within bbox, paginating through results.
+
+    Uses fq (filter query) for spatial filtering — the bbox parameter is not
+    reliably applied by the ALA biocache API.
+    """
     # bbox: [minx, miny, maxx, maxy] in WGS84
+    minx, miny, maxx, maxy = bbox
     params = {
         "q": f'taxon_name:"{species}"',
-        "bbox": f"{bbox[1]},{bbox[0]},{bbox[3]},{bbox[2]}",  # miny,minx,maxy,maxx
+        "fq": f"decimalLongitude:[{minx} TO {maxx}] AND decimalLatitude:[{miny} TO {maxy}]",
         "pageSize": PAGE_SIZE,
         "fl": "decimalLongitude,decimalLatitude",
         "startIndex": 0,
@@ -43,7 +48,7 @@ def fetch_all(species: str, bbox: list) -> gpd.GeoDataFrame:
     probe = requests.get(ALA_BIOCACHE_URL, params={**params, "pageSize": 0}, timeout=30)
     probe.raise_for_status()
     total = probe.json().get("totalRecords", 0)
-    logger.info("Total ALA records for '%s' in bbox: %d", species, total)
+    logger.info("Total ALA records for '%s' in catchment bbox: %d", species, total)
 
     if total == 0:
         logger.warning("No records found — check species name and catchment bbox")
@@ -63,7 +68,7 @@ def fetch_all(species: str, bbox: list) -> gpd.GeoDataFrame:
         if not page:
             break
         records.extend(page)
-        start += params["pageSize"]  # advance by requested size, not returned size
+        start += params["pageSize"]
         logger.info("  fetched %d / %d", min(len(records), to_fetch), to_fetch)
 
     df = pd.DataFrame(records)
@@ -94,12 +99,8 @@ def main() -> None:
 
     gdf = fetch_all(config.ALA_SPECIES_QUERY, bbox)
 
-    # Clip to catchment polygon (not just bbox) — ensure matching CRS
-    gdf_clipped = gpd.clip(gdf.to_crs("EPSG:4326"), catchment.to_crs("EPSG:4326"))
-    logger.info("Records within catchment boundary: %d", len(gdf_clipped))
-
     out_path = Path(config.CACHE_DIR) / "ala_occurrences.gpkg"
-    gdf_clipped.to_file(out_path, driver="GPKG")
+    gdf.to_file(out_path, driver="GPKG")
     logger.info("Written: %s", out_path)
 
 
