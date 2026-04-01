@@ -238,15 +238,9 @@ def _build_baseline(bbox, config) -> xr.DataArray:
         baseline = baseline.squeeze()
     baseline = baseline.rio.write_crs(config.TARGET_CRS)
 
-    for p in valid_paths:
-        p.unlink(missing_ok=True)
-    merged_path.unlink(missing_ok=True)
-    try:
-        scratch_dir.rmdir()
-    except OSError:
-        pass
-
-    return baseline
+    # Scratch tiles are cleaned up by main() after a successful write so that
+    # a write failure leaves the tiles intact for recovery on the next run.
+    return baseline, valid_paths, merged_path, scratch_dir
 
 
 def main() -> None:
@@ -281,7 +275,7 @@ def main() -> None:
             rebuild = True
 
     if rebuild or not baseline_path.exists():
-        baseline = _build_baseline(bbox, config)
+        baseline, _tile_paths, _merged_path, _scratch_dir = _build_baseline(bbox, config)
         baseline_path.parent.mkdir(parents=True, exist_ok=True)
         write_cog(baseline, baseline_path)
         with rasterio.open(str(baseline_path), "r+") as dst:
@@ -289,6 +283,13 @@ def main() -> None:
                 IMAGEDESCRIPTION=f"NDVI_BASELINE:{config.BASELINE_START_YEAR}-{config.YEAR - 1}"
             )
         logger.info("Baseline written: %s", baseline_path)
+        for p in _tile_paths:
+            p.unlink(missing_ok=True)
+        _merged_path.unlink(missing_ok=True)
+        try:
+            _scratch_dir.rmdir()
+        except OSError:
+            pass
     else:
         baseline = read_raster(baseline_path)
         if baseline.ndim == 3:

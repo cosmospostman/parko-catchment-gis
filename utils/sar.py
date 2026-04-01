@@ -4,6 +4,7 @@ Isolated so tests can mock preprocess_s1_scene() without importing sarsen.
 """
 
 import logging
+import os
 from pathlib import Path
 from typing import Any, Optional
 
@@ -11,6 +12,8 @@ import numpy as np
 import xarray as xr
 
 logger = logging.getLogger(__name__)
+
+LOCAL_DEM_PATH = os.environ.get("LOCAL_DEM_PATH", "")
 
 
 def preprocess_s1_scene(
@@ -45,6 +48,17 @@ _COP_DEM_VRT = (
 )
 
 
+def _dem_urlpath() -> str:
+    """Return the DEM path to use: local EBS cache if set, else remote VRT."""
+    if LOCAL_DEM_PATH and Path(LOCAL_DEM_PATH).exists():
+        return LOCAL_DEM_PATH
+    logger.warning(
+        "LOCAL_DEM_PATH not set or not found — fetching COP-DEM tiles from S3 "
+        "(set LOCAL_DEM_PATH to avoid ~200 MB/scene download overhead)"
+    )
+    return _COP_DEM_VRT
+
+
 def _safe_root_from_item(item: Any) -> str:
     """Return the SAFE root URL/path from a pystac Item.
 
@@ -71,6 +85,7 @@ def _preprocess_with_sarsen(item: Any, bbox: list, resolution: int) -> xr.Datase
 
     safe_root = _safe_root_from_item(item)
     logger.debug("sarsen SAFE root: %s", safe_root)
+    dem = _dem_urlpath()
 
     bands = {}
     for pol in ("VV", "VH"):
@@ -80,7 +95,7 @@ def _preprocess_with_sarsen(item: Any, bbox: list, resolution: int) -> xr.Datase
         )
         da = sarsen.terrain_correction(
             product,
-            dem_urlpath=_COP_DEM_VRT,
+            dem_urlpath=dem,
             output_urlpath=None,
             correct_radiometry="gamma_nearest",
         )
