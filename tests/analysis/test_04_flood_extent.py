@@ -969,7 +969,11 @@ class TestVHGuardScientificContracts:
 
 
 class TestSanityGuardScientificContracts:
-    """The 30% water-fraction guard must fire on dry scenes and not on flooded ones."""
+    """The VV-only water-fraction guard (40%) must fire on dry scenes and not on flooded ones.
+
+    The guard is evaluated on the VV Otsu result *before* the VH guard, so that a
+    unimodal VV failure is caught even when the VH guard would otherwise mask it.
+    """
 
     def _patch_warp(self, ds):
         return patch("utils.sar._preprocess_gcp_warp", return_value=ds)

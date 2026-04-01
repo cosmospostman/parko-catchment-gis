@@ -127,6 +127,18 @@ def flood_mask_from_scene(
     water = observed & (vv_db < otsu_vv)
     del vv_db
 
+    # Sanity check on VV-only water fraction: if Otsu classified an implausibly
+    # large fraction of the scene as water the VV histogram was likely unimodal
+    # (dry scene) and Otsu split within the land distribution.  Check this
+    # *before* the VH guard — the VH guard can mask a bad Otsu by stripping out
+    # the false water, hiding the unimodal failure from the downstream check.
+    # 40% allows for large inundation events on the Mitchell megafan.
+    vv_water_fraction = water.sum() / max(observed.sum(), 1)
+    if vv_water_fraction > 0.40:
+        logger.info("Scene %s discarded — VV water fraction %.1f%% exceeds sanity limit (40%%)",
+                    item.id, 100 * vv_water_fraction)
+        return None
+
     # VH guard: open water has VH backscatter below a known physical threshold
     # (~-20 dB for calm water at C-band IW).  Wind-roughened surfaces and dry
     # scalds that produce anomalously low VV typically retain VH above -20 dB,
@@ -149,17 +161,6 @@ def flood_mask_from_scene(
         logger.info("VH guard applied at %.1f dB: %d water pixels remain",
                     VH_WATER_THRESHOLD_DB, water.sum())
         del vh_db, vh_observed
-
-    # Sanity check: if Otsu classified an implausibly large fraction of the
-    # scene as water the histogram was likely unimodal (dry scene) and Otsu
-    # split within the land distribution.  Discard the scene in that case.
-    # 40% allows for large inundation events on the Mitchell megafan while
-    # the VH guard handles per-pixel false positives.
-    water_fraction = water.sum() / max(observed.sum(), 1)
-    if water_fraction > 0.40:
-        logger.info("Scene %s discarded — water fraction %.1f%% exceeds sanity limit (40%%)",
-                    item.id, 100 * water_fraction)
-        return None
 
     # Exclude pixels that are persistently low-backscatter in the dry season
     if reference_mask is not None and reference_mask.shape == water.shape:
