@@ -323,7 +323,7 @@ def compute_hand(
     accum = grid.accumulation(fdir)
 
     # Build stream mask from accumulation threshold – must be a pysheds Raster
-    from pysheds.raster import Raster as PyshedsRaster
+    from pysheds.sview import Raster as PyshedsRaster
     stream_mask = PyshedsRaster(
         (np.array(accum) >= min_upstream_px),
         viewfinder=accum.viewfinder,
