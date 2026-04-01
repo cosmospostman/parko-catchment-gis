@@ -56,19 +56,24 @@ def _otsu_threshold(values: np.ndarray, n_bins: int = 512) -> float:
 
 
 def _focal_median(arr: np.ndarray, radius: int = 1) -> np.ndarray:
-    """Apply a (2*radius+1) × (2*radius+1) median speckle filter.
+    """Apply a (2*radius+1) × (2*radius+1) mean speckle filter.
 
-    NaN pixels are temporarily replaced with the array median before filtering
+    Uses uniform_filter (box mean) rather than median_filter. At 3×3 on
+    multi-looked S1 GRD data the smoothing effect is equivalent for flood
+    thresholding purposes, and uniform_filter runs in O(n) memory vs the
+    O(n×kernel) working buffers that median_filter allocates internally.
+
+    NaN pixels are temporarily replaced with the array mean before filtering
     so they don't contaminate neighbours, then restored after.
     """
-    from scipy.ndimage import median_filter
+    from scipy.ndimage import uniform_filter
     size = 2 * radius + 1
     nan_mask = ~np.isfinite(arr)
     if nan_mask.any():
-        fill = float(np.nanmedian(arr))
+        fill = float(np.nanmean(arr))
         arr = arr.copy()
         arr[nan_mask] = fill
-    result = median_filter(arr, size=size, mode="reflect").astype(np.float32)
+    result = uniform_filter(arr, size=size, mode="reflect").astype(np.float32)
     result[nan_mask] = np.nan
     return result
 
