@@ -170,9 +170,6 @@ def main() -> None:
             future = next(as_completed(in_flight))
             item = in_flight.pop(future)
             completed += 1
-            # Submit the next item before processing the result so the worker
-            # that just freed up starts immediately, but only one at a time.
-            _submit_next()
             try:
                 scene = future.result()
                 if scene is None:
@@ -207,6 +204,9 @@ def main() -> None:
                 else:
                     logger.warning("Flood scene failed [%d/%d]: %s: %s",
                                    completed, len(items), item.id, exc)
+            # Submit the next job only after the result has been consumed and
+            # its arrays freed — ensures at most flood_workers scenes in memory.
+            _submit_next()
 
     if flood_count is None:
         raise RuntimeError("No valid S1 scenes processed")
