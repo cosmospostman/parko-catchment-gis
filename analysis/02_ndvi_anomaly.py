@@ -20,6 +20,7 @@ from typing import List, Optional
 import geopandas as gpd
 import numpy as np
 import rasterio
+import rioxarray
 from rasterio.enums import Resampling
 import xarray as xr
 
@@ -291,7 +292,7 @@ def main() -> None:
         except OSError:
             pass
     else:
-        baseline = read_raster(baseline_path)
+        baseline = rioxarray.open_rasterio(str(baseline_path), masked=True, chunks={"x": 2048, "y": 2048})
         if baseline.ndim == 3:
             baseline = baseline.squeeze()
 
@@ -299,7 +300,7 @@ def main() -> None:
     ndvi_path = config.ndvi_median_path(config.YEAR)
     if not ndvi_path.exists():
         raise FileNotFoundError(f"Step 01 output not found: {ndvi_path}")
-    ndvi_current = read_raster(ndvi_path)
+    ndvi_current = rioxarray.open_rasterio(str(ndvi_path), masked=True, chunks={"x": 2048, "y": 2048})
     if ndvi_current.ndim == 3:
         ndvi_current = ndvi_current.squeeze()
 
