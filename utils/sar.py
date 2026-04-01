@@ -96,6 +96,12 @@ def flood_mask_from_scene(
         return None
 
     vv_lin = ds["VV"].values  # linear sigma-naught proxy
+    has_vh = "VH" in ds
+    vh_lin = ds["VH"].values if has_vh else None
+    x_coords = ds["VV"].coords["x"].values
+    y_coords = ds["VV"].coords["y"].values
+    del ds  # release the xr.Dataset before allocating filter/dB arrays
+
     observed = np.isfinite(vv_lin) & (vv_lin > 0)
 
     if observed.sum() == 0:
@@ -103,9 +109,11 @@ def flood_mask_from_scene(
 
     # Speckle filter (3×3 median) on linear values before dB conversion
     vv_filt = _focal_median(np.where(observed, vv_lin, np.nan), radius=1)
+    del vv_lin
 
     with np.errstate(divide="ignore", invalid="ignore"):
         vv_db = 10 * np.log10(vv_filt + 1e-12)
+    del vv_filt
 
     # Per-scene Otsu threshold on VV dB values within the observed footprint
     vv_valid = vv_db[observed]
@@ -115,31 +123,29 @@ def flood_mask_from_scene(
     logger.info("Otsu VV threshold for %s: %.1f dB", item.id, otsu_vv)
 
     water = observed & (vv_db < otsu_vv)
+    del vv_db
 
     # VH guard — require VH also below its Otsu threshold
-    if "VH" in ds:
-        vh_lin = ds["VH"].values
+    if vh_lin is not None:
         vh_filt = _focal_median(np.where(observed, vh_lin, np.nan), radius=1)
+        del vh_lin
         with np.errstate(divide="ignore", invalid="ignore"):
             vh_db = 10 * np.log10(vh_filt + 1e-12)
+        del vh_filt
         vh_valid = vh_db[observed]
         if vh_valid.size >= 100:
             otsu_vh = _otsu_threshold(vh_valid)
             logger.info("Otsu VH threshold for %s: %.1f dB", item.id, otsu_vh)
             water = water & (vh_db < otsu_vh)
-        del vh_lin, vh_filt, vh_db
+        del vh_db
 
     # Exclude pixels that are persistently low-backscatter in the dry season
     if reference_mask is not None and reference_mask.shape == water.shape:
         water = water & ~reference_mask
 
-    del vv_lin, vv_filt, vv_db
-
     logger.info("Water pixels %s: %d / %d observed (%.1f%%)",
                 item.id, water.sum(), observed.sum(), 100 * water.sum() / max(observed.sum(), 1))
 
-    x_coords = ds["VV"].coords["x"].values
-    y_coords = ds["VV"].coords["y"].values
     return xr.Dataset({
         "water":    xr.DataArray(water,    dims=["y", "x"], coords={"x": x_coords, "y": y_coords}),
         "observed": xr.DataArray(observed, dims=["y", "x"], coords={"x": x_coords, "y": y_coords}),
