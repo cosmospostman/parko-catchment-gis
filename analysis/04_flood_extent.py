@@ -18,7 +18,7 @@ from shapely.ops import unary_union
 # Script-level constants
 S1_POLARISATIONS = ["VV", "VH"]
 VV_OPEN_WATER_THRESHOLD_DB = -14.0          # dB — below this = open water
-FLOOD_UNION_SIMPLIFY_TOLERANCE = 20         # metres
+FLOOD_UNION_SIMPLIFY_TOLERANCE = 100        # metres — coarser than pixel size (50 m) is fine
 DASK_CHUNK_SPATIAL = 2048
 S1_MAX_WORKERS = 4                          # concurrent S1 scene downloads
 S1_RESOLUTION = 50                          # metres — flood mapping doesn't need 10 m
@@ -114,8 +114,8 @@ def main() -> None:
     logger.info("Vectorising flood extent...")
     import rasterio.features
     import rasterio.transform
+    from scipy.ndimage import binary_closing
 
-    data = combined.astype(np.uint8)
     # Build affine transform from the reference DataArray coordinates
     import affine
     x = combined_coords.coords["x"].values
@@ -123,6 +123,13 @@ def main() -> None:
     res_x = float(x[1] - x[0]) if len(x) > 1 else config.TARGET_RESOLUTION
     res_y = float(y[1] - y[0]) if len(y) > 1 else -config.TARGET_RESOLUTION
     transform = affine.Affine(res_x, 0, float(x[0]), 0, res_y, float(y[0]))
+
+    # Morphological closing merges nearby blobs at raster stage, drastically
+    # reducing polygon count before vectorisation and unary_union.
+    CLOSING_RADIUS_PX = 3  # 3 px × 50 m = 150 m closing radius
+    struct = np.ones((CLOSING_RADIUS_PX * 2 + 1, CLOSING_RADIUS_PX * 2 + 1), dtype=bool)
+    data = binary_closing(combined, structure=struct).astype(np.uint8)
+    logger.info("Morphological closing done; flood pixels: %d", data.sum())
 
     shapes = list(
         rasterio.features.shapes(data, mask=data, transform=transform)
