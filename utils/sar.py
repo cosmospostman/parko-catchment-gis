@@ -68,23 +68,62 @@ def flood_mask_from_scene(
     dst_height = max(1, int((dst_bounds[3] - dst_bounds[1]) / resolution))
     dst_transform = rasterio.transform.from_bounds(*dst_bounds, dst_width, dst_height)
 
-    # Read source in chunks, warp to temp file on disk to avoid holding two
-    # large float32 arrays in memory simultaneously.
-    import tempfile
+    # Use GCPs to find the source pixel window covering the bbox — avoids reading
+    # the full ~16k×26k swath (~1.6 GB float32) when only a subset is needed.
+    gcp_lons = np.array([g.x for g in gcps])
+    gcp_lats = np.array([g.y for g in gcps])
+    gcp_cols = np.array([g.col for g in gcps])
+    gcp_rows = np.array([g.row for g in gcps])
+
+    margin = 0.5  # degrees
+    mask_near = (
+        (gcp_lons >= minx - margin) & (gcp_lons <= maxx + margin) &
+        (gcp_lats >= miny - margin) & (gcp_lats <= maxy + margin)
+    )
+
     with rasterio.open(meas_asset.href) as src:
-        src_width, src_height = src.width, src.height
+        full_width, full_height = src.width, src.height
+
+    if mask_near.any():
+        col_min = max(0, int(gcp_cols[mask_near].min()) - 100)
+        col_max = min(full_width,  int(gcp_cols[mask_near].max()) + 100)
+        row_min = max(0, int(gcp_rows[mask_near].min()) - 100)
+        row_max = min(full_height, int(gcp_rows[mask_near].max()) + 100)
+    else:
+        col_min, row_min = 0, 0
+        col_max, row_max = full_width, full_height
+
+    window = rasterio.windows.Window(
+        col_off=col_min, row_off=row_min,
+        width=col_max - col_min, height=row_max - row_min,
+    )
+    with rasterio.open(meas_asset.href) as src:
+        window = window.intersection(rasterio.windows.Window(0, 0, src.width, src.height))
+        src_data = src.read(1, window=window).astype(np.float32)
+        win_col_off = int(window.col_off)
+        win_row_off = int(window.row_off)
+
+    win_height, win_width = src_data.shape
+    logger.info("Windowed read %s VV: %dx%d px (%.1f MB)",
+                item.id, win_width, win_height, win_width * win_height * 4 / 1e6)
+
+    # Adjust GCP coordinates to be relative to the window
+    windowed_gcps = [
+        rasterio.control.GroundControlPoint(
+            row=g.row - win_row_off, col=g.col - win_col_off,
+            x=g.x, y=g.y, z=g.z,
+        )
+        for g in gcps
+    ]
 
     dst_data = np.empty((dst_height, dst_width), dtype=np.float32)
 
     with rasterio.io.MemoryFile() as memfile:
-        # Read and immediately write into MemoryFile; src array freed after block
-        with rasterio.open(meas_asset.href) as src:
-            src_data = src.read(1).astype(np.float32)
         with memfile.open(driver="GTiff", count=1, dtype="float32",
-                          width=src_width, height=src_height) as mem_ds:
+                          width=win_width, height=win_height) as mem_ds:
             mem_ds.write(src_data, 1)
-            mem_ds.gcps = (gcps, src_crs)
-            del src_data  # free before warp allocates dst
+            mem_ds.gcps = (windowed_gcps, src_crs)
+            del src_data
             rasterio.warp.reproject(
                 source=rasterio.band(mem_ds, 1),
                 destination=dst_data,
@@ -93,6 +132,7 @@ def flood_mask_from_scene(
                 resampling=rasterio.warp.Resampling.bilinear,
                 src_nodata=0,
                 dst_nodata=np.nan,
+                num_threads=1,
             )
 
     logger.info("Warped %s VV: %dx%d px (%.0f MB)",
@@ -249,6 +289,7 @@ def _preprocess_gcp_warp(item: Any, bbox: list, resolution: int) -> xr.Dataset:
                     resampling=rasterio.warp.Resampling.bilinear,
                     src_nodata=0,
                     dst_nodata=np.nan,
+                    num_threads=1,
                 )
 
         # Convert DN to sigma-naught linear scale (S1 GRD: sigma0 = (DN^2) / cal_factor)
