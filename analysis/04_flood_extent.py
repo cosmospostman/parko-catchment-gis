@@ -21,6 +21,7 @@ VV_OPEN_WATER_THRESHOLD_DB = -14.0          # dB — below this = open water
 FLOOD_UNION_SIMPLIFY_TOLERANCE = 20         # metres
 DASK_CHUNK_SPATIAL = 2048
 S1_MAX_WORKERS = 2                          # concurrent S1 scene downloads
+S1_RESOLUTION = 50                          # metres — flood mapping doesn't need 10 m
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +74,7 @@ def main() -> None:
         return flood_mask_from_scene(
             item,
             bbox=bbox_wgs84,
-            resolution=config.TARGET_RESOLUTION,
+            resolution=S1_RESOLUTION,
             threshold_db=VV_OPEN_WATER_THRESHOLD_DB,
         )
 
