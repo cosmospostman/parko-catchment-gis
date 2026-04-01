@@ -89,14 +89,12 @@ def flood_mask_from_scene(
     If reference_mask is provided (True = persistent low-backscatter non-water),
     those pixels are excluded from the water classification.
     """
-    ds = _preprocess_gcp_warp(item, bbox, resolution)
+    ds = _preprocess_gcp_warp(item, bbox, resolution, polarisations=("VV",))
 
     if "VV" not in ds:
         return None
 
     vv_lin = ds["VV"].values  # linear sigma-naught proxy
-    has_vh = "VH" in ds
-    vh_lin = ds["VH"].values if has_vh else None
     x_coords = ds["VV"].coords["x"].values
     y_coords = ds["VV"].coords["y"].values
     del ds  # release the xr.Dataset before allocating filter/dB arrays
@@ -137,33 +135,12 @@ def flood_mask_from_scene(
                     item.id, 100 * water_fraction)
         return None
 
-    # VH guard — require VH also below its Otsu threshold, clamped to the
-    # scene median so it cannot split within the water distribution.
-    # On wet scenes the VH histogram is bimodal (water low, land high) and
-    # Otsu finds the correct valley. On dry scenes the histogram is unimodal
-    # and Otsu would land somewhere in the middle of the land distribution;
-    # clamping to the median ensures the threshold stays at or below the
-    # typical scene brightness, so genuine water pixels (which are darker
-    # than median) are retained rather than eliminated.
+    # VH is not used for thresholding — in this dataset the DN²/1e6
+    # normalisation compresses the VH dynamic range so that water and land
+    # have nearly identical dB values, making any VH threshold unreliable.
+    # Water classification relies solely on VV Otsu + the water-fraction guard.
     if vh_lin is not None:
-        vh_nan = ~observed
-        vh_lin[vh_nan] = np.nan
-        _focal_mean_inplace(vh_lin, vh_nan, radius=1)
-        del vh_nan
-        with np.errstate(divide="ignore", invalid="ignore"):
-            np.log10(vh_lin + 1e-12, out=vh_lin)
-            vh_lin *= 10
-        vh_db = vh_lin
         del vh_lin
-        vh_valid = vh_db[observed]
-        if vh_valid.size >= 100:
-            otsu_vh = _otsu_threshold(vh_valid)
-            vh_median = float(np.median(vh_valid))
-            vh_threshold = min(otsu_vh, vh_median)
-            logger.info("VH guard for %s: Otsu=%.1f dB  median=%.1f dB  threshold=%.1f dB",
-                        item.id, otsu_vh, vh_median, vh_threshold)
-            water = water & (vh_db < vh_threshold)
-        del vh_db
 
     # Exclude pixels that are persistently low-backscatter in the dry season
     if reference_mask is not None and reference_mask.shape == water.shape:
