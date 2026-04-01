@@ -127,10 +127,13 @@ def flood_mask_from_scene(
     water = observed & (vv_db < otsu_vv)
     del vv_db
 
-    # VH guard: true water has low backscatter in both VV and VH.
-    # Wind-roughened surfaces and dry scalds often have anomalously low VV
-    # but retain higher VH, so requiring VH < Otsu(VH) suppresses those
-    # false positives.
+    # VH guard: open water has VH backscatter below a known physical threshold
+    # (~-20 dB for calm water at C-band IW).  Wind-roughened surfaces and dry
+    # scalds that produce anomalously low VV typically retain VH above -20 dB,
+    # so this fixed threshold cleanly separates them from true water without
+    # needing Otsu (which would be unreliable on VH when water is a small
+    # fraction of the scene).
+    VH_WATER_THRESHOLD_DB = -20.0
     if vh_lin is not None:
         vh_observed = np.isfinite(vh_lin) & (vh_lin > 0)
         vh_nan = ~vh_observed
@@ -142,21 +145,19 @@ def flood_mask_from_scene(
             vh_lin *= 10
         vh_db = vh_lin
         del vh_lin
-        vh_valid = vh_db[vh_observed & observed]
-        if vh_valid.size >= 100:
-            otsu_vh = _otsu_threshold(vh_valid)
-            logger.info("Otsu VH threshold for %s: %.1f dB", item.id, otsu_vh)
-            water = water & (vh_db < otsu_vh)
+        water = water & (vh_db < VH_WATER_THRESHOLD_DB)
+        logger.info("VH guard applied at %.1f dB: %d water pixels remain",
+                    VH_WATER_THRESHOLD_DB, water.sum())
         del vh_db, vh_observed
 
     # Sanity check: if Otsu classified an implausibly large fraction of the
     # scene as water the histogram was likely unimodal (dry scene) and Otsu
     # split within the land distribution.  Discard the scene in that case.
-    # 30% is the upper bound for a realistic large flood event on the Mitchell
-    # megafan; scenes above this are almost certainly unimodal-histogram failures.
+    # 40% allows for large inundation events on the Mitchell megafan while
+    # the VH guard handles per-pixel false positives.
     water_fraction = water.sum() / max(observed.sum(), 1)
-    if water_fraction > 0.30:
-        logger.info("Scene %s discarded — water fraction %.1f%% exceeds sanity limit",
+    if water_fraction > 0.40:
+        logger.info("Scene %s discarded — water fraction %.1f%% exceeds sanity limit (40%%)",
                     item.id, 100 * water_fraction)
         return None
 

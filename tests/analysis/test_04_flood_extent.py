@@ -760,13 +760,15 @@ def _make_bimodal_ds(
     """Dataset with a clean spatial bimodal VV signal and matching VH.
 
     Water pixels have low backscatter in *both* VV and VH.
-    Land pixels have normal backscatter in both.
+    VH over water is ~0.0005 linear (~-33 dB) — well below the -20 dB guard threshold.
+    VH over land is ~0.008 linear (~-21 dB) — just below the threshold but these
+    pixels won't be VV-candidates anyway.
     This mirrors the physical reality that drives the algorithm.
     """
     vv = np.full((H, W), land_value_lin, dtype=np.float32)
-    vh = np.full((H, W), land_value_lin * 0.25, dtype=np.float32)  # VH ~6 dB below VV on land
+    vh = np.full((H, W), 0.008, dtype=np.float32)   # land VH ~-21 dB
     vv[water_rows, :] = water_value_lin
-    vh[water_rows, :] = water_value_lin * 0.25                      # VH also low over water
+    vh[water_rows, :] = 0.0005   # water VH ~-33 dB — well below -20 dB guard
     if x is None:
         x = np.linspace(700000, 750000, W)
     if y is None:
@@ -782,17 +784,21 @@ def _make_false_positive_ds(
     fp_rows: slice,
     land_value_lin: float = 0.030,
     fp_vv_lin: float = 0.001,   # low VV — looks like water in VV alone
-    fp_vh_lin: float = 0.020,   # but VH is high — wind roughening / scald
+    fp_vh_lin: float = 0.015,   # VH above -20 dB threshold (~0.015 linear) — wind/scald
 ) -> xr.Dataset:
-    """Dataset where some pixels have low VV but normal VH (false-positive scenario).
+    """Dataset where some pixels have low VV but VH above the -20 dB water threshold.
 
     These pixels should be rejected by the VH guard.  Without the guard they
     would be classified as water.
+    fp_vh_lin=0.015 ≈ -18 dB — above the -20 dB threshold so it fails the guard.
+    True water would be ~0.001 linear ≈ -30 dB — well below -20 dB.
     """
     vv = np.full((H, W), land_value_lin, dtype=np.float32)
-    vh = np.full((H, W), land_value_lin * 0.25, dtype=np.float32)
+    # Land VH: ~-21 dB (0.008 linear) — just below the threshold, but these pixels
+    # won't be classified as water by VV anyway so the guard doesn't matter for them.
+    vh = np.full((H, W), 0.008, dtype=np.float32)
     vv[fp_rows, :] = fp_vv_lin
-    vh[fp_rows, :] = fp_vh_lin   # VH stays high — the telling sign
+    vh[fp_rows, :] = fp_vh_lin   # VH above -20 dB — fails the water threshold
     x = np.linspace(700000, 750000, W)
     y = np.linspace(-1600000, -1650000, H)
     return xr.Dataset({
@@ -921,28 +927,29 @@ class TestVHGuardScientificContracts:
                  f"despite having high VH backscatter. Was VH actually loaded and used?")
 
     def test_vh_guard_uses_and_not_or(self):
-        """The guard must be VV_low AND VH_low, not VV_low OR VH_low.
+        """The guard must be VV_low AND VH < -20 dB, not VV_low OR VH < -20 dB.
 
-        Construct a scene where each half of the image has one low-backscatter band:
-        - Left half:  low VV, high VH  → false positive, must be rejected
-        - Right half: high VV, low VH  → also not water, must be rejected
-        Only pixels that are low in *both* simultaneously qualify as water — which
-        here means no pixels at all should be classified.
+        Construct a scene where each half of the image isolates one condition:
+        - Left half:  low VV (~-30 dB), but VH above -20 dB  → false positive, rejected
+        - Right half: high VV (land), VH below -20 dB         → not a VV candidate anyway
+        Only pixels that satisfy both conditions simultaneously qualify — none here.
         """
         H, W = 60, 60
-        land_lin   = 0.030
-        low_lin    = 0.001
+        land_vv_lin  = 0.030   # ~-15 dB
+        low_vv_lin   = 0.001   # ~-30 dB
+        vh_above_thr = 0.015   # ~-18 dB — above -20 dB threshold → fails guard
+        vh_below_thr = 0.0005  # ~-33 dB — below -20 dB threshold → passes guard
 
-        vv = np.full((H, W), land_lin, dtype=np.float32)
-        vh = np.full((H, W), land_lin * 0.25, dtype=np.float32)
+        vv = np.full((H, W), land_vv_lin, dtype=np.float32)
+        vh = np.full((H, W), vh_above_thr, dtype=np.float32)
 
-        # Left half: only VV is low
-        vv[:, :W//2] = low_lin
-        vh[:, :W//2] = land_lin * 0.25  # VH normal
+        # Left half: low VV but VH above threshold → VH guard rejects
+        vv[:, :W//2] = low_vv_lin
+        vh[:, :W//2] = vh_above_thr
 
-        # Right half: only VH is low
-        vv[:, W//2:] = land_lin
-        vh[:, W//2:] = low_lin * 0.25
+        # Right half: normal VV, VH below threshold → VV Otsu doesn't flag these
+        vv[:, W//2:] = land_vv_lin
+        vh[:, W//2:] = vh_below_thr
 
         x = np.linspace(700000, 750000, W)
         y = np.linspace(-1600000, -1650000, H)
@@ -1000,13 +1007,13 @@ class TestSanityGuardScientificContracts:
             ("Dry unimodal scene was not discarded by the sanity guard. "
              "Guard threshold may have been removed or set too high.")
 
-    def test_guard_accepts_scene_at_25_percent_water(self):
-        """A scene with 25% genuine flood coverage must pass the sanity guard."""
+    def test_guard_accepts_scene_at_35_percent_water(self):
+        """A scene with 35% genuine flood coverage must pass the sanity guard (limit is 40%)."""
         H, W = 100, 100
         vv = np.full((H, W), 0.030, dtype=np.float32)
-        vv[:25, :] = 0.001   # 25% of pixels are water
-        vh = np.full((H, W), 0.030 * 0.25, dtype=np.float32)
-        vh[:25, :] = 0.001 * 0.25
+        vv[:35, :] = 0.001   # 35% of pixels are water
+        vh = np.full((H, W), 0.008, dtype=np.float32)
+        vh[:35, :] = 0.0005  # water VH well below -20 dB — passes guard
         x = np.linspace(700000, 750000, W)
         y = np.linspace(-1600000, -1650000, H)
         ds = xr.Dataset({
@@ -1018,17 +1025,17 @@ class TestSanityGuardScientificContracts:
             result = flood_mask_from_scene(item, bbox=[141, -17, 143, -15], resolution=50)
 
         assert result is not None, \
-            ("Scene with 25% genuine flood coverage was discarded. "
-             "Sanity guard threshold is too aggressive.")
+            ("Scene with 35% genuine flood coverage was discarded. "
+             "Sanity guard threshold is too aggressive (should be 40%).")
 
     def test_guard_threshold_is_strict_less_than(self):
-        """The boundary condition: exactly 30% water fraction must be ACCEPTED
+        """The boundary condition: exactly 40% water fraction must be ACCEPTED
         (the guard fires on >, not >=)."""
         H, W = 100, 100
         vv = np.full((H, W), 0.030, dtype=np.float32)
-        vv[:30, :] = 0.001   # exactly 30%
-        vh = np.full((H, W), 0.030 * 0.25, dtype=np.float32)
-        vh[:30, :] = 0.001 * 0.25
+        vv[:40, :] = 0.001   # exactly 40%
+        vh = np.full((H, W), 0.008, dtype=np.float32)
+        vh[:40, :] = 0.0005  # water VH well below -20 dB
         x = np.linspace(700000, 750000, W)
         y = np.linspace(-1600000, -1650000, H)
         ds = xr.Dataset({
@@ -1040,7 +1047,7 @@ class TestSanityGuardScientificContracts:
             result = flood_mask_from_scene(item, bbox=[141, -17, 143, -15], resolution=50)
 
         assert result is not None, \
-            "Scene at exactly 30% water fraction should not be discarded (guard is >, not >=)."
+            "Scene at exactly 40% water fraction should not be discarded (guard is >, not >=)."
 
 
 class TestFrequencyThresholdScientificContracts:
