@@ -69,7 +69,7 @@ def main() -> None:
     import config
     from utils.io import configure_logging, ensure_output_dirs
     from utils.stac import search_sentinel1
-    from utils.sar import flood_mask_from_scene, build_dry_season_reference_mask
+    from utils.sar import flood_mask_from_scene
     from utils.quicklook import save_quicklook
 
     configure_logging()
@@ -84,42 +84,14 @@ def main() -> None:
     dry_workers   = S1_DRY_WORKERS   if PIPELINE_RUN else 1
     flood_workers = S1_FLOOD_WORKERS if PIPELINE_RUN else 1
 
-    # --- Dry-season reference mask (Oct–Nov of same year) --------------------
-    dry_mask_cache = config.dry_season_mask_path(config.YEAR)
+    # Dry-season reference mask is disabled: the DN²/1e6 normalisation produces
+    # uncalibrated backscatter values that vary too much between scenes to set a
+    # meaningful absolute threshold.  At -16 dB the mask flags ~76% of the
+    # catchment (normal vegetation + bare soil), wiping out real flood signal.
+    # The water-fraction sanity guard and frequency threshold handle false
+    # positives without needing a reference mask.
     reference_mask = None
-    if dry_mask_cache.exists():
-        logger.info("Loading cached dry-season reference mask: %s", dry_mask_cache)
-        reference_mask = np.load(str(dry_mask_cache))
-    else:
-        dry_start = f"{config.YEAR}-10-01"
-        dry_end   = f"{config.YEAR}-11-30"
-        logger.info("Searching dry-season S1 reference items: %s → %s", dry_start, dry_end)
-        dry_items = search_sentinel1(
-            bbox=bbox_wgs84,
-            start=dry_start,
-            end=dry_end,
-            endpoint=config.STAC_ENDPOINT_ELEMENT84,
-            collection=config.S1_COLLECTION,
-        )
-        if LOCAL_S1_ROOT and dry_items:
-            from utils.stac import rewrite_hrefs_to_local
-            dry_items = rewrite_hrefs_to_local(dry_items, LOCAL_S1_ROOT)
-
-        if dry_items:
-            logger.info("Building dry-season reference mask from %d scenes (workers=%d)",
-                        len(dry_items), dry_workers)
-            reference_mask = build_dry_season_reference_mask(
-                dry_items,
-                bbox=bbox_wgs84,
-                resolution=S1_RESOLUTION,
-                max_workers=dry_workers,
-            )
-            if reference_mask is not None:
-                dry_mask_cache.parent.mkdir(parents=True, exist_ok=True)
-                np.save(str(dry_mask_cache), reference_mask)
-                logger.info("Cached dry-season reference mask: %s", dry_mask_cache)
-        else:
-            logger.warning("No dry-season S1 items found; sodic-scald masking will be skipped")
+    dry_mask_cache = config.dry_season_mask_path(config.YEAR)  # kept for path reference only
 
     # --- Flood-season scenes --------------------------------------------------
     logger.info("Searching Sentinel-1 items: %s → %s", flood_start, flood_end)
