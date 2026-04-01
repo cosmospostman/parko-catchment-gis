@@ -72,6 +72,11 @@ TARGET_OVERALL_ACCURACY: float = 0.85
 TARGET_RECALL: float = 0.80
 CHANGE_DETECTION_MEAN_TOLERANCE: float = 0.05
 
+# HAND-based flood connectivity (Step 4)
+HAND_FLOOD_THRESHOLD_M: float = 5.0    # metres above nearest drainage
+HAND_MIN_UPSTREAM_KM2: float  = 1.0   # minimum upstream area to define a stream pixel
+DEM_BURN_DEPTH_M: float       = 10.0  # channel burn depth for flow conditioning
+
 # ---------------------------------------------------------------------------
 # Data source constants
 # ---------------------------------------------------------------------------
@@ -143,6 +148,6 @@ def ndvi_baseline_path() -> Path:
     return CACHE_DIR / "ndvi_baseline_median.tif"
 
 
-def dry_season_mask_path(year: int) -> Path:
-    """Return the path for the cached dry-season SAR reference mask for the given year."""
-    return CACHE_DIR / f"dry_season_mask_{year}.npy"
+def hand_raster_path(year: int) -> Path:
+    """Return the path for the HAND raster diagnostic output for the given year."""
+    return OUTPUTS_DIR / str(year) / f"hand_{year}.tif"
