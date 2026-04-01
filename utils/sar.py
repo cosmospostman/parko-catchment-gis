@@ -28,6 +28,31 @@ def preprocess_s1_scene(
     return _preprocess_gcp_warp(item, bbox, resolution)
 
 
+def _otsu_threshold(values: np.ndarray, n_bins: int = 512) -> float:
+    """Return Otsu's optimal threshold for a 1-D array of positive values."""
+    counts, edges = np.histogram(values, bins=n_bins)
+    bin_centres = (edges[:-1] + edges[1:]) / 2
+    total = counts.sum()
+    sum_total = (counts * bin_centres).sum()
+    sum_b, weight_b = 0.0, 0.0
+    best_var, best_t = 0.0, bin_centres[0]
+    for i in range(n_bins):
+        weight_b += counts[i]
+        if weight_b == 0:
+            continue
+        weight_f = total - weight_b
+        if weight_f == 0:
+            break
+        sum_b += counts[i] * bin_centres[i]
+        mean_b = sum_b / weight_b
+        mean_f = (sum_total - sum_b) / weight_f
+        var_between = weight_b * weight_f * (mean_b - mean_f) ** 2
+        if var_between > best_var:
+            best_var = var_between
+            best_t = bin_centres[i]
+    return float(best_t)
+
+
 def flood_mask_from_scene(
     item: Any,
     bbox: list,
@@ -138,12 +163,16 @@ def flood_mask_from_scene(
     logger.info("Warped %s VV: %dx%d px (%.0f MB)",
                 item.id, dst_width, dst_height, dst_width * dst_height * 4 / 1e6)
 
-    # Convert DN² to dB and threshold — result is bool (1 byte/pixel)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        vv_db = 10 * np.log10((dst_data ** 2) / 1e6 + 1e-12)
+    # Otsu threshold on valid (non-nan) DN values — finds the natural land/water
+    # break without requiring calibrated sigma-naught.
+    valid = dst_data[np.isfinite(dst_data) & (dst_data > 0)]
+    if valid.size == 0:
+        del dst_data
+        return None
+    otsu_threshold = _otsu_threshold(valid)
+    logger.info("Otsu threshold %s VV: %.1f DN", item.id, otsu_threshold)
+    mask = (dst_data > 0) & (dst_data < otsu_threshold)
     del dst_data
-    mask = vv_db < threshold_db
-    del vv_db
 
     x_coords = np.linspace(dst_bounds[0], dst_bounds[2], dst_width)
     y_coords = np.linspace(dst_bounds[3], dst_bounds[1], dst_height)
