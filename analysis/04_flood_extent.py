@@ -88,7 +88,7 @@ def main() -> None:
                 mask = future.result()
                 if mask is not None:
                     flood_masks.append(mask)
-                    logger.info("S1 scene processed (%d/%d): %s", completed, len(items), item.id)
+                    logger.info("S1 scene processed (%d/%d, %.1f%%): %s", completed, len(items), 100 * completed / len(items), item.id)
             except Exception as exc:
                 logger.warning("Failed to process S1 scene %s: %s", item.id, exc)
 
@@ -144,6 +144,16 @@ def main() -> None:
     out_path = config.flood_extent_path(config.YEAR)
     gdf.to_file(str(out_path), driver="GPKG")
     logger.info("Written: %s  (%d features)", out_path, len(gdf))
+
+    ql_path = out_path.with_name(out_path.stem + "_quicklook.png")
+    save_quicklook(
+        combined.squeeze(drop=True).astype(np.float32),
+        ql_path,
+        vmin=0.0,
+        vmax=1.0,
+        cmap="Blues",
+        title=f"Flood Extent {config.YEAR}",
+    )
 
 
 if __name__ == "__main__":
