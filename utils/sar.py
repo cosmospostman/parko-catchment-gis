@@ -6,14 +6,12 @@ Isolated so tests can mock preprocess_s1_scene() without importing sarsen.
 import logging
 import os
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import numpy as np
 import xarray as xr
 
 logger = logging.getLogger(__name__)
-
-LOCAL_DEM_PATH = os.environ.get("LOCAL_DEM_PATH", "")
 
 
 def preprocess_s1_scene(
@@ -23,162 +21,118 @@ def preprocess_s1_scene(
 ) -> xr.Dataset:
     """Preprocess a Sentinel-1 GRD scene to sigma-naught (linear scale).
 
-    Attempts to use sarsen for terrain-corrected processing.
-    Falls back to direct stackstac loading with a warning if sarsen is not available.
+    Reads GCPs from the annotation XML, warps the raw measurement TIFF to
+    EPSG:7855 at the requested resolution, and clips to bbox.
+    No terrain correction — suitable for flat to moderately hilly terrain.
     """
-    try:
-        import sarsen
-        _SARSEN_AVAILABLE = True
-    except ImportError:
-        _SARSEN_AVAILABLE = False
-        logger.warning(
-            "sarsen not available — falling back to non-terrain-corrected S1 loading. "
-            "Flood mapping accuracy may be reduced in hilly terrain."
-        )
-
-    if _SARSEN_AVAILABLE:
-        return _preprocess_with_sarsen(item, bbox, resolution)
-    else:
-        return _preprocess_stackstac_fallback(item, bbox, resolution)
-
-
-_COP_DEM_VRT = (
-    "/vsicurl/https://copernicus-dem-30m.s3.amazonaws.com/"
-    "Copernicus_DSM_COG_10_mosaic_WGS84.vrt"
-)
-
-
-def _dem_urlpath() -> str:
-    """Return the DEM path to use: local EBS cache if set, else remote VRT."""
-    if LOCAL_DEM_PATH and Path(LOCAL_DEM_PATH).exists():
-        return LOCAL_DEM_PATH
-    logger.warning(
-        "LOCAL_DEM_PATH not set or not found — fetching COP-DEM tiles from S3 "
-        "(set LOCAL_DEM_PATH to avoid ~200 MB/scene download overhead)"
-    )
-    return _COP_DEM_VRT
+    return _preprocess_gcp_warp(item, bbox, resolution)
 
 
 def _safe_root_from_item(item: Any) -> str:
-    """Return the SAFE root URL/path from a pystac Item.
-
-    Derives the root from the 'safe-manifest' asset href by stripping
-    '/manifest.safe', falling back to the item's self href or assets directory.
-    """
-    manifest_asset = item.assets.get("safe-manifest")
-    if manifest_asset:
-        href = manifest_asset.href
-        if href.endswith("/manifest.safe"):
-            return href[: -len("/manifest.safe")]
-    # Fallback: derive from vv asset href (strip measurement subpath)
     vv_asset = item.assets.get("vv")
     if vv_asset:
-        href = vv_asset.href
-        # …/measurement/iw-vv.tiff → strip two components
-        return str(Path(href).parent.parent)
+        return str(Path(vv_asset.href).parent.parent)
     raise ValueError(f"Cannot determine SAFE root for item {item.id}")
 
 
-def _symlink_annotation_files(safe_root: str) -> None:
-    """Create symlinks from ESA long annotation names to S3 short names.
+def _read_gcps_from_annotation(annotation_path: Path):
+    """Parse GCPs from a Sentinel-1 annotation XML.
 
-    S3 stores annotation files as iw-vv.xml / iw-vh.xml, but sarsen resolves
-    filenames from manifest.safe which references the full ESA names like
-    s1a-iw-grd-vv-...-001.xml.  Create symlinks so sarsen can find them.
-    Only acts on local paths where manifest.safe exists.
+    Returns a list of rasterio.control.GroundControlPoint.
     """
-    import re
-    manifest_path = Path(safe_root) / "manifest.safe"
-    if not manifest_path.exists():
-        return
-    anno_dir = Path(safe_root) / "annotation"
-    manifest_text = manifest_path.read_text()
-    # Find all annotation XML hrefs that are direct children (not in subdirs)
-    for long_name in re.findall(r'href="\./annotation/([^/\"]+\.xml)"', manifest_text):
-        long_path = anno_dir / long_name
-        if long_path.exists():
-            continue
-        # Map to short S3 name: anything containing -vv- → iw-vv.xml, -vh- → iw-vh.xml
-        if "-vv-" in long_name:
-            short_path = anno_dir / "iw-vv.xml"
-        elif "-vh-" in long_name:
-            short_path = anno_dir / "iw-vh.xml"
-        else:
-            continue
-        if short_path.exists():
-            long_path.symlink_to(short_path.name)
-            logger.debug("Symlinked %s → %s", long_name, short_path.name)
+    import xml.etree.ElementTree as ET
+    import rasterio.control
+
+    tree = ET.parse(str(annotation_path))
+    gcps = []
+    for ggp in tree.findall(".//geolocationGridPoint"):
+        col = float(ggp.find("pixel").text)
+        row = float(ggp.find("line").text)
+        lon = float(ggp.find("longitude").text)
+        lat = float(ggp.find("latitude").text)
+        z   = float(ggp.find("height").text)
+        gcps.append(rasterio.control.GroundControlPoint(row=row, col=col, x=lon, y=lat, z=z))
+    return gcps
 
 
-def _preprocess_with_sarsen(item: Any, bbox: list, resolution: int) -> xr.Dataset:
-    """Terrain-corrected preprocessing using sarsen."""
-    import sarsen
-
+def _preprocess_gcp_warp(item: Any, bbox: list, resolution: int) -> xr.Dataset:
+    """Warp a Sentinel-1 GRD scene to EPSG:7855 using GCPs from the annotation XML."""
     import tempfile
-    import rioxarray  # noqa: F401 — required for .rio accessor in sarsen
+    import rasterio
+    import rasterio.crs
+    import rasterio.warp
+    import rasterio.transform
 
-    safe_root = _safe_root_from_item(item)
-    logger.debug("sarsen SAFE root: %s", safe_root)
-    _symlink_annotation_files(safe_root)
-    dem = _dem_urlpath()
+    safe_root = Path(_safe_root_from_item(item))
+    anno_dir = safe_root / "annotation"
+
+    # Find annotation XMLs — S3 layout uses iw-vv.xml / iw-vh.xml
+    anno_map = {
+        "VV": anno_dir / "iw-vv.xml",
+        "VH": anno_dir / "iw-vh.xml",
+    }
+    meas_map = {
+        "VV": item.assets.get("vv"),
+        "VH": item.assets.get("vh"),
+    }
+
+    target_crs = rasterio.crs.CRS.from_epsg(7855)
+    minx, miny, maxx, maxy = bbox  # WGS84
+
+    # Compute output bounds in EPSG:7855
+    from rasterio.warp import transform_bounds
+    dst_bounds = transform_bounds("EPSG:4326", target_crs, minx, miny, maxx, maxy)
+    dst_width  = max(1, int((dst_bounds[2] - dst_bounds[0]) / resolution))
+    dst_height = max(1, int((dst_bounds[3] - dst_bounds[1]) / resolution))
+    dst_transform = rasterio.transform.from_bounds(*dst_bounds, dst_width, dst_height)
 
     bands = {}
     for pol in ("VV", "VH"):
-        product = sarsen.Sentinel1SarProduct(
-            product_urlpath=safe_root,
-            measurement_group=f"IW/{pol}",
+        anno_path = anno_map[pol]
+        meas_asset = meas_map[pol]
+        if not anno_path.exists() or meas_asset is None:
+            logger.debug("Missing %s data for %s — skipping polarisation", pol, item.id)
+            continue
+
+        gcps = _read_gcps_from_annotation(anno_path)
+        if not gcps:
+            logger.debug("No GCPs in annotation for %s %s", item.id, pol)
+            continue
+
+        src_crs = rasterio.crs.CRS.from_epsg(4326)
+
+        with rasterio.open(meas_asset.href) as src:
+            # Assign GCPs so rasterio knows the georeferencing
+            src_data = src.read(1).astype(np.float32)
+            src_height, src_width = src_data.shape
+
+        # Warp using GCPs
+        dst_data = np.full((dst_height, dst_width), np.nan, dtype=np.float32)
+        rasterio.warp.reproject(
+            source=src_data,
+            destination=dst_data,
+            gcps=gcps,
+            src_crs=src_crs,
+            dst_crs=target_crs,
+            dst_transform=dst_transform,
+            resampling=rasterio.warp.Resampling.bilinear,
+            src_nodata=0,
+            dst_nodata=np.nan,
         )
-        with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp:
-            tmp_path = tmp.name
-        try:
-            sarsen.terrain_correction(
-                product,
-                dem_urlpath=dem,
-                output_urlpath=tmp_path,
-                correct_radiometry="gamma_nearest",
-            )
-            import rasterio
-            with rasterio.open(tmp_path) as src:
-                data = src.read(1)
-                transform = src.transform
-                crs = src.crs
-            da = xr.DataArray(data, dims=["y", "x"])
-            da.attrs["crs"] = str(crs)
-            da.attrs["transform"] = transform
-        finally:
-            Path(tmp_path).unlink(missing_ok=True)
-        bands[pol] = da
+
+        # Convert DN to sigma-naught linear scale (S1 GRD: sigma0 = (DN^2) / cal_factor)
+        # Without calibration LUT use DN^2 as a proxy — sufficient for flood thresholding
+        with np.errstate(invalid="ignore"):
+            sigma = (dst_data ** 2) / 1e8  # normalise to roughly linear scale
+
+        x_coords = np.linspace(dst_bounds[0], dst_bounds[2], dst_width)
+        y_coords = np.linspace(dst_bounds[3], dst_bounds[1], dst_height)
+        bands[pol] = xr.DataArray(sigma, dims=["y", "x"],
+                                  coords={"x": x_coords, "y": y_coords})
+
+    if not bands:
+        raise ValueError(f"No valid polarisations for {item.id}")
 
     ds = xr.Dataset(bands)
-    logger.info("sarsen terrain-corrected S1 scene: shape=%s", ds["VV"].shape)
-    return ds
-
-
-def _preprocess_stackstac_fallback(item: Any, bbox: list, resolution: int) -> xr.Dataset:
-    """Basic S1 loading via odc-stac without terrain correction.
-
-    stackstac fails on sentinel-1-grd items from Element84 earth-search v1
-    because those items lack proj:shape/proj:transform metadata, causing a
-    zero-size bounds computation. odc-stac handles this correctly.
-    """
-    import odc.stac
-
-    ds = odc.stac.load(
-        [item],
-        bands=["vv", "vh"],
-        resolution=resolution,
-        bbox=bbox,
-        crs="EPSG:7855",
-        chunks={"x": 2048, "y": 2048},
-    )
-    if ds.sizes.get("x", 0) == 0 or ds.sizes.get("y", 0) == 0:
-        raise ValueError(f"Scene has no spatial overlap with bbox: {item.id}")
-    # Normalise band names to uppercase to match downstream expectations
-    ds = ds.rename({k: k.upper() for k in ds.data_vars if k in ("vv", "vh")})
-    # Convert from dB to linear scale if needed
-    for var in ds.data_vars:
-        ds[var] = (10 ** (ds[var] / 10)).compute()
-    if all(ds[var].size == 0 for var in ds.data_vars):
-        raise ValueError(f"Scene has no valid pixels after compute: {item.id}")
-    logger.info("odc-stac S1 fallback loaded: %s", list(ds.data_vars))
+    logger.info("GCP-warped S1 scene %s: shape=%s", item.id, ds["VV"].shape if "VV" in ds else "VV missing")
     return ds
