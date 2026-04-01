@@ -55,27 +55,21 @@ def _otsu_threshold(values: np.ndarray, n_bins: int = 512) -> float:
     return float(best_t)
 
 
-def _focal_median(arr: np.ndarray, radius: int = 1) -> np.ndarray:
+def _focal_mean_inplace(arr: np.ndarray, nan_mask: np.ndarray, radius: int = 1) -> np.ndarray:
     """Apply a (2*radius+1) × (2*radius+1) mean speckle filter.
 
-    Uses uniform_filter (box mean) rather than median_filter. At 3×3 on
-    multi-looked S1 GRD data the smoothing effect is equivalent for flood
-    thresholding purposes, and uniform_filter runs in O(n) memory vs the
-    O(n×kernel) working buffers that median_filter allocates internally.
-
-    NaN pixels are temporarily replaced with the array mean before filtering
-    so they don't contaminate neighbours, then restored after.
+    Operates on `arr` in-place (caller must not need the original values).
+    NaN pixels (indicated by nan_mask) are filled with the array mean before
+    filtering so they don't contaminate neighbours, then restored after.
+    Uses uniform_filter (box mean) for O(n) memory overhead.
     """
     from scipy.ndimage import uniform_filter
     size = 2 * radius + 1
-    nan_mask = ~np.isfinite(arr)
     if nan_mask.any():
-        fill = float(np.nanmean(arr))
-        arr = arr.copy()
-        arr[nan_mask] = fill
-    result = uniform_filter(arr, size=size, mode="reflect").astype(np.float32)
-    result[nan_mask] = np.nan
-    return result
+        arr[nan_mask] = float(np.nanmean(arr))
+    uniform_filter(arr, size=size, mode="reflect", output=arr)
+    arr[nan_mask] = np.nan
+    return arr
 
 
 def flood_mask_from_scene(
@@ -112,15 +106,18 @@ def flood_mask_from_scene(
     if observed.sum() == 0:
         return None
 
-    # Speckle filter (3×3 median) on linear values before dB conversion
-    vv_filt = _focal_median(np.where(observed, vv_lin, np.nan), radius=1)
-    del vv_lin
-
+    # Speckle filter then dB conversion, both in-place on vv_lin to avoid
+    # allocating a separate filtered copy.
+    vv_nan = ~observed  # unobserved pixels treated as NaN for the filter
+    vv_lin[vv_nan] = np.nan
+    _focal_mean_inplace(vv_lin, vv_nan, radius=1)  # vv_lin now holds filtered values
+    del vv_nan
     with np.errstate(divide="ignore", invalid="ignore"):
-        vv_db = 10 * np.log10(vv_filt + 1e-12)
-    del vv_filt
+        np.log10(vv_lin + 1e-12, out=vv_lin)
+        vv_lin *= 10  # vv_lin now holds dB values
+    vv_db = vv_lin
+    del vv_lin  # alias only — vv_db IS vv_lin
 
-    # Per-scene Otsu threshold on VV dB values within the observed footprint
     vv_valid = vv_db[observed]
     if vv_valid.size < 100:
         return None
@@ -132,11 +129,15 @@ def flood_mask_from_scene(
 
     # VH guard — require VH also below its Otsu threshold
     if vh_lin is not None:
-        vh_filt = _focal_median(np.where(observed, vh_lin, np.nan), radius=1)
-        del vh_lin
+        vh_nan = ~observed
+        vh_lin[vh_nan] = np.nan
+        _focal_mean_inplace(vh_lin, vh_nan, radius=1)
+        del vh_nan
         with np.errstate(divide="ignore", invalid="ignore"):
-            vh_db = 10 * np.log10(vh_filt + 1e-12)
-        del vh_filt
+            np.log10(vh_lin + 1e-12, out=vh_lin)
+            vh_lin *= 10
+        vh_db = vh_lin
+        del vh_lin
         vh_valid = vh_db[observed]
         if vh_valid.size >= 100:
             otsu_vh = _otsu_threshold(vh_valid)
@@ -390,7 +391,6 @@ def _preprocess_gcp_warp(
                 col_max, row_max = src.width, src.height
 
         import rasterio.windows
-        import rasterio.io
         window = rasterio.windows.Window(
             col_off=col_min, row_off=row_min,
             width=col_max - col_min, height=row_max - row_min,
@@ -428,22 +428,21 @@ def _preprocess_gcp_warp(
                     item.id, pol, win_width, win_height,
                     win_width * win_height * 4 / 1e6)
 
+        src_transform = rasterio.transform.from_gcps(windowed_gcps)
         dst_data = np.full((dst_height, dst_width), np.nan, dtype=np.float32)
-        with rasterio.io.MemoryFile() as memfile:
-            with memfile.open(driver="GTiff", count=1, dtype="float32",
-                              width=win_width, height=win_height) as mem_ds:
-                mem_ds.write(src_data, 1)
-                mem_ds.gcps = (windowed_gcps, src_crs)
-                rasterio.warp.reproject(
-                    source=rasterio.band(mem_ds, 1),
-                    destination=dst_data,
-                    dst_crs=target_crs,
-                    dst_transform=dst_transform,
-                    resampling=rasterio.warp.Resampling.bilinear,
-                    src_nodata=0,
-                    dst_nodata=np.nan,
-                    num_threads=1,
-                )
+        rasterio.warp.reproject(
+            source=src_data,
+            destination=dst_data,
+            src_transform=src_transform,
+            src_crs=src_crs,
+            dst_crs=target_crs,
+            dst_transform=dst_transform,
+            resampling=rasterio.warp.Resampling.bilinear,
+            src_nodata=0,
+            dst_nodata=np.nan,
+            num_threads=1,
+        )
+        del src_data
 
         # Convert DN to sigma-naught linear scale (S1 GRD: sigma0 = (DN^2) / cal_factor)
         # Without calibration LUT use DN^2 as a proxy — sufficient for flood thresholding
