@@ -48,6 +48,7 @@ def write_cog(da: xr.DataArray, path: Path, nodata: float = np.nan) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if nodata is not None:
         da.attrs.pop("_FillValue", None)
+        da.encoding.pop("_FillValue", None)
         da = da.rio.write_nodata(nodata)
     da.rio.to_raster(
         str(path),
