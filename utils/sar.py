@@ -155,7 +155,7 @@ def build_dry_season_reference_mask(
     total = len(items)
 
     def _process_dry(item):
-        ds = _preprocess_gcp_warp(item, bbox, resolution)
+        ds = _preprocess_gcp_warp(item, bbox, resolution, polarisations=("VV",))
         if "VV" not in ds:
             return None
         vv_lin = ds["VV"].values
@@ -234,7 +234,12 @@ def _read_gcps_from_annotation(annotation_path: Path):
     return gcps
 
 
-def _preprocess_gcp_warp(item: Any, bbox: list, resolution: int) -> xr.Dataset:
+def _preprocess_gcp_warp(
+    item: Any,
+    bbox: list,
+    resolution: int,
+    polarisations: tuple = ("VV", "VH"),
+) -> xr.Dataset:
     """Warp a Sentinel-1 GRD scene to EPSG:7855 using GCPs from the annotation XML."""
     import rasterio
     import rasterio.control
@@ -266,7 +271,7 @@ def _preprocess_gcp_warp(item: Any, bbox: list, resolution: int) -> xr.Dataset:
     dst_transform = rasterio.transform.from_bounds(*dst_bounds, dst_width, dst_height)
 
     bands = {}
-    for pol in ("VV", "VH"):
+    for pol in polarisations:
         anno_path = anno_map[pol]
         meas_asset = meas_map[pol]
         if not anno_path.exists() or meas_asset is None:
