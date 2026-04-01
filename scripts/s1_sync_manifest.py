@@ -14,7 +14,7 @@ import argparse
 import sys
 from pathlib import Path
 
-REQUIRED_ASSETS = ["vv", "vh", "safe-manifest", "schema-product-vv", "schema-product-vh",
+REQUIRED_ASSETS = ["vv", "vh", "safe-manifest",
                    "schema-calibration-vv", "schema-calibration-vh", "schema-noise-vv", "schema-noise-vh"]
 
 
@@ -80,12 +80,12 @@ def main() -> None:
             if href.startswith("s3://"):
                 uris.append(href)
 
-        # Main annotation XMLs required by sarsen.
-        vv_asset = item.assets.get("vv")
-        if vv_asset and vv_asset.href.startswith("s3://"):
-            scene_root = vv_asset.href.rsplit("/measurement/", 1)[0]
-            uris.append(f"{scene_root}/annotation/iw-vv.xml")
-            uris.append(f"{scene_root}/annotation/iw-vh.xml")
+        # Annotation XMLs — use STAC asset keys schema-product-vv/vh which
+        # point directly to the per-subswath annotation files on this collection.
+        for ann_key in ("schema-product-vv", "schema-product-vh"):
+            ann_asset = item.assets.get(ann_key)
+            if ann_asset and ann_asset.href.startswith("s3://"):
+                uris.append(ann_asset.href)
 
     # Deduplicate while preserving order
     seen: set[str] = set()
