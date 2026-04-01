@@ -139,8 +139,9 @@ def main() -> None:
             try:
                 scene = future.result()
                 if scene is None:
+                    logger.info("Flood scene skipped — no valid pixels [%d/%d]: %s",
+                                completed, len(items), item.id)
                     continue
-                logger.info("S1 scene processed (%d/%d, %.1f%%): %s", completed, len(items), 100 * completed / len(items), item.id)
                 water    = scene["water"].values.view(np.uint8)
                 observed = scene["observed"].values.view(np.uint8)
                 if flood_count is None:
@@ -152,13 +153,21 @@ def main() -> None:
                         flood_count += water
                         obs_count   += observed
                     else:
-                        logger.debug("Shape mismatch for %s — skipping", item.id)
+                        logger.info("Flood scene skipped — shape mismatch [%d/%d]: %s",
+                                    completed, len(items), item.id)
+                        continue
+                logger.info("Flood scene accumulated [%d/%d, %.0f%%]: %s  "
+                            "(water=%d obs=%d)",
+                            completed, len(items), 100 * completed / len(items),
+                            item.id, water.sum(), observed.sum())
             except Exception as exc:
                 msg = str(exc)
                 if "no spatial overlap" in msg or "no valid pixels" in msg or "zero-size" in msg:
-                    logger.debug("Skipped S1 scene %s (no overlap)", item.id)
+                    logger.info("Flood scene skipped — no overlap [%d/%d]: %s",
+                                completed, len(items), item.id)
                 else:
-                    logger.warning("Failed to process S1 scene %s: %s", item.id, exc)
+                    logger.warning("Flood scene failed [%d/%d]: %s: %s",
+                                   completed, len(items), item.id, exc)
 
     if flood_count is None:
         raise RuntimeError("No valid S1 scenes processed")
