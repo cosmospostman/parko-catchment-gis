@@ -329,11 +329,20 @@ def _preprocess_gcp_warp(
     safe_root = Path(_safe_root_from_item(item))
     anno_dir = safe_root / "annotation"
 
-    # Find annotation XMLs — S3 layout uses iw-vv.xml / iw-vh.xml
-    anno_map = {
-        "VV": anno_dir / "iw-vv.xml",
-        "VH": anno_dir / "iw-vh.xml",
-    }
+    def _find_annotation(pol: str) -> Path | None:
+        """Return the annotation XML for `pol`, handling both single-file
+        (iw-vv.xml) and per-subswath (iw1-vv.xml, iw2-vv.xml, …) layouts."""
+        # Preferred: single merged file used by some STAC-hosted reformats
+        single = anno_dir / f"iw-{pol.lower()}.xml"
+        if single.exists():
+            return single
+        # Fall back to first matching subswath file (iw1-, iw2-, iw3-)
+        matches = sorted(anno_dir.glob(f"*-{pol.lower()}-*.xml"))
+        if matches:
+            return matches[0]
+        return None
+
+    anno_map = {pol: _find_annotation(pol) for pol in ("VV", "VH")}
     meas_map = {
         "VV": item.assets.get("vv"),
         "VH": item.assets.get("vh"),
@@ -353,7 +362,7 @@ def _preprocess_gcp_warp(
     for pol in polarisations:
         anno_path = anno_map[pol]
         meas_asset = meas_map[pol]
-        if not anno_path.exists() or meas_asset is None:
+        if anno_path is None or meas_asset is None:
             logger.debug("Missing %s data for %s — skipping polarisation", pol, item.id)
             continue
 
