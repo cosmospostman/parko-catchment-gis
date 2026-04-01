@@ -44,6 +44,7 @@ def ensure_output_dirs(year: int) -> None:
 
 def write_cog(da: xr.DataArray, path: Path, nodata: float = np.nan) -> None:
     """Write an xarray DataArray as a Cloud-Optimised GeoTIFF."""
+    import rasterio
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     if nodata is not None:
@@ -58,8 +59,10 @@ def write_cog(da: xr.DataArray, path: Path, nodata: float = np.nan) -> None:
         tiled=True,
         blockxsize=512,
         blockysize=512,
-        overviews="auto",
     )
+    with rasterio.open(str(path), "r+") as dst:
+        dst.build_overviews([2, 4, 8, 16, 32], rasterio.enums.Resampling.average)
+        dst.update_tags(ns="rio_overview", resampling="average")
     logger.info("Written COG: %s", path)
 
 
