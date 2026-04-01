@@ -1,5 +1,7 @@
 # Core geospatial
 rioxarray>=0.15,<0.17
+scipy>=1.12,<2
+pysheds>=0.4,<1
 xarray>=2024.1,<2026
 numpy>=1.26,<3
 geopandas>=0.14,<2

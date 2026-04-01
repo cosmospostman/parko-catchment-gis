@@ -75,7 +75,7 @@ export PIPELINE_RUN=1
 export PYTHONPATH="${CODE_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 export LOCAL_S2_ROOT="${LOCAL_S2_ROOT:-}"
 export LOCAL_S1_ROOT="${LOCAL_S1_ROOT:-}"
-export LOCAL_DEM_PATH="${LOCAL_DEM_PATH:-}"
+export LOCAL_DEM_ROOT="${LOCAL_DEM_ROOT:-}"
 export TILE_SIZE_PX="${TILE_SIZE_PX:-512}"
 export FETCH_WORKERS="${FETCH_WORKERS:-$([ -n "${LOCAL_S2_ROOT}" ] && echo 4 || echo 16)}"
 export COMPUTE_WORKERS="${COMPUTE_WORKERS:-$(python -c 'import os; print(os.cpu_count() or 4)')}"
@@ -268,7 +268,7 @@ if [[ "${DRY_RUN}" == "true" ]]; then
     echo "Steps that would run:"
     [[ -n "${LOCAL_S2_ROOT}" ]] && printf "  Step 00  s2_ebs_sync (LOCAL_S2_ROOT=%s)\n" "${LOCAL_S2_ROOT}"
     [[ -n "${LOCAL_S1_ROOT}" ]] && printf "  Step 00  s1_ebs_sync (LOCAL_S1_ROOT=%s)\n" "${LOCAL_S1_ROOT}"
-    [[ -n "${LOCAL_DEM_PATH}" ]] && printf "  Step 00  dem_cache (LOCAL_DEM_PATH=%s)\n" "${LOCAL_DEM_PATH}"
+    [[ -n "${LOCAL_DEM_ROOT}" ]] && printf "  Step 00  dem_cache (LOCAL_DEM_ROOT=%s)\n" "${LOCAL_DEM_ROOT}"
     for step_num in 1 2 3 4 5 6 7; do
         printf "  Step %02d\n" "${step_num}"
     done
@@ -440,7 +440,7 @@ run_step_or_abort() {
 }
 
 # ── Stage 0: EBS sync (S2 and/or S1 and/or DEM, only when LOCAL_*_ROOT/PATH is set) ──────────
-if [[ -n "${LOCAL_S2_ROOT}" || -n "${LOCAL_S1_ROOT}" || -n "${LOCAL_DEM_PATH}" ]]; then
+if [[ -n "${LOCAL_S2_ROOT}" || -n "${LOCAL_S1_ROOT}" || -n "${LOCAL_DEM_ROOT}" ]]; then
     STEP_NUMS+=(0)
     STEP_NAMES+=("ebs_sync")
 
@@ -513,11 +513,11 @@ if [[ -n "${LOCAL_S2_ROOT}" || -n "${LOCAL_S1_ROOT}" || -n "${LOCAL_DEM_PATH}" ]
         fi
 
         # ── DEM sync ─────────────────────────────────────────────────────────
-        if [[ -n "${LOCAL_DEM_PATH}" ]]; then
-            printf "Caching COP-DEM GLO-30 → %s\n" "${LOCAL_DEM_PATH}"
+        if [[ -n "${LOCAL_DEM_ROOT}" ]]; then
+            printf "Caching COP-DEM GLO-30 tiles → %s\n" "${LOCAL_DEM_ROOT}"
 
             _dem_exit=0
-            python "${CODE_DIR}/scripts/dem_cache.py" --out "${LOCAL_DEM_PATH}" || _dem_exit=$?
+            python "${CODE_DIR}/scripts/dem_cache.py" --tile-dir "${LOCAL_DEM_ROOT}" || _dem_exit=$?
             if [[ ${_dem_exit} -ne 0 ]]; then
                 printf "${RED}${BOLD}FAILED: dem_cache.py (exit ${_dem_exit})${RESET}\n"
                 OVERALL_EXIT=1; STEP_STATUSES+=("FAIL")
