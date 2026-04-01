@@ -154,11 +154,17 @@ def _build_baseline(bbox, config) -> xr.DataArray:
             # evenly within each year — avoids 39 sequential round-trips to DEA
             # while still guaranteeing even temporal coverage across all missions.
             max_items_per_year = 12
+            # Fetch at most max_items_per_year × n_years items total. Items are
+            # returned chronologically so this still risks truncating recent years,
+            # but the subsequent per-year grouping and subsampling corrects for
+            # any imbalance — years with fewer items simply contribute fewer scenes.
+            n_years = end_year - start_year + 1
             tile_catalog = pystac_client.Client.open("https://explorer.dea.ga.gov.au/stac")
             all_items = list(tile_catalog.search(
                 collections=DEA_LANDSAT_COLLECTIONS,
                 bbox=tile_bbox,
                 datetime=f"{start_year}-{dry_start_mm_dd}/{end_year}-{dry_end_mm_dd}",
+                max_items=max_items_per_year * n_years,
             ).items())
 
             # Group by year, filter to dry-season months, subsample evenly.
