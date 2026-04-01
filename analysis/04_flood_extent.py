@@ -20,7 +20,7 @@ S1_POLARISATIONS = ["VV", "VH"]
 VV_OPEN_WATER_THRESHOLD_DB = -14.0          # dB — below this = open water
 FLOOD_UNION_SIMPLIFY_TOLERANCE = 20         # metres
 DASK_CHUNK_SPATIAL = 2048
-S1_MAX_WORKERS = 8                          # concurrent S1 scene downloads
+S1_MAX_WORKERS = 2                          # concurrent S1 scene downloads
 
 logger = logging.getLogger(__name__)
 
@@ -74,10 +74,14 @@ def main() -> None:
         if "VV" not in ds:
             logger.warning("VV band missing in item %s — skipping", item.id)
             return None
-        vv_db = _sigma_to_db(ds["VV"])
-        return (vv_db < VV_OPEN_WATER_THRESHOLD_DB).compute()
+        vv = ds["VV"]
+        if vv.size == 0 or 0 in vv.shape:
+            raise ValueError(f"VV band is zero-size for {item.id}")
+        vv_db = _sigma_to_db(vv)
+        return (vv_db < VV_OPEN_WATER_THRESHOLD_DB)
 
-    flood_masks = []
+    combined = None
+    combined_coords = None
     completed = 0
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
         futures = {executor.submit(_process_scene, item): item for item in items}
@@ -86,44 +90,41 @@ def main() -> None:
             completed += 1
             try:
                 mask = future.result()
-                if mask is not None:
-                    flood_masks.append(mask)
-                    logger.info("S1 scene processed (%d/%d, %.1f%%): %s", completed, len(items), 100 * completed / len(items), item.id)
+                if mask is None:
+                    continue
+                logger.info("S1 scene processed (%d/%d, %.1f%%): %s", completed, len(items), 100 * completed / len(items), item.id)
+                if combined is None:
+                    combined_coords = mask  # keep first DataArray for coords/quicklook
+                    combined = mask.values
+                else:
+                    m = mask.values
+                    if m.shape == combined.shape:
+                        combined |= m
+                    else:
+                        logger.debug("Shape mismatch for %s — skipping", item.id)
             except Exception as exc:
                 msg = str(exc)
-                if "no spatial overlap" in msg or "no valid pixels" in msg:
+                if "no spatial overlap" in msg or "no valid pixels" in msg or "zero-size" in msg:
                     logger.debug("Skipped S1 scene %s (no overlap)", item.id)
                 else:
                     logger.warning("Failed to process S1 scene %s: %s", item.id, exc)
 
-    if not flood_masks:
+    if combined is None:
         raise RuntimeError("No valid S1 scenes processed")
-
-    # Union of all flood masks across dates
-    combined = flood_masks[0].copy()
-    for mask in flood_masks[1:]:
-        try:
-            combined = combined | mask.reindex_like(combined, method="nearest")
-        except Exception:
-            combined = combined | mask
 
     # Vectorise flood mask to polygons
     logger.info("Vectorising flood extent...")
     import rasterio.features
     import rasterio.transform
 
-    data = combined.values.astype(np.uint8)
-    # Build an affine transform from the DataArray coordinates
-    try:
-        transform = combined.rio.transform()
-    except Exception:
-        # Fallback: construct from coordinate arrays
-        import affine
-        x = combined.coords.get("x", combined.coords.get("longitude"))
-        y = combined.coords.get("y", combined.coords.get("latitude"))
-        res_x = float(x[1] - x[0]) if len(x) > 1 else config.TARGET_RESOLUTION
-        res_y = float(y[1] - y[0]) if len(y) > 1 else -config.TARGET_RESOLUTION
-        transform = affine.Affine(res_x, 0, float(x[0]), 0, res_y, float(y[0]))
+    data = combined.astype(np.uint8)
+    # Build affine transform from the reference DataArray coordinates
+    import affine
+    x = combined_coords.coords["x"].values
+    y = combined_coords.coords["y"].values
+    res_x = float(x[1] - x[0]) if len(x) > 1 else config.TARGET_RESOLUTION
+    res_y = float(y[1] - y[0]) if len(y) > 1 else -config.TARGET_RESOLUTION
+    transform = affine.Affine(res_x, 0, float(x[0]), 0, res_y, float(y[0]))
 
     shapes = list(
         rasterio.features.shapes(data, mask=data, transform=transform)
@@ -151,7 +152,7 @@ def main() -> None:
 
     ql_path = out_path.with_name(out_path.stem + "_quicklook.png")
     save_quicklook(
-        combined.squeeze(drop=True).astype(np.float32),
+        combined_coords.squeeze(drop=True).astype(np.float32),
         ql_path,
         vmin=0.0,
         vmax=1.0,
