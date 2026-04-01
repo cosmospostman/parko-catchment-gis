@@ -63,8 +63,8 @@ def fetch_all(species: str, bbox: list) -> gpd.GeoDataFrame:
         if not page:
             break
         records.extend(page)
-        start += len(page)
-        logger.info("  fetched %d / %d", len(records), to_fetch)
+        start += params["pageSize"]  # advance by requested size, not returned size
+        logger.info("  fetched %d / %d", min(len(records), to_fetch), to_fetch)
 
     df = pd.DataFrame(records)
     df = df.dropna(subset=["decimalLongitude", "decimalLatitude"])
@@ -94,8 +94,8 @@ def main() -> None:
 
     gdf = fetch_all(config.ALA_SPECIES_QUERY, bbox)
 
-    # Clip to catchment polygon (not just bbox)
-    gdf_clipped = gpd.clip(gdf, catchment)
+    # Clip to catchment polygon (not just bbox) — ensure matching CRS
+    gdf_clipped = gpd.clip(gdf.to_crs("EPSG:4326"), catchment.to_crs("EPSG:4326"))
     logger.info("Records within catchment boundary: %d", len(gdf_clipped))
 
     out_path = Path(config.CACHE_DIR) / "ala_occurrences.gpkg"
