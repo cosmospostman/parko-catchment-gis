@@ -101,6 +101,7 @@ STAGE2_FILES=(
     "outputs/${YEAR}/ndvi_anomaly_${YEAR}.tif"
     "outputs/${YEAR}/ndvi_anomaly_${YEAR}_quicklook.png"
     "cache/ndvi_baseline_median.tif"     # reusable; copy if present
+    "cache/ala_occurrences.gpkg"         # reusable; copy if present
 )
 
 STAGE3_FILES=(
