@@ -455,14 +455,16 @@ def _preprocess_gcp_warp(
         del src_data
 
         # Convert DN to sigma-naught linear scale (S1 GRD: sigma0 = (DN^2) / cal_factor)
-        # Without calibration LUT use DN^2 as a proxy — sufficient for flood thresholding
+        # Both operations in-place on dst_data to avoid a second 272 MB allocation.
         with np.errstate(invalid="ignore"):
-            sigma = (dst_data ** 2) / 1e6  # normalise to roughly linear scale
+            np.multiply(dst_data, dst_data, out=dst_data)
+            dst_data /= 1e6
 
         x_coords = np.linspace(dst_bounds[0], dst_bounds[2], dst_width)
         y_coords = np.linspace(dst_bounds[3], dst_bounds[1], dst_height)
-        bands[pol] = xr.DataArray(sigma, dims=["y", "x"],
+        bands[pol] = xr.DataArray(dst_data, dims=["y", "x"],
                                   coords={"x": x_coords, "y": y_coords})
+        del dst_data
 
     if not bands:
         raise ValueError(f"No valid polarisations for {item.id}")
