@@ -60,8 +60,11 @@ def check_raster_present(label: str, path: Path) -> dict:
 def check_raster_crs(label: str, path: Path, expected_crs: str) -> dict:
     import rasterio
 
-    with rasterio.open(path) as src:
-        crs = src.crs
+    try:
+        with rasterio.open(path) as src:
+            crs = src.crs
+    except Exception as exc:
+        return _result(label, FAIL, f"Read error — file may be truncated or corrupted: {exc}")
 
     ok = crs is not None and crs.to_epsg() == int(expected_crs.split(":")[-1])
     detail = f"CRS={crs}  (expected {expected_crs})"
@@ -78,9 +81,12 @@ def check_spatial_consistency(paths: list[Path]) -> dict:
 
     bounds_list = []
     for p in paths:
-        with rasterio.open(p) as src:
-            b = src.bounds
-            bounds_list.append((b.left, b.bottom, b.right, b.top))
+        try:
+            with rasterio.open(p) as src:
+                b = src.bounds
+                bounds_list.append((b.left, b.bottom, b.right, b.top))
+        except Exception:
+            pass  # corrupted file already reported by check_raster_present / check_raster_crs
 
     if len(bounds_list) < 2:
         return _result("Raster spatial consistency", SKIP, "Fewer than 2 rasters to compare")
@@ -113,9 +119,12 @@ def check_spatial_consistency(paths: list[Path]) -> dict:
 def check_nan_fraction(label: str, path: Path, max_frac: float) -> dict:
     import rasterio
 
-    with rasterio.open(path) as src:
-        arr = src.read(1).astype(np.float32)
-        nodata = src.nodata
+    try:
+        with rasterio.open(path) as src:
+            arr = src.read(1).astype(np.float32)
+            nodata = src.nodata
+    except Exception as exc:
+        return _result(label, FAIL, f"Read error — file may be truncated or corrupted: {exc}")
 
     if nodata is not None:
         arr[arr == nodata] = np.nan
@@ -139,9 +148,12 @@ def check_nan_fraction(label: str, path: Path, max_frac: float) -> dict:
 def check_ndvi_median_range(path: Path, expected_min: float, expected_max: float) -> dict:
     import rasterio
 
-    with rasterio.open(path) as src:
-        arr = src.read(1).astype(np.float32)
-        nodata = src.nodata
+    try:
+        with rasterio.open(path) as src:
+            arr = src.read(1).astype(np.float32)
+            nodata = src.nodata
+    except Exception as exc:
+        return _result("NDVI median value range", FAIL, f"Read error — file may be truncated or corrupted: {exc}")
 
     if nodata is not None:
         arr[arr == nodata] = np.nan
@@ -167,9 +179,12 @@ def check_ndvi_median_range(path: Path, expected_min: float, expected_max: float
 def check_ndvi_anomaly_distribution(path: Path, import_config) -> dict:
     import rasterio
 
-    with rasterio.open(path) as src:
-        arr = src.read(1).astype(np.float32)
-        nodata = src.nodata
+    try:
+        with rasterio.open(path) as src:
+            arr = src.read(1).astype(np.float32)
+            nodata = src.nodata
+    except Exception as exc:
+        return _result("NDVI anomaly distribution", FAIL, f"Read error — file may be truncated or corrupted: {exc}")
 
     if nodata is not None:
         arr[arr == nodata] = np.nan
@@ -209,17 +224,23 @@ def check_ndvi_anomaly_distribution(path: Path, import_config) -> dict:
 def check_flowering_correlation(ndvi_anomaly_path: Path, flowering_path: Path, max_corr: float) -> dict:
     import rasterio
 
-    with rasterio.open(ndvi_anomaly_path) as src:
-        ndvi_arr = src.read(1).astype(np.float32)
-        nodata = src.nodata
-    if nodata is not None:
-        ndvi_arr[ndvi_arr == nodata] = np.nan
+    try:
+        with rasterio.open(ndvi_anomaly_path) as src:
+            ndvi_arr = src.read(1).astype(np.float32)
+            nodata = src.nodata
+        if nodata is not None:
+            ndvi_arr[ndvi_arr == nodata] = np.nan
+    except Exception as exc:
+        return _result("Flowering ≠ NDVI anomaly (correlation)", FAIL, f"Read error on ndvi_anomaly — file may be truncated or corrupted: {exc}")
 
-    with rasterio.open(flowering_path) as src2:
-        fl_arr = src2.read(1).astype(np.float32)
-        nodata2 = src2.nodata
-    if nodata2 is not None:
-        fl_arr[fl_arr == nodata2] = np.nan
+    try:
+        with rasterio.open(flowering_path) as src2:
+            fl_arr = src2.read(1).astype(np.float32)
+            nodata2 = src2.nodata
+        if nodata2 is not None:
+            fl_arr[fl_arr == nodata2] = np.nan
+    except Exception as exc:
+        return _result("Flowering ≠ NDVI anomaly (correlation)", FAIL, f"Read error on flowering_index — file may be truncated or corrupted: {exc}")
 
     # Align shapes (take common valid pixels via smallest shape)
     min_rows = min(ndvi_arr.shape[0], fl_arr.shape[0])
