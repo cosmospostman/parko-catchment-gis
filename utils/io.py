@@ -59,6 +59,7 @@ def write_cog(da: xr.DataArray, path: Path, nodata: float = np.nan) -> None:
         tiled=True,
         blockxsize=512,
         blockysize=512,
+        BIGTIFF="YES",
     )
     with rasterio.open(str(path), "r+") as dst:
         min_dim = min(dst.width, dst.height)
