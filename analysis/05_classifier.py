@@ -279,10 +279,11 @@ def main() -> None:
 
     # Build X, y, sample_weight arrays
     # Real ALA records: weight=1.0 — synthetic ecological samples: weight=SYNTH_SAMPLE_WEIGHT
-    X_pres       = np.array([feat_stack[r, c] for r, c in presence_pixels])
-    X_abs        = np.array([feat_stack[r, c] for r, c in absence_pixels])
-    X_synth_pres = np.array([feat_stack[r, c] for r, c in synth_pres_pixels])
-    X_synth_abs  = np.array([feat_stack[r, c] for r, c in synth_abs_pixels])
+    n_feat = feat_stack.shape[-1]
+    X_pres       = np.array([feat_stack[r, c] for r, c in presence_pixels]) if presence_pixels else np.empty((0, n_feat))
+    X_abs        = np.array([feat_stack[r, c] for r, c in absence_pixels]) if absence_pixels else np.empty((0, n_feat))
+    X_synth_pres = np.array([feat_stack[r, c] for r, c in synth_pres_pixels]) if synth_pres_pixels else np.empty((0, n_feat))
+    X_synth_abs  = np.array([feat_stack[r, c] for r, c in synth_abs_pixels]) if synth_abs_pixels else np.empty((0, n_feat))
 
     X = np.vstack([X_pres, X_abs, X_synth_pres, X_synth_abs])
     y = np.array(

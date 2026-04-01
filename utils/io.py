@@ -61,7 +61,10 @@ def write_cog(da: xr.DataArray, path: Path, nodata: float = np.nan) -> None:
         blockysize=512,
     )
     with rasterio.open(str(path), "r+") as dst:
-        dst.build_overviews([2, 4, 8, 16, 32], rasterio.enums.Resampling.average)
+        min_dim = min(dst.width, dst.height)
+        levels = [l for l in [2, 4, 8, 16, 32] if l < min_dim]
+        if levels:
+            dst.build_overviews(levels, rasterio.enums.Resampling.average)
         dst.update_tags(ns="rio_overview", resampling="average")
     logger.info("Written COG: %s", path)
 
