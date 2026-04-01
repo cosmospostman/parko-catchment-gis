@@ -134,6 +134,7 @@ def main() -> None:
     shapes = list(
         rasterio.features.shapes(data, mask=data, transform=transform)
     )
+    logger.info("Vectorised to %d shapes before union", len(shapes))
     if not shapes:
         logger.warning("No flood pixels found — writing empty GeoDataFrame")
         gdf = gpd.GeoDataFrame(geometry=[], crs=config.TARGET_CRS)
