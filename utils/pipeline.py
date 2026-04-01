@@ -82,8 +82,12 @@ def setup_proj() -> None:
         pass
 
 
-def _worker_init(fetch_fn, compute_fn, scratch_dir, fetch_workers, compute_workers):
-    """Pool initializer: store callables in module-level state so _run_tile can reach them."""
+def _worker_init():
+    """No-op pool initializer — state is inherited via fork from _WORKER_STATE."""
+
+
+def _populate_worker_state(fetch_fn, compute_fn, scratch_dir, fetch_workers, compute_workers):
+    """Populate module-level worker state before forking so children inherit it."""
     _WORKER_STATE["fetch_fn"] = fetch_fn
     _WORKER_STATE["compute_fn"] = compute_fn
     _WORKER_STATE["scratch_dir"] = scratch_dir
@@ -207,12 +211,12 @@ def run_tiled_pipeline(
     stats_thread = threading.Thread(target=_stats_writer, daemon=True)
     stats_thread.start()
 
+    _populate_worker_state(fetch_fn, compute_fn, scratch_dir, fetch_workers, compute_workers)
     mp_ctx = multiprocessing.get_context("fork")
     with ProcessPoolExecutor(
         max_workers=fetch_workers,
         mp_context=mp_ctx,
         initializer=_worker_init,
-        initargs=(fetch_fn, compute_fn, scratch_dir, fetch_workers, compute_workers),
     ) as pool:
         futures = {
             pool.submit(_run_tile, args): args[0]
