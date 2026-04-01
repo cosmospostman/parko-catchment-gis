@@ -387,14 +387,27 @@ def _preprocess_gcp_warp(
         with rasterio.open(meas_asset.href) as src:
             # Clamp window to actual dataset bounds
             window = window.intersection(rasterio.windows.Window(0, 0, src.width, src.height))
-            src_data = src.read(1, window=window).astype(np.float32)
+            # Oversample factor: read at ~2× the output resolution to avoid aliasing,
+            # but no finer than needed.  S1 GRD native pixel ≈ 10 m; output is
+            # `resolution` metres.  Decimate during the read to cap memory use.
+            native_m = 10  # S1 GRD IW native ground resolution (metres)
+            out_factor = max(1, resolution // (native_m * 2))  # e.g. 50 m → factor 2
+            win_h = max(1, round(window.height / out_factor))
+            win_w = max(1, round(window.width  / out_factor))
+            src_data = src.read(
+                1, window=window,
+                out_shape=(win_h, win_w),
+                resampling=rasterio.enums.Resampling.average,
+            ).astype(np.float32)
             win_col_off = int(window.col_off)
             win_row_off = int(window.row_off)
 
-        # Adjust GCP pixel/line coordinates to be relative to the window
+        # Adjust GCP pixel/line coordinates to be relative to the window,
+        # then scale down to match the decimated src_data pixel grid.
         windowed_gcps = [
             rasterio.control.GroundControlPoint(
-                row=g.row - win_row_off, col=g.col - win_col_off,
+                row=(g.row - win_row_off) / out_factor,
+                col=(g.col - win_col_off) / out_factor,
                 x=g.x, y=g.y, z=g.z,
             )
             for g in gcps
