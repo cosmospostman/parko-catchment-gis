@@ -60,6 +60,14 @@ def main() -> None:
             if href.startswith("s3://"):
                 uris.append(href)
 
+        # Add annotation XMLs — not exposed as STAC assets but required by sarsen.
+        # Derive scene root from the vv asset and construct the known paths.
+        vv_href = item.assets.get("vv", None)
+        if vv_href and vv_href.href.startswith("s3://"):
+            scene_root = vv_href.href.rsplit("/measurement/", 1)[0]
+            uris.append(f"{scene_root}/annotation/iw-vv.xml")
+            uris.append(f"{scene_root}/annotation/iw-vh.xml")
+
     # Deduplicate while preserving order
     seen: set[str] = set()
     deduped: list[str] = []
