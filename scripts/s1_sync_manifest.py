@@ -52,9 +52,9 @@ def main() -> None:
         print(f"ERROR: No Sentinel-1 items found for {args.year}", file=sys.stderr)
         sys.exit(1)
 
-    # Dry-season reference: Oct–Nov of the prior year
-    dry_start = f"{args.year - 1}-10-01"
-    dry_end   = f"{args.year - 1}-11-30"
+    # Dry-season reference: Oct–Nov of the analysis year
+    dry_start = f"{args.year}-10-01"
+    dry_end   = f"{args.year}-11-30"
     logger.info("Searching Sentinel-1 dry-season reference items: %s → %s", dry_start, dry_end)
     dry_items = search_sentinel1(
         bbox=bbox,

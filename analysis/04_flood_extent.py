@@ -61,8 +61,8 @@ def main() -> None:
     flood_end   = f"{config.YEAR}-{config.FLOOD_SEASON_END}"
 
     # --- Dry-season reference mask (Oct–Nov of prior year) -------------------
-    dry_start = f"{config.YEAR - 1}-10-01"
-    dry_end   = f"{config.YEAR - 1}-11-30"
+    dry_start = f"{config.YEAR}-10-01"
+    dry_end   = f"{config.YEAR}-11-30"
     logger.info("Searching dry-season S1 reference items: %s → %s", dry_start, dry_end)
     dry_items = search_sentinel1(
         bbox=bbox_wgs84,

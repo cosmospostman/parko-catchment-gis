@@ -4,7 +4,7 @@
 **Version:** 2.0
 **Status:** Draft
 **Prepared for:** Kowanyama Aboriginal Land and Natural Resources Management Office (KALNRMO)
-**Last updated:** March 2026
+**Last updated:** April 2026
 
 ---
 
@@ -236,15 +236,37 @@ The long-term baseline is computed once and cached; only the current-year compos
 ### Step 4 — Sentinel-1 flood extent
 
 ```python
-# Load S1 GRD IW scenes (VV + VH) for Nov–Apr wet season
-# Preprocessing: thermal noise removal, radiometric calibration,
-#                terrain correction (via sarsen + s1-reader, or SNAP)
-# Open water detection: VV backscatter < threshold
-# Flood extent = union of inundated pixels across wet season
+# Phase 1 — Dry-season reference mask (Oct–Nov, same year)
+# Load S1 GRD IW VV scenes for Oct–Nov of YEAR
+# Per-pixel median VV backscatter across all scenes
+# Flag pixels with median VV < -16 dB as persistent low-backscatter non-water
+# (sodic scalds, smooth gully floors — Mitchell megafan-specific confound)
+# Output: reference_mask  [bool array, in-memory only]
+#
+# Phase 2 — Wet-season flood classification (Jan–May, current year)
+# Load S1 GRD IW scenes (VV + VH) for Jan–May wet season
+# Per scene:
+#   - Warp VV and VH to EPSG:7855 at 50 m via GCP-based reprojection
+#   - Apply 3×3 median speckle filter (NaN-aware)
+#   - Per-scene Otsu threshold on VV dB histogram → water/non-water
+#   - VH guard: pixel must also fall below VH Otsu threshold
+#     (reduces false positives from wind roughening and smooth dry soil)
+#   - Exclude pixels flagged in reference mask
+# Accumulate per-pixel flood count and observation count across scenes
+# Flood frequency = flood_count / obs_count per pixel
+# Threshold at FLOOD_MIN_FREQUENCY (10%) → flood extent binary mask
+# Morphological closing (150 m radius) to merge adjacent blobs
+# Vectorise → union → simplify (100 m tolerance) → clip to catchment
 # Output: flood_extent_YYYY.gpkg
 ```
 
-Note: S1 GRD requires preprocessing before analysis. This is the only step that cannot use raw STAC-delivered data directly. `sarsen` + `s1-reader` is the Python-native approach; SNAP (ESA's Sentinel Application Platform) is the standard alternative. Allocate additional setup time for this step.
+**Why Otsu over a fixed threshold:** The Mitchell megafan's diverse land cover — open water, inundated grassland, bare scalds, sparse savanna — means a single dB cutoff calibrated for one scene type performs poorly on others. Per-scene Otsu finds the natural bimodal break in each backscatter histogram, making the classification robust to scene-to-scene variation in soil moisture and vegetation state.
+
+**Why the VH guard:** VV backscatter drops over both open water and very smooth dry surfaces (sodic scalds). VH backscatter is more sensitive to volume scattering from vegetation structure and is less affected by specular reflection from bare soil — so requiring the Otsu threshold to be met in both bands substantially reduces false positives from scalds while retaining flooded-grassland detections.
+
+**Why a dry-season reference mask:** The Mitchell megafan's sodic soils produce extensive bare "scalds" and gully floors that can read below -15 dB in dry conditions, within the range of true water. A median composite of Oct–Nov scenes (typically the driest month) identifies these persistently low-backscatter surfaces so they can be excluded from wet-season classification. Oct–Nov of the same analysis year is used: it represents the annual backscatter minimum before the onset of summer storms, and is available by the time the pipeline runs as an annual batch job after the wet season ends.
+
+**Prefetch:** Both dry-season reference scenes (Oct–Nov, YEAR) and wet-season scenes (Jan–May, YEAR) are fetched by `scripts/s1_sync_manifest.py` in Stage 0. The reference mask is recomputed from the cached scenes each run — no separate cache file.
 
 **Cross-validation:** Compare output against DEA Wetlands Insight Tool for the same wet season. The WIT provides inundation time series for Queensland wetlands since 1987 and gives an independent area estimate to validate against.
 
