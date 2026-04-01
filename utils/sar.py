@@ -5,6 +5,7 @@ Isolated so tests can mock preprocess_s1_scene() without importing sarsen.
 
 import logging
 import os
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
@@ -166,9 +167,26 @@ def build_dry_season_reference_mask(
             vv_db = np.where(observed, 10 * np.log10(vv_lin + 1e-12), np.nan)
         return vv_db, observed.sum()
 
-    vv_stack = []
     ref_shape = None
     completed = 0
+    # scene results buffered as (vv_db_float16, n_valid) until shape is known
+    pending: list[tuple[np.ndarray, int]] = []
+    # index into the mmap once shape is known
+    mmap_file = None
+    mmap_arr = None   # shape (n_scenes, H, W), float16, memory-mapped
+    mmap_idx = 0
+
+    def _write_to_mmap(vv_db: np.ndarray, n_valid: int, item_id: str) -> None:
+        nonlocal mmap_arr, mmap_idx
+        if mmap_arr is None:
+            return
+        if vv_db.shape != ref_shape:
+            logger.debug("Dry-season scene %s: shape mismatch — skipped", item_id)
+            return
+        mmap_arr[mmap_idx] = vv_db.astype(np.float16)
+        mmap_idx += 1
+        logger.info("Dry-season reference: added %s (%d valid px) [%d/%d]",
+                    item_id, n_valid, completed, total)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(_process_dry, item): item for item in items}
@@ -182,25 +200,54 @@ def build_dry_season_reference_mask(
                                  item.id, completed, total)
                     continue
                 vv_db, n_valid = result
+
                 if ref_shape is None:
+                    # First good scene — now we know the grid shape.
+                    # Allocate a memory-mapped array for all scenes (worst case = total).
                     ref_shape = vv_db.shape
-                if vv_db.shape == ref_shape:
-                    vv_stack.append(vv_db)
-                    logger.info("Dry-season reference: added %s (%d valid px) [%d/%d]",
-                                item.id, n_valid, completed, total)
+                    mmap_file = tempfile.NamedTemporaryFile(suffix=".npy", delete=False)
+                    mmap_arr = np.lib.format.open_memmap(
+                        mmap_file.name, mode="w+", dtype=np.float16,
+                        shape=(total, ref_shape[0], ref_shape[1]),
+                    )
+                    logger.info("Allocated dry-season mmap: %d × %dx%d float16 (%.0f MB)",
+                                total, ref_shape[0], ref_shape[1],
+                                total * ref_shape[0] * ref_shape[1] * 2 / 1e6)
+                    # Flush any results that arrived before shape was known
+                    for pv, pn in pending:
+                        _write_to_mmap(pv, pn, "buffered")
+                    pending.clear()
+                    _write_to_mmap(vv_db, n_valid, item.id)
+                elif mmap_arr is None:
+                    pending.append((vv_db.astype(np.float16), n_valid))
                 else:
-                    logger.debug("Dry-season scene %s: shape mismatch — skipped (%d/%d)",
-                                 item.id, completed, total)
+                    _write_to_mmap(vv_db, n_valid, item.id)
+
             except Exception as exc:
                 logger.warning("Dry-season scene %s failed (%d/%d): %s",
                                item.id, completed, total, exc)
 
-    if not vv_stack:
+    if mmap_arr is None or mmap_idx == 0:
         logger.warning("No dry-season scenes processed — reference mask unavailable")
+        if mmap_file:
+            os.unlink(mmap_file.name)
         return None
 
-    logger.info("Computing reference mask median from %d scenes...", len(vv_stack))
-    median_vv = np.nanmedian(np.stack(vv_stack, axis=0), axis=0)
+    valid_stack = mmap_arr[:mmap_idx]  # shape (n_scenes, H, W), mmap-backed
+    n_scenes, h, w = valid_stack.shape
+    logger.info("Computing reference mask median from %d scenes (chunked, mmap)...", n_scenes)
+    # Process in row chunks so peak RAM ≈ chunk_rows × W × n_scenes × 4 bytes (float32)
+    # 256 rows × 9046 cols × 39 scenes × 4 B ≈ 360 MB — safe on any instance.
+    CHUNK_ROWS = 256
+    median_vv = np.empty((h, w), dtype=np.float32)
+    for row_start in range(0, h, CHUNK_ROWS):
+        row_end = min(row_start + CHUNK_ROWS, h)
+        chunk = valid_stack[:, row_start:row_end, :].astype(np.float32)
+        median_vv[row_start:row_end, :] = np.nanmedian(chunk, axis=0)
+        del chunk
+    del valid_stack, mmap_arr
+    os.unlink(mmap_file.name)
+
     mask = (median_vv < low_backscatter_threshold_db) & np.isfinite(median_vv)
     logger.info("Dry-season reference mask: %d / %d pixels flagged (%.1f%%)",
                 mask.sum(), mask.size, 100 * mask.sum() / mask.size)
