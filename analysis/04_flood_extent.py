@@ -22,7 +22,7 @@ FLOOD_UNION_SIMPLIFY_TOLERANCE = 100        # metres — coarser than pixel size
 DASK_CHUNK_SPATIAL = 2048
 S1_MAX_WORKERS = 4                          # concurrent S1 scene downloads
 S1_RESOLUTION = 50                          # metres — flood mapping doesn't need 10 m
-FLOOD_MIN_FREQUENCY = 0.25                  # pixel must be water in ≥25% of scenes
+FLOOD_MIN_FREQUENCY = 0.10                  # pixel must be water in ≥10% of scenes
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +119,7 @@ def main() -> None:
                 min_scenes, scene_count, FLOOD_MIN_FREQUENCY * 100)
     for pct in [50, 75, 90, 95, 99]:
         logger.info("  flood_count p%d = %d scenes", pct, np.percentile(flood_count, pct))
+    logger.info("  flood_count max = %d, pixels > 0: %d", flood_count.max(), (flood_count > 0).sum())
     combined = flood_count >= min_scenes
     del flood_count
 
