@@ -56,10 +56,21 @@ def _otsu_threshold(values: np.ndarray, n_bins: int = 512) -> float:
 
 
 def _focal_median(arr: np.ndarray, radius: int = 1) -> np.ndarray:
-    """Apply a (2*radius+1) × (2*radius+1) median speckle filter, ignoring NaNs."""
-    from scipy.ndimage import generic_filter
+    """Apply a (2*radius+1) × (2*radius+1) median speckle filter.
+
+    NaN pixels are temporarily replaced with the array median before filtering
+    so they don't contaminate neighbours, then restored after.
+    """
+    from scipy.ndimage import median_filter
     size = 2 * radius + 1
-    return generic_filter(arr, lambda x: np.nanmedian(x), size=size, mode="reflect").astype(np.float32)
+    nan_mask = ~np.isfinite(arr)
+    if nan_mask.any():
+        fill = float(np.nanmedian(arr))
+        arr = arr.copy()
+        arr[nan_mask] = fill
+    result = median_filter(arr, size=size, mode="reflect").astype(np.float32)
+    result[nan_mask] = np.nan
+    return result
 
 
 def flood_mask_from_scene(
