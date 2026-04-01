@@ -113,6 +113,11 @@ def flood_extent_path(year: int) -> Path:
     return OUTPUTS_DIR / str(year) / f"flood_extent_{year}.gpkg"
 
 
+def flood_obs_count_path(year: int) -> Path:
+    """Return the path for the per-pixel observation count raster for the given year."""
+    return OUTPUTS_DIR / str(year) / f"flood_obs_count_{year}.tif"
+
+
 def probability_raster_path(year: int) -> Path:
     """Return the path for the Parkinsonia probability raster for the given year."""
     return OUTPUTS_DIR / str(year) / f"probability_raster_{year}.tif"

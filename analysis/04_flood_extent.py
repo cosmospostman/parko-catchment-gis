@@ -211,36 +211,77 @@ def main() -> None:
     if flood_count is None:
         raise RuntimeError("No valid S1 scenes processed")
 
-    # Flood frequency = flood_count / obs_count per pixel (ignore unobserved pixels)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        freq = np.where(obs_count > 0, flood_count / obs_count.astype(np.float32), 0.0)
-    logger.info("Flood frequency threshold: %.0f%%  obs_count median: %d",
-                FLOOD_MIN_FREQUENCY * 100, int(np.median(obs_count[obs_count > 0])))
-    for pct in [50, 75, 90, 95, 99]:
-        logger.info("  freq p%d = %.1f%%", pct, np.percentile(freq[obs_count > 0], pct) * 100)
-    combined = freq >= FLOOD_MIN_FREQUENCY
-    del flood_count, obs_count, freq
+    # Minimum observations required to classify a pixel — pixels seen by fewer
+    # scenes are coverage-edge artefacts (sub-swath boundaries, orbit gaps) and
+    # produce false positives because Otsu is calibrated on the full-scene
+    # histogram, not on the edge incidence-angle zone.
+    # With 13 passes per orbit × 4 orbits = ~52 theoretical observations,
+    # requiring at least 4 ensures every valid pixel was seen by at least one
+    # full orbit's worth of passes.
+    MIN_OBS = 4
 
-    # Vectorise flood mask to polygons
-    logger.info("Vectorising flood extent...")
+    import affine
+    import rasterio
     import rasterio.features
     import rasterio.transform
     from scipy.ndimage import binary_closing
 
-    # Build affine transform from the reference DataArray coordinates
-    import affine
+    # Build affine transform from the reference DataArray coordinates (used
+    # for both the obs_count raster write and the vectorisation below).
     x = combined_coords.coords["x"].values
     y = combined_coords.coords["y"].values
     res_x = float(x[1] - x[0]) if len(x) > 1 else config.TARGET_RESOLUTION
     res_y = float(y[1] - y[0]) if len(y) > 1 else -config.TARGET_RESOLUTION
     transform = affine.Affine(res_x, 0, float(x[0]), 0, res_y, float(y[0]))
 
+    # Persist obs_count as a GeoTIFF for diagnostics and quality masking
+    obs_path = config.flood_obs_count_path(config.YEAR)
+    obs_path.parent.mkdir(parents=True, exist_ok=True)
+    with rasterio.open(
+        str(obs_path), "w", driver="GTiff", count=1, dtype="uint16",
+        width=obs_count.shape[1], height=obs_count.shape[0],
+        crs=config.TARGET_CRS, transform=transform,
+        compress="deflate",
+    ) as dst:
+        dst.write(obs_count, 1)
+    logger.info("Written obs_count raster: %s", obs_path)
+
+    # Flood frequency = flood_count / obs_count per pixel (ignore unobserved pixels)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        freq = np.where(obs_count > 0, flood_count / obs_count.astype(np.float32), 0.0)
+    sufficient_obs = obs_count >= MIN_OBS
+    logger.info("Flood frequency threshold: %.0f%%  obs_count median: %d  min_obs filter: %d",
+                FLOOD_MIN_FREQUENCY * 100, int(np.median(obs_count[obs_count > 0])), MIN_OBS)
+    logger.info("Pixels excluded by min_obs filter: %d (%.1f%%)",
+                (~sufficient_obs & (obs_count > 0)).sum(),
+                100 * (~sufficient_obs & (obs_count > 0)).sum() / max((obs_count > 0).sum(), 1))
+    for pct in [50, 75, 90, 95, 99]:
+        logger.info("  freq p%d = %.1f%%", pct, np.percentile(freq[sufficient_obs], pct) * 100)
+    combined = (freq >= FLOOD_MIN_FREQUENCY) & sufficient_obs
+    del flood_count, obs_count, freq, sufficient_obs
+
+    # Vectorise flood mask to polygons
+    logger.info("Vectorising flood extent...")
+
     # Morphological closing merges nearby blobs at raster stage, drastically
     # reducing polygon count before vectorisation and unary_union.
     CLOSING_RADIUS_PX = 3  # 3 px × 50 m = 150 m closing radius
+    # Minimum contiguous patch size to retain — removes isolated speckle pixels
+    # that survive Otsu + VH guard.  4 px × (50 m)² = 1 ha minimum.
+    MIN_PATCH_PX = 4
     struct = np.ones((CLOSING_RADIUS_PX * 2 + 1, CLOSING_RADIUS_PX * 2 + 1), dtype=bool)
     data = binary_closing(combined, structure=struct).astype(np.uint8)
     logger.info("Morphological closing done; flood pixels: %d", data.sum())
+
+    from scipy.ndimage import label
+    labelled, n_features = label(data)
+    patch_sizes = np.bincount(labelled.ravel())  # index 0 = background
+    small_labels = np.where(patch_sizes < MIN_PATCH_PX)[0]
+    small_labels = small_labels[small_labels > 0]  # exclude background
+    if small_labels.size:
+        data[np.isin(labelled, small_labels)] = 0
+    del labelled, patch_sizes, small_labels
+    logger.info("After min-patch filter (%d px): flood pixels: %d", MIN_PATCH_PX, data.sum())
 
     shapes = list(
         rasterio.features.shapes(data, mask=data, transform=transform)

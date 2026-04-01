@@ -127,6 +127,16 @@ def flood_mask_from_scene(
     water = observed & (vv_db < otsu_vv)
     del vv_db
 
+    # Sanity check: if Otsu classified an implausibly large fraction of the
+    # scene as water the histogram was likely unimodal (dry scene) and Otsu
+    # split within the land distribution.  Discard the scene in that case.
+    # 40% is generous — the Mitchell megafan at peak flood is ~15–20% water.
+    water_fraction = water.sum() / max(observed.sum(), 1)
+    if water_fraction > 0.40:
+        logger.info("Scene %s discarded — water fraction %.1f%% exceeds sanity limit",
+                    item.id, 100 * water_fraction)
+        return None
+
     # VH guard — require VH also below its Otsu threshold
     if vh_lin is not None:
         vh_nan = ~observed
