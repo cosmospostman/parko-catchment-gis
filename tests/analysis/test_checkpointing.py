@@ -88,7 +88,9 @@ class TestCheckpointing01:
             da = _make_synthetic_stack(bands=["nir"]).isel(time=0, band=0)
             da.rio.to_raster(str(out_path), driver="GTiff", dtype="float32")
 
-        with patch("utils.stac.search_sentinel2", return_value=[MagicMock()]), \
+        mock_item = MagicMock()
+        mock_item.bbox = [140.0, -18.0, 144.0, -14.0]
+        with patch("utils.stac.search_sentinel2", return_value=[mock_item]), \
              patch("utils.stac.load_stackstac", load_mock), \
              patch("utils.tiling.make_tile_bboxes",
                    return_value=[[141.0, -17.0, 143.0, -15.0]]), \
@@ -150,7 +152,9 @@ class TestCheckpointing03:
             da = _make_synthetic_stack(bands=["nir"]).isel(time=0, band=0)
             da.rio.to_raster(str(out_path), driver="GTiff", dtype="float32")
 
-        with patch("utils.stac.search_sentinel2", return_value=[MagicMock()]), \
+        mock_item = MagicMock()
+        mock_item.bbox = [140.0, -18.0, 144.0, -14.0]
+        with patch("utils.stac.search_sentinel2", return_value=[mock_item]), \
              patch("utils.stac.load_stackstac", load_mock), \
              patch("utils.tiling.make_tile_bboxes",
                    return_value=[[141.0, -17.0, 143.0, -15.0]]), \
