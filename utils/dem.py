@@ -332,6 +332,9 @@ def compute_hand(
     hand_arr = grid.compute_hand(fdir, dem_raster, stream_mask)
     result = np.array(hand_arr).astype(np.float32)
 
+    # pysheds returns nodata (nan) for stream pixels themselves; set them to 0
+    result[np.array(stream_mask).astype(bool)] = 0.0
+
     # Clamp negatives (numerical noise in flat areas) and mask voids
     result = np.where(np.isfinite(result), np.maximum(result, 0.0), np.nan)
     result[~np.isfinite(dem.values)] = np.nan
