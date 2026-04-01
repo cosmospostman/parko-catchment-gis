@@ -169,11 +169,13 @@ def flood_mask_from_scene(
     if valid.size == 0:
         del dst_data
         return None
-    otsu_threshold = _otsu_threshold(valid)
-    logger.info("Otsu threshold %s VV: %.1f DN", item.id, otsu_threshold)
     observed = np.isfinite(dst_data) & (dst_data > 0)
-    water    = observed & (dst_data < otsu_threshold)
-    del dst_data
+    with np.errstate(divide="ignore", invalid="ignore"):
+        vv_db = 10 * np.log10((dst_data ** 2) / 1e6 + 1e-12)
+    water = observed & (vv_db < threshold_db)
+    del dst_data, vv_db
+    logger.info("Water pixels %s: %d / %d observed (%.1f%%)",
+                item.id, water.sum(), observed.sum(), 100 * water.sum() / max(observed.sum(), 1))
 
     x_coords = np.linspace(dst_bounds[0], dst_bounds[2], dst_width)
     y_coords = np.linspace(dst_bounds[3], dst_bounds[1], dst_height)

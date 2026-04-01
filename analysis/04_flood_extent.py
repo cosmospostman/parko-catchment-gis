@@ -17,7 +17,7 @@ from shapely.ops import unary_union
 
 # Script-level constants
 S1_POLARISATIONS = ["VV", "VH"]
-VV_OPEN_WATER_THRESHOLD_DB = -14.0          # dB — below this = open water
+VV_OPEN_WATER_THRESHOLD_DB = -16.0          # dB — below this = open water (DN²/1e6 scale)
 FLOOD_UNION_SIMPLIFY_TOLERANCE = 100        # metres — coarser than pixel size (50 m) is fine
 DASK_CHUNK_SPATIAL = 2048
 S1_MAX_WORKERS = 2                          # concurrent S1 scene downloads
