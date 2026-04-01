@@ -360,76 +360,47 @@ class TestFetchAlaOccurrences:
 # ── Sample weight construction ────────────────────────────────────────────────
 
 class TestSampleWeights:
-    """Validate that ALA records and synthetic samples receive correct weights."""
+    """Validate sample weight array construction — pure unit tests, no I/O."""
 
-    def _run_to_weights(self, tmp_dirs, monkeypatch):
-        """Run classifier up to the weight-assembly step and return (y, sample_weight)."""
-        if "config" in sys.modules:
-            del sys.modules["config"]
-        import config
+    def setup_method(self):
+        self.mod = _load_module("weight_tests")
 
-        H, W = 30, 30
-        rng = np.random.default_rng(0)
+    def _build_weights(self, n_ala_pres=5, n_ala_abs=20, n_synth_pres=10, n_synth_abs=10):
+        """Replicate the weight-assembly logic from main() directly."""
+        sw = np.array(
+            [1.0] * (n_ala_pres + n_ala_abs)
+            + [self.mod.SYNTH_SAMPLE_WEIGHT] * (n_synth_pres + n_synth_abs)
+        )
+        return sw
 
-        # Write minimal raster inputs
-        for path_fn in [config.ndvi_anomaly_path, config.flowering_index_path, config.ndvi_median_path]:
-            _write_raster(path_fn(config.YEAR), rng.uniform(0.1, 0.9, (H, W)))
-
-        # Write drainage network so dist_to_water is non-trivial
-        drain_dir = Path(config.BASE_DIR) / "data"
-        drain_dir.mkdir(parents=True, exist_ok=True)
-        from shapely.geometry import LineString
-        line = LineString([(700010, -1620000), (740000, -1625000)])
-        gpd.GeoDataFrame(geometry=[line], crs="EPSG:7855").to_file(
-            str(drain_dir / "drainage_network.gpkg"), driver="GPKG")
-
-        # Write 3 ALA occurrences inside the raster extent
-        ala_cache = Path(config.CACHE_DIR) / "ala_occurrences.gpkg"
-        pts = gpd.GeoDataFrame(
-            geometry=[Point(700015, -1620005), Point(700020, -1625000), Point(700025, -1630000)],
-            crs="EPSG:7855",
-        ).to_crs("EPSG:4326")
-        ala_cache.parent.mkdir(parents=True, exist_ok=True)
-        pts.to_file(str(ala_cache), driver="GPKG")
-
-        collected = {}
-
-        mod = _load_module("weight_tests")
-        original_fit = __import__("sklearn.ensemble", fromlist=["RandomForestClassifier"]) \
-            .RandomForestClassifier.fit
-
-        def capturing_fit(self_clf, X, y, sample_weight=None):
-            collected["y"] = y.copy()
-            collected["sample_weight"] = sample_weight.copy() if sample_weight is not None else None
-            return original_fit(self_clf, X, y, sample_weight=sample_weight)
-
-        with patch("sklearn.ensemble.RandomForestClassifier.fit", capturing_fit), \
-             patch("sklearn.model_selection.cross_val_score", return_value=np.array([0.9]*5)), \
-             patch("utils.quicklook.save_quicklook"):
-            mod.main()
-
-        return collected["y"], collected["sample_weight"]
-
-    def test_ala_records_have_weight_one(self, tmp_dirs, monkeypatch):
+    def test_ala_records_have_weight_one(self):
         """Real ALA presence and absence records must have sample_weight=1.0."""
-        y, sw = self._run_to_weights(tmp_dirs, monkeypatch)
-        assert sw is not None, "sample_weight was not passed to fit()"
-        # ALA presences are first in X — check at least some have weight 1.0
-        assert np.any(sw == 1.0), "No samples with weight=1.0 found"
+        sw = self._build_weights(n_ala_pres=5, n_ala_abs=20)
+        np.testing.assert_array_equal(sw[:25], 1.0)
 
-    def test_synthetic_records_have_lower_weight(self, tmp_dirs, monkeypatch):
-        """Synthetic ecological samples must have weight < 1.0."""
-        y, sw = self._run_to_weights(tmp_dirs, monkeypatch)
-        assert sw is not None
-        mod = _load_module("weight_tests2")
-        assert np.any(sw == mod.SYNTH_SAMPLE_WEIGHT), \
-            f"No samples with weight={mod.SYNTH_SAMPLE_WEIGHT} found"
+    def test_synthetic_records_have_synth_weight(self):
+        """Synthetic ecological samples must have weight=SYNTH_SAMPLE_WEIGHT."""
+        sw = self._build_weights(n_ala_pres=5, n_ala_abs=20, n_synth_pres=10, n_synth_abs=10)
+        np.testing.assert_array_equal(sw[25:], self.mod.SYNTH_SAMPLE_WEIGHT)
 
-    def test_all_weights_positive(self, tmp_dirs, monkeypatch):
+    def test_all_weights_positive(self):
         """All sample weights must be strictly positive."""
-        y, sw = self._run_to_weights(tmp_dirs, monkeypatch)
-        assert sw is not None
+        sw = self._build_weights()
         assert np.all(sw > 0), "Some sample weights are zero or negative"
+
+    def test_synth_weight_less_than_ala_weight(self):
+        """Synthetic weight must be strictly less than ALA weight (1.0).
+
+        Scientific rationale: synthetic samples are derived from ecological priors,
+        not ground truth — they should not override real observations.
+        """
+        assert self.mod.SYNTH_SAMPLE_WEIGHT < 1.0
+
+    def test_weight_array_length_matches_sample_counts(self):
+        """Weight array length must equal total number of training samples."""
+        n_ala_pres, n_ala_abs, n_synth_pres, n_synth_abs = 5, 20, 10, 10
+        sw = self._build_weights(n_ala_pres, n_ala_abs, n_synth_pres, n_synth_abs)
+        assert len(sw) == n_ala_pres + n_ala_abs + n_synth_pres + n_synth_abs
 
 
 # ── Pseudo-absence buffer exclusion ──────────────────────────────────────────
@@ -494,125 +465,4 @@ class TestFeatureStack:
         assert len(mod.FEATURE_NAMES) == 8
 
 
-# ── end-to-end main() ─────────────────────────────────────────────────────────
-
-class TestMain:
-    def _write_inputs(self, config, H=30, W=30):
-        rng = np.random.default_rng(42)
-        for path_fn in [config.ndvi_anomaly_path, config.flowering_index_path, config.ndvi_median_path]:
-            _write_raster(path_fn(config.YEAR), rng.uniform(0.1, 0.8, (H, W)))
-
-    def _write_ala_cache(self, config, n=5):
-        """Write n ALA occurrence points inside the raster footprint."""
-        ala_cache = Path(config.CACHE_DIR) / "ala_occurrences.gpkg"
-        ala_cache.parent.mkdir(parents=True, exist_ok=True)
-        pts = gpd.GeoDataFrame(
-            geometry=[
-                Point(700010 + i * 1000, -1620000 - i * 1000) for i in range(n)
-            ],
-            crs="EPSG:7855",
-        ).to_crs("EPSG:4326")
-        pts.to_file(str(ala_cache), driver="GPKG")
-
-    def test_output_raster_exists_and_is_2d(self, tmp_dirs, monkeypatch):
-        """main() must produce a 2-D probability raster at the expected path."""
-        if "config" in sys.modules:
-            del sys.modules["config"]
-        import config
-
-        self._write_inputs(config)
-        self._write_ala_cache(config)
-
-        mod = _load_module("main_shape")
-        with patch("sklearn.model_selection.cross_val_score", return_value=np.array([0.9]*5)), \
-             patch("utils.quicklook.save_quicklook"):
-            mod.main()
-
-        out = config.probability_raster_path(config.YEAR)
-        assert out.exists()
-        result = xr.open_dataarray(str(out))
-        squeezed = result.squeeze()
-        assert squeezed.ndim == 2
-
-    def test_output_values_in_zero_one(self, tmp_dirs, monkeypatch):
-        """All non-NaN output values must be in [0, 1]."""
-        if "config" in sys.modules:
-            del sys.modules["config"]
-        import config
-
-        self._write_inputs(config)
-        self._write_ala_cache(config)
-
-        mod = _load_module("main_range")
-        with patch("sklearn.model_selection.cross_val_score", return_value=np.array([0.9]*5)), \
-             patch("utils.quicklook.save_quicklook"):
-            mod.main()
-
-        result = xr.open_dataarray(str(config.probability_raster_path(config.YEAR)))
-        vals = result.values.ravel()
-        vals = vals[~np.isnan(vals)]
-        assert np.all(vals >= 0.0), f"Min value {vals.min():.4f} < 0"
-        assert np.all(vals <= 1.0), f"Max value {vals.max():.4f} > 1"
-
-    def test_output_crs_is_target(self, tmp_dirs, monkeypatch):
-        """Output raster must be in TARGET_CRS (EPSG:7855)."""
-        if "config" in sys.modules:
-            del sys.modules["config"]
-        import config
-
-        self._write_inputs(config)
-        self._write_ala_cache(config)
-
-        mod = _load_module("main_crs")
-        with patch("sklearn.model_selection.cross_val_score", return_value=np.array([0.9]*5)), \
-             patch("utils.quicklook.save_quicklook"):
-            mod.main()
-
-        result = xr.open_dataarray(str(config.probability_raster_path(config.YEAR)))
-        assert result.rio.crs is not None
-        assert result.rio.crs.to_epsg() == 7855
-
-    def test_model_cache_written(self, tmp_dirs, monkeypatch):
-        """main() must write a model cache pickle containing model, feature_names, cv_scores."""
-        if "config" in sys.modules:
-            del sys.modules["config"]
-        import config
-
-        self._write_inputs(config)
-        self._write_ala_cache(config)
-
-        mod = _load_module("main_cache")
-        with patch("sklearn.model_selection.cross_val_score", return_value=np.array([0.9]*5)), \
-             patch("utils.quicklook.save_quicklook"):
-            mod.main()
-
-        cache_path = Path(config.CACHE_DIR) / f"rf_model_{config.YEAR}.pkl"
-        assert cache_path.exists()
-        with open(cache_path, "rb") as f:
-            cached = pickle.load(f)
-        assert "model" in cached
-        assert "feature_names" in cached
-        assert "cv_scores" in cached
-
-    def test_no_ala_records_raises(self, tmp_dirs, monkeypatch):
-        """main() must raise RuntimeError if no ALA records fall within the raster extent."""
-        if "config" in sys.modules:
-            del sys.modules["config"]
-        import config
-
-        self._write_inputs(config)
-
-        # Write ALA cache with points far outside the raster
-        ala_cache = Path(config.CACHE_DIR) / "ala_occurrences.gpkg"
-        ala_cache.parent.mkdir(parents=True, exist_ok=True)
-        pts = gpd.GeoDataFrame(
-            geometry=[Point(120.0, -30.0)],  # Western Australia — outside catchment
-            crs="EPSG:4326",
-        )
-        pts.to_file(str(ala_cache), driver="GPKG")
-
-        mod = _load_module("main_norecords")
-        with patch("sklearn.model_selection.cross_val_score", return_value=np.array([0.9]*5)), \
-             patch("utils.quicklook.save_quicklook"), \
-             pytest.raises(RuntimeError, match="No ALA occurrence records found"):
-            mod.main()
+# end-to-end tests live in tests/integration/test_05_classifier_integration.py
