@@ -115,6 +115,7 @@ def _preprocess_stackstac_fallback(item: Any, bbox: list, resolution: int) -> xr
         assets=["vv", "vh"],
         resolution=resolution,
         bounds_latlon=bbox,
+        epsg=4326,
     )
     ds = da.to_dataset(dim="band")
     # Normalise band names to uppercase to match downstream expectations
