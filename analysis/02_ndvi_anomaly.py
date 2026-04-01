@@ -320,10 +320,11 @@ def main() -> None:
     logger.info("Writing COG: %s", out_path)
     write_cog(anomaly, out_path)
     logger.info("── Step 02 complete  output: %s ────────────────────────────────────────", out_path)
+    del anomaly
 
     ql_path = Path(str(out_path).replace(".tif", "_quicklook.png"))
     save_quicklook(
-        anomaly,
+        out_path,
         ql_path,
         vmin=-0.3,
         vmax=0.3,
