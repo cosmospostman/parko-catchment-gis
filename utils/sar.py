@@ -326,29 +326,22 @@ def _preprocess_gcp_warp(
     import rasterio.warp
     import rasterio.transform
 
-    meas_map = {
-        "VV": item.assets.get("vv"),
-        "VH": item.assets.get("vh"),
-    }
-
-    # Annotation XML path — only meaningful for local SAFE directories.
-    # Remote COG assets (earth-search v1) embed GCPs directly in the TIFF.
-    safe_root = None
-    vv_asset = item.assets.get("vv")
-    if vv_asset and not vv_asset.href.startswith(("http", "s3://")):
-        _root = Path(vv_asset.href).parent.parent
-        if (_root / "annotation").is_dir():
-            safe_root = _root
+    safe_root = Path(_safe_root_from_item(item))
+    anno_dir = safe_root / "annotation"
 
     def _find_annotation(pol: str) -> Path | None:
-        if safe_root is None:
-            return None
-        anno_dir = safe_root / "annotation"
+        """Return the annotation XML for `pol`, handling both single-file
+        (iw-vv.xml) and per-subswath (iw1-vv.xml, iw2-vv.xml, …) layouts."""
         single = anno_dir / f"iw-{pol.lower()}.xml"
         if single.exists():
             return single
         matches = sorted(anno_dir.glob(f"*-{pol.lower()}-*.xml"))
         return matches[0] if matches else None
+
+    meas_map = {
+        "VV": item.assets.get("vv"),
+        "VH": item.assets.get("vh"),
+    }
 
     target_crs = rasterio.crs.CRS.from_epsg(7855)
     minx, miny, maxx, maxy = bbox  # WGS84
@@ -362,36 +355,15 @@ def _preprocess_gcp_warp(
 
     bands = {}
     for pol in polarisations:
+        anno_path = _find_annotation(pol)
         meas_asset = meas_map[pol]
-        if meas_asset is None:
-            logger.debug("Missing %s asset for %s — skipping polarisation", pol, item.id)
+        if anno_path is None or meas_asset is None:
+            logger.debug("Missing %s data for %s — skipping polarisation", pol, item.id)
             continue
 
-        gcps = None
-        src_crs = rasterio.crs.CRS.from_epsg(4326)  # default; overridden by embedded GCP CRS
-
-        # 1. Try annotation XML (local SAFE directories)
-        anno_path = _find_annotation(pol)
-        if anno_path is not None:
-            gcps = _read_gcps_from_annotation(anno_path)
-            if not gcps:
-                logger.debug("No GCPs in annotation for %s %s", item.id, pol)
-
-        # 2. Fall back to GCPs embedded in the COG/TIFF itself
+        gcps = _read_gcps_from_annotation(anno_path)
         if not gcps:
-            try:
-                with rasterio.open(meas_asset.href) as src:
-                    _embedded_gcps, _gcp_crs = src.gcps()
-                    if _embedded_gcps:
-                        gcps = _embedded_gcps
-                        src_crs = _gcp_crs
-                        logger.debug("Using embedded GCPs from COG for %s %s (%d gcps)",
-                                     item.id, pol, len(gcps))
-            except Exception as _e:
-                logger.debug("Could not read embedded GCPs for %s %s: %s", item.id, pol, _e)
-
-        if not gcps:
-            logger.debug("No GCPs available for %s %s — skipping polarisation", item.id, pol)
+            logger.debug("No GCPs in annotation for %s %s", item.id, pol)
             continue
 
         # Use GCPs to find the source pixel window covering the bbox,
