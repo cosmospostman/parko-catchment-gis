@@ -28,7 +28,7 @@ from shapely.ops import unary_union
 # Script-level constants
 FLOOD_UNION_SIMPLIFY_TOLERANCE = 100        # metres — coarser than pixel size (50 m) is fine
 DASK_CHUNK_SPATIAL = 2048
-S1_MAX_WORKERS = 2                          # concurrent S1 scene downloads
+S1_MAX_WORKERS = int(os.environ.get("FETCH_WORKERS", 2))  # override with --fetch-workers
 S1_RESOLUTION = 50                          # metres — flood mapping doesn't need 10 m
 FLOOD_MIN_FREQUENCY = 0.10                  # pixel must be water in ≥10% of scenes
 
