@@ -137,13 +137,14 @@ def flood_mask_from_scene(
                     item.id, 100 * water_fraction)
         return None
 
-    # VH guard — require VH also below a fixed -20 dB threshold.
-    # Open water returns very low VH backscatter (typically -22 to -25 dB);
-    # land surfaces (even smooth dry scalds) are generally above -20 dB.
-    # A fixed threshold is more reliable than Otsu here because on dry scenes
-    # the VH histogram is unimodal and Otsu would split within the land
-    # distribution, eliminating the few real water pixels VV correctly found.
-    VH_WATER_THRESHOLD_DB = -20.0
+    # VH guard — require VH also below its Otsu threshold, clamped to the
+    # scene median so it cannot split within the water distribution.
+    # On wet scenes the VH histogram is bimodal (water low, land high) and
+    # Otsu finds the correct valley. On dry scenes the histogram is unimodal
+    # and Otsu would land somewhere in the middle of the land distribution;
+    # clamping to the median ensures the threshold stays at or below the
+    # typical scene brightness, so genuine water pixels (which are darker
+    # than median) are retained rather than eliminated.
     if vh_lin is not None:
         vh_nan = ~observed
         vh_lin[vh_nan] = np.nan
@@ -154,8 +155,14 @@ def flood_mask_from_scene(
             vh_lin *= 10
         vh_db = vh_lin
         del vh_lin
-        logger.info("VH guard threshold for %s: %.1f dB (fixed)", item.id, VH_WATER_THRESHOLD_DB)
-        water = water & (vh_db < VH_WATER_THRESHOLD_DB)
+        vh_valid = vh_db[observed]
+        if vh_valid.size >= 100:
+            otsu_vh = _otsu_threshold(vh_valid)
+            vh_median = float(np.median(vh_valid))
+            vh_threshold = min(otsu_vh, vh_median)
+            logger.info("VH guard for %s: Otsu=%.1f dB  median=%.1f dB  threshold=%.1f dB",
+                        item.id, otsu_vh, vh_median, vh_threshold)
+            water = water & (vh_db < vh_threshold)
         del vh_db
 
     # Exclude pixels that are persistently low-backscatter in the dry season
