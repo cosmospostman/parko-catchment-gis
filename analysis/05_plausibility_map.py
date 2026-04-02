@@ -108,15 +108,17 @@ def vectorise_zones(
     Patches smaller than min_patch_ha are removed.  Returns an empty GeoDataFrame
     (with the correct CRS) if no patches survive the size filter.
     """
+    from shapely.geometry import shape as _shape
+
     geoms = [
-        geom
-        for geom, val in shapes(binary.astype(np.uint8), mask=binary.astype(np.uint8), transform=transform)
+        _shape(geom_dict)
+        for geom_dict, val in shapes(binary.astype(np.uint8), mask=binary.astype(np.uint8), transform=transform)
         if val == 1
     ]
     if not geoms:
         return gpd.GeoDataFrame(geometry=[], crs=crs)
 
-    gdf = gpd.GeoDataFrame.from_features(geoms, crs=crs)
+    gdf = gpd.GeoDataFrame(geometry=geoms, crs=crs)
     gdf["area_ha"] = gdf.geometry.area / 1e4
     gdf = gdf[gdf["area_ha"] >= min_patch_ha].reset_index(drop=True)
     return gdf

@@ -363,15 +363,32 @@ class TestEcologicalSignalEncoding:
 
     def test_upland_green_pixel_suppressed_by_hand(self):
         """A spectrally positive pixel at HAND=80 m scores below a weaker spectral
-        pixel at HAND=2 m — HAND acts as an ecological gate."""
-        score = self._three_pixel_scene(
-            ndvi_vals=[0.5, 0.2, 0.0],      # pixel 0: spectrally strong; pixel 1: weak
-            flower_vals=[0.8, 0.1, 0.0],
-            hand_vals=[80.0, 2.0, 0.1],     # pixel 0: upland; pixel 1: floodplain
-        )
-        # Upland green pixel (0) should score lower than weaker-spectral floodplain pixel (1)
+        pixel at HAND=2 m — HAND acts as an ecological gate.
+
+        We use a 1×10 scene so percentile scaling has enough range to clearly
+        separate the upland (HAND=80 m → hand_inv_norm≈0) from the floodplain
+        (HAND=2 m → hand_inv_norm≈1).
+        """
+        # 10-pixel scene: pixel 0 = spectrally strong upland, pixel 1 = weak floodplain,
+        # remaining 8 pixels = background context spanning the HAND range
+        n = 10
+        ndvi   = np.zeros((1, n), dtype=np.float32)
+        flower = np.zeros((1, n), dtype=np.float32)
+        hand   = np.linspace(0.5, 100.0, n, dtype=np.float32).reshape(1, n)
+
+        # pixel 0: strong spectral but upland (highest HAND in scene)
+        ndvi[0, 0]   = 0.5
+        flower[0, 0] = 0.8
+        hand[0, 0]   = 100.0   # upland — maps to hand_inv_norm ≈ 0
+
+        # pixel 1: weak spectral but floodplain (lowest HAND in scene)
+        ndvi[0, 1]   = 0.2
+        flower[0, 1] = 0.1
+        hand[0, 1]   = 0.5    # floodplain — maps to hand_inv_norm ≈ 1
+
+        score = compute_plausibility(ndvi, flower, hand)
         assert score[0, 0] < score[0, 1], (
-            f"Upland pixel (HAND=80 m) should score below floodplain pixel, "
+            f"Upland pixel (HAND=100 m) should score below floodplain pixel, "
             f"got {score[0, 0]:.3f} vs {score[0, 1]:.3f}"
         )
 
