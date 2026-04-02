@@ -172,6 +172,118 @@ def check_baseline_year_span(year: int, baseline_start_year: int) -> dict:
         f"{baseline_start_year}–{year - 1}  ({n_years} years)")
 
 
+def check_baseline_tag(path: Path, year: int, baseline_start_year: int) -> dict:
+    """IMAGEDESCRIPTION tag must match the expected year range.
+
+    A mismatch means the cache was built for a different YEAR or
+    BASELINE_START_YEAR and will produce a large anomaly mean.
+    """
+    label = "Baseline cache tag"
+    if not path.exists():
+        return _result(label, SKIP, "Cache absent")
+    import rasterio
+    try:
+        with rasterio.open(path) as src:
+            tag = src.tags().get("IMAGEDESCRIPTION", "")
+    except Exception as exc:
+        return _result(label, FAIL, f"Cannot read tags: {exc}")
+    expected = f"NDVI_BASELINE:{baseline_start_year}-{year - 1}"
+    if tag != expected:
+        return _result(label, FAIL,
+            f"Tag '{tag}' does not match expected '{expected}' — "
+            "cache is stale, set REBUILD_BASELINE=true")
+    return _result(label, PASS, tag)
+
+
+def check_anomaly_preview(
+    ndvi_path: Path,
+    baseline_path: Path,
+    mean_tol: float,
+    min_std: float,
+    max_std: float,
+) -> list:
+    """Sample both rasters at 1/8 resolution and preview anomaly mean & std.
+
+    Uses the same tolerances as the post-run verifier so problems are caught
+    before the ~5-minute write step.  Returns two result dicts.
+    """
+    label_mean = "Anomaly preview mean"
+    label_std  = "Anomaly preview std"
+
+    if not ndvi_path.exists() or not baseline_path.exists():
+        skip_msg = "Requires both Stage 01 NDVI and baseline cache"
+        return [
+            _result(label_mean, SKIP, skip_msg),
+            _result(label_std,  SKIP, skip_msg),
+        ]
+
+    import rasterio
+    from rasterio.enums import Resampling as _Resampling
+
+    def _read_decimated(p: Path):
+        try:
+            with rasterio.open(p) as src:
+                factor = 8
+                out_h = max(1, src.height // factor)
+                out_w = max(1, src.width  // factor)
+                arr = src.read(
+                    1,
+                    out_shape=(out_h, out_w),
+                    resampling=_Resampling.average,
+                ).astype(np.float32)
+                nodata = src.nodata
+            if nodata is not None:
+                arr[arr == nodata] = np.nan
+            return arr
+        except Exception:
+            return None
+
+    ndvi_arr     = _read_decimated(ndvi_path)
+    baseline_arr = _read_decimated(baseline_path)
+
+    if ndvi_arr is None or baseline_arr is None:
+        msg = "Cannot read one or both rasters"
+        return [_result(label_mean, FAIL, msg), _result(label_std, FAIL, msg)]
+
+    # Resize baseline to match ndvi if shapes differ (different native resolutions)
+    if ndvi_arr.shape != baseline_arr.shape:
+        from PIL import Image
+        bl_img = Image.fromarray(baseline_arr)
+        baseline_arr = np.array(
+            bl_img.resize((ndvi_arr.shape[1], ndvi_arr.shape[0]), Image.BILINEAR),
+            dtype=np.float32,
+        )
+
+    anomaly = ndvi_arr - baseline_arr
+    valid = anomaly[np.isfinite(anomaly)]
+
+    if valid.size < 100:
+        skip_msg = f"Only {valid.size} valid pixels after decimation"
+        return [
+            _result(label_mean, SKIP, skip_msg),
+            _result(label_std,  SKIP, skip_msg),
+        ]
+
+    a_mean = float(np.mean(valid))
+    a_std  = float(np.std(valid))
+
+    mean_ok = abs(a_mean) <= mean_tol
+    std_ok  = min_std <= a_std <= max_std
+
+    result_mean = _result(
+        label_mean,
+        PASS if mean_ok else FAIL,
+        f"mean={a_mean:.4f}  (tolerance ±{mean_tol})"
+        + ("" if mean_ok else "  ← baseline may be stale or mismatched"),
+    )
+    result_std = _result(
+        label_std,
+        PASS if std_ok else FAIL,
+        f"std={a_std:.4f}  (expected [{min_std}, {max_std}])",
+    )
+    return [result_mean, result_std]
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -211,6 +323,9 @@ def main() -> None:
             "Baseline cache CRS", baseline_path, int(config.TARGET_CRS.split(":")[-1])
         ))
         sci_results.append(check_ndvi_range("Baseline cache value range", baseline_path))
+        sci_results.append(check_baseline_tag(
+            baseline_path, config.YEAR, config.BASELINE_START_YEAR
+        ))
     else:
         sci_results.append(_result(
             "Baseline cache quality", SKIP,
@@ -219,6 +334,15 @@ def main() -> None:
 
     # Year configuration
     sci_results.append(check_baseline_year_span(config.YEAR, config.BASELINE_START_YEAR))
+
+    # Anomaly preview — catch mean/std failures before the full run
+    sci_results.extend(check_anomaly_preview(
+        ndvi_path,
+        baseline_path,
+        mean_tol=config.CHANGE_DETECTION_MEAN_TOLERANCE,
+        min_std=config.NDVI_ANOMALY_MIN_STD,
+        max_std=config.NDVI_ANOMALY_MAX_STD,
+    ))
 
     ok = _summary(file_results, sci_results)
     sys.exit(0 if ok else 1)
