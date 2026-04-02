@@ -226,7 +226,8 @@ def build_baseline(bbox, config, tile_cache_dir: Path, rebuild: bool) -> None:
     logger.info("Merging %d tiles…", len(valid_paths))
     merge_tile_rasters(valid_paths, merged_path, nodata=np.nan, crs=config.TARGET_CRS)
 
-    baseline = xr.open_dataarray(str(merged_path)).load()
+    import rioxarray
+    baseline = rioxarray.open_rasterio(str(merged_path), masked=True).load()
     if baseline.ndim == 3:
         baseline = baseline.squeeze()
     baseline = baseline.rio.write_crs(config.TARGET_CRS)
