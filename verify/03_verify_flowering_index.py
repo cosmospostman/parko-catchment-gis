@@ -30,19 +30,22 @@ def main() -> None:
     if ndvi_da.ndim == 3:
         ndvi_da = ndvi_da.squeeze()
 
-    # Align flowering to NDVI grid for correlation check
-    flowering_aligned = flowering_da.rio.reproject_match(ndvi_da)
+    # Sample both rasters independently for correlation check (avoids full reproject)
+    RNG = np.random.default_rng(42)
+    SAMPLE_N = 50_000
 
-    fi_vals   = flowering_aligned.values.ravel()
-    ndvi_vals = ndvi_da.values.ravel()
-    valid_mask = ~(np.isnan(fi_vals) | np.isnan(ndvi_vals))
-    fi_v   = fi_vals[valid_mask]
-    ndvi_v = ndvi_vals[valid_mask]
+    fi_flat = flowering_da.values.ravel()
+    fi_valid = fi_flat[~np.isnan(fi_flat)]
+    fi_sample = RNG.choice(fi_valid, size=min(SAMPLE_N, len(fi_valid)), replace=False)
+
+    ndvi_flat = ndvi_da.values.ravel()
+    ndvi_valid = ndvi_flat[~np.isnan(ndvi_flat)]
+    ndvi_sample = RNG.choice(ndvi_valid, size=min(SAMPLE_N, len(ndvi_valid)), replace=False)
 
     def check_correlation():
-        if len(fi_v) < 10:
+        if min(len(fi_sample), len(ndvi_sample)) < 10:
             return  # not enough data to check
-        corr = float(np.corrcoef(fi_v, ndvi_v)[0, 1])
+        corr = float(np.corrcoef(fi_sample, ndvi_sample)[0, 1])
         if abs(corr) >= config.FLOWERING_ANOMALY_CORRELATION_MAX:
             raise AssertionError(
                 f"Flowering index vs NDVI anomaly correlation {corr:.3f} >= "

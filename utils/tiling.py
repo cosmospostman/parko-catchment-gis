@@ -104,11 +104,15 @@ def merge_tile_rasters(
         vrt_path = vrt_file.name
 
     try:
-        subprocess.run(
+        r1 = subprocess.run(
             ["gdalbuildvrt", "-vrtnodata", nodata_str, vrt_path] + valid,
-            check=True, capture_output=True,
+            capture_output=True,
         )
-        subprocess.run(
+        if r1.returncode != 0:
+            raise subprocess.CalledProcessError(
+                r1.returncode, r1.args, r1.stdout, r1.stderr
+            )
+        r2 = subprocess.run(
             [
                 "gdal_translate",
                 "-of", "GTiff",
@@ -121,8 +125,13 @@ def merge_tile_rasters(
                 "-a_nodata", nodata_str,
                 vrt_path, str(out_path),
             ],
-            check=True, capture_output=True,
+            capture_output=True,
         )
+        if r2.returncode != 0:
+            logger.error("gdal_translate stderr:\n%s", r2.stderr.decode(errors="replace"))
+            raise subprocess.CalledProcessError(
+                r2.returncode, r2.args, r2.stdout, r2.stderr
+            )
     finally:
         Path(vrt_path).unlink(missing_ok=True)
 

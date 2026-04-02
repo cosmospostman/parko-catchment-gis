@@ -157,6 +157,24 @@ def main() -> None:
         dst.write(arr, 1)
     logger.info("Written HAND raster: %s", hand_path)
 
+    # Reproject HAND to TARGET_RESOLUTION (10 m) so it shares the same grid as
+    # the NDVI anomaly and flowering index rasters.  Doing this once here avoids
+    # a reproject_match call on every Stage 05 run and keeps all three inputs
+    # grid-consistent for the verify-input check.
+    import rioxarray as rxr
+    hand_da = rxr.open_rasterio(str(hand_path)).squeeze()
+    hand_da = hand_da.rio.reproject(
+        config.TARGET_CRS,
+        resolution=config.TARGET_RESOLUTION,
+        resampling=rasterio.enums.Resampling.bilinear,
+    )
+    hand_da.rio.write_nodata(-9999.0, inplace=True)
+    hand_da.rio.to_raster(str(hand_path), dtype="float32", compress="deflate")
+    logger.info(
+        "Reprojected HAND raster to %d m: shape=%s",
+        config.TARGET_RESOLUTION, hand_da.shape,
+    )
+
     # Log HAND percentile diagnostics
     valid_hand = hand.values[np.isfinite(hand.values)]
     if valid_hand.size > 0:

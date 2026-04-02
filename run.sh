@@ -77,8 +77,8 @@ export LOCAL_S2_ROOT="${LOCAL_S2_ROOT:-}"
 export LOCAL_S1_ROOT="${LOCAL_S1_ROOT:-}"
 export LOCAL_DEM_ROOT="${LOCAL_DEM_ROOT:-}"
 export TILE_SIZE_PX="${TILE_SIZE_PX:-512}"
-export FETCH_WORKERS="${FETCH_WORKERS:-$([ -n "${LOCAL_S2_ROOT}" ] && echo 4 || echo 16)}"
-export COMPUTE_WORKERS="${COMPUTE_WORKERS:-$(python -c 'import os; print(os.cpu_count() or 4)')}"
+export FETCH_WORKERS="${FETCH_WORKERS:-16}"
+export COMPUTE_WORKERS="${COMPUTE_WORKERS:-16}"
 export DRY_WORKERS="${DRY_WORKERS:-4}"
 
 # ── Logging setup ─────────────────────────────────────────────────────────────

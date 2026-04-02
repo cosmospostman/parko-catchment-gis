@@ -23,6 +23,12 @@ from pathlib import Path
 
 import numpy as np
 
+# Maximum number of valid pixels to sample for statistical checks.
+# At 37k×45k the full raster is ~6 GB as float32; 500k pixels gives
+# < 2 MB per raster and keeps all statistics well within tolerance.
+_SAMPLE_N = 500_000
+_RNG = np.random.default_rng(42)
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -123,26 +129,52 @@ def check_grids_consistent(paths: list[Path], labels: list[str]) -> dict:
 # Section 2 — Scientific sanity checks
 # ---------------------------------------------------------------------------
 
+def _sample_raster(path: Path, n: int = _SAMPLE_N) -> tuple:
+    """Return a 1-D float32 sample of valid pixels and the nodata value.
+
+    Reads the raster in a single overview pass when overviews exist, otherwise
+    reads a systematic stride of rows to avoid loading the full array.  Peak
+    memory is O(n) not O(width × height).
+    """
+    import rasterio
+    from rasterio.enums import Resampling
+
+    with rasterio.open(path) as src:
+        nodata = src.nodata
+        full_pixels = src.width * src.height
+        # Downsample to a thumbnail whose pixel count slightly exceeds n so that
+        # after removing nodata we still have enough valid samples.
+        scale = max(1, int((full_pixels / (n * 2)) ** 0.5))
+        out_h = max(1, src.height // scale)
+        out_w = max(1, src.width  // scale)
+        arr = src.read(
+            1,
+            out_shape=(out_h, out_w),
+            resampling=Resampling.nearest,
+        ).astype(np.float32)
+
+    if nodata is not None and np.isfinite(nodata):
+        arr[arr == nodata] = np.nan
+
+    valid = arr[np.isfinite(arr)]
+    if valid.size > n:
+        valid = _RNG.choice(valid, size=n, replace=False)
+    return valid, nodata
+
+
 def check_ndvi_anomaly_distribution(ndvi_path: Path) -> dict:
     """Mean should be near zero (|mean| < 0.05); std in [0.03, 0.20].
 
     A large absolute mean suggests the baseline was computed from the wrong years
     or the NDVI composite contains cloud contamination.
     """
-    import rasterio
-
     if not ndvi_path.exists():
         return _result("NDVI anomaly distribution", SKIP, "File not found")
     try:
-        with rasterio.open(ndvi_path) as src:
-            arr = src.read(1).astype(np.float32)
-            nodata = src.nodata
+        valid, _ = _sample_raster(ndvi_path)
     except Exception as exc:
         return _result("NDVI anomaly distribution", FAIL, f"Cannot read: {exc}")
 
-    if nodata is not None and np.isfinite(nodata):
-        arr[arr == nodata] = np.nan
-    valid = arr[np.isfinite(arr)]
     if valid.size < 100:
         return _result("NDVI anomaly distribution", SKIP, f"Only {valid.size} valid pixels")
 
@@ -168,17 +200,23 @@ def check_flowering_ndvi_decorrelation(flower_path: Path, ndvi_path: Path) -> di
     case one should be dropped before Stage 6.
     """
     import rasterio
+    from rasterio.enums import Resampling
 
     for p in (flower_path, ndvi_path):
         if not p.exists():
             return _result("Flowering–NDVI decorrelation", SKIP, f"File not found: {p.name}")
 
+    # Read both rasters at the same downsampled shape so pixels are co-located.
     try:
         with rasterio.open(flower_path) as src:
-            f_arr = src.read(1).astype(np.float32)
+            full_pixels = src.width * src.height
+            scale = max(1, int((full_pixels / (_SAMPLE_N * 2)) ** 0.5))
+            out_h = max(1, src.height // scale)
+            out_w = max(1, src.width  // scale)
+            f_arr = src.read(1, out_shape=(out_h, out_w), resampling=Resampling.nearest).astype(np.float32)
             f_nd  = src.nodata
         with rasterio.open(ndvi_path) as src:
-            n_arr = src.read(1).astype(np.float32)
+            n_arr = src.read(1, out_shape=(out_h, out_w), resampling=Resampling.nearest).astype(np.float32)
             n_nd  = src.nodata
     except Exception as exc:
         return _result("Flowering–NDVI decorrelation", FAIL, f"Cannot read: {exc}")
@@ -192,7 +230,14 @@ def check_flowering_ndvi_decorrelation(flower_path: Path, ndvi_path: Path) -> di
     if valid.sum() < 100:
         return _result("Flowering–NDVI decorrelation", SKIP, "Too few co-valid pixels")
 
-    r = float(np.corrcoef(f_arr[valid], n_arr[valid])[0, 1])
+    f_valid = f_arr[valid]
+    n_valid = n_arr[valid]
+    if f_valid.size > _SAMPLE_N:
+        idx = _RNG.choice(f_valid.size, size=_SAMPLE_N, replace=False)
+        f_valid = f_valid[idx]
+        n_valid = n_valid[idx]
+
+    r = float(np.corrcoef(f_valid, n_valid)[0, 1])
     ok = abs(r) < 0.70
     detail = f"Pearson r={r:.3f} (threshold <0.70)"
     if not ok:
@@ -202,13 +247,18 @@ def check_flowering_ndvi_decorrelation(flower_path: Path, ndvi_path: Path) -> di
 
 def check_hand_floodplain_coverage(hand_path: Path) -> dict:
     """At least 5% of valid HAND pixels should be below 5 m (confirms floodplain terrain)."""
-    import rasterio
-
     if not hand_path.exists():
         return _result("HAND floodplain coverage", SKIP, "File not found")
     try:
+        import rasterio
+        from rasterio.enums import Resampling
+
         with rasterio.open(hand_path) as src:
-            arr = src.read(1).astype(np.float32)
+            full_pixels = src.width * src.height
+            scale = max(1, int((full_pixels / (_SAMPLE_N * 2)) ** 0.5))
+            out_h = max(1, src.height // scale)
+            out_w = max(1, src.width  // scale)
+            arr = src.read(1, out_shape=(out_h, out_w), resampling=Resampling.nearest).astype(np.float32)
             nodata = src.nodata
     except Exception as exc:
         return _result("HAND floodplain coverage", FAIL, f"Cannot read: {exc}")
@@ -219,13 +269,11 @@ def check_hand_floodplain_coverage(hand_path: Path) -> dict:
     if valid.size < 100:
         return _result("HAND floodplain coverage", SKIP, f"Only {valid.size} valid pixels")
 
-    void_frac  = float(np.isnan(arr).mean())
+    void_frac   = float(np.isnan(arr).mean())
     below5_frac = float((valid < 5.0).mean())
     issues = []
     if below5_frac < 0.05:
         issues.append(f"only {below5_frac:.1%} of pixels <5 m — too few floodplain pixels")
-    # Void fraction threshold is generous: HAND rasters typically cover the full DEM bbox
-    # which extends well outside the catchment boundary, so out-of-catchment nodata is expected.
     if void_frac >= 0.70:
         issues.append(f"void fraction {void_frac:.1%} ≥ 70% — unusually high, check DEM coverage")
 

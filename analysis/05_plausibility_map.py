@@ -157,10 +157,6 @@ def main() -> None:
     logger.info("Loading HAND from %s", hand_path)
     hand_da = rxr.open_rasterio(str(hand_path)).squeeze()
 
-    # ── Align to NDVI anomaly grid ───────────────────────────────────────────
-    flower_da = flower_da.rio.reproject_match(ndvi_da)
-    hand_da   = hand_da.rio.reproject_match(ndvi_da)
-
     ndvi_arr   = ndvi_da.values.astype(np.float32)
     flower_arr = flower_da.values.astype(np.float32)
     hand_arr   = hand_da.values.astype(np.float32)
