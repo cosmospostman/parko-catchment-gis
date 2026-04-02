@@ -161,19 +161,39 @@ def main() -> None:
     # the NDVI anomaly and flowering index rasters.  Doing this once here avoids
     # a reproject_match call on every Stage 05 run and keeps all three inputs
     # grid-consistent for the verify-input check.
-    import rioxarray as rxr
-    hand_da = rxr.open_rasterio(str(hand_path)).squeeze()
-    hand_da = hand_da.rio.reproject(
-        config.TARGET_CRS,
-        resolution=config.TARGET_RESOLUTION,
-        resampling=rasterio.enums.Resampling.bilinear,
-    )
-    hand_da.rio.write_nodata(-9999.0, inplace=True)
-    hand_da.rio.to_raster(str(hand_path), dtype="float32", compress="deflate")
-    logger.info(
-        "Reprojected HAND raster to %d m: shape=%s",
-        config.TARGET_RESOLUTION, hand_da.shape,
-    )
+    # Use gdalwarp via subprocess to stream tiles and avoid loading the full
+    # reprojected array into memory (would exceed RAM on 32 GB instances).
+    import subprocess
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".tif", delete=False, dir=hand_path.parent) as tmp:
+        tmp_path = tmp.name
+    try:
+        subprocess.run(
+            [
+                "gdalwarp",
+                "-t_srs", config.TARGET_CRS,
+                "-tr", str(config.TARGET_RESOLUTION), str(config.TARGET_RESOLUTION),
+                "-r", "bilinear",
+                "-srcnodata", "-9999",
+                "-dstnodata", "-9999",
+                "-ot", "Float32",
+                "-co", "COMPRESS=DEFLATE",
+                "-co", "TILED=YES",
+                "-overwrite",
+                str(hand_path),
+                tmp_path,
+            ],
+            check=True,
+        )
+        Path(tmp_path).replace(hand_path)
+    except Exception:
+        Path(tmp_path).unlink(missing_ok=True)
+        raise
+    with rasterio.open(str(hand_path)) as ds:
+        logger.info(
+            "Reprojected HAND raster to %d m: shape=(%d, %d)",
+            config.TARGET_RESOLUTION, ds.height, ds.width,
+        )
 
     # Log HAND percentile diagnostics
     valid_hand = hand.values[np.isfinite(hand.values)]
