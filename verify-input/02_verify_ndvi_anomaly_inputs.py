@@ -282,14 +282,18 @@ def check_baseline_tag(
 def check_anomaly_preview(
     ndvi_path: Path,
     baseline_path: Path,
-    mean_tol: float,
     min_std: float,
     max_std: float,
 ) -> list:
-    """Sample both rasters at 1/8 resolution and preview anomaly mean & std.
+    """Sample both rasters at 1/8 resolution and preview anomaly std.
 
-    Uses the same tolerances as the post-run verifier so problems are caught
-    before the ~5-minute write step.  Returns two result dicts.
+    Checks that the anomaly has meaningful spread — a std near zero means the
+    subtraction silently failed (e.g. misaligned grids producing all-NaN then
+    falling back to the raw NDVI).  The mean is not checked: year-to-year climate
+    variability (e.g. La Niña wet years) means a large positive or negative mean
+    anomaly is ecologically valid and should not be flagged as a pipeline error.
+
+    Returns two result dicts.
     """
     label_mean = "Anomaly preview mean"
     label_std  = "Anomaly preview std"
@@ -352,19 +356,18 @@ def check_anomaly_preview(
     a_mean = float(np.mean(valid))
     a_std  = float(np.std(valid))
 
-    mean_ok = abs(a_mean) <= mean_tol
-    std_ok  = min_std <= a_std <= max_std
+    std_ok = min_std <= a_std <= max_std
 
     result_mean = _result(
         label_mean,
-        PASS if mean_ok else FAIL,
-        f"mean={a_mean:.4f}  (tolerance ±{mean_tol})"
-        + ("" if mean_ok else "  ← baseline may be stale or mismatched"),
+        PASS,
+        f"mean={a_mean:.4f}  (informational only — climate variability makes this non-diagnostic)",
     )
     result_std = _result(
         label_std,
         PASS if std_ok else FAIL,
-        f"std={a_std:.4f}  (expected [{min_std}, {max_std}])",
+        f"std={a_std:.4f}  (expected [{min_std}, {max_std}])"
+        + ("" if std_ok else "  ← near-zero std suggests subtraction failed silently"),
     )
     return [result_mean, result_std]
 
@@ -427,7 +430,6 @@ def main() -> None:
     sci_results.extend(check_anomaly_preview(
         ndvi_path,
         baseline_path,
-        mean_tol=config.CHANGE_DETECTION_MEAN_TOLERANCE,
         min_std=config.NDVI_ANOMALY_MIN_STD,
         max_std=config.NDVI_ANOMALY_MAX_STD,
     ))
