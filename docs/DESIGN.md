@@ -262,11 +262,32 @@ The original Sentinel-1 / Otsu thresholding approach was abandoned — C-band GR
 # Output: parkinsonia_probability_YYYY.tif  (Float32, 0–1)
 ```
 
+**Training data strategy:** The Mitchell catchment contains only ~13 ALA occurrence records — statistically insufficient for a robust classifier. An NT transfer learning approach (training on Katherine or McArthur NT sightings and applying the fitted model to Mitchell) was evaluated and rejected in favour of collecting Mitchell-specific ground truth via drone surveys. See the Training Data section below for the full rationale.
+
 **ALA data caveat:** ALA records are presence-only and spatially biased toward roadsides and surveyed areas. A standard RF trained on these will over-predict near infrastructure and under-predict in remote areas. Options: use MaxEnt or a presence-background approach (e.g. `elapid`) for initial habitat suitability modelling; or constrain pseudo-absence generation to plausible habitat with a minimum distance buffer from known positives. Year 1 outputs should be treated as first-pass screening, not confirmed detections.
 
 **Feature importance check:** NDVI anomaly should be the dominant feature. If distance-to-watercourse dominates, the model is fitting geography rather than spectral signal.
 
+**Overfitting mitigations:** Use `max_depth=6–8`, `min_samples_leaf=50–100`, spatial block CV (GroupKFold on ~50 km grid), and constrain pseudo-absences to riparian-adjacent pixels (within 5 km of drainage, outside the presence buffer). These prevent NT-specific or survey-bias artefacts from being encoded in deep splits.
+
 Target accuracy: >85% overall, >80% recall on positive class (missing a plant is worse than a false alarm). Validate annually against new KALNRMO ground-truth surveys. Retrain when ground-truth dataset grows materially.
+
+### Training data and the plausibility map
+
+**Why NT transfer learning was rejected:** The Mitchell catchment's ~13 ALA occurrence records are insufficient to train a robust classifier directly. An NT transfer learning approach — training on abundant NT sightings (Katherine/Daly River or McArthur River) and applying the fitted model to Mitchell feature rasters — was evaluated. It was rejected because: (1) drone surveys of the Mitchell catchment are planned anyway, producing ground truth in the correct domain; (2) Mitchell-specific training data eliminates covariate shift and enables genuine held-out validation against Mitchell detections; (3) the NT approach would be redundant once ground truth exists, and the quality gap between NT-trained and Mitchell-trained classifiers is substantial for the precision requirements of seed dispersal modelling (see below).
+
+**Seed dispersal and eradication vs management:** The probability raster feeds directly into upstream seed source ranking, which is the primary input to the eradication vs suppression strategic decision. Hydrochory dispersal modelling requires precision, not just recall: spurious upstream source populations propagate errors through the dispersal model, generating false eradication targets at significant cost. A Mitchell-trained classifier with confirmed absence labels provides calibrated probabilities suitable for this purpose; an NT-trained classifier does not. The quality gap matters here in a way it would not for a survey-direction tool.
+
+**Drone survey design:** The drone surveys should be optimised for classifier training, not just presence confirmation:
+- Collect confirmed absences as well as presences, sampled from high-plausibility zones (riparian pixels where Parkinsonia is ecologically plausible but absent on inspection)
+- Ensure spatial coverage across the full upstream network, not just the densest infestation areas, to avoid training a classifier that only recognises dense established stands
+- Aim for 200+ confirmed presence pixels and a comparable absence set before training
+
+**Plausibility map (pre-survey interim product):** Before drone survey ground truth is available, a rule-based threshold map using the three most ecologically grounded features can be produced directly from Stage 1–4 outputs with no training data:
+
+> Flag pixels where: **NDVI anomaly > X** AND **flowering_index > Y** AND **HAND < Z**
+
+This produces a ranked plausibility surface — not a calibrated probability map — identifying pixels that are simultaneously persistently green in the dry season, show an August–October flowering pulse, and sit in a low-drainage topographic position. These are the locations where Parkinsonia is both ecologically plausible and spectrally detectable. The plausibility map serves two purposes: directing drone survey zone selection, and validating against the 13 known ALA sightings (if the map misses known locations, a threshold or feature is miscalibrated before surveys begin). See [DESIGN-PLAUSIBILITY-MAP.md](DESIGN-PLAUSIBILITY-MAP.md) for the implementation plan.
 
 ### Step 6 — Vectorisation and prioritisation
 
@@ -472,17 +493,19 @@ mitchell-parkinsonia/
 │   ├── 02_ndvi_anomaly.py
 │   ├── 03_flowering_index.py
 │   ├── 04_flood_extent.py
-│   ├── 05_classifier.py
-│   ├── 06_vectorise_prioritise.py
-│   └── 07_change_detection.py
+│   ├── 05_plausibility_map.py
+│   ├── 06_classifier.py
+│   ├── 07_priority_patches.py
+│   └── 08_change_detection.py
 ├── verify/
 │   ├── 01_verify_ndvi_composite.py
 │   ├── 02_verify_ndvi_anomaly.py
 │   ├── 03_verify_flowering_index.py
 │   ├── 04_verify_flood_extent.py
-│   ├── 05_verify_classifier.py
-│   ├── 06_verify_vectors.py
-│   └── 07_verify_change_detection.py
+│   ├── 05_verify_plausibility_map.py
+│   ├── 06_verify_classifier.py
+│   ├── 07_verify_priority_patches.py
+│   └── 08_verify_change_detection.py
 └── outputs/
     └── .gitkeep
 ```
@@ -546,9 +569,10 @@ run_step 01_ndvi_composite
 run_step 02_ndvi_anomaly
 run_step 03_flowering_index
 run_step 04_flood_extent
-run_step 05_classifier
-run_step 06_vectorise_prioritise
-run_step 07_change_detection
+run_step 05_plausibility_map
+run_step 06_classifier
+run_step 07_priority_patches
+run_step 08_change_detection
 
 log "Analysis complete. Outputs in $OUTPUTS_DIR/$YEAR/"
 log "Tag this run: git tag analysis/$YEAR $(git rev-parse --short HEAD)"

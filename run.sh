@@ -538,9 +538,9 @@ run_step_or_abort 1 "01_ndvi_composite"    "01_verify_ndvi_composite"
 run_step_or_abort 2 "02_ndvi_anomaly"      "02_verify_ndvi_anomaly"
 run_step_or_abort 3 "03_flowering_index"   "03_verify_flowering_index"
 run_step_or_abort 4 "04_flood_extent"      "04_verify_flood_extent"
-run_step_or_abort 5 "05_classifier"        "05_verify_classifier"
-run_step_or_abort 6 "06_priority_patches"  "06_verify_priority_patches"
-run_step_or_abort 7 "07_change_detection"  "07_verify_change_detection"
+run_step_or_abort 5 "06_classifier"        "06_verify_classifier"
+run_step_or_abort 6 "07_priority_patches"  "07_verify_priority_patches"
+run_step_or_abort 7 "08_change_detection"  "08_verify_change_detection"
 
 print_summary
 

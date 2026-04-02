@@ -20,7 +20,7 @@ def main() -> None:
                         format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
                         stream=sys.stdout)
 
-    step = "06_priority_patches"
+    step = "07_priority_patches"
     checks_passed = 0
     checks_failed = 0
     messages = []

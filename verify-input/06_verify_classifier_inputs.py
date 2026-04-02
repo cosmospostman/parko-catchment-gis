@@ -1,5 +1,5 @@
 """
-verify-input/05_verify_classifier_inputs.py — Input checks for Stage 05 (classifier).
+verify-input/06_verify_classifier_inputs.py — Input checks for Stage 05 (classifier).
 
 Stage 05 trains a Random Forest classifier using raster feature layers from
 Stages 01–03 and ALA occurrence records. This script verifies all inputs
@@ -17,7 +17,7 @@ Sections
 
 Usage:
     source config.sh
-    python verify-input/05_verify_classifier_inputs.py [--no-ala-check]
+    python verify-input/06_verify_classifier_inputs.py [--no-ala-check]
 """
 import argparse
 import sys

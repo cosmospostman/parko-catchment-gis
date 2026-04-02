@@ -1,4 +1,4 @@
-"""Tests for verify/05_verify_classifier.py — geographic overfitting check."""
+"""Tests for verify/06_verify_classifier.py — geographic overfitting check."""
 import importlib.util
 import pickle
 import sys
@@ -71,7 +71,7 @@ def test_geographic_top_feature_fails(tmp_dirs):
     cache_path = Path(config.CACHE_DIR) / f"rf_model_{config.YEAR}.pkl"
     _write_model_cache(cache_path, top_feature="dist_to_watercourse", cv_mean=0.92)
 
-    script = PROJECT_ROOT / "verify" / "05_verify_classifier.py"
+    script = PROJECT_ROOT / "verify" / "06_verify_classifier.py"
     mod = _load_module(script, "verify05")
 
     with pytest.raises(SystemExit) as exc_info:
@@ -92,7 +92,7 @@ def test_good_top_feature_passes(tmp_dirs):
     cache_path = Path(config.CACHE_DIR) / f"rf_model_{config.YEAR}.pkl"
     _write_model_cache(cache_path, top_feature="ndvi_anomaly", cv_mean=0.92)
 
-    script = PROJECT_ROOT / "verify" / "05_verify_classifier.py"
+    script = PROJECT_ROOT / "verify" / "06_verify_classifier.py"
     mod = _load_module(script, "verify05_good")
     mod.main()  # should not raise SystemExit(2)
 
@@ -111,7 +111,7 @@ def test_low_cv_accuracy_fails(tmp_dirs):
     # cv_mean=0.60 is well below TARGET_OVERALL_ACCURACY=0.85
     _write_model_cache(cache_path, top_feature="ndvi_anomaly", cv_mean=0.60)
 
-    script = PROJECT_ROOT / "verify" / "05_verify_classifier.py"
+    script = PROJECT_ROOT / "verify" / "06_verify_classifier.py"
     mod = _load_module(script, "verify05_low_cv")
 
     with pytest.raises(SystemExit) as exc_info:

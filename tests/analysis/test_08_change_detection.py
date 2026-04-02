@@ -1,4 +1,4 @@
-"""Tests for analysis/07_change_detection.py — including Year 1 path."""
+"""Tests for analysis/08_change_detection.py — including Year 1 path."""
 import importlib.util
 import sys
 from pathlib import Path
@@ -45,7 +45,7 @@ def test_year1_run_no_prior_raster(tmp_dirs):
     cur_path.parent.mkdir(parents=True, exist_ok=True)
     _write_prob_raster(cur_path, np.full((10, 10), 0.5, dtype=np.float32))
 
-    script = PROJECT_ROOT / "analysis" / "07_change_detection.py"
+    script = PROJECT_ROOT / "analysis" / "08_change_detection.py"
     mod = _load_module(script, "step07")
     mod.main()
 
@@ -67,7 +67,7 @@ def test_crs_mismatch_raises(tmp_dirs):
     prior_path.parent.mkdir(parents=True, exist_ok=True)
     _write_prob_raster(prior_path, np.full((10, 10), 0.4, dtype=np.float32), crs_epsg=4326)
 
-    script = PROJECT_ROOT / "analysis" / "07_change_detection.py"
+    script = PROJECT_ROOT / "analysis" / "08_change_detection.py"
     mod = _load_module(script, "step07_crs")
     with pytest.raises(ValueError, match="CRS mismatch"):
         mod.main()
@@ -89,7 +89,7 @@ def test_normal_run_produces_output(tmp_dirs):
     prior_path.parent.mkdir(parents=True, exist_ok=True)
     _write_prob_raster(prior_path, np.full((10, 10), 0.4, dtype=np.float32))
 
-    script = PROJECT_ROOT / "analysis" / "07_change_detection.py"
+    script = PROJECT_ROOT / "analysis" / "08_change_detection.py"
     with patch("utils.quicklook.save_quicklook"):
         _load_module(script, "step07_normal").main()
 
@@ -116,7 +116,7 @@ def test_output_values_reflect_change_direction(tmp_dirs):
     prior_path.parent.mkdir(parents=True, exist_ok=True)
     _write_prob_raster(prior_path, np.full((10, 10), 0.3, dtype=np.float32))
 
-    script = PROJECT_ROOT / "analysis" / "07_change_detection.py"
+    script = PROJECT_ROOT / "analysis" / "08_change_detection.py"
     with patch("utils.quicklook.save_quicklook"):
         _load_module(script, "step07_direction").main()
 
@@ -143,7 +143,7 @@ def test_output_values_clipped_to_minus1_plus1(tmp_dirs):
     prior_path.parent.mkdir(parents=True, exist_ok=True)
     _write_prob_raster(prior_path, np.full((10, 10), 0.0, dtype=np.float32))
 
-    script = PROJECT_ROOT / "analysis" / "07_change_detection.py"
+    script = PROJECT_ROOT / "analysis" / "08_change_detection.py"
     with patch("utils.quicklook.save_quicklook"):
         _load_module(script, "step07_clip").main()
 

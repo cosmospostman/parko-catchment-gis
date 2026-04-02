@@ -1,4 +1,4 @@
-"""Integration tests for analysis/05_classifier.py — end-to-end main() execution.
+"""Integration tests for analysis/06_classifier.py — end-to-end main() execution.
 
 All tests use fully synthetic raster and vector inputs derived from the conftest
 catchment (box 141–143 lon, -17 to -15 lat, EPSG:4326), projected to EPSG:7855.
@@ -24,7 +24,7 @@ from shapely.geometry import Point, box
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-SCRIPT = PROJECT_ROOT / "analysis" / "05_classifier.py"
+SCRIPT = PROJECT_ROOT / "analysis" / "06_classifier.py"
 
 # EPSG:7855 bounds of the conftest catchment (box 141–143, -17 to -15 in WGS84)
 # Computed via: gpd.GeoDataFrame(geometry=[box(141,-17,143,-15)], crs=4326).to_crs(7855).total_bounds

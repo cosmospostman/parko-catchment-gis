@@ -52,9 +52,9 @@ def _write_stub_scripts(project_root: Path, step_nums=range(1, 8)):
         2: ("02_ndvi_anomaly",      "02_verify_ndvi_anomaly"),
         3: ("03_flowering_index",   "03_verify_flowering_index"),
         4: ("04_flood_extent",      "04_verify_flood_extent"),
-        5: ("05_classifier",        "05_verify_classifier"),
-        6: ("06_priority_patches",  "06_verify_priority_patches"),
-        7: ("07_change_detection",  "07_verify_change_detection"),
+        5: ("06_classifier",        "06_verify_classifier"),
+        6: ("07_priority_patches",  "07_verify_priority_patches"),
+        7: ("08_change_detection",  "08_verify_change_detection"),
     }
     analysis_dir = project_root / "analysis"
     verify_dir   = project_root / "verify"

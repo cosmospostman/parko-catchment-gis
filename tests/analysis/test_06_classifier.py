@@ -1,4 +1,4 @@
-"""Tests for analysis/05_classifier.py — Random Forest Parkinsonia classifier.
+"""Tests for analysis/06_classifier.py — Random Forest Parkinsonia classifier.
 
 Covers:
   - _compute_glcm_features: contrast/homogeneity values, NaN propagation, uniform input
@@ -26,7 +26,7 @@ from shapely.geometry import Point, box
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-SCRIPT = PROJECT_ROOT / "analysis" / "05_classifier.py"
+SCRIPT = PROJECT_ROOT / "analysis" / "06_classifier.py"
 
 
 def _load_module(module_name: str = "classifier05"):
@@ -465,4 +465,4 @@ class TestFeatureStack:
         assert len(mod.FEATURE_NAMES) == 8
 
 
-# end-to-end tests live in tests/integration/test_05_classifier_integration.py
+# end-to-end tests live in tests/integration/test_06_classifier_integration.py

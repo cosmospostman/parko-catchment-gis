@@ -1,4 +1,4 @@
-"""Tests for verify/06_verify_priority_patches.py."""
+"""Tests for verify/07_verify_priority_patches.py."""
 import importlib.util
 import sys
 from pathlib import Path
@@ -37,7 +37,7 @@ def test_single_tier_fails(tmp_dirs):
     }, geometry=[poly], crs="EPSG:7844")
     _write_patches(config.priority_patches_path(config.YEAR), gdf)
 
-    script = PROJECT_ROOT / "verify" / "06_verify_priority_patches.py"
+    script = PROJECT_ROOT / "verify" / "07_verify_priority_patches.py"
     mod = _load_module(script, "verify06_single_tier")
     with pytest.raises(SystemExit) as exc_info:
         mod.main()
@@ -52,7 +52,7 @@ def test_valid_patches_pass(tmp_dirs, synthetic_patches_gdf):
 
     _write_patches(config.priority_patches_path(config.YEAR), synthetic_patches_gdf)
 
-    script = PROJECT_ROOT / "verify" / "06_verify_priority_patches.py"
+    script = PROJECT_ROOT / "verify" / "07_verify_priority_patches.py"
     mod = _load_module(script, "verify06_valid")
     mod.main()  # should not raise
 
@@ -76,7 +76,7 @@ def test_below_min_area_fails(tmp_dirs):
     }, geometry=[poly_a, poly_b], crs="EPSG:7844")
     _write_patches(config.priority_patches_path(config.YEAR), gdf)
 
-    script = PROJECT_ROOT / "verify" / "06_verify_priority_patches.py"
+    script = PROJECT_ROOT / "verify" / "07_verify_priority_patches.py"
     mod = _load_module(script, "verify06_min_area")
     with pytest.raises(SystemExit) as exc_info:
         mod.main()
@@ -98,7 +98,7 @@ def test_wrong_crs_fails(tmp_dirs):
     }, geometry=[poly_a, poly_b], crs="EPSG:4326")
     _write_patches(config.priority_patches_path(config.YEAR), gdf)
 
-    script = PROJECT_ROOT / "verify" / "06_verify_priority_patches.py"
+    script = PROJECT_ROOT / "verify" / "07_verify_priority_patches.py"
     mod = _load_module(script, "verify06_wrong_crs")
     with pytest.raises(SystemExit) as exc_info:
         mod.main()

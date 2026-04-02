@@ -21,7 +21,7 @@ def main() -> None:
                         format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
                         stream=sys.stdout)
 
-    step = "05_classifier"
+    step = "06_classifier"
     checks_passed = 0
     checks_failed = 0
     messages = []
