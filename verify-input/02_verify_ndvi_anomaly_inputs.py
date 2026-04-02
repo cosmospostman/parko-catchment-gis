@@ -329,14 +329,15 @@ def check_anomaly_preview(
         msg = "Cannot read one or both rasters"
         return [_result(label_mean, FAIL, msg), _result(label_std, FAIL, msg)]
 
-    # Resize baseline to match ndvi if shapes differ (different native resolutions)
+    # Resize baseline to match ndvi if shapes differ (different native resolutions).
+    # Use scipy zoom rather than PIL: PIL.Image.fromarray silently converts NaN→0,
+    # which makes the anomaly preview spuriously large wherever the baseline has voids.
     if ndvi_arr.shape != baseline_arr.shape:
-        from PIL import Image
-        bl_img = Image.fromarray(baseline_arr)
-        baseline_arr = np.array(
-            bl_img.resize((ndvi_arr.shape[1], ndvi_arr.shape[0]), Image.BILINEAR),
-            dtype=np.float32,
-        )
+        from scipy.ndimage import zoom
+        zy = ndvi_arr.shape[0] / baseline_arr.shape[0]
+        zx = ndvi_arr.shape[1] / baseline_arr.shape[1]
+        # order=1 (bilinear); NaN propagates correctly through scipy zoom
+        baseline_arr = zoom(baseline_arr, (zy, zx), order=1, mode="nearest")
 
     anomaly = ndvi_arr - baseline_arr
     valid = anomaly[np.isfinite(anomaly)]
