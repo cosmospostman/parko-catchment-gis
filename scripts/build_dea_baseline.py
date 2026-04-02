@@ -33,8 +33,8 @@ import xarray as xr
 
 DEA_BANDS = ["nbart_red", "nbart_nir"]
 
-BASELINE_TILE_SIZE_PX = int(os.environ.get("BASELINE_TILE_SIZE_PX", "1024"))
-FETCH_WORKERS         = int(os.environ.get("FETCH_WORKERS",   "16"))
+BASELINE_TILE_SIZE_PX = int(os.environ.get("BASELINE_TILE_SIZE_PX", "512"))
+FETCH_WORKERS         = int(os.environ.get("FETCH_WORKERS",   "4"))
 COMPUTE_WORKERS       = int(os.environ.get("COMPUTE_WORKERS", str(os.cpu_count() or 4)))
 
 logger = logging.getLogger(__name__)
