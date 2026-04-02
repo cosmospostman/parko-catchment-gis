@@ -133,7 +133,7 @@ def main() -> None:
     from utils.io import configure_logging, ensure_output_dirs
 
     configure_logging()
-    ensure_output_dirs(config.OUTPUTS_DIR, config.YEAR)
+    ensure_output_dirs(config.YEAR)
 
     year = config.YEAR
     logger.info("Stage 05 — plausibility map (year=%d)", year)
