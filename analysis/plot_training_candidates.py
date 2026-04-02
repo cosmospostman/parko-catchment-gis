@@ -23,7 +23,7 @@ GPKG_PATH = Path(__file__).parent.parent / "outputs" / "australia_occurrences" /
 OUT_PATH  = Path(__file__).parent.parent / "outputs" / "australia_occurrences" / "training_candidates.png"
 
 # Zoom extent: NT + western QLD
-PLOT_EXTENT = [128.0, -25.0, 148.0, -10.0]
+PLOT_EXTENT = [128.0, -22.0, 148.0, -10.0]
 
 # Mitchell catchment bbox (for reference)
 MITCHELL_BBOX = [141.3453505, -18.23350524, 145.51819104, -14.92188926]
@@ -36,14 +36,9 @@ CANDIDATES = [
         "color": "#e6550d",
     },
     {
-        "label": "NT — Roper / Arnhem",
-        "bbox": [133.5, -16.5, 137.0, -13.5],
+        "label": "NT — McArthur River",
+        "bbox": [135.5, -19.0, 138.5, -16.5],
         "color": "#756bb1",
-    },
-    {
-        "label": "W QLD — Cloncurry / Flinders",
-        "bbox": [140.0, -22.0, 144.5, -18.0],
-        "color": "#31a354",
     },
 ]
 
