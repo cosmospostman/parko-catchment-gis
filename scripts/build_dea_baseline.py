@@ -23,6 +23,9 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import List, Optional
 
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 import geopandas as gpd
 import numpy as np
 import rasterio
