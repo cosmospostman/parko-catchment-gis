@@ -25,10 +25,13 @@ will reveal whether any signal warrants heavier weight before Stage 6 is built.
 """
 
 import logging
+import subprocess
 import sys
+import tempfile
 
 import geopandas as gpd
 import numpy as np
+import rasterio
 import rioxarray as rxr
 from rasterio.features import shapes
 
@@ -128,8 +131,68 @@ def vectorise_zones(
 # Main entry point
 # ---------------------------------------------------------------------------
 
+def _compute_percentiles(path, nodata, sample_rows: int = 200) -> tuple[float, float]:
+    """Compute p2/p98 over a systematic row sample without loading the full raster."""
+    with rasterio.open(str(path)) as src:
+        h, w = src.height, src.width
+        step = max(1, h // sample_rows)
+        rows = range(0, h, step)
+        chunks = []
+        for row in rows:
+            window = rasterio.windows.Window(0, row, w, min(step, h - row))
+            arr = src.read(1, window=window).astype(np.float32)
+            if nodata is not None and np.isfinite(nodata):
+                arr[arr == nodata] = np.nan
+            valid = arr[np.isfinite(arr)]
+            if valid.size:
+                chunks.append(valid)
+    all_valid = np.concatenate(chunks) if chunks else np.array([], dtype=np.float32)
+    if all_valid.size == 0:
+        return 0.0, 1.0
+    return float(np.percentile(all_valid, 2)), float(np.percentile(all_valid, 98))
+
+
+def _warp_hand_to_ndvi(hand_path, ndvi_path) -> str:
+    """Reproject HAND to match NDVI grid via gdalwarp. Returns temp file path."""
+    with rasterio.open(str(ndvi_path)) as src:
+        ndvi_crs = src.crs.to_string()
+        t = src.transform
+        h, w = src.height, src.width
+    xmin = t.c
+    ymax = t.f
+    xmax = xmin + t.a * w
+    ymin = ymax + t.e * h
+    tmp = tempfile.NamedTemporaryFile(suffix=".tif", delete=False,
+                                      dir=str(hand_path.parent))
+    tmp.close()
+    subprocess.run(
+        [
+            "gdalwarp",
+            "-t_srs", ndvi_crs,
+            "-te", str(xmin), str(ymin), str(xmax), str(ymax),
+            "-ts", str(w), str(h),
+            "-r", "bilinear",
+            "-srcnodata", "-9999",
+            "-dstnodata", "-9999",
+            "-ot", "Float32",
+            "-co", "COMPRESS=DEFLATE",
+            "-overwrite",
+            str(hand_path),
+            tmp.name,
+        ],
+        check=True,
+    )
+    return tmp.name
+
+
+# Number of rows to process per chunk — tuned so three float32 chunks fit well
+# within available memory even on a 32 GB instance.
+_CHUNK_ROWS = 512
+
+
 def main() -> None:
     import config
+    from pathlib import Path
     from utils.io import configure_logging, ensure_output_dirs
 
     configure_logging()
@@ -138,7 +201,7 @@ def main() -> None:
     year = config.YEAR
     logger.info("Stage 05 — plausibility map (year=%d)", year)
 
-    # ── Load inputs ──────────────────────────────────────────────────────────
+    # ── Resolve input paths ──────────────────────────────────────────────────
     ndvi_path   = config.ndvi_anomaly_path(year)
     flower_path = config.flowering_index_path(year)
     hand_path   = config.hand_raster_path(year)
@@ -148,100 +211,121 @@ def main() -> None:
             logger.error("Required input not found: %s", p)
             sys.exit(1)
 
-    logger.info("Loading NDVI anomaly from %s", ndvi_path)
-    ndvi_da = rxr.open_rasterio(str(ndvi_path)).squeeze()
-
-    logger.info("Loading flowering index from %s", flower_path)
-    flower_da = rxr.open_rasterio(str(flower_path)).squeeze()
-
-    logger.info("Loading HAND from %s", hand_path)
-    hand_da = rxr.open_rasterio(str(hand_path)).squeeze()
-
-    if hand_da.shape != ndvi_da.shape or hand_da.rio.transform() != ndvi_da.rio.transform():
-        logger.info(
-            "HAND grid %s does not match NDVI grid %s — reprojecting to match via gdalwarp",
-            hand_da.shape, ndvi_da.shape,
+    # ── Align HAND grid to NDVI if needed ───────────────────────────────────
+    with rasterio.open(str(ndvi_path)) as ndvi_src, \
+         rasterio.open(str(hand_path)) as hand_src:
+        need_warp = (
+            (hand_src.height, hand_src.width) != (ndvi_src.height, ndvi_src.width)
+            or hand_src.transform != ndvi_src.transform
         )
-        import subprocess
-        import tempfile
-        import rasterio
-        ndvi_t = ndvi_da.rio.transform()
-        ndvi_crs = str(ndvi_da.rio.crs)
-        h, w = ndvi_da.shape
-        xmin = ndvi_t.c
-        ymax = ndvi_t.f
-        xmax = xmin + ndvi_t.a * w
-        ymin = ymax + ndvi_t.e * h
-        res = ndvi_t.a
-        with tempfile.NamedTemporaryFile(suffix=".tif", delete=False, dir=hand_path.parent) as tmp:
-            tmp_path = tmp.name
-        try:
-            subprocess.run(
-                [
-                    "gdalwarp",
-                    "-t_srs", ndvi_crs,
-                    "-te", str(xmin), str(ymin), str(xmax), str(ymax),
-                    "-ts", str(w), str(h),
-                    "-r", "bilinear",
-                    "-srcnodata", "-9999",
-                    "-dstnodata", "-9999",
-                    "-ot", "Float32",
-                    "-co", "COMPRESS=DEFLATE",
-                    "-overwrite",
-                    str(hand_path),
-                    tmp_path,
-                ],
-                check=True,
-            )
-            hand_da = rxr.open_rasterio(tmp_path).squeeze()
-        finally:
-            from pathlib import Path as _Path
-            _Path(tmp_path).unlink(missing_ok=True)
 
-    ndvi_arr   = ndvi_da.values.astype(np.float32)
-    flower_arr = flower_da.values.astype(np.float32)
-    hand_arr   = hand_da.values.astype(np.float32)
+    warped_hand_tmp = None
+    if need_warp:
+        logger.info("HAND grid differs from NDVI — reprojecting via gdalwarp")
+        warped_hand_tmp = _warp_hand_to_ndvi(hand_path, ndvi_path)
+        aligned_hand_path = Path(warped_hand_tmp)
+    else:
+        aligned_hand_path = hand_path
 
-    # Replace any nodata sentinel values with NaN
-    for da, arr in [(ndvi_da, ndvi_arr), (flower_da, flower_arr), (hand_da, hand_arr)]:
-        nodata = da.rio.nodata
-        if nodata is not None and np.isfinite(nodata):
-            arr[arr == nodata] = np.nan
+    try:
+        # ── First pass: compute global percentiles for scaling ────────────────
+        logger.info("Computing global percentiles for scaling")
+        with rasterio.open(str(ndvi_path)) as src:
+            ndvi_nodata = src.nodata
+        with rasterio.open(str(flower_path)) as src:
+            flower_nodata = src.nodata
+        with rasterio.open(str(aligned_hand_path)) as src:
+            hand_nodata = src.nodata
 
-    # ── Compute plausibility ─────────────────────────────────────────────────
-    logger.info("Computing plausibility score")
-    plausibility = compute_plausibility(ndvi_arr, flower_arr, hand_arr)
+        ndvi_p2,   ndvi_p98   = _compute_percentiles(ndvi_path,          ndvi_nodata)
+        flower_p2, flower_p98 = _compute_percentiles(flower_path,        flower_nodata)
+        hand_p2,   hand_p98   = _compute_percentiles(aligned_hand_path,  hand_nodata)
+        logger.info("NDVI   p2=%.4f  p98=%.4f", ndvi_p2,   ndvi_p98)
+        logger.info("Flower p2=%.4f  p98=%.4f", flower_p2, flower_p98)
+        logger.info("HAND   p2=%.4f  p98=%.4f", hand_p2,   hand_p98)
 
-    valid_count = int(np.isfinite(plausibility).sum())
-    nan_frac = np.isnan(plausibility).mean()
-    logger.info(
-        "Plausibility computed: %d valid pixels, %.1f%% NaN",
-        valid_count, nan_frac * 100,
-    )
+        # ── Open all sources + output for chunked processing ─────────────────
+        raster_path = config.plausibility_map_path(year)
+        raster_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # ── Write continuous raster ───────────────────────────────────────────────
-    out_da = ndvi_da.copy(data=plausibility.astype(np.float32))
-    out_da.rio.write_nodata(np.nan, inplace=True)
+        with rasterio.open(str(ndvi_path)) as ndvi_src, \
+             rasterio.open(str(flower_path)) as flower_src, \
+             rasterio.open(str(aligned_hand_path)) as hand_src:
 
-    raster_path = config.plausibility_map_path(year)
-    raster_path.parent.mkdir(parents=True, exist_ok=True)
-    out_da.rio.to_raster(str(raster_path), dtype="float32", compress="deflate")
-    logger.info("Plausibility raster written to %s", raster_path)
+            profile = ndvi_src.profile.copy()
+            profile.update(dtype="float32", count=1, compress="deflate",
+                           nodata=np.nan, tiled=True, blockxsize=512, blockysize=512)
 
-    # ── Vectorise threshold zones ─────────────────────────────────────────────
-    binary = apply_threshold(plausibility, PLAUSIBILITY_THRESHOLD)
-    transform = ndvi_da.rio.transform()
-    crs = ndvi_da.rio.crs
+            h, w = ndvi_src.height, ndvi_src.width
 
-    gdf = vectorise_zones(binary, transform, crs, MIN_PATCH_HA)
-    logger.info(
-        "Plausibility zones: %d polygon(s) above threshold %.2f (min patch %.2f ha)",
-        len(gdf), PLAUSIBILITY_THRESHOLD, MIN_PATCH_HA,
-    )
+            with rasterio.open(str(raster_path), "w", **profile) as dst:
+                binary_rows = []
+                valid_count = 0
 
-    zones_path = config.plausibility_zones_path(year)
-    gdf.to_file(str(zones_path), driver="GPKG")
-    logger.info("Plausibility zones written to %s", zones_path)
+                for row_off in range(0, h, _CHUNK_ROWS):
+                    n_rows = min(_CHUNK_ROWS, h - row_off)
+                    window = rasterio.windows.Window(0, row_off, w, n_rows)
+
+                    ndvi_chunk   = ndvi_src.read(1,   window=window).astype(np.float32)
+                    flower_chunk = flower_src.read(1, window=window).astype(np.float32)
+                    hand_chunk   = hand_src.read(1,   window=window).astype(np.float32)
+
+                    # Replace nodata with NaN
+                    for arr, nd in [(ndvi_chunk, ndvi_nodata),
+                                    (flower_chunk, flower_nodata),
+                                    (hand_chunk, hand_nodata)]:
+                        if nd is not None and np.isfinite(nd):
+                            arr[arr == nd] = np.nan
+
+                    # Scale using global percentiles
+                    def _scale(arr, p_lo, p_hi):
+                        scaled = (arr - p_lo) / (p_hi - p_lo + 1e-9)
+                        return np.clip(scaled, 0.0, 1.0).astype(np.float32)
+
+                    ndvi_norm   = _scale(ndvi_chunk,   ndvi_p2,   ndvi_p98)
+                    flower_norm = _scale(flower_chunk, flower_p2, flower_p98)
+                    hand_norm   = _scale(hand_chunk,   hand_p2,   hand_p98)
+
+                    valid = np.isfinite(ndvi_chunk) & np.isfinite(flower_chunk) & np.isfinite(hand_chunk)
+                    plaus = np.full((n_rows, w), np.nan, dtype=np.float32)
+                    plaus[valid] = (
+                        ndvi_norm[valid] + flower_norm[valid] + (1.0 - hand_norm[valid])
+                    ) / 3.0
+
+                    dst.write(plaus, 1, window=window)
+                    valid_count += int(valid.sum())
+                    binary_rows.append((row_off, apply_threshold(plaus, PLAUSIBILITY_THRESHOLD)))
+
+                    if (row_off // _CHUNK_ROWS) % 10 == 0:
+                        logger.info("  processed rows %d–%d / %d", row_off, row_off + n_rows, h)
+
+        nan_frac = 1.0 - valid_count / (h * w)
+        logger.info("Plausibility computed: %d valid pixels, %.1f%% NaN", valid_count, nan_frac * 100)
+        logger.info("Plausibility raster written to %s", raster_path)
+
+        # ── Assemble full binary mask for vectorisation ───────────────────────
+        binary = np.zeros((h, w), dtype=bool)
+        for row_off, chunk in binary_rows:
+            binary[row_off:row_off + chunk.shape[0], :] = chunk
+        del binary_rows
+
+        with rasterio.open(str(ndvi_path)) as src:
+            transform = src.transform
+            crs = src.crs
+
+        gdf = vectorise_zones(binary, transform, crs, MIN_PATCH_HA)
+        logger.info(
+            "Plausibility zones: %d polygon(s) above threshold %.2f (min patch %.2f ha)",
+            len(gdf), PLAUSIBILITY_THRESHOLD, MIN_PATCH_HA,
+        )
+
+        zones_path = config.plausibility_zones_path(year)
+        gdf.to_file(str(zones_path), driver="GPKG")
+        logger.info("Plausibility zones written to %s", zones_path)
+
+    finally:
+        if warped_hand_tmp:
+            Path(warped_hand_tmp).unlink(missing_ok=True)
 
     logger.info("Stage 05 complete")
 
