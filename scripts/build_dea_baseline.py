@@ -114,6 +114,9 @@ def build_baseline(bbox, config, tile_cache_dir: Path, rebuild: bool) -> None:
                 ndvi = (nir - red) / (nir + red + 1e-10)
                 ndvi = ndvi.clip(-1.0, 1.0)
                 baseline_tile = ndvi.median(dim="time", skipna=True)
+                baseline_tile = baseline_tile.assign_coords(
+                    x=nir.coords["x"], y=nir.coords["y"]
+                )
                 baseline_tile = baseline_tile.rio.write_crs(config.TARGET_CRS)
                 baseline_tile.rio.to_raster(
                     str(tile_path), driver="GTiff", dtype="float32", compress="deflate",
