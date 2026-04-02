@@ -159,14 +159,44 @@ def main() -> None:
 
     if hand_da.shape != ndvi_da.shape or hand_da.rio.transform() != ndvi_da.rio.transform():
         logger.info(
-            "HAND grid %s does not match NDVI grid %s — reprojecting to match",
+            "HAND grid %s does not match NDVI grid %s — reprojecting to match via gdalwarp",
             hand_da.shape, ndvi_da.shape,
         )
+        import subprocess
+        import tempfile
         import rasterio
-        hand_da = hand_da.rio.reproject_match(
-            ndvi_da,
-            resampling=rasterio.enums.Resampling.bilinear,
-        )
+        ndvi_t = ndvi_da.rio.transform()
+        ndvi_crs = str(ndvi_da.rio.crs)
+        h, w = ndvi_da.shape
+        xmin = ndvi_t.c
+        ymax = ndvi_t.f
+        xmax = xmin + ndvi_t.a * w
+        ymin = ymax + ndvi_t.e * h
+        res = ndvi_t.a
+        with tempfile.NamedTemporaryFile(suffix=".tif", delete=False, dir=hand_path.parent) as tmp:
+            tmp_path = tmp.name
+        try:
+            subprocess.run(
+                [
+                    "gdalwarp",
+                    "-t_srs", ndvi_crs,
+                    "-te", str(xmin), str(ymin), str(xmax), str(ymax),
+                    "-ts", str(w), str(h),
+                    "-r", "bilinear",
+                    "-srcnodata", "-9999",
+                    "-dstnodata", "-9999",
+                    "-ot", "Float32",
+                    "-co", "COMPRESS=DEFLATE",
+                    "-overwrite",
+                    str(hand_path),
+                    tmp_path,
+                ],
+                check=True,
+            )
+            hand_da = rxr.open_rasterio(tmp_path).squeeze()
+        finally:
+            from pathlib import Path as _Path
+            _Path(tmp_path).unlink(missing_ok=True)
 
     ndvi_arr   = ndvi_da.values.astype(np.float32)
     flower_arr = flower_da.values.astype(np.float32)
