@@ -36,8 +36,8 @@ unset _PYTHON _RASTERIO_PROJ_DATA _PYPROJ_DATA
 export COMPOSITE_START="${COMPOSITE_START:-08-01}"
 export COMPOSITE_END="${COMPOSITE_END:-11-30}"
 
-# Auto-activate local S2 cache if the EBS volume is mounted at /mnt/s2cache
-export LOCAL_S2_ROOT="${LOCAL_S2_ROOT:-$([ -d /mnt/s2cache ] && echo /mnt/s2cache || echo '')}"
+# Auto-activate local S2 cache if the EBS volume is mounted at /mnt/ebs/s2cache
+export LOCAL_S2_ROOT="${LOCAL_S2_ROOT:-$([ -d /mnt/ebs/s2cache ] && echo /mnt/ebs/s2cache || echo '')}"
 
 # Auto-activate local S1 cache if the EBS volume is mounted at /mnt/ebs/s1cache
 export LOCAL_S1_ROOT="${LOCAL_S1_ROOT:-$([ -d /mnt/ebs/s1cache ] && echo /mnt/ebs/s1cache || echo '')}"
