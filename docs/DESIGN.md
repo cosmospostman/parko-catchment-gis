@@ -233,44 +233,11 @@ The long-term baseline is computed once and cached; only the current-year compos
 
 **Validation check:** The flowering index should show a different spatial pattern from the NDVI anomaly — patchier, more temporally specific. If the two rasters are highly correlated (>0.7), they are measuring the same thing and only one should enter the classifier feature stack.
 
-### Step 4 — Sentinel-1 flood extent
+### Step 4 — Flood extent (HAND-based)
 
-```python
-# Phase 1 — Dry-season reference mask (Oct–Nov, same year)
-# Load S1 GRD IW VV scenes for Oct–Nov of YEAR
-# Per-pixel median VV backscatter across all scenes
-# Flag pixels with median VV < -16 dB as persistent low-backscatter non-water
-# (sodic scalds, smooth gully floors — Mitchell megafan-specific confound)
-# Output: reference_mask  [bool array, in-memory only]
-#
-# Phase 2 — Wet-season flood classification (Jan–May, current year)
-# Load S1 GRD IW scenes (VV + VH) for Jan–May wet season
-# Per scene:
-#   - Warp VV and VH to EPSG:7855 at 50 m via GCP-based reprojection
-#   - Apply 3×3 median speckle filter (NaN-aware)
-#   - Per-scene Otsu threshold on VV dB histogram → water/non-water
-#   - VH guard: pixel must also fall below VH Otsu threshold
-#     (reduces false positives from wind roughening and smooth dry soil)
-#   - Exclude pixels flagged in reference mask
-# Accumulate per-pixel flood count and observation count across scenes
-# Flood frequency = flood_count / obs_count per pixel
-# Threshold at FLOOD_MIN_FREQUENCY (10%) → flood extent binary mask
-# Morphological closing (150 m radius) to merge adjacent blobs
-# Vectorise → union → simplify (100 m tolerance) → clip to catchment
-# Output: flood_extent_YYYY.gpkg
-```
+See [DESIGN-FLOOD-CONNECTIVITY.md](DESIGN-FLOOD-CONNECTIVITY.md) for the full design.
 
-**Why Otsu over a fixed threshold:** The Mitchell megafan's diverse land cover — open water, inundated grassland, bare scalds, sparse savanna — means a single dB cutoff calibrated for one scene type performs poorly on others. Per-scene Otsu finds the natural bimodal break in each backscatter histogram, making the classification robust to scene-to-scene variation in soil moisture and vegetation state.
-
-**Why the VH guard:** VV backscatter drops over both open water and very smooth dry surfaces (sodic scalds). VH backscatter is more sensitive to volume scattering from vegetation structure and is less affected by specular reflection from bare soil — so requiring the Otsu threshold to be met in both bands substantially reduces false positives from scalds while retaining flooded-grassland detections.
-
-**Why a dry-season reference mask:** The Mitchell megafan's sodic soils produce extensive bare "scalds" and gully floors that can read below -15 dB in dry conditions, within the range of true water. A median composite of Oct–Nov scenes (typically the driest month) identifies these persistently low-backscatter surfaces so they can be excluded from wet-season classification. Oct–Nov of the same analysis year is used: it represents the annual backscatter minimum before the onset of summer storms, and is available by the time the pipeline runs as an annual batch job after the wet season ends.
-
-**Prefetch:** Both dry-season reference scenes (Oct–Nov, YEAR) and wet-season scenes (Jan–May, YEAR) are fetched by `scripts/s1_sync_manifest.py` in Stage 0. The reference mask is recomputed from the cached scenes each run — no separate cache file.
-
-**Cross-validation:** Compare output against DEA Wetlands Insight Tool for the same wet season. The WIT provides inundation time series for Queensland wetlands since 1987 and gives an independent area estimate to validate against.
-
-**S1B note:** S1B was decommissioned August 2022. Flood mapping now relies on S1A alone (12-day revisit). Adequate for seasonal flood mapping; a 12-day gap is unlikely to miss major inundation events.
+The original Sentinel-1 / Otsu thresholding approach was abandoned — C-band GRD cannot penetrate the dense grassland/sedgeland canopy in the Mitchell catchment. Step 4 now derives flood connectivity from terrain geometry using the Height Above Nearest Drainage (HAND) index computed from the Copernicus GLO-30 DEM.
 
 ### Step 5 — Random Forest classifier
 
