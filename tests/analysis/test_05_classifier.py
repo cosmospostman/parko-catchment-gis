@@ -452,7 +452,7 @@ class TestFeatureStack:
         """The feature stack column order must match FEATURE_NAMES exactly."""
         mod = _load_module("featstack_tests")
         expected = [
-            "ndvi_anomaly", "flowering_index", "vv_db", "vh_db",
+            "ndvi_anomaly", "flowering_index", "hand", "flood_extent",
             "ndvi_median", "glcm_contrast", "glcm_homogeneity", "dist_to_watercourse",
         ]
         assert mod.FEATURE_NAMES == expected, (
