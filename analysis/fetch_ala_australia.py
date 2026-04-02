@@ -29,6 +29,9 @@ ALA_MAX_START_INDEX = 5000   # ALA biocache hard cap: returns empty page beyond 
 # Australia bounding box (WGS84)
 AUS_BBOX = [112.0, -44.0, 154.0, -10.0]
 
+# Mitchell catchment bounding box — used for reporting only
+MITCHELL_BBOX = [141.3453505, -18.23350524, 145.51819104, -14.92188926]
+
 # Tile grid dimensions — each tile must stay under ALA_MAX_START_INDEX records.
 # 8 lon x 6 lat = 48 tiles across Australia.
 TILE_LON_STEPS = 8
@@ -39,8 +42,9 @@ OUT_DIR = Path(__file__).parent.parent / "outputs" / "australia_occurrences"
 logger = logging.getLogger(__name__)
 
 
-def fetch_bbox(species: str, minx: float, miny: float, maxx: float, maxy: float) -> list[dict]:
-    """Fetch all records within a single bbox, paginating up to ALA's hard cap."""
+def fetch_bbox(species: str, minx: float, miny: float, maxx: float, maxy: float,
+               depth: int = 0) -> list[dict]:
+    """Fetch all records within a bbox, recursively splitting if total exceeds ALA's cap."""
     params = {
         "q": f'taxon_name:"{species}"',
         "fq": (
@@ -60,19 +64,25 @@ def fetch_bbox(species: str, minx: float, miny: float, maxx: float, maxy: float)
         return []
 
     if total > ALA_MAX_START_INDEX:
-        logger.warning(
-            "Tile [%.1f,%.1f,%.1f,%.1f] has %d records > cap %d — subdivide further",
-            minx, miny, maxx, maxy, total, ALA_MAX_START_INDEX,
+        logger.debug(
+            "%sTile [%.2f,%.2f,%.2f,%.2f] has %d records — splitting (depth %d)",
+            "  " * depth, minx, miny, maxx, maxy, total, depth,
+        )
+        midx = (minx + maxx) / 2
+        midy = (miny + maxy) / 2
+        return (
+            fetch_bbox(species, minx, miny, midx, midy, depth + 1)
+            + fetch_bbox(species, midx, miny, maxx, midy, depth + 1)
+            + fetch_bbox(species, minx, midy, midx, maxy, depth + 1)
+            + fetch_bbox(species, midx, midy, maxx, maxy, depth + 1)
         )
 
-    to_fetch = min(total, ALA_MAX_START_INDEX)
     params["pageSize"] = PAGE_SIZE
-
     records = []
     start = 0
-    while start < to_fetch:
+    while start < total:
         params["startIndex"] = start
-        params["pageSize"] = min(PAGE_SIZE, to_fetch - start)
+        params["pageSize"] = min(PAGE_SIZE, total - start)
         resp = requests.get(ALA_BIOCACHE_URL, params=params, timeout=30)
         resp.raise_for_status()
         page = resp.json().get("occurrences", [])
@@ -85,7 +95,7 @@ def fetch_bbox(species: str, minx: float, miny: float, maxx: float, maxy: float)
 
 
 def fetch_all(species: str, bbox: list[float]) -> gpd.GeoDataFrame:
-    """Tile the bbox into a grid and fetch each tile, bypassing ALA's 5k per-query cap."""
+    """Tile the bbox into a grid and fetch each tile, recursively splitting dense tiles."""
     minx, miny, maxx, maxy = bbox
     lon_edges = [minx + (maxx - minx) * i / TILE_LON_STEPS for i in range(TILE_LON_STEPS + 1)]
     lat_edges = [miny + (maxy - miny) * i / TILE_LAT_STEPS for i in range(TILE_LAT_STEPS + 1)]
@@ -95,7 +105,7 @@ def fetch_all(species: str, bbox: list[float]) -> gpd.GeoDataFrame:
         for i in range(TILE_LON_STEPS)
         for j in range(TILE_LAT_STEPS)
     ]
-    logger.info("Fetching '%s' across %d tiles...", species, len(tiles))
+    logger.info("Fetching '%s' across %d initial tiles...", species, len(tiles))
 
     all_records = []
     for n, (tx0, ty0, tx1, ty1) in enumerate(tiles, 1):
@@ -199,6 +209,10 @@ def main() -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     gdf = fetch_all(SPECIES, AUS_BBOX)
+
+    minx, miny, maxx, maxy = MITCHELL_BBOX
+    in_mitchell = gdf.cx[minx:maxx, miny:maxy]
+    logger.info("Sightings within Mitchell catchment bbox: %d", len(in_mitchell))
 
     gpkg_path = OUT_DIR / "ala_australia_occurrences.gpkg"
     gdf.to_file(gpkg_path, driver="GPKG")
