@@ -24,18 +24,23 @@ from shapely.geometry import Point
 ALA_BIOCACHE_URL = "https://biocache.ala.org.au/ws/occurrences/search"
 SPECIES = "Parkinsonia aculeata"
 PAGE_SIZE = 1000
-MAX_RECORDS = 100_000         # ALA has ~40k records for this species in Australia
+ALA_MAX_START_INDEX = 5000   # ALA biocache hard cap: returns empty page beyond this
 
 # Australia bounding box (WGS84)
 AUS_BBOX = [112.0, -44.0, 154.0, -10.0]
+
+# Tile grid dimensions — each tile must stay under ALA_MAX_START_INDEX records.
+# 8 lon x 6 lat = 48 tiles across Australia.
+TILE_LON_STEPS = 8
+TILE_LAT_STEPS = 6
 
 OUT_DIR = Path(__file__).parent.parent / "outputs" / "australia_occurrences"
 
 logger = logging.getLogger(__name__)
 
 
-def fetch_all(species: str, bbox: list[float]) -> gpd.GeoDataFrame:
-    minx, miny, maxx, maxy = bbox
+def fetch_bbox(species: str, minx: float, miny: float, maxx: float, maxy: float) -> list[dict]:
+    """Fetch all records within a single bbox, paginating up to ALA's hard cap."""
     params = {
         "q": f'taxon_name:"{species}"',
         "fq": (
@@ -50,14 +55,17 @@ def fetch_all(species: str, bbox: list[float]) -> gpd.GeoDataFrame:
     probe = requests.get(ALA_BIOCACHE_URL, params=params, timeout=30)
     probe.raise_for_status()
     total = probe.json().get("totalRecords", 0)
-    logger.info("Total ALA records for '%s' in Australia bbox: %d", species, total)
 
     if total == 0:
-        logger.warning("No records found.")
-        return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+        return []
 
-    to_fetch = min(total, MAX_RECORDS)
-    logger.info("Fetching %d records in pages of %d...", to_fetch, PAGE_SIZE)
+    if total > ALA_MAX_START_INDEX:
+        logger.warning(
+            "Tile [%.1f,%.1f,%.1f,%.1f] has %d records > cap %d — subdivide further",
+            minx, miny, maxx, maxy, total, ALA_MAX_START_INDEX,
+        )
+
+    to_fetch = min(total, ALA_MAX_START_INDEX)
     params["pageSize"] = PAGE_SIZE
 
     records = []
@@ -72,16 +80,40 @@ def fetch_all(species: str, bbox: list[float]) -> gpd.GeoDataFrame:
             break
         records.extend(page)
         start += len(page)
-        logger.info("  fetched %d / %d", len(records), to_fetch)
 
-    df = pd.DataFrame(records)
+    return records
+
+
+def fetch_all(species: str, bbox: list[float]) -> gpd.GeoDataFrame:
+    """Tile the bbox into a grid and fetch each tile, bypassing ALA's 5k per-query cap."""
+    minx, miny, maxx, maxy = bbox
+    lon_edges = [minx + (maxx - minx) * i / TILE_LON_STEPS for i in range(TILE_LON_STEPS + 1)]
+    lat_edges = [miny + (maxy - miny) * i / TILE_LAT_STEPS for i in range(TILE_LAT_STEPS + 1)]
+
+    tiles = [
+        (lon_edges[i], lat_edges[j], lon_edges[i + 1], lat_edges[j + 1])
+        for i in range(TILE_LON_STEPS)
+        for j in range(TILE_LAT_STEPS)
+    ]
+    logger.info("Fetching '%s' across %d tiles...", species, len(tiles))
+
+    all_records = []
+    for n, (tx0, ty0, tx1, ty1) in enumerate(tiles, 1):
+        recs = fetch_bbox(species, tx0, ty0, tx1, ty1)
+        all_records.extend(recs)
+        logger.info("  tile %d/%d → %d records (total so far: %d)", n, len(tiles), len(recs), len(all_records))
+
+    logger.info("Total raw records: %d", len(all_records))
+
+    df = pd.DataFrame(all_records)
     df = df.dropna(subset=["decimalLongitude", "decimalLatitude"])
+    df = df.drop_duplicates(subset=["decimalLongitude", "decimalLatitude"])
     gdf = gpd.GeoDataFrame(
         df,
         geometry=[Point(r.decimalLongitude, r.decimalLatitude) for r in df.itertuples()],
         crs="EPSG:4326",
     )
-    logger.info("Records with valid coordinates: %d", len(gdf))
+    logger.info("Records with valid coordinates (deduped): %d", len(gdf))
     return gdf
 
 
