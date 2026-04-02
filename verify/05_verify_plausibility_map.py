@@ -4,9 +4,13 @@ import sys
 
 logger = logging.getLogger(__name__)
 
+_SAMPLE_ROWS = 200  # rows to sample for statistical checks — avoids loading full raster
+
 
 def main() -> None:
     import numpy as np
+    import rasterio
+    from rasterio.enums import Resampling
     import rioxarray as rxr
     import geopandas as gpd
     import config
@@ -26,8 +30,19 @@ def main() -> None:
     raster_path = config.plausibility_map_path(config.YEAR)
     zones_path  = config.plausibility_zones_path(config.YEAR)
 
-    plaus = rxr.open_rasterio(str(raster_path)).squeeze()
-    vals  = plaus.values.astype(float)
+    # Read raster at reduced resolution to avoid OOM on large grids
+    with rasterio.open(str(raster_path)) as src:
+        plaus_crs = src.crs
+        nodata = src.nodata
+        full_h, full_w = src.height, src.width
+        scale = max(1, int(((full_h * full_w) / (_SAMPLE_ROWS * full_w)) ** 0.5))
+        out_h = max(1, full_h // scale)
+        out_w = max(1, full_w // scale)
+        vals = src.read(1, out_shape=(out_h, out_w),
+                        resampling=Resampling.nearest).astype(np.float32)
+
+    if nodata is not None and np.isfinite(nodata):
+        vals[vals == nodata] = np.nan
     valid = vals[np.isfinite(vals)]
     gdf   = gpd.read_file(str(zones_path))
 
@@ -42,13 +57,13 @@ def main() -> None:
 
     def check_nan_fraction():
         nan_frac = float(np.isnan(vals).mean())
-        if nan_frac >= config.NAN_FRACTION_MAX:
+        if nan_frac >= config.PLAUSIBILITY_NAN_FRACTION_MAX:
             raise AssertionError(
-                f"NaN fraction {nan_frac:.1%} >= {config.NAN_FRACTION_MAX:.1%} — check input rasters"
+                f"NaN fraction {nan_frac:.1%} >= {config.PLAUSIBILITY_NAN_FRACTION_MAX:.1%} — check input rasters"
             )
 
     def check_crs_raster():
-        crs_str = str(plaus.rio.crs)
+        crs_str = str(plaus_crs)
         if "7855" not in crs_str and "GDA2020" not in crs_str:
             raise AssertionError(f"Plausibility raster CRS unexpected: {crs_str}")
 
