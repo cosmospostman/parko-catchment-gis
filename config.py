@@ -151,3 +151,13 @@ def ndvi_baseline_path() -> Path:
 def hand_raster_path(year: int) -> Path:
     """Return the path for the HAND raster diagnostic output for the given year."""
     return OUTPUTS_DIR / str(year) / f"hand_{year}.tif"
+
+
+def plausibility_map_path(year: int) -> Path:
+    """Return the path for the continuous plausibility score raster for the given year."""
+    return OUTPUTS_DIR / str(year) / f"plausibility_map_{year}.tif"
+
+
+def plausibility_zones_path(year: int) -> Path:
+    """Return the path for the plausibility zone polygons GeoPackage for the given year."""
+    return OUTPUTS_DIR / str(year) / f"plausibility_zones_{year}.gpkg"
