@@ -91,37 +91,74 @@ def check_raster_exists(label: str, path: Path) -> dict:
 
 
 def check_grids_consistent(paths: list[Path], labels: list[str]) -> dict:
-    """All three rasters must share the same CRS, shape, and transform."""
-    import rasterio
+    """Check grid alignment for Stage 05 inputs.
 
-    info = []
+    NDVI anomaly and flowering index must share the same CRS, shape, and
+    transform exactly — Stage 05 does not align them.
+
+    HAND may differ in shape/transform (Stage 05 calls reproject_match), but
+    must share the same CRS, overlap the NDVI extent, and have a resolution
+    within 4× of NDVI (coarser is fine; drastically finer would be suspicious).
+    """
+    import rasterio
+    from rasterio.crs import CRS
+
+    info = {}
     for p, lbl in zip(paths, labels):
         if not p.exists():
             return _result("Grid consistency", SKIP, f"{lbl} not found — skipping")
         with rasterio.open(p) as src:
-            info.append({
-                "label": lbl,
-                "crs": str(src.crs),
+            info[lbl] = {
+                "crs": src.crs,
                 "shape": (src.height, src.width),
                 "transform": src.transform,
-            })
+                "bounds": src.bounds,
+                "res": src.res,  # (pixel_width, pixel_height)
+            }
 
-    ref = info[0]
+    ndvi   = info["NDVI anomaly"]
+    flower = info["Flowering index"]
+    hand   = info["HAND"]
     mismatches = []
-    for item in info[1:]:
-        if item["crs"] != ref["crs"]:
-            mismatches.append(f"{item['label']} CRS {item['crs']} ≠ {ref['crs']}")
-        if item["shape"] != ref["shape"]:
-            mismatches.append(f"{item['label']} shape {item['shape']} ≠ {ref['shape']}")
-        if item["transform"] != ref["transform"]:
-            mismatches.append(f"{item['label']} transform differs from {ref['label']}")
+
+    # NDVI and flowering must be exactly aligned
+    if ndvi["crs"] != flower["crs"]:
+        mismatches.append(f"Flowering CRS {flower['crs']} ≠ NDVI {ndvi['crs']}")
+    if ndvi["shape"] != flower["shape"]:
+        mismatches.append(f"Flowering shape {flower['shape']} ≠ NDVI {ndvi['shape']}")
+    if ndvi["transform"] != flower["transform"]:
+        mismatches.append("Flowering transform differs from NDVI anomaly")
+
+    # HAND must share CRS with NDVI
+    if ndvi["crs"] != hand["crs"]:
+        mismatches.append(f"HAND CRS {hand['crs']} ≠ NDVI {ndvi['crs']}")
+    else:
+        # HAND must overlap NDVI extent
+        nb, hb = ndvi["bounds"], hand["bounds"]
+        overlap = (
+            hb.left < nb.right and hb.right > nb.left
+            and hb.bottom < nb.top and hb.top > nb.bottom
+        )
+        if not overlap:
+            mismatches.append("HAND extent does not overlap NDVI anomaly extent")
+
+        # HAND resolution must be within 4× of NDVI (guards against wrong-unit CRS)
+        ndvi_res = ndvi["res"][0]
+        hand_res = hand["res"][0]
+        ratio = hand_res / ndvi_res if ndvi_res > 0 else 0
+        if not (0.25 <= ratio <= 4.0):
+            mismatches.append(
+                f"HAND resolution {hand_res:.1f} m is more than 4× different from "
+                f"NDVI resolution {ndvi_res:.1f} m (ratio={ratio:.1f})"
+            )
 
     if mismatches:
         return _result("Grid consistency", FAIL, "; ".join(mismatches))
-    shape = ref["shape"]
     return _result(
         "Grid consistency", PASS,
-        f"All three rasters share CRS={ref['crs']}  shape={shape[0]}×{shape[1]}",
+        f"NDVI/flowering exactly aligned  shape={ndvi['shape'][0]}×{ndvi['shape'][1]}; "
+        f"HAND compatible ({hand['shape'][0]}×{hand['shape'][1]}, "
+        f"res={hand['res'][0]:.0f} m, same CRS, overlapping extent)",
     )
 
 

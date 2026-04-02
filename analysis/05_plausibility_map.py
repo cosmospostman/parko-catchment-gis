@@ -157,6 +157,17 @@ def main() -> None:
     logger.info("Loading HAND from %s", hand_path)
     hand_da = rxr.open_rasterio(str(hand_path)).squeeze()
 
+    if hand_da.shape != ndvi_da.shape or hand_da.rio.transform() != ndvi_da.rio.transform():
+        logger.info(
+            "HAND grid %s does not match NDVI grid %s — reprojecting to match",
+            hand_da.shape, ndvi_da.shape,
+        )
+        import rasterio
+        hand_da = hand_da.rio.reproject_match(
+            ndvi_da,
+            resampling=rasterio.enums.Resampling.bilinear,
+        )
+
     ndvi_arr   = ndvi_da.values.astype(np.float32)
     flower_arr = flower_da.values.astype(np.float32)
     hand_arr   = hand_da.values.astype(np.float32)
