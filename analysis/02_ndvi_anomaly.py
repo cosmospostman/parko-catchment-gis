@@ -155,32 +155,20 @@ def _build_baseline(bbox, config) -> xr.DataArray:
             # evenly within each year — avoids 39 sequential round-trips to DEA
             # while still guaranteeing even temporal coverage across all missions.
             max_items_per_year = 12
-            # Fetch at most max_items_per_year × n_years items total. Items are
-            # returned chronologically so this still risks truncating recent years,
-            # but the subsequent per-year grouping and subsampling corrects for
-            # any imbalance — years with fewer items simply contribute fewer scenes.
-            n_years = end_year - start_year + 1
             tile_catalog = pystac_client.Client.open("https://explorer.dea.ga.gov.au/stac")
-            all_items = list(tile_catalog.search(
-                collections=DEA_LANDSAT_COLLECTIONS,
-                bbox=tile_bbox,
-                datetime=f"{start_year}-{dry_start_mm_dd}/{end_year}-{dry_end_mm_dd}",
-                max_items=max_items_per_year * n_years,
-            ).items())
 
-            # Group by year, filter to dry-season months, subsample evenly.
-            dry_start_month = int(dry_start_mm_dd.split("-")[0])
-            dry_end_month   = int(dry_end_mm_dd.split("-")[0])
-            by_year: dict = {}
-            for it in all_items:
-                dt = it.datetime or it.properties.get("datetime", "")
-                yr = int(str(dt)[:4])
-                mo = int(str(dt)[5:7])
-                if dry_start_month <= mo <= dry_end_month and start_year <= yr <= end_year:
-                    by_year.setdefault(yr, []).append(it)
-
+            # Query per-year so that the chronological STAC result ordering cannot
+            # cause recent years to be truncated by a global max_items cap.  Each
+            # yearly window is small enough that max_items_per_year is never hit
+            # for a typical dry-season tile, keeping round-trips bounded.
             tile_items = []
-            for yr_items in by_year.values():
+            for yr in range(start_year, end_year + 1):
+                yr_items = list(tile_catalog.search(
+                    collections=DEA_LANDSAT_COLLECTIONS,
+                    bbox=tile_bbox,
+                    datetime=f"{yr}-{dry_start_mm_dd}/{yr}-{dry_end_mm_dd}",
+                    max_items=max_items_per_year,
+                ).items())
                 if len(yr_items) > max_items_per_year:
                     step = len(yr_items) / max_items_per_year
                     yr_items = [yr_items[round(i * step)] for i in range(max_items_per_year)]

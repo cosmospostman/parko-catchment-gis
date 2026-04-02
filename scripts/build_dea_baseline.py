@@ -151,27 +151,18 @@ def build_baseline(bbox, config, tile_cache_dir: Path, rebuild: bool) -> None:
         t_fetch = time.monotonic()
         try:
             max_items_per_year = 12
-            n_years = end_year - start_year + 1
             tile_catalog = pystac_client.Client.open("https://explorer.dea.ga.gov.au/stac")
-            all_items = list(tile_catalog.search(
-                collections=DEA_LANDSAT_COLLECTIONS,
-                bbox=tile_bbox,
-                datetime=f"{start_year}-{dry_start_mm_dd}/{end_year}-{dry_end_mm_dd}",
-                max_items=max_items_per_year * n_years,
-            ).items())
 
-            dry_start_month = int(dry_start_mm_dd.split("-")[0])
-            dry_end_month   = int(dry_end_mm_dd.split("-")[0])
-            by_year: dict = {}
-            for it in all_items:
-                dt = it.datetime or it.properties.get("datetime", "")
-                yr = int(str(dt)[:4])
-                mo = int(str(dt)[5:7])
-                if dry_start_month <= mo <= dry_end_month and start_year <= yr <= end_year:
-                    by_year.setdefault(yr, []).append(it)
-
+            # Query per-year so that the chronological STAC result ordering cannot
+            # cause recent years to be truncated by a global max_items cap.
             tile_items = []
-            for yr_items in by_year.values():
+            for yr in range(start_year, end_year + 1):
+                yr_items = list(tile_catalog.search(
+                    collections=DEA_LANDSAT_COLLECTIONS,
+                    bbox=tile_bbox,
+                    datetime=f"{yr}-{dry_start_mm_dd}/{yr}-{dry_end_mm_dd}",
+                    max_items=max_items_per_year,
+                ).items())
                 if len(yr_items) > max_items_per_year:
                     step = len(yr_items) / max_items_per_year
                     yr_items = [yr_items[round(i * step)] for i in range(max_items_per_year)]
@@ -179,7 +170,7 @@ def build_baseline(bbox, config, tile_cache_dir: Path, rebuild: bool) -> None:
 
             logger.info(
                 "Tile %d/%d  STAC: %d items across %d years",
-                tile_idx + 1, n_tiles, len(tile_items), n_years,
+                tile_idx + 1, n_tiles, len(tile_items), end_year - start_year + 1,
             )
             if not tile_items:
                 q.put((tile_idx, None, 0.0, None))

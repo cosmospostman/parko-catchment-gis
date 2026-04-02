@@ -172,6 +172,87 @@ def check_baseline_year_span(year: int, baseline_start_year: int) -> dict:
         f"{baseline_start_year}–{year - 1}  ({n_years} years)")
 
 
+def check_baseline_nan_fraction(path: Path, max_frac: float = 0.05) -> dict:
+    """Baseline NaN fraction must be low — gaps mean DEA tiles failed for those areas.
+
+    Uses a downsampled read to avoid loading the full raster into memory.
+    The threshold is tighter than for the NDVI median because the baseline
+    is a multi-decade median and should have near-complete coverage everywhere
+    the DEM and Landsat orbit overlap.
+    """
+    label = "Baseline cache NaN fraction"
+    if not path.exists():
+        return _result(label, SKIP, "Cache absent")
+    import rasterio
+    from rasterio.enums import Resampling as _R
+    try:
+        with rasterio.open(path) as src:
+            factor = max(1, min(src.width, src.height) // 1000)
+            out_h = max(1, src.height // factor)
+            out_w = max(1, src.width  // factor)
+            arr = src.read(1, out_shape=(out_h, out_w), resampling=_R.nearest).astype(np.float32)
+            nodata = src.nodata
+    except Exception as exc:
+        return _result(label, FAIL, f"Cannot read: {exc}")
+    if nodata is not None and np.isfinite(nodata):
+        arr[arr == nodata] = np.nan
+    nan_frac = float(np.isnan(arr).mean())
+    ok = nan_frac < max_frac
+    detail = f"{nan_frac * 100:.1f}% NaN  (threshold <{max_frac * 100:.0f}%)"
+    if not ok:
+        detail += "  ← DEA tiles likely failed for part of the catchment; rebuild with --rebuild-baseline"
+    return _result(label, PASS if ok else FAIL, detail)
+
+
+def check_baseline_covers_ndvi_extent(baseline_path: Path, ndvi_path: Path) -> dict:
+    """Baseline bounds must contain the NDVI median bounds.
+
+    A baseline that doesn't cover the full NDVI extent will produce NaN in
+    the anomaly wherever the two rasters don't overlap — the root cause of
+    the 73% NaN anomaly failure mode.
+    """
+    label = "Baseline covers NDVI median extent"
+    if not baseline_path.exists():
+        return _result(label, SKIP, "Baseline cache absent")
+    if not ndvi_path.exists():
+        return _result(label, SKIP, "NDVI median not found")
+    import rasterio
+    try:
+        with rasterio.open(str(baseline_path)) as src:
+            bb = src.bounds
+            b_crs = src.crs
+        with rasterio.open(str(ndvi_path)) as src:
+            nb = src.bounds
+            n_crs = src.crs
+    except Exception as exc:
+        return _result(label, FAIL, f"Cannot read bounds: {exc}")
+
+    if str(b_crs) != str(n_crs):
+        return _result(label, FAIL,
+            f"CRS mismatch: baseline={b_crs} ndvi={n_crs} — cannot compare bounds")
+
+    # Allow a small margin (one 30 m pixel) for floating-point edge differences
+    margin = 30.0
+    covers = (
+        bb.left   <= nb.left   + margin and
+        bb.right  >= nb.right  - margin and
+        bb.bottom <= nb.bottom + margin and
+        bb.top    >= nb.top    - margin
+    )
+    detail = (
+        f"baseline=({bb.left:.0f},{bb.bottom:.0f},{bb.right:.0f},{bb.top:.0f})  "
+        f"ndvi=({nb.left:.0f},{nb.bottom:.0f},{nb.right:.0f},{nb.top:.0f})"
+    )
+    if not covers:
+        gaps = []
+        if bb.left   > nb.left   + margin: gaps.append(f"west short by {bb.left - nb.left:.0f} m")
+        if bb.right  < nb.right  - margin: gaps.append(f"east short by {nb.right - bb.right:.0f} m")
+        if bb.bottom > nb.bottom + margin: gaps.append(f"south short by {bb.bottom - nb.bottom:.0f} m")
+        if bb.top    < nb.top    - margin: gaps.append(f"north short by {nb.top - bb.top:.0f} m")
+        detail += "  ← " + "; ".join(gaps) + " — rebuild baseline with --rebuild-baseline"
+    return _result(label, PASS if covers else FAIL, detail)
+
+
 def check_baseline_tag(
     path: Path, year: int, baseline_start_year: int,
     composite_start: str, composite_end: str,
@@ -326,6 +407,8 @@ def main() -> None:
             "Baseline cache CRS", baseline_path, int(config.TARGET_CRS.split(":")[-1])
         ))
         sci_results.append(check_ndvi_range("Baseline cache value range", baseline_path))
+        sci_results.append(check_baseline_nan_fraction(baseline_path))
+        sci_results.append(check_baseline_covers_ndvi_extent(baseline_path, ndvi_path))
         sci_results.append(check_baseline_tag(
             baseline_path, config.YEAR, config.BASELINE_START_YEAR,
             config.COMPOSITE_START, config.COMPOSITE_END,
