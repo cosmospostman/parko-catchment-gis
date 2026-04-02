@@ -298,7 +298,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--hand-raster", default="",
-        help="Pre-computed HAND raster (optional — run Stage 04 first)",
+        help="Pre-computed HAND raster (defaults to config.hand_raster_path(YEAR))",
     )
     args = parser.parse_args()
 
@@ -329,22 +329,16 @@ def main() -> None:
     else:
         sci_results.append(_result("DEM void fraction", SKIP, "No tiles to check"))
 
-    if args.hand_raster:
-        hand_path = Path(args.hand_raster)
-        if not hand_path.exists():
-            sci_results.append(_result(
-                "HAND checks", SKIP,
-                f"--hand-raster not found at {hand_path} — run Stage 04 first",
-            ))
-        else:
-            sci_results.append(check_hand_spatial_extent(hand_path))
-            sci_results.append(check_hand_distribution(hand_path))
-            sci_results.append(check_hand_flood_fractions(hand_path, config.HAND_FLOOD_THRESHOLD_M))
-    else:
+    hand_path = Path(args.hand_raster) if args.hand_raster else config.hand_raster_path(config.YEAR)
+    if not hand_path.exists():
         sci_results.append(_result(
-            "HAND distribution / flood fractions", SKIP,
-            "--hand-raster not provided — run Stage 04 then re-run with --hand-raster",
+            "HAND checks", SKIP,
+            f"HAND raster not found at {hand_path} — run Stage 04 first",
         ))
+    else:
+        sci_results.append(check_hand_spatial_extent(hand_path))
+        sci_results.append(check_hand_distribution(hand_path))
+        sci_results.append(check_hand_flood_fractions(hand_path, config.HAND_FLOOD_THRESHOLD_M))
 
     ok = _summary(file_results, sci_results)
     sys.exit(0 if ok else 1)

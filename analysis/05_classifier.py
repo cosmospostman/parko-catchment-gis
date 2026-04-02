@@ -18,8 +18,8 @@ import xarray as xr
 FEATURE_NAMES = [
     "ndvi_anomaly",
     "flowering_index",
-    "vv_db",
-    "vh_db",
+    "hand",
+    "flood_extent",
     "ndvi_median",
     "glcm_contrast",
     "glcm_homogeneity",
@@ -106,20 +106,23 @@ def _generate_ecological_samples(
     flowering: np.ndarray,
     ndvi_median: np.ndarray,
     rng: np.random.Generator,
+    hand: np.ndarray = None,
 ) -> Tuple[list, list]:
     """Generate high-confidence synthetic presence and absence pixels from ecological priors.
 
     Presence criteria (all required):
-      - Within 500m of watercourse (obligate riparian)
+      - Within 500m of watercourse (obligate riparian) OR HAND <= HAND_FLOOD_THRESHOLD_M
       - ndvi_anomaly in top quartile (stays green while natives senesce)
       - flowering_index above scene median (Aug-Oct phenological signal)
       - ndvi_median in moderate range (not bare ground, not closed-canopy rainforest)
 
     Absence criteria (any one sufficient):
-      - Beyond 2km from watercourse
+      - Beyond 2km from watercourse AND HAND > HAND_FLOOD_THRESHOLD_M (if HAND available)
       - Very low ndvi_median (bare ground / sparse grass)
       - Low ndvi_anomaly AND low flowering_index AND beyond 500m from water
     """
+    import config as _config
+
     H, W = ndvi_anomaly.shape
     valid = ~np.isnan(ndvi_anomaly) & ~np.isnan(flowering) & ~np.isnan(ndvi_median)
 
@@ -128,10 +131,20 @@ def _generate_ecological_samples(
     ndvi_anom_q25 = float(np.nanpercentile(ndvi_anomaly, 25))
     flower_q25    = float(np.nanpercentile(flowering, 25))
 
+    # Riparian proximity: dist_to_water criterion, strengthened by HAND when available
+    if hand is not None and not np.all(hand == 0):
+        near_water = (dist_to_water <= SYNTH_PRESENCE_MAX_DIST_WATER_M) | (hand <= _config.HAND_FLOOD_THRESHOLD_M)
+        far_from_water = (dist_to_water >= SYNTH_ABSENCE_MIN_DIST_WATER_M) & (hand > _config.HAND_FLOOD_THRESHOLD_M)
+        beyond_presence = (dist_to_water > SYNTH_PRESENCE_MAX_DIST_WATER_M) & (hand > _config.HAND_FLOOD_THRESHOLD_M)
+    else:
+        near_water = dist_to_water <= SYNTH_PRESENCE_MAX_DIST_WATER_M
+        far_from_water = dist_to_water >= SYNTH_ABSENCE_MIN_DIST_WATER_M
+        beyond_presence = dist_to_water > SYNTH_PRESENCE_MAX_DIST_WATER_M
+
     # High-confidence presence mask
     pres_mask = (
         valid
-        & (dist_to_water <= SYNTH_PRESENCE_MAX_DIST_WATER_M)
+        & near_water
         & (ndvi_anomaly >= ndvi_anom_q75)
         & (flowering >= flower_median)
         & (ndvi_median >= SYNTH_NDVI_MEDIAN_MIN)
@@ -140,12 +153,12 @@ def _generate_ecological_samples(
 
     # High-confidence absence mask
     abs_mask = valid & (
-        (dist_to_water >= SYNTH_ABSENCE_MIN_DIST_WATER_M)
+        far_from_water
         | (ndvi_median < SYNTH_NDVI_MEDIAN_MIN)
         | (
             (ndvi_anomaly <= ndvi_anom_q25)
             & (flowering <= flower_q25)
-            & (dist_to_water > SYNTH_PRESENCE_MAX_DIST_WATER_M)
+            & beyond_presence
         )
     )
 
@@ -220,9 +233,38 @@ def main() -> None:
         logger.warning("Drainage network not found — dist_to_watercourse set to 0")
         dist_to_water = np.zeros_like(ndvi_arr)
 
-    # VV/VH SAR features (use zeros if flood extent not available as raster)
-    vv_db = np.zeros_like(ndvi_arr)
-    vh_db = np.zeros_like(ndvi_arr)
+    # HAND raster (Height Above Nearest Drainage) from stage 04
+    hand_path = config.hand_raster_path(config.YEAR)
+    if hand_path.exists():
+        logger.info("Loading HAND raster: %s", hand_path)
+        hand_da = read_raster(hand_path).squeeze().rio.reproject_match(ndvi_anomaly_da)
+        hand_arr = hand_da.values.astype(np.float32)
+        hand_arr[~np.isfinite(hand_arr)] = np.nan
+    else:
+        logger.warning("HAND raster not found — hand feature set to 0 (run stage 04 first)")
+        hand_arr = np.zeros_like(ndvi_arr)
+
+    # Flood extent mask from stage 04 (rasterised to classifier grid)
+    flood_path = config.flood_extent_path(config.YEAR)
+    transform = ndvi_anomaly_da.rio.transform()
+    if flood_path.exists():
+        logger.info("Rasterising flood extent: %s", flood_path)
+        from rasterio.features import rasterize as rio_rasterize
+        flood_gdf = gpd.read_file(str(flood_path)).to_crs(config.TARGET_CRS)
+        if len(flood_gdf) > 0:
+            flood_mask_arr = rio_rasterize(
+                [(geom, 1) for geom in flood_gdf.geometry],
+                out_shape=ndvi_arr.shape,
+                transform=transform,
+                fill=0,
+                dtype=np.float32,
+            )
+        else:
+            logger.warning("Flood extent is empty — flood_extent feature set to 0")
+            flood_mask_arr = np.zeros_like(ndvi_arr)
+    else:
+        logger.warning("Flood extent not found — flood_extent feature set to 0 (run stage 04 first)")
+        flood_mask_arr = np.zeros_like(ndvi_arr)
 
     # ── Training data: ALA occurrences + pseudo-absences ─────────────────────
     logger.info("Fetching ALA occurrences...")
@@ -237,7 +279,7 @@ def main() -> None:
 
     # Build feature stack
     feat_stack = np.stack([
-        ndvi_arr, flower_arr, vv_db, vh_db,
+        ndvi_arr, flower_arr, hand_arr, flood_mask_arr,
         ndvi_med_arr, glcm_contrast, glcm_homogeneity, dist_to_water,
     ], axis=-1)  # (H, W, n_features)
 
@@ -274,7 +316,7 @@ def main() -> None:
     # Ecological bootstrap: supplement sparse ALA records with high-confidence
     # synthetic samples derived from ecological priors
     synth_pres_pixels, synth_abs_pixels = _generate_ecological_samples(
-        feat_stack, dist_to_water, ndvi_arr, flower_arr, ndvi_med_arr, rng,
+        feat_stack, dist_to_water, ndvi_arr, flower_arr, ndvi_med_arr, rng, hand=hand_arr,
     )
 
     # Build X, y, sample_weight arrays
