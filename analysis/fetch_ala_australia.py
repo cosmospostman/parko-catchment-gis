@@ -17,7 +17,6 @@ from pathlib import Path
 
 import geopandas as gpd
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 import pandas as pd
 import requests
 from shapely.geometry import Point
@@ -25,7 +24,7 @@ from shapely.geometry import Point
 ALA_BIOCACHE_URL = "https://biocache.ala.org.au/ws/occurrences/search"
 SPECIES = "Parkinsonia aculeata"
 PAGE_SIZE = 1000
-MAX_RECORDS = 50_000          # raise if needed; ALA has ~3-4k verified Aus records
+MAX_RECORDS = 100_000         # ALA has ~40k records for this species in Australia
 
 # Australia bounding box (WGS84)
 AUS_BBOX = [112.0, -44.0, 154.0, -10.0]
@@ -87,20 +86,59 @@ def fetch_all(species: str, bbox: list[float]) -> gpd.GeoDataFrame:
 
 
 def make_map(gdf: gpd.GeoDataFrame, out_path: Path) -> None:
-    # Load Australia states outline from naturalearth (bundled with geopandas)
-    world = gpd.read_file(gpd.datasets.get_path("naturalearth_lowres"))
-    aus = world[world["name"] == "Australia"]
+    # Load Australia outline from naturalearth via cartopy or a simple bbox polygon
+    try:
+        import cartopy.crs as ccrs
+        import cartopy.feature as cfeature
+        fig = plt.figure(figsize=(12, 9))
+        ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
+        ax.set_extent([112, 154, -44, -10], crs=ccrs.PlateCarree())
+        ax.add_feature(cfeature.LAND, facecolor="#f5f0eb")
+        ax.add_feature(cfeature.COASTLINE, linewidth=0.8, edgecolor="#aaa")
+        ax.add_feature(cfeature.BORDERS, linewidth=0.5, edgecolor="#ccc")
+        ax.add_feature(cfeature.STATES, linewidth=0.4, edgecolor="#ccc")
+        if len(gdf) > 0:
+            x = gdf.geometry.x.values
+            y = gdf.geometry.y.values
+            hb = ax.hexbin(x, y, gridsize=60, cmap="YlOrRd", mincnt=1, alpha=0.85,
+                           extent=[112, 154, -44, -10], transform=ccrs.PlateCarree())
+            fig.colorbar(hb, ax=ax, shrink=0.6, label="Sightings per hex cell")
+        ax.set_title(
+            f"Parkinsonia aculeata — ALA occurrence records (n={len(gdf):,})\n"
+            "Source: Atlas of Living Australia biocache API",
+            fontsize=13,
+        )
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        logger.info("Map saved: %s", out_path)
+        plt.close(fig)
+        return
+    except ImportError:
+        pass
+
+    # Fallback: download naturalearth shapefile on the fly
+    import io, zipfile, urllib.request
+    NE_URL = (
+        "https://naturalearth.s3.amazonaws.com/110m_cultural/"
+        "ne_110m_admin_0_countries.zip"
+    )
+    logger.info("Downloading naturalearth countries shapefile for basemap...")
+    with urllib.request.urlopen(NE_URL, timeout=30) as resp:
+        zf = zipfile.ZipFile(io.BytesIO(resp.read()))
+    shp_name = next(n for n in zf.namelist() if n.endswith(".shp"))
+    with zf.open(shp_name) as f:
+        world = gpd.read_file(f)
+    aus = world[world["NAME"] == "Australia"]
 
     fig, ax = plt.subplots(figsize=(12, 9))
     aus.plot(ax=ax, color="#f5f0eb", edgecolor="#aaa", linewidth=0.8)
 
-    # Hexbin density layer
     if len(gdf) > 0:
         x = gdf.geometry.x.values
         y = gdf.geometry.y.values
         hb = ax.hexbin(x, y, gridsize=60, cmap="YlOrRd", mincnt=1, alpha=0.85,
                        extent=[112, 154, -44, -10])
-        cb = fig.colorbar(hb, ax=ax, shrink=0.6, label="Sightings per hex cell")
+        fig.colorbar(hb, ax=ax, shrink=0.6, label="Sightings per hex cell")
 
     ax.set_xlim(112, 154)
     ax.set_ylim(-44, -10)

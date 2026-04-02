@@ -119,7 +119,6 @@ STAGE4_FILES=(
 # Also fetch the catchment boundary if present (needed by all stages)
 COMMON_FILES=(
     "mitchell_catchment.geojson"
-    "data/drainage_network.gpkg"
 )
 
 # ── per-host fetch ────────────────────────────────────────────────────────────
