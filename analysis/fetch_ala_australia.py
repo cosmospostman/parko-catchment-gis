@@ -116,8 +116,8 @@ def make_map(gdf: gpd.GeoDataFrame, out_path: Path) -> None:
     except ImportError:
         pass
 
-    # Fallback: download naturalearth shapefile on the fly
-    import io, zipfile, urllib.request
+    # Fallback: download naturalearth shapefile on the fly, extract to temp dir
+    import io, tempfile, zipfile, urllib.request
     NE_URL = (
         "https://naturalearth.s3.amazonaws.com/110m_cultural/"
         "ne_110m_admin_0_countries.zip"
@@ -125,9 +125,10 @@ def make_map(gdf: gpd.GeoDataFrame, out_path: Path) -> None:
     logger.info("Downloading naturalearth countries shapefile for basemap...")
     with urllib.request.urlopen(NE_URL, timeout=30) as resp:
         zf = zipfile.ZipFile(io.BytesIO(resp.read()))
-    shp_name = next(n for n in zf.namelist() if n.endswith(".shp"))
-    with zf.open(shp_name) as f:
-        world = gpd.read_file(f)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        zf.extractall(tmpdir)
+        shp_path = next(Path(tmpdir).glob("*.shp"))
+        world = gpd.read_file(shp_path)
     aus = world[world["NAME"] == "Australia"]
 
     fig, ax = plt.subplots(figsize=(12, 9))
