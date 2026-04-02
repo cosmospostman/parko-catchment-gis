@@ -80,7 +80,7 @@ else
 fi
 
 curl -fsSL --retry 5 --retry-delay 2 "$HTTPS_URL" -o "$LOCAL_PATH"
-echo "sync:$LOCAL_PATH" >> "${COUNTS_DIR}/synced"
+echo "$LOCAL_PATH" >> "${COUNTS_DIR}/synced"
 COPY_EOF
 
 chmod +x "$COPY_SCRIPT"
