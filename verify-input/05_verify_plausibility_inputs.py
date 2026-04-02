@@ -224,8 +224,10 @@ def check_hand_floodplain_coverage(hand_path: Path) -> dict:
     issues = []
     if below5_frac < 0.05:
         issues.append(f"only {below5_frac:.1%} of pixels <5 m — too few floodplain pixels")
-    if void_frac >= 0.05:
-        issues.append(f"void fraction {void_frac:.1%} ≥ 5%")
+    # Void fraction threshold is generous: HAND rasters typically cover the full DEM bbox
+    # which extends well outside the catchment boundary, so out-of-catchment nodata is expected.
+    if void_frac >= 0.70:
+        issues.append(f"void fraction {void_frac:.1%} ≥ 70% — unusually high, check DEM coverage")
 
     detail = f"pixels<5m: {below5_frac:.1%}  void: {void_frac:.1%}"
     if issues:
