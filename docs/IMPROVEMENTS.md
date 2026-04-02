@@ -14,7 +14,7 @@ occurrence records.
 
 ### Partial mitigation implemented
 
-`05_classifier.py` now supplements the ALA records with **ecological bootstrap
+`06_classifier.py` now supplements the ALA records with **ecological bootstrap
 samples** — high-confidence synthetic presences and absences derived from known
 Parkinsonia biology:
 

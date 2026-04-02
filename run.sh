@@ -269,7 +269,7 @@ if [[ "${DRY_RUN}" == "true" ]]; then
     [[ -n "${LOCAL_S2_ROOT}" ]] && printf "  Step 00  s2_ebs_sync (LOCAL_S2_ROOT=%s)\n" "${LOCAL_S2_ROOT}"
     [[ -n "${LOCAL_S1_ROOT}" ]] && printf "  Step 00  s1_ebs_sync (LOCAL_S1_ROOT=%s)\n" "${LOCAL_S1_ROOT}"
     [[ -n "${LOCAL_DEM_ROOT}" ]] && printf "  Step 00  dem_cache (LOCAL_DEM_ROOT=%s)\n" "${LOCAL_DEM_ROOT}"
-    for step_num in 1 2 3 4 5 6 7; do
+    for step_num in 1 2 3 4 5 6 7 8; do
         printf "  Step %02d\n" "${step_num}"
     done
     exit 0
@@ -538,9 +538,10 @@ run_step_or_abort 1 "01_ndvi_composite"    "01_verify_ndvi_composite"
 run_step_or_abort 2 "02_ndvi_anomaly"      "02_verify_ndvi_anomaly"
 run_step_or_abort 3 "03_flowering_index"   "03_verify_flowering_index"
 run_step_or_abort 4 "04_flood_extent"      "04_verify_flood_extent"
-run_step_or_abort 5 "06_classifier"        "06_verify_classifier"
-run_step_or_abort 6 "07_priority_patches"  "07_verify_priority_patches"
-run_step_or_abort 7 "08_change_detection"  "08_verify_change_detection"
+run_step_or_abort 5 "05_plausibility_map"  "05_verify_plausibility_map"
+run_step_or_abort 6 "06_classifier"        "06_verify_classifier"
+run_step_or_abort 7 "07_priority_patches"  "07_verify_priority_patches"
+run_step_or_abort 8 "08_change_detection"  "08_verify_change_detection"
 
 print_summary
 
