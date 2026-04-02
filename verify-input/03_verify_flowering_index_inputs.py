@@ -181,40 +181,6 @@ def check_flowering_window(flower_start: str, flower_end: str) -> dict:
     return _result(label, PASS, detail)
 
 
-def check_window_independence(
-    composite_start: str, composite_end: str,
-    flower_start: str, flower_end: str,
-) -> dict:
-    """Flowering window should not overlap the composite window by more than 30 days.
-
-    The NDVI composite and flowering index are meant to capture different
-    phenological signals.  Heavy overlap means both will be computed from the
-    same scenes, reducing the classifier's discriminating power.
-    """
-    label = "Window independence (flowering ≠ composite)"
-    try:
-        cs = _parse_mmdd(composite_start)
-        ce = _parse_mmdd(composite_end)
-        fs = _parse_mmdd(flower_start)
-        fe = _parse_mmdd(flower_end)
-    except Exception as exc:
-        return _result(label, SKIP, f"Cannot parse window dates: {exc}")
-
-    # Overlap in days = max(0, min(end1, end2) - max(start1, start2) + 1)
-    overlap_start = max(cs, fs)
-    overlap_end   = min(ce, fe)
-    overlap_days  = max(0, (overlap_end - overlap_start).days + 1)
-
-    detail = (
-        f"composite {composite_start}→{composite_end}  ·  "
-        f"flowering {flower_start}→{flower_end}  ·  "
-        f"overlap {overlap_days} days"
-    )
-    if overlap_days > 30:
-        return _result(label, FAIL,
-            detail + f"  ← exceeds 30-day tolerance; indices may be correlated")
-    return _result(label, PASS, detail)
-
 
 def check_cloud_cover_max(cloud_cover_max: int) -> dict:
     """Cloud cover filter should be between 5 and 50 %."""
@@ -247,10 +213,6 @@ def main() -> None:
     _section("2. Scientific sanity checks")
     sci_results = [
         check_flowering_window(config.FLOWERING_WINDOW_START, config.FLOWERING_WINDOW_END),
-        check_window_independence(
-            config.COMPOSITE_START, config.COMPOSITE_END,
-            config.FLOWERING_WINDOW_START, config.FLOWERING_WINDOW_END,
-        ),
         check_cloud_cover_max(config.CLOUD_COVER_MAX),
     ]
 

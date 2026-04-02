@@ -285,11 +285,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Validate Stage 04 flood connectivity inputs"
     )
+    default_tile_dir = (
+        os.environ.get("LOCAL_DEM_ROOT")
+        or os.environ.get("DEM_CACHE_DIR")
+        or "/mnt/ebs/dem/copernicus-dem-30m"
+    )
     parser.add_argument(
         "--tile-dir",
-        default=os.environ.get("DEM_TILE_DIR", ""),
+        default=default_tile_dir,
         help="Directory of Copernicus GLO-30 DEM tiles "
-             "(or set DEM_TILE_DIR env var)",
+             "(defaults to LOCAL_DEM_ROOT → DEM_CACHE_DIR → /mnt/ebs/dem/copernicus-dem-30m)",
     )
     parser.add_argument(
         "--hand-raster", default="",
@@ -300,10 +305,6 @@ def main() -> None:
     import config
 
     print(f"{_BOLD}Stage 04 — Flood connectivity input verification  (year: {config.YEAR}){_RESET}")
-
-    if not args.tile_dir:
-        print(f"{_RED}Error: --tile-dir not specified and DEM_TILE_DIR not set{_RESET}")
-        sys.exit(1)
 
     tile_dir   = Path(args.tile_dir)
     tile_paths = sorted(tile_dir.glob("*.tif")) if tile_dir.is_dir() else []
