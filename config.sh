@@ -31,6 +31,11 @@ if [[ -n "${_PYTHON}" ]] && "${_PYTHON}" -c "import rasterio" 2>/dev/null; then
 fi
 unset _PYTHON _RASTERIO_PROJ_DATA _PYPROJ_DATA
 
+# Composite seasonal window — late dry season to capture vegetation stress
+# (post-wet flush ends ~July; wet season breaks ~December in Gulf Country)
+export COMPOSITE_START="${COMPOSITE_START:-08-01}"
+export COMPOSITE_END="${COMPOSITE_END:-11-30}"
+
 # Auto-activate local S2 cache if the EBS volume is mounted at /mnt/s2cache
 export LOCAL_S2_ROOT="${LOCAL_S2_ROOT:-$([ -d /mnt/s2cache ] && echo /mnt/s2cache || echo '')}"
 

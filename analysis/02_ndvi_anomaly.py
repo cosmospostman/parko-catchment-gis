@@ -262,7 +262,7 @@ def main() -> None:
         try:
             with rasterio.open(str(baseline_path)) as src:
                 desc = src.tags().get("IMAGEDESCRIPTION", "")
-            expected_desc = f"NDVI_BASELINE:{config.BASELINE_START_YEAR}-{config.YEAR - 1}"
+            expected_desc = f"NDVI_BASELINE:{config.BASELINE_START_YEAR}-{config.YEAR - 1}:{config.COMPOSITE_START}/{config.COMPOSITE_END}"
             if desc != expected_desc:
                 logger.info(
                     "Baseline cache tag mismatch ('%s' vs '%s') — rebuilding",
@@ -281,7 +281,7 @@ def main() -> None:
         write_cog(baseline, baseline_path)
         with rasterio.open(str(baseline_path), "r+") as dst:
             dst.update_tags(
-                IMAGEDESCRIPTION=f"NDVI_BASELINE:{config.BASELINE_START_YEAR}-{config.YEAR - 1}"
+                IMAGEDESCRIPTION=f"NDVI_BASELINE:{config.BASELINE_START_YEAR}-{config.YEAR - 1}:{config.COMPOSITE_START}/{config.COMPOSITE_END}"
             )
         logger.info("Baseline written: %s", baseline_path)
         for p in _tile_paths:

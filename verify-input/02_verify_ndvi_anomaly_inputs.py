@@ -172,11 +172,14 @@ def check_baseline_year_span(year: int, baseline_start_year: int) -> dict:
         f"{baseline_start_year}–{year - 1}  ({n_years} years)")
 
 
-def check_baseline_tag(path: Path, year: int, baseline_start_year: int) -> dict:
-    """IMAGEDESCRIPTION tag must match the expected year range.
+def check_baseline_tag(
+    path: Path, year: int, baseline_start_year: int,
+    composite_start: str, composite_end: str,
+) -> dict:
+    """IMAGEDESCRIPTION tag must match years and composite window.
 
-    A mismatch means the cache was built for a different YEAR or
-    BASELINE_START_YEAR and will produce a large anomaly mean.
+    A mismatch means the cache was built for a different YEAR,
+    BASELINE_START_YEAR, or seasonal window and will produce a biased anomaly.
     """
     label = "Baseline cache tag"
     if not path.exists():
@@ -187,7 +190,7 @@ def check_baseline_tag(path: Path, year: int, baseline_start_year: int) -> dict:
             tag = src.tags().get("IMAGEDESCRIPTION", "")
     except Exception as exc:
         return _result(label, FAIL, f"Cannot read tags: {exc}")
-    expected = f"NDVI_BASELINE:{baseline_start_year}-{year - 1}"
+    expected = f"NDVI_BASELINE:{baseline_start_year}-{year - 1}:{composite_start}/{composite_end}"
     if tag != expected:
         return _result(label, FAIL,
             f"Tag '{tag}' does not match expected '{expected}' — "
@@ -324,7 +327,8 @@ def main() -> None:
         ))
         sci_results.append(check_ndvi_range("Baseline cache value range", baseline_path))
         sci_results.append(check_baseline_tag(
-            baseline_path, config.YEAR, config.BASELINE_START_YEAR
+            baseline_path, config.YEAR, config.BASELINE_START_YEAR,
+            config.COMPOSITE_START, config.COMPOSITE_END,
         ))
     else:
         sci_results.append(_result(
