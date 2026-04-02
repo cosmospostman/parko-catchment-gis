@@ -23,7 +23,7 @@ GPKG_PATH = Path(__file__).parent.parent / "outputs" / "australia_occurrences" /
 OUT_PATH  = Path(__file__).parent.parent / "outputs" / "australia_occurrences" / "training_candidates.png"
 
 # Zoom extent: NT + western QLD
-PLOT_EXTENT = [128.0, -22.0, 148.0, -10.0]
+PLOT_EXTENT = [128.0, -24.0, 148.0, -10.0]
 
 # Mitchell catchment bbox (for reference)
 MITCHELL_BBOX = [141.3453505, -18.23350524, 145.51819104, -14.92188926]
@@ -39,6 +39,11 @@ CANDIDATES = [
         "label": "NT — McArthur River",
         "bbox": [135.5, -19.0, 138.5, -16.5],
         "color": "#756bb1",
+    },
+    {
+        "label": "NT/QLD — Georgina / Tablelands",
+        "bbox": [133.5, -22.0, 139.0, -17.5],
+        "color": "#31a354",
     },
 ]
 
