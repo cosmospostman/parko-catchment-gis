@@ -11,33 +11,93 @@ load-testdata
     Analogy: manage.py in Django — administrative operations clearly separated
     from the main pipeline execution.
 
-run (future session)
-    Full training pipeline: Stage 0 fetch → extraction → quality → waveform →
-    feature assembly → RF fit → spatial validation gate → artefact writes.
+run
+    Full training pipeline: Stage 0 fetch → extraction → quality scoring →
+    waveform → feature assembly → RF fit → spatial validation gate → artefact
+    writes.
+
+    Required:
+        --points PATH   CSV file with columns: point_id,lon,lat,label
+                        label=1 for presence, label=0 for absence.
+    Optional:
+        --run-id ID     Identifier for this run's output artefacts.
+                        Defaults to a timestamp-based ID.
+        --output-dir    Directory for artefacts. Default: outputs/
+        --from-checkpoint {observations|features}
+                        Resume from a previously written checkpoint.
+                        observations: skip Stage 0 fetch + extraction;
+                                      load observations_{run_id}.parquet.
+                        features:     skip everything through waveform;
+                                      load features_{run_id}.parquet.
+        --stac-start    STAC search start date (YYYY-MM-DD). Default: 2019-01-01
+        --stac-end      STAC search end date (YYYY-MM-DD). Default: today
+        --cloud-max     Max cloud cover % for STAC filter. Default: 30
+        --workers       ProcessPool workers. Default: auto (_pool_size)
+
+drop-checkpoint
+    Delete all artefacts for a given run ID from the output directory.
+    Requires --run-id and --yes to guard against accidental deletion.
+
+Output artefacts (all written to --output-dir)
+----------------------------------------------
+observations_{run_id}.parquet   per-point raw observation table
+observations_{run_id}.progress  sidecar: set of completed point IDs
+archive_stats_{run_id}.json     NDVI archive mean + std
+features_{run_id}.parquet       assembled feature matrix
+validation_{run_id}.json        spatial validation metrics
+feature_names_{run_id}.json     ordered feature name list (inference contract)
+model_{run_id}.pkl              fitted RandomForestClassifier (written last)
+
+model_{run_id}.pkl is written ONLY after the spatial validation gate passes.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import csv as _csv
+import json
 import logging
+import multiprocessing
+import os
+import pickle
 import subprocess
 import sys
+import uuid
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from analysis.constants import BANDS, SCL_BAND
+from analysis.constants import (
+    BANDS,
+    SCL_BAND,
+    SPATIAL_VALIDATION_THRESHOLD,
+)
+from analysis.primitives.indices import flowering_index
+from analysis.primitives.quality import ArchiveStats, score_observation
+from analysis.primitives.validation import validate_spatial
+from analysis.timeseries.extraction import extract_observations
+from analysis.timeseries.features import assemble_feature_vector
+from analysis.timeseries.waveform import extract_waveform_features
+from stage0.chip_store import DiskChipStore
 from stage0.fetch import fetch_chips
+from utils.pipeline import _pool_size
 from utils.stac import search_sentinel2
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Fixture point set — small (~5 points) Parkinsonia presence locations in the
-# Mitchell catchment area (north Queensland). Used only by load-testdata.
-# Source: ALA occurrences filtered to lon 141–145, lat -15 to -20.
+# Module-level worker state (populated before fork, inherited by children)
+# ---------------------------------------------------------------------------
+
+_WORKER_STATE: dict[str, Any] = {}
+
+# ---------------------------------------------------------------------------
+# Fixture point set — load-testdata only
 # ---------------------------------------------------------------------------
 
 FIXTURE_POINTS: list[tuple[str, float, float]] = [
@@ -48,18 +108,15 @@ FIXTURE_POINTS: list[tuple[str, float, float]] = [
     ("fixture_005", 141.54217,  -15.79650),
 ]
 
-# Sentinel-2 bands to fetch for fixture chips: spectral + SCL + AOT
 FIXTURE_BANDS: list[str] = ["B03", "B04", "B08", "B8A", "B11", SCL_BAND, "AOT"]
-
-# Search parameters for fixture STAC query
-FIXTURE_BBOX: list[float] = [141.0, -19.0, 143.5, -15.5]  # covers all fixture points
+FIXTURE_BBOX: list[float] = [141.0, -19.0, 143.5, -15.5]
 FIXTURE_START: str = "2022-07-01"
 FIXTURE_END:   str = "2022-10-31"
 FIXTURE_CLOUD_MAX: int = 30
 
-FIXTURE_DIR  = PROJECT_ROOT / "tests" / "fixtures"
+FIXTURE_DIR   = PROJECT_ROOT / "tests" / "fixtures"
 SENTINEL_FILE = FIXTURE_DIR / ".fixture_commit"
-INPUTS_DIR   = PROJECT_ROOT / "inputs"
+INPUTS_DIR    = PROJECT_ROOT / "inputs"
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +133,176 @@ def _current_git_commit() -> str:
         ).decode().strip()
     except Exception:
         return "unknown"
+
+
+def _run_id_from_timestamp() -> str:
+    """Generate a run ID from the current UTC timestamp."""
+    return datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _load_points_csv(path: Path) -> list[tuple[str, float, float, int]]:
+    """Load a points CSV with columns point_id,lon,lat,label.
+
+    Returns list of (point_id, lon, lat, label).
+    Raises ValueError on malformed input.
+    """
+    points = []
+    with open(path, newline="") as fh:
+        reader = _csv.DictReader(fh)
+        required = {"point_id", "lon", "lat", "label"}
+        if not required.issubset(set(reader.fieldnames or [])):
+            raise ValueError(
+                f"Points CSV must have columns {required}; "
+                f"got {reader.fieldnames}"
+            )
+        for i, row in enumerate(reader, start=2):
+            try:
+                pid = row["point_id"].strip()
+                lon = float(row["lon"])
+                lat = float(row["lat"])
+                label = int(row["label"])
+            except (ValueError, KeyError) as exc:
+                raise ValueError(f"Bad row {i} in {path}: {exc}") from exc
+            if label not in (0, 1):
+                raise ValueError(
+                    f"Row {i}: label must be 0 or 1, got {label!r}"
+                )
+            points.append((pid, lon, lat, label))
+    if not points:
+        raise ValueError(f"Points CSV {path} is empty.")
+    return points
+
+
+def _spatial_train_val_split(
+    points: list[tuple[str, float, float, int]],
+    val_fraction: float = 0.2,
+) -> tuple[list[tuple[str, float, float, int]], list[tuple[str, float, float, int]]]:
+    """Split points into train / val using a geographic latitude band.
+
+    Points north of the (1 - val_fraction) latitude quantile are held out
+    as the validation set. This ensures spatial separation rather than
+    random mixing, which would inflate AUC via spatial autocorrelation.
+
+    Both splits are returned with at least one presence and one absence
+    sample, or a ValueError is raised (the caller should add more points).
+    """
+    lats = sorted(p[2] for p in points)
+    n = len(lats)
+    cutoff_idx = int(n * (1 - val_fraction))
+    cutoff_lat = lats[min(cutoff_idx, n - 1)]
+
+    train = [p for p in points if p[2] <= cutoff_lat]
+    val   = [p for p in points if p[2] > cutoff_lat]
+
+    # Ensure both splits have both classes
+    for split_name, split in (("train", train), ("val", val)):
+        labels = {p[3] for p in split}
+        if 0 not in labels or 1 not in labels:
+            raise ValueError(
+                f"Spatial split produced a {split_name} set with only one "
+                f"class (labels present: {labels}). "
+                "Add more points from diverse latitudes, or reduce val_fraction."
+            )
+    return train, val
+
+
+# ---------------------------------------------------------------------------
+# Worker: per-point feature extraction (runs in ProcessPoolExecutor)
+# ---------------------------------------------------------------------------
+
+def _worker_init_fn(archive_stats_dict: dict) -> None:
+    """Pool initializer: deserialise ArchiveStats into worker-local state."""
+    _WORKER_STATE["archive_stats"] = ArchiveStats(
+        mean=archive_stats_dict["mean"],
+        std=archive_stats_dict["std"],
+    )
+
+
+def _extract_point_features(
+    point: tuple[str, float, float, int],
+    items: list,
+    inputs_dir: Path,
+) -> tuple[str, int, dict[str, float] | None]:
+    """Worker function: extraction → quality → waveform → features for one point.
+
+    Returns (point_id, label, feature_vector) or (point_id, label, None) if
+    the point has insufficient usable data.
+
+    This function is called in a forked worker process. It reads ArchiveStats
+    from the module-level _WORKER_STATE dict populated by _worker_init_fn.
+    """
+    point_id, lon, lat, label = point
+    archive_stats: ArchiveStats = _WORKER_STATE["archive_stats"]
+
+    store = DiskChipStore(inputs_dir=inputs_dir)
+    points_arg = [(point_id, lon, lat)]
+
+    # Stage 5: extract
+    raw_obs = extract_observations(items, points_arg, store, bands=BANDS)
+    if not raw_obs:
+        return (point_id, label, None)
+
+    # Stage 6: quality score
+    scored_obs = [score_observation(obs, archive_stats) for obs in raw_obs]
+
+    # Stage 7: waveform
+    waveform = extract_waveform_features(scored_obs, index_fn=flowering_index)
+    if not waveform:
+        return (point_id, label, None)
+
+    # Stage 8: feature assembly (structural features as NaN sentinel — joined later)
+    # Structural features (HAND, dist_to_water) are not available in the
+    # chip store; they must be joined from GIS data. For Session 11 we emit
+    # placeholder 0.0 values so the pipeline end-to-end is testable. The
+    # production caller should pass structural_features from a GIS lookup.
+    structural: dict[str, float] = {"HAND": 0.0, "dist_to_water": 0.0}
+    fv = assemble_feature_vector(waveform, structural, scored_obs)
+    return (point_id, label, fv)
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint helpers
+# ---------------------------------------------------------------------------
+
+def _write_observations_parquet(
+    observations: list[dict],
+    path: Path,
+) -> None:
+    """Write per-observation records to parquet via pandas."""
+    import pandas as pd
+    df = pd.DataFrame(observations)
+    df.to_parquet(path, index=False)
+
+
+def _load_observations_parquet(path: Path) -> list[dict]:
+    import pandas as pd
+    return pd.read_parquet(path).to_dict(orient="records")
+
+
+def _write_features_parquet(rows: list[dict], path: Path) -> None:
+    import pandas as pd
+    df = pd.DataFrame(rows)
+    df.to_parquet(path, index=False)
+
+
+def _load_features_parquet(path: Path) -> list[dict]:
+    import pandas as pd
+    return pd.read_parquet(path).to_dict(orient="records")
+
+
+def _progress_path(observations_path: Path) -> Path:
+    return observations_path.with_suffix(".progress")
+
+
+def _load_progress(progress_path: Path) -> set[str]:
+    if not progress_path.exists():
+        return set()
+    return set(progress_path.read_text().splitlines())
+
+
+def _append_progress(progress_path: Path, point_id: str) -> None:
+    with open(progress_path, "a") as fh:
+        fh.write(point_id + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -118,12 +345,354 @@ def cmd_load_testdata(args: argparse.Namespace) -> None:
         max_concurrent=32,
     ))
 
-    # Write sentinel: current git commit hash
     FIXTURE_DIR.mkdir(parents=True, exist_ok=True)
     commit = _current_git_commit()
     SENTINEL_FILE.write_text(commit + "\n")
     logger.info("load-testdata complete — sentinel written: %s (commit %s)",
                 SENTINEL_FILE, commit[:12])
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: run
+# ---------------------------------------------------------------------------
+
+def cmd_run(args: argparse.Namespace) -> None:
+    """Full training pipeline."""
+    import config as _config
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+        stream=sys.stdout,
+    )
+
+    run_id: str = args.run_id or _run_id_from_timestamp()
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    inputs_dir = INPUTS_DIR
+
+    checkpoint: str | None = args.from_checkpoint
+
+    logger.info("run: run_id=%s  output_dir=%s  checkpoint=%s",
+                run_id, output_dir, checkpoint or "none")
+
+    # ------------------------------------------------------------------
+    # Load point set
+    # ------------------------------------------------------------------
+    all_points = _load_points_csv(Path(args.points))
+    logger.info("run: loaded %d points from %s", len(all_points), args.points)
+
+    train_points, val_points = _spatial_train_val_split(all_points)
+    logger.info("run: train=%d  val=%d (spatial latitude split)",
+                len(train_points), len(val_points))
+
+    # ------------------------------------------------------------------
+    # Artefact paths
+    # ------------------------------------------------------------------
+    obs_path       = output_dir / f"observations_{run_id}.parquet"
+    progress_path  = _progress_path(obs_path)
+    stats_path     = output_dir / f"archive_stats_{run_id}.json"
+    features_path  = output_dir / f"features_{run_id}.parquet"
+    validation_path = output_dir / f"validation_{run_id}.json"
+    fnames_path    = output_dir / f"feature_names_{run_id}.json"
+    model_path     = output_dir / f"model_{run_id}.pkl"
+
+    # ------------------------------------------------------------------
+    # Stage 0: fetch + Stage 5–6 first pass (unless checkpointing past it)
+    # ------------------------------------------------------------------
+    archive_stats: ArchiveStats | None = None
+    raw_observation_rows: list[dict] = []
+
+    if checkpoint in ("observations", "features"):
+        logger.info("run: --from-checkpoint %s — skipping Stage 0 + extraction",
+                    checkpoint)
+        if stats_path.exists():
+            s = json.loads(stats_path.read_text())
+            archive_stats = ArchiveStats(mean=s["mean"], std=s["std"])
+            logger.info("run: loaded ArchiveStats from %s", stats_path)
+        else:
+            logger.warning("run: archive_stats file not found at %s — "
+                           "will recompute from parquet observations", stats_path)
+
+    else:
+        # Stage 0: STAC search + fetch
+        logger.info("run: Stage 0 — searching STAC")
+        bbox = [
+            min(p[1] for p in all_points) - 0.1,
+            min(p[2] for p in all_points) - 0.1,
+            max(p[1] for p in all_points) + 0.1,
+            max(p[2] for p in all_points) + 0.1,
+        ]
+        items = search_sentinel2(
+            bbox=bbox,
+            start=args.stac_start,
+            end=args.stac_end,
+            cloud_cover_max=args.cloud_max,
+            endpoint=_config.STAC_ENDPOINT_ELEMENT84,
+            collection=_config.S2_COLLECTION,
+        )
+        if not items:
+            logger.error("run: No STAC items found for search parameters.")
+            sys.exit(1)
+        logger.info("run: found %d STAC items", len(items))
+
+        bands_to_fetch = BANDS + [SCL_BAND, "AOT"]
+        points_xy = [(p[0], p[1], p[2]) for p in all_points]
+
+        logger.info("run: fetching chips (%d items × %d points)", len(items), len(points_xy))
+        asyncio.run(fetch_chips(
+            points=points_xy,
+            items=items,
+            bands=bands_to_fetch,
+            window_px=5,
+            inputs_dir=inputs_dir,
+            scl_filter=True,
+            max_concurrent=32,
+        ))
+        logger.info("run: Stage 0 complete")
+
+        # First-pass extraction (single-threaded) to compute ArchiveStats
+        logger.info("run: first-pass extraction for ArchiveStats")
+        store = DiskChipStore(inputs_dir=inputs_dir)
+        raw_obs_all = extract_observations(items, points_xy, store, bands=BANDS)
+        if len(raw_obs_all) < 2:
+            logger.error("run: fewer than 2 observations extracted — cannot compute ArchiveStats")
+            sys.exit(1)
+
+        archive_stats = ArchiveStats.from_observations(raw_obs_all)
+        stats_path.write_text(json.dumps({"mean": archive_stats.mean, "std": archive_stats.std}))
+        logger.info("run: ArchiveStats mean=%.4f std=%.4f  written to %s",
+                    archive_stats.mean, archive_stats.std, stats_path)
+
+        # Store items reference for the parallel pass below
+        _stored_items = items
+
+    # ------------------------------------------------------------------
+    # Stage 5–8: parallel per-point feature extraction
+    # (unless --from-checkpoint features)
+    # ------------------------------------------------------------------
+    feature_rows: list[dict] = []
+
+    if checkpoint == "features":
+        logger.info("run: --from-checkpoint features — loading %s", features_path)
+        if not features_path.exists():
+            logger.error("run: features checkpoint not found: %s", features_path)
+            sys.exit(1)
+        feature_rows = _load_features_parquet(features_path)
+        logger.info("run: loaded %d feature rows from checkpoint", len(feature_rows))
+
+    else:
+        if checkpoint == "observations":
+            logger.info("run: --from-checkpoint observations — loading %s", obs_path)
+            if not obs_path.exists():
+                logger.error("run: observations checkpoint not found: %s", obs_path)
+                sys.exit(1)
+            # Re-run STAC search to get items (needed for extraction)
+            import config as _config2
+            bbox2 = [
+                min(p[1] for p in all_points) - 0.1,
+                min(p[2] for p in all_points) - 0.1,
+                max(p[1] for p in all_points) + 0.1,
+                max(p[2] for p in all_points) + 0.1,
+            ]
+            _stored_items = search_sentinel2(
+                bbox=bbox2,
+                start=args.stac_start,
+                end=args.stac_end,
+                cloud_cover_max=args.cloud_max,
+                endpoint=_config2.STAC_ENDPOINT_ELEMENT84,
+                collection=_config2.S2_COLLECTION,
+            )
+            if not _stored_items:
+                logger.error("run: No STAC items found when resuming from observations checkpoint.")
+                sys.exit(1)
+            if archive_stats is None:
+                logger.error("run: ArchiveStats required but not loaded from %s", stats_path)
+                sys.exit(1)
+
+        # Parallel extraction
+        already_done = _load_progress(progress_path)
+        remaining = [p for p in all_points if p[0] not in already_done]
+        logger.info("run: %d/%d points remaining (progress: %d done)",
+                    len(remaining), len(all_points), len(already_done))
+
+        n_workers = args.workers if args.workers else _pool_size(len(remaining))
+        logger.info("run: ProcessPoolExecutor workers=%d", n_workers)
+
+        archive_stats_dict = {"mean": archive_stats.mean, "std": archive_stats.std}
+
+        mp_ctx = multiprocessing.get_context("fork")
+        with ProcessPoolExecutor(
+            max_workers=n_workers,
+            mp_context=mp_ctx,
+            initializer=_worker_init_fn,
+            initargs=(archive_stats_dict,),
+        ) as pool:
+            futures = {
+                pool.submit(_extract_point_features, pt, _stored_items, inputs_dir): pt
+                for pt in remaining
+            }
+            for future in as_completed(futures):
+                pt = futures[future]
+                try:
+                    point_id, label, fv = future.result()
+                except Exception as exc:
+                    logger.warning("run: worker failed for %s: %s", pt[0], exc)
+                    continue
+
+                if fv is not None:
+                    fv["point_id"] = point_id
+                    fv["label"] = label
+                    feature_rows.append(fv)
+
+                _append_progress(progress_path, point_id)
+                logger.debug("run: point %s done — features=%s", point_id,
+                             "yes" if fv is not None else "no (insufficient data)")
+
+        logger.info("run: extraction complete — %d/%d points produced features",
+                    len(feature_rows), len(all_points))
+
+        if not feature_rows:
+            logger.error("run: no feature vectors produced — cannot train. "
+                         "Check chip data and FLOWERING_THRESHOLD.")
+            sys.exit(1)
+
+        _write_features_parquet(feature_rows, features_path)
+        logger.info("run: features written to %s", features_path)
+
+    # ------------------------------------------------------------------
+    # RF fit
+    # ------------------------------------------------------------------
+    from sklearn.ensemble import RandomForestClassifier
+
+    feature_names = [k for k in feature_rows[0].keys()
+                     if k not in ("point_id", "label")]
+
+    X_all = [[row[k] for k in feature_names] for row in feature_rows]
+    y_all = [row["label"] for row in feature_rows]
+    ids_all = [row["point_id"] for row in feature_rows]
+
+    # Map point_id to label for split
+    id_to_label = {p[0]: p[3] for p in all_points}
+    val_ids = {p[0] for p in val_points}
+
+    X_train, y_train, X_val, y_val = [], [], [], []
+    for x, y, pid in zip(X_all, y_all, ids_all):
+        if pid in val_ids:
+            X_val.append(x)
+            y_val.append(y)
+        else:
+            X_train.append(x)
+            y_train.append(y)
+
+    if len(X_train) == 0:
+        logger.error("run: training set is empty after spatial split.")
+        sys.exit(1)
+    if len(X_val) == 0:
+        logger.error("run: validation set is empty after spatial split.")
+        sys.exit(1)
+
+    logger.info("run: fitting RF on %d training samples", len(X_train))
+    rf = RandomForestClassifier(n_estimators=500, n_jobs=-1, random_state=42)
+    rf.fit(X_train, y_train)
+    logger.info("run: RF fit complete")
+
+    # ------------------------------------------------------------------
+    # Spatial validation gate
+    # ------------------------------------------------------------------
+    val_probs = rf.predict_proba(X_val)[:, 1].tolist()
+    val_result = validate_spatial(y_val, val_probs)
+
+    logger.info(
+        "run: validation  AUC=%.3f  precision=%.3f  recall=%.3f  "
+        "calibration_error=%.3f  presence=%d  absence=%d",
+        val_result.auc, val_result.precision, val_result.recall,
+        val_result.calibration_error, val_result.n_presence, val_result.n_absence,
+    )
+
+    validation_payload = {
+        "run_id": run_id,
+        "auc": val_result.auc,
+        "precision": val_result.precision,
+        "recall": val_result.recall,
+        "calibration_error": val_result.calibration_error,
+        "confusion_matrix": list(val_result.confusion_matrix),
+        "n_presence": val_result.n_presence,
+        "n_absence": val_result.n_absence,
+        "threshold": SPATIAL_VALIDATION_THRESHOLD,
+        "passed": val_result.passes_gate(SPATIAL_VALIDATION_THRESHOLD),
+    }
+    validation_path.write_text(json.dumps(validation_payload, indent=2))
+    logger.info("run: validation written to %s", validation_path)
+
+    if not val_result.passes_gate(SPATIAL_VALIDATION_THRESHOLD):
+        logger.error(
+            "run: VALIDATION GATE FAILED — AUC %.3f < threshold %.2f. "
+            "model_%s.pkl will NOT be written.",
+            val_result.auc, SPATIAL_VALIDATION_THRESHOLD, run_id,
+        )
+        sys.exit(1)
+
+    # ------------------------------------------------------------------
+    # Write feature_names and model — only after validation passes
+    # ------------------------------------------------------------------
+    fnames_path.write_text(json.dumps(feature_names, indent=2))
+    logger.info("run: feature_names written to %s", fnames_path)
+
+    with open(model_path, "wb") as fh:
+        pickle.dump(rf, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    logger.info("run: model written to %s", model_path)
+
+    logger.info(
+        "run: COMPLETE  run_id=%s  AUC=%.3f  artefacts in %s",
+        run_id, val_result.auc, output_dir,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: drop-checkpoint
+# ---------------------------------------------------------------------------
+
+def cmd_drop_checkpoint(args: argparse.Namespace) -> None:
+    """Delete all artefacts for a given run ID."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+        stream=sys.stdout,
+    )
+
+    if not args.yes:
+        logger.error(
+            "drop-checkpoint: pass --yes to confirm deletion of run '%s'",
+            args.run_id,
+        )
+        sys.exit(1)
+
+    output_dir = Path(args.output_dir)
+    patterns = [
+        f"observations_{args.run_id}.parquet",
+        f"observations_{args.run_id}.progress",
+        f"archive_stats_{args.run_id}.json",
+        f"features_{args.run_id}.parquet",
+        f"validation_{args.run_id}.json",
+        f"feature_names_{args.run_id}.json",
+        f"model_{args.run_id}.pkl",
+    ]
+
+    deleted = []
+    for name in patterns:
+        p = output_dir / name
+        if p.exists():
+            p.unlink()
+            deleted.append(name)
+            logger.info("drop-checkpoint: deleted %s", p)
+
+    if not deleted:
+        logger.info("drop-checkpoint: nothing to delete for run_id=%s in %s",
+                    args.run_id, output_dir)
+    else:
+        logger.info("drop-checkpoint: deleted %d file(s) for run_id=%s",
+                    len(deleted), args.run_id)
 
 
 # ---------------------------------------------------------------------------
@@ -138,12 +707,70 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
     sub.required = True
 
-    # load-testdata
+    # ---- load-testdata ----
     p_ltd = sub.add_parser(
         "load-testdata",
         help="Fetch fixture chips from STAC and write the pytest sentinel.",
     )
     p_ltd.set_defaults(func=cmd_load_testdata)
+
+    # ---- run ----
+    p_run = sub.add_parser(
+        "run",
+        help="Full training pipeline: fetch → extract → quality → waveform "
+             "→ features → RF fit → validation gate → artefact writes.",
+    )
+    p_run.add_argument(
+        "--points", required=True, metavar="CSV",
+        help="CSV file with columns: point_id,lon,lat,label",
+    )
+    p_run.add_argument(
+        "--run-id", default=None, metavar="ID",
+        help="Run identifier for artefact filenames. Default: timestamp.",
+    )
+    p_run.add_argument(
+        "--output-dir", default=str(PROJECT_ROOT / "outputs"),
+        metavar="DIR", help="Directory for artefacts. Default: outputs/",
+    )
+    p_run.add_argument(
+        "--from-checkpoint",
+        choices=["observations", "features"],
+        default=None, dest="from_checkpoint",
+        help="Resume from a previously written checkpoint.",
+    )
+    p_run.add_argument(
+        "--stac-start", default="2019-01-01", metavar="DATE",
+        help="STAC search start date (YYYY-MM-DD). Default: 2019-01-01",
+    )
+    p_run.add_argument(
+        "--stac-end", default=datetime.now(tz=timezone.utc).strftime("%Y-%m-%d"),
+        metavar="DATE",
+        help="STAC search end date (YYYY-MM-DD). Default: today",
+    )
+    p_run.add_argument(
+        "--cloud-max", type=int, default=30, metavar="PCT",
+        help="Max cloud cover %% for STAC filter. Default: 30",
+    )
+    p_run.add_argument(
+        "--workers", type=int, default=None, metavar="N",
+        help="ProcessPool worker count. Default: auto",
+    )
+    p_run.set_defaults(func=cmd_run)
+
+    # ---- drop-checkpoint ----
+    p_drop = sub.add_parser(
+        "drop-checkpoint",
+        help="Delete all artefacts for a run ID. Requires --yes.",
+    )
+    p_drop.add_argument("--run-id", required=True, metavar="ID",
+                        help="Run ID whose artefacts to delete.")
+    p_drop.add_argument(
+        "--output-dir", default=str(PROJECT_ROOT / "outputs"),
+        metavar="DIR", help="Directory containing artefacts. Default: outputs/",
+    )
+    p_drop.add_argument("--yes", action="store_true",
+                        help="Confirm deletion (required).")
+    p_drop.set_defaults(func=cmd_drop_checkpoint)
 
     return parser
 

@@ -5,6 +5,7 @@ Provides:
   setup_gdal_env()       — GDAL HTTP settings and AWS env vars
   setup_proj()           — PROJ_DATA bootstrap + pyproj set_data_dir()
   run_tiled_pipeline()   — Process-pool tiled pipeline for steps 01 and 03
+  _pool_size()           — Recommended worker count for ProcessPoolExecutor
 """
 import csv
 import logging
@@ -28,6 +29,22 @@ _STAT_FIELDS = [
     "array_bytes", "chunk_size", "fetch_workers", "compute_workers",
     "compute_s", "compute_ok",
 ]
+
+
+def _pool_size(n_points: int | None = None) -> int:
+    """Return a sensible ProcessPoolExecutor worker count.
+
+    Formula: min(cpu_count, n_points) capped at 8 to avoid process
+    startup overhead dominating for small point sets.
+
+    cpu_count() is None in some constrained environments; falls back to 4.
+    n_points=None means "don't cap by point count".
+    """
+    cpus = multiprocessing.cpu_count() or 4
+    workers = min(cpus, 8)
+    if n_points is not None:
+        workers = min(workers, n_points)
+    return max(1, workers)
 
 
 def setup_gdal_env() -> None:
