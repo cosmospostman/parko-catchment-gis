@@ -1,6 +1,7 @@
 """Shared pytest fixtures for the Parkinsonia GIS pipeline test suite."""
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -14,6 +15,74 @@ import rioxarray  # noqa: F401 — registers .rio accessor
 # Ensure project root is on sys.path
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+
+# ---------------------------------------------------------------------------
+# Pipeline source files whose modification should trigger a test data refresh.
+# If any of these files changed after the sentinel was written, test data is
+# considered stale and the pipeline may not reflect current code.
+# ---------------------------------------------------------------------------
+
+_FIXTURE_DIR = PROJECT_ROOT / "tests" / "fixtures"
+_SENTINEL_FILE = _FIXTURE_DIR / ".fixture_commit"
+
+_PIPELINE_SOURCES = [
+    "stage0/fetch.py",
+    "stage0/chip_store.py",
+    "analysis/constants.py",
+    "analysis/timeseries/observation.py",
+]
+
+
+def _git_diff_names(since_commit: str) -> list[str]:
+    """Return list of files changed since the given commit (relative paths)."""
+    try:
+        out = subprocess.check_output(
+            ["git", "diff", "--name-only", since_commit, "HEAD"],
+            cwd=PROJECT_ROOT,
+            stderr=subprocess.DEVNULL,
+        )
+        return [line.strip() for line in out.decode().splitlines() if line.strip()]
+    except Exception:
+        return []
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Warn if fixture test data is missing or stale.
+
+    Missing sentinel → warn (data not yet staged; tests that need real chips
+    will fail with FileNotFoundError rather than a confusing collection error).
+
+    Stale sentinel → warn (pipeline sources changed since load-testdata ran).
+
+    We warn rather than exit so the full unit test suite (which uses synthetic
+    fixtures) continues to run during normal development. Only tests that
+    explicitly require staged chip data will fail when data is absent.
+
+    To refresh: python pipelines/train.py load-testdata
+    """
+    if not _SENTINEL_FILE.exists():
+        print(
+            "\n[conftest] WARNING: fixture test data not staged.\n"
+            "  Some tests require real chip data. Run:\n"
+            "    python pipelines/train.py load-testdata\n",
+            file=sys.stderr,
+        )
+        return
+
+    recorded_commit = _SENTINEL_FILE.read_text().strip()
+    if not recorded_commit or recorded_commit == "unknown":
+        return
+
+    changed = _git_diff_names(recorded_commit)
+    stale = [f for f in changed if f in _PIPELINE_SOURCES]
+    if stale:
+        print(
+            f"\n[conftest] WARNING: test data may be stale — pipeline sources "
+            f"changed since load-testdata ran:\n"
+            + "".join(f"  {f}\n" for f in stale)
+            + "  Run: python pipelines/train.py load-testdata\n",
+            file=sys.stderr,
+        )
 
 
 # ---------------------------------------------------------------------------
