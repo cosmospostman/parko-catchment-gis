@@ -8,15 +8,14 @@ import os
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Path constants — sourced from environment (set by config.sh)
+# Path constants — sourced from environment
 # ---------------------------------------------------------------------------
 
 def _require_env(name: str) -> str:
     value = os.environ.get(name)
     if value is None:
         raise KeyError(
-            f"Required environment variable '{name}' is not set. "
-            f"Did you forget to run 'source config.sh' before this script?"
+            f"Required environment variable '{name}' is not set."
         )
     return value
 
