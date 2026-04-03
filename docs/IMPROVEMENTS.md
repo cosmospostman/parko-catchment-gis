@@ -196,6 +196,80 @@ rule-based Stage 5.
 
 ---
 
+## Stage 5: Robustness to anomalously wet years
+
+### The problem
+
+In an unusually wet year (e.g. 2025), all three Stage 5 signals are distorted in the
+same direction:
+
+- **NDVI anomaly** — elevated catchment-wide as native vegetation responds to rainfall.
+  Parkinsonia patches no longer stand out against the background of unusually green
+  native vegetation. The `percentile_scale` normalisation makes things worse: it scales
+  relative to within-year variation, so a "high" score just means greener than the
+  catchment average within an already-green year.
+- **Flowering index** — may also be elevated if native species are flowering more
+  prolifically, reducing signal-to-noise for Parkinsonia's specific yellow flush.
+- **HAND** — unaffected by rainfall (terrain-derived), but its contribution is diluted
+  when the other two signals are noisy.
+
+The result is a plausibility map with little spatial discrimination — almost the entire
+catchment scores green, producing 28,000+ zone polygons that are not useful for
+prioritising drone surveys.
+
+There is also a secondary issue: the HAND inversion (`1 - hand_norm`) currently
+penalises river channel pixels (HAND ≈ 0) rather than rewarding them, because p2 of
+HAND is near zero and the inversion maps low-HAND to low score. The floodplain fringe
+(HAND 1–5 m) is intended to score high, but the channel itself scores low — the
+opposite of where Parkinsonia is most likely to establish.
+
+### Adaptive composite window
+
+The most promising improvement is to replace the fixed Aug–Nov composite window with an
+**adaptive window that maximises contrast between riparian and upland vegetation**.
+
+The logic: Parkinsonia is deep-rooted and accesses alluvial groundwater, so it stays
+green even during the driest part of the year. Native upland and shallow-rooted
+vegetation senesces. The period of maximum contrast between low-HAND (riparian) and
+high-HAND (upland) NDVI is the period where Parkinsonia signal is strongest — and this
+window shifts between years depending on when the dry season arrives and how severe it
+is.
+
+**Implementation approach:**
+
+- Stage 1 already fetches scenes across the composite window. The fetch would need to
+  retain per-month (or per-fortnight) NDVI mosaics rather than collapsing to a single
+  median.
+- A new sub-step computes, for each candidate window of fixed length (e.g. 6 weeks),
+  the mean NDVI difference between low-HAND pixels (HAND < 5 m) and high-HAND pixels
+  (HAND > 20 m).
+- The window with maximum contrast is selected and the NDVI composite for that window
+  is used downstream.
+
+**Key open questions before implementing:**
+
+1. Does Stage 1 retain per-scene or per-month data, or does it collapse to a single
+   composite? If collapsed, this requires a Stage 1 change to retain temporal
+   granularity.
+2. Should the window length be fixed (e.g. always 6 weeks) or variable?
+3. In an exceptionally wet year where native vegetation never senesces, the contrast
+   window may not exist at all — the pipeline should detect and warn on this condition
+   rather than silently selecting a poor window.
+
+**Caveat:** In a year as wet as 2025, even the adaptive window may not find sufficient
+contrast — the improvement is most valuable for moderately wet years. In extreme years,
+Stage 6 (trained classifier with ground truth) remains the only robust path.
+
+### HAND scoring fix
+
+The `1 - hand_norm` inversion currently gives the lowest score to channel pixels
+(HAND ≈ 0) and the highest to mid-floodplain pixels. Consider capping or clipping HAND
+before inversion so that pixels below a threshold (e.g. HAND < 1 m, i.e. in-channel)
+are treated the same as pixels at 1 m rather than penalised. This is a small change to
+`compute_plausibility` in Stage 5.
+
+---
+
 ## Stage 5: Sparse ALA training data in the Mitchell catchment
 
 The ALA database contains only ~16 georeferenced *Parkinsonia aculeata* records within
