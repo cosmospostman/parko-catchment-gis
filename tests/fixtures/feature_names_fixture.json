@@ -1,0 +1,11 @@
+[
+  "peak_value",
+  "peak_doy",
+  "spike_duration",
+  "peak_doy_mean",
+  "peak_doy_sd",
+  "years_detected",
+  "HAND",
+  "dist_to_water",
+  "mean_quality"
+]

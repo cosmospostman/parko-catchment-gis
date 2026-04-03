@@ -9,6 +9,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=config.sh
 source "${SCRIPT_DIR}/config.sh"
 
+# Resolve Python binary: prefer venv, fall back to python3, then python.
+if [[ -x "${SCRIPT_DIR}/.venv/bin/python3" ]]; then
+    PYTHON="${SCRIPT_DIR}/.venv/bin/python3"
+elif command -v python3 &>/dev/null; then
+    PYTHON="python3"
+else
+    PYTHON="python"
+fi
+
 # ── Colours ──────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -147,14 +156,14 @@ else
 fi
 
 # 3. Python dependencies
-if python -c "import stackstac, odc, rioxarray, sklearn, geopandas" 2>/dev/null; then
+if ${PYTHON} -c "import stackstac, odc, rioxarray, sklearn, geopandas" 2>/dev/null; then
     preflight_check "Python dependencies importable" "true"
 else
     preflight_check "Python dependencies importable (stackstac, odc, rioxarray, sklearn, geopandas)" "false"
 fi
 
 # 4. Composite window is valid (start < end, both parseable as MM-DD dates)
-_cs_days=$(python -c "
+_cs_days=$(${PYTHON} -c "
 import sys
 from datetime import datetime
 try:
@@ -179,7 +188,7 @@ else
 fi
 
 # 6. TARGET_CRS covers the catchment bbox (catches wrong zone / unprojected CRS)
-_crs_check=$(python -c "
+_crs_check=$(${PYTHON} -c "
 import sys
 sys.path.insert(0, '${CODE_DIR}')
 import config
@@ -214,7 +223,7 @@ else
 fi
 
 # 7. STAC endpoint reachable (soft warning only — network may be unavailable)
-_stac_url=$(python -c "import sys; sys.path.insert(0,'${CODE_DIR}'); import config; print(config.STAC_ENDPOINT_ELEMENT84)" 2>/dev/null || echo "")
+_stac_url=$(${PYTHON} -c "import sys; sys.path.insert(0,'${CODE_DIR}'); import config; print(config.STAC_ENDPOINT_ELEMENT84)" 2>/dev/null || echo "")
 if [[ -n "${_stac_url}" ]] && curl --silent --max-time 5 --head "${_stac_url}" -o /dev/null 2>/dev/null; then
     preflight_check "STAC endpoint reachable (${_stac_url})" "true"
 else
@@ -233,7 +242,7 @@ fi
 # 10. Prior year probability raster (only for year > baseline)
 PRIOR_YEAR=$(( YEAR - 1 ))
 if [[ ${YEAR} -gt 2020 ]]; then
-    PRIOR_PROB="$(python -c "
+    PRIOR_PROB="$(${PYTHON} -c "
 import sys, os
 sys.path.insert(0, '${CODE_DIR}')
 import config
@@ -339,7 +348,7 @@ run_step() {
     stderr_file="$(mktemp)"
     local exit_code=0
 
-    if ! python "${analysis_script}" 2>"${stderr_file}"; then
+    if ! ${PYTHON} "${analysis_script}" 2>"${stderr_file}"; then
         exit_code=$?
         echo ""
         printf "${RED}${BOLD}FAILED: analysis/${analysis_name}.py (exit ${exit_code})${RESET}\n"
@@ -360,7 +369,7 @@ run_step() {
     stderr_file="$(mktemp)"
     local verify_exit=0
 
-    if ! python "${verify_script}" 2>"${stderr_file}"; then
+    if ! ${PYTHON} "${verify_script}" 2>"${stderr_file}"; then
         verify_exit=$?
         echo ""
         printf "${RED}${BOLD}FAILED: verify/${verify_name}.py (exit ${verify_exit}) — science checks did not pass${RESET}\n"
@@ -470,7 +479,7 @@ if [[ -n "${LOCAL_S2_ROOT}" || -n "${LOCAL_S1_ROOT}" || -n "${LOCAL_DEM_ROOT}" ]
             printf "Generating S2 manifest → %s\n" "${_manifest_s2}"
 
             _manifest_exit=0
-            python "${CODE_DIR}/scripts/s2_sync_manifest.py" "${YEAR}" --out "${_manifest_s2}" || _manifest_exit=$?
+            ${PYTHON} "${CODE_DIR}/scripts/s2_sync_manifest.py" "${YEAR}" --out "${_manifest_s2}" || _manifest_exit=$?
             if [[ ${_manifest_exit} -ne 0 ]]; then
                 printf "${RED}${BOLD}FAILED: s2_sync_manifest.py (exit ${_manifest_exit})${RESET}\n"
                 OVERALL_EXIT=1; STEP_STATUSES+=("FAIL")
@@ -494,7 +503,7 @@ if [[ -n "${LOCAL_S2_ROOT}" || -n "${LOCAL_S1_ROOT}" || -n "${LOCAL_DEM_ROOT}" ]
             printf "Generating S1 manifest → %s\n" "${_manifest_s1}"
 
             _manifest_exit=0
-            python "${CODE_DIR}/scripts/s1_sync_manifest.py" "${YEAR}" --out "${_manifest_s1}" || _manifest_exit=$?
+            ${PYTHON} "${CODE_DIR}/scripts/s1_sync_manifest.py" "${YEAR}" --out "${_manifest_s1}" || _manifest_exit=$?
             if [[ ${_manifest_exit} -ne 0 ]]; then
                 printf "${RED}${BOLD}FAILED: s1_sync_manifest.py (exit ${_manifest_exit})${RESET}\n"
                 OVERALL_EXIT=1; STEP_STATUSES+=("FAIL")
@@ -517,7 +526,7 @@ if [[ -n "${LOCAL_S2_ROOT}" || -n "${LOCAL_S1_ROOT}" || -n "${LOCAL_DEM_ROOT}" ]
             printf "Caching COP-DEM GLO-30 tiles → %s\n" "${LOCAL_DEM_ROOT}"
 
             _dem_exit=0
-            python "${CODE_DIR}/scripts/dem_cache.py" --tile-dir "${LOCAL_DEM_ROOT}" || _dem_exit=$?
+            ${PYTHON} "${CODE_DIR}/scripts/dem_cache.py" --tile-dir "${LOCAL_DEM_ROOT}" || _dem_exit=$?
             if [[ ${_dem_exit} -ne 0 ]]; then
                 printf "${RED}${BOLD}FAILED: dem_cache.py (exit ${_dem_exit})${RESET}\n"
                 OVERALL_EXIT=1; STEP_STATUSES+=("FAIL")
