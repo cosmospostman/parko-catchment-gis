@@ -115,34 +115,19 @@ def observations(science_points: pd.DataFrame) -> dict[str, list]:
     Returns dict keyed by point_id. All years pooled.
     Reads chips from tests/fixtures/chips/.
     """
-    from utils.stac import search_sentinel2
-    import config as _config
+    import json
+    import pystac
     from stage0.chip_store import DiskChipStore
     from analysis.timeseries.extraction import extract_observations
     from analysis.primitives.quality import ArchiveStats, score_observation
-    from pipelines.train import FIXTURE_WINDOWS, FIXTURE_BBOX, FIXTURE_CLOUD_MAX
 
     points: list[tuple[str, float, float]] = [
         (row.point_id, row.lon, row.lat)
         for row in science_points.itertuples()
     ]
 
-    # Collect items across all fixture windows (deduplicated)
-    seen_ids: set[str] = set()
-    items = []
-    for start, end in FIXTURE_WINDOWS:
-        window_items = search_sentinel2(
-            bbox=FIXTURE_BBOX,
-            start=start,
-            end=end,
-            cloud_cover_max=FIXTURE_CLOUD_MAX,
-            endpoint=_config.STAC_ENDPOINT_ELEMENT84,
-            collection=_config.S2_COLLECTION,
-        )
-        for it in window_items:
-            if it.id not in seen_ids:
-                seen_ids.add(it.id)
-                items.append(it)
+    items_json = FIXTURE_DIR / "stac_items.json"
+    items = [pystac.Item.from_dict(d) for d in json.loads(items_json.read_text())]
 
     store = DiskChipStore(inputs_dir=CHIPS_DIR)
     raw_obs = extract_observations(items, points, store)

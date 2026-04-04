@@ -17,8 +17,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Protocol
 
+import warnings
+
 import numpy as np
 import rasterio
+from rasterio.errors import NotGeoreferencedWarning
 
 
 class ChipStore(Protocol):
@@ -74,8 +77,10 @@ class DiskChipStore:
                 f"  item_id={item_id!r}, band={band!r}, point_id={point_id!r}\n"
                 "  Has Stage 0 fetch been run for this configuration?"
             )
-        with rasterio.open(path) as src:
-            arr = src.read(1)  # single-band chip → 2-D array
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", NotGeoreferencedWarning)
+            with rasterio.open(path) as src:
+                arr = src.read(1)  # single-band chip → 2-D array
         return arr
 
 

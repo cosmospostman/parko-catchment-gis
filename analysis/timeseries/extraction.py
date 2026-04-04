@@ -126,7 +126,7 @@ def extract_observations(
             # --- Quality: optional chips (default to 1.0 when absent) -------
             aot_quality = _read_center(
                 store, item_id, AOT_BAND, point_id, center_px,
-                transform=lambda v: 1.0 - min(v, 1.0),
+                transform=lambda v: 1.0 - min(v * 0.001, 1.0),
                 default=1.0,
             )
             vza_quality = _read_center(

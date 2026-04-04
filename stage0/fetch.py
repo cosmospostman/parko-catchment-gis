@@ -39,6 +39,7 @@ from rasterio.errors import NotGeoreferencedWarning
 from rasterio.windows import Window
 
 from analysis.constants import SCL_BAND, SCL_CLEAR_VALUES
+from analysis.timeseries.extraction import _scl_has_clear_pixels
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +86,14 @@ def _read_chip(href: str, lon: float, lat: float, window_px: int) -> np.ndarray 
     except Exception as exc:
         logger.debug("Could not read chip from %s: %s", href, exc)
         return None
+
+
+def _read_chip_from_path(path: Path) -> np.ndarray:
+    """Blocking: read band 1 from an existing chip file."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", rasterio.errors.NotGeoreferencedWarning)
+        with rasterio.open(path) as src:
+            return src.read(1)
 
 
 def _write_chip(path: Path, arr: np.ndarray) -> None:
@@ -228,14 +237,14 @@ async def fetch_chips(
                 scl_path = inputs_dir / item_id / f"{SCL_BAND}_{point_id}.tif"
                 if scl_path.exists():
                     scl_arr = await loop.run_in_executor(
-                        executor, lambda p=scl_path: rasterio.open(p).read(1)
+                        executor, _read_chip_from_path, scl_path
                     )
                 else:
                     scl_arr = await fetch_one(item_id, SCL_BAND, point_id,
                                               scl_href, lon, lat)
                     if scl_arr is None and scl_path.exists():
                         scl_arr = await loop.run_in_executor(
-                            executor, lambda p=scl_path: rasterio.open(p).read(1)
+                            executor, _read_chip_from_path, scl_path
                         )
                 if scl_arr is not None and not _scl_has_clear_pixels(scl_arr):
                     filtered += 1

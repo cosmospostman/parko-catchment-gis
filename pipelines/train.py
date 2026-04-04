@@ -142,6 +142,7 @@ FIXTURE_CLOUD_MAX: int = 30
 
 FIXTURE_DIR        = PROJECT_ROOT / "tests" / "fixtures"
 FIXTURE_CHIPS_DIR  = FIXTURE_DIR / "chips"
+FIXTURE_ITEMS_JSON = FIXTURE_DIR / "stac_items.json"
 SENTINEL_FILE      = FIXTURE_DIR / ".fixture_commit"
 INPUTS_DIR         = PROJECT_ROOT / "inputs"
 
@@ -428,6 +429,10 @@ def cmd_load_testdata(args: argparse.Namespace) -> None:
 
     logger.info("load-testdata: fetching chips for %d items × %d points × %d bands",
                 len(items), len(points), len(FIXTURE_BANDS))
+
+    import json as _json
+    FIXTURE_ITEMS_JSON.write_text(_json.dumps([it.to_dict() for it in items], indent=2))
+    logger.info("load-testdata: wrote %d item dicts to %s", len(items), FIXTURE_ITEMS_JSON)
 
     FIXTURE_CHIPS_DIR.mkdir(parents=True, exist_ok=True)
     asyncio.run(fetch_chips(
