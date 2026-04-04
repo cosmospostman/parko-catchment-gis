@@ -124,18 +124,18 @@ FIXTURE_BAND_ALIAS: dict[str, str] = {
     "SCL": "scl",
     "AOT": "aot",
 }
-# Bbox derived from the actual science point extent (lon 145.036–146.0,
-# lat -21.75 to -20.85) with a small margin. Kept tight so the STAC search
+# Bbox derived from the actual science point extent (lon 136.20–136.40,
+# lat -19.60 to -19.40) with a small margin. Kept tight so the STAC search
 # only returns tiles that genuinely cover the points — a loose bbox pulls in
-# adjacent tiles (55KBS, 55KBR, etc.) whose UTM grids don't overlap the points,
-# causing every COG read to fail with an out-of-bounds window error.
-# All 80 science points fall within tile 55KCS.
-FIXTURE_BBOX: list[float] = [145.03, -21.76, 146.01, -20.84]
+# adjacent tiles whose UTM grids don't overlap the points, causing every COG
+# read to fail with an out-of-bounds window error.
+# All 80 science points fall within the McArthur River / Barkly Tablelands NT region.
+FIXTURE_BBOX: list[float] = [136.19, -19.61, 136.41, -19.39]
 # Three years chosen to represent distinct rainfall regimes:
-#   2020 — dry year, 2021 — typical, 2025 — wet/recent
+#   2021 — survey year (Flora Atlas NT), 2022 — survey year, 2025 — recent
 FIXTURE_WINDOWS: list[tuple[str, str]] = [
-    ("2020-07-01", "2020-10-31"),
     ("2021-07-01", "2021-10-31"),
+    ("2022-07-01", "2022-10-31"),
     ("2025-07-01", "2025-10-31"),
 ]
 FIXTURE_CLOUD_MAX: int = 30
