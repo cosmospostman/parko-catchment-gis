@@ -28,7 +28,9 @@ def _peak_values(obs_by_point: dict, labels: dict[str, int], label: int) -> list
     for pid, obs_list in obs_by_point.items():
         if labels.get(pid) != label:
             continue
-        wf = extract_waveform_features(obs_list, index_fn=flowering_index, window=FLOWERING_WINDOW)
+        wf = extract_waveform_features(
+            obs_list, index_fn=flowering_index, window=FLOWERING_WINDOW, min_years=1,
+        )
         if wf:
             peaks.append(wf["peak_value"])
     return peaks

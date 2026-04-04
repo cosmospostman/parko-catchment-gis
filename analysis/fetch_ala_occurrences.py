@@ -14,6 +14,7 @@ Output:
 """
 import logging
 import sys
+from datetime import date
 from pathlib import Path
 
 import geopandas as gpd
@@ -38,17 +39,10 @@ FIELDS = ",".join([
 logger = logging.getLogger(__name__)
 
 
-def fetch_all(species: str, bbox: list) -> gpd.GeoDataFrame:
-    """Fetch all occurrence records within bbox, paginating through results.
-
-    Uses fq (filter query) for spatial filtering — the bbox parameter is not
-    reliably applied by the ALA biocache API.
-    """
-    # bbox: [minx, miny, maxx, maxy] in WGS84
-    minx, miny, maxx, maxy = bbox
+def fetch_all(species: str) -> gpd.GeoDataFrame:
+    """Fetch all occurrence records nationwide, paginating through results."""
     params = {
         "q": f'taxon_name:"{species}"',
-        "fq": f"decimalLongitude:[{minx} TO {maxx}] AND decimalLatitude:[{miny} TO {maxy}]",
         "pageSize": PAGE_SIZE,
         "fl": FIELDS,
         "startIndex": 0,
@@ -88,6 +82,9 @@ def fetch_all(species: str, bbox: list) -> gpd.GeoDataFrame:
         geometry=[Point(r["decimalLongitude"], r["decimalLatitude"]) for _, r in df.iterrows()],
         crs="EPSG:4326",
     )
+    if "eventDate" in gdf.columns:
+        gdf["eventDate"] = pd.to_datetime(gdf["eventDate"], unit="ms", errors="coerce").dt.strftime("%Y-%m-%d")
+    gdf["fetched_date"] = date.today().isoformat()
     logger.info("Records with valid coordinates: %d", len(gdf))
     return gdf
 
@@ -100,14 +97,10 @@ def main() -> None:
     )
 
     import config
-    from utils.io import ensure_output_dirs
-    ensure_output_dirs(config.YEAR)
 
-    catchment = gpd.read_file(config.CATCHMENT_GEOJSON).to_crs("EPSG:4326")
-    bbox = list(catchment.total_bounds)  # [minx, miny, maxx, maxy]
-    logger.info("Catchment bbox (WGS84): %s", bbox)
+    Path(config.CACHE_DIR).mkdir(parents=True, exist_ok=True)
 
-    gdf = fetch_all(config.ALA_SPECIES_QUERY, bbox)
+    gdf = fetch_all(config.ALA_SPECIES_QUERY)
 
     out_path = Path(config.CACHE_DIR) / "ala_occurrences.gpkg"
     gdf.to_file(out_path, driver="GPKG")

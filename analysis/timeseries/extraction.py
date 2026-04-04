@@ -149,11 +149,13 @@ def extract_observations(
             )
 
             # --- Extract center pixel for each spectral band ----------------
+            # Sentinel-2 L2A chips are stored as DN (0–10000); divide by 10000
+            # to convert to surface reflectance (0–1) expected by index functions.
             band_values: dict[str, float] = {}
             for band in bands:
                 try:
                     chip = store.get(item_id, band, point_id)
-                    band_values[band] = float(chip[center_px, center_px])
+                    band_values[band] = float(chip[center_px, center_px]) / 10000.0
                 except FileNotFoundError:
                     logger.debug(
                         "Band chip missing: item=%s band=%s point=%s — skipping band",
