@@ -71,11 +71,13 @@ python pipelines/train.py load-testdata
 from the pre-downloaded ALA gpkg. It is committed to the repo so `load-testdata`
 can run without network access to ALA.
 
-Current contents (generated 2026-04-03, seed=42):
+Current contents (generated 2026-04-04, seed=42):
 - **40 presence points** — ALA-confirmed Parkinsonia, clustered near Longreach
   (145.04°E, 21.49°S), coordinate uncertainty ≤ 100m, ≥ 1 ALA neighbour within 50m
-- **40 absence points** — regular grid across tropical QLD, ≥ 500m from any
-  presence point
+- **40 absence points** — regular 0.1° grid within S2 tile 55KCS
+  (145.07–146.13°E, 21.79–20.79°S), ≥ 500m from any presence point.
+  Constraining to one tile keeps all chips on the same STAC item set,
+  making `load-testdata` fast.
 
 Hard negatives (known Melaleuca/Acacia stands, `label=2`) are not yet included.
 They can be added manually to the CSV; `load-testdata` will fetch chips for them
@@ -108,8 +110,14 @@ def science_points() -> pd.DataFrame:
 @pytest.fixture(scope="session")
 def observations(science_points) -> dict[str, list[Observation]]:
     """Extract and quality-score observations for all science points.
-    Returns dict keyed by point_id.
+    Returns dict keyed by point_id. All years pooled.
     Reads chips from tests/fixtures/chips/."""
+
+@pytest.fixture(scope="session")
+def observations_by_year(observations) -> dict[int, dict[str, list[Observation]]]:
+    """Split observations by acquisition year.
+    Returns dict[year, dict[point_id, list[Observation]]].
+    Years present: 2020 (dry), 2021 (typical), 2025 (wet/recent)."""
 
 @pytest.fixture(scope="session")
 def waveforms(observations) -> dict[str, dict]:
@@ -121,6 +129,30 @@ def features(waveforms, observations) -> pd.DataFrame:
     """Assemble full feature vectors. Returns DataFrame with point_id,
     label, and all feature columns."""
 ```
+
+### Per-year discrimination
+
+The three fixture years represent distinct rainfall regimes (2020 dry, 2021 typical, 2025 wet/recent).
+`observations_by_year` enables per-cohort signal checks without pooling years together.
+
+Typical usage in a test:
+
+```python
+def test_flowering_signal_by_year(observations_by_year, science_points):
+    labels = science_points.set_index("point_id")["label"]
+    for year, obs_by_point in observations_by_year.items():
+        presence_peaks = [
+            extract_waveform_features(obs, flowering_index, window=FLOWERING_WINDOW)["peak_value"]
+            for pid, obs in obs_by_point.items()
+            if labels[pid] == 1
+            and extract_waveform_features(obs, flowering_index, window=FLOWERING_WINDOW)
+        ]
+        # assert or record per-year result into ReportCollector
+```
+
+Per-year results should be reported as separate sections in `report.md` so a weak signal in one year
+is visible rather than averaged away. There is no pass/fail gate on individual years — the purpose
+is to surface anomalies for investigation, not to assert expected outcomes we don't yet know.
 
 Session-scoped so chip reads and extraction run once per `pytest tests/science/`
 invocation regardless of how many test files import them.
@@ -238,9 +270,7 @@ designed to remove, or the threshold needs adjustment.
 - **Hard negatives** (Melaleuca, Acacia discrimination) — requires a species
   layer not yet assembled; add when `label=2` points are added to
   `science_points.csv`
-- **Multi-year wet/dry robustness** — requires chips spanning multiple years
-  including 2025; `load-testdata` currently fetches 2022 only; extend
-  `FIXTURE_START`/`FIXTURE_END` when ready
+- **Multi-year wet/dry robustness** — chips now cover 2020 (dry), 2021 (typical), 2025 (wet/recent); science tests can filter by year if needed
 - **Absolute accuracy metrics** (AUC, F1) — these require a trained model and
   belong in the pipeline verify layer (`verify/`), not science tests
 

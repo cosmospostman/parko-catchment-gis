@@ -105,11 +105,39 @@ _WORKER_STATE: dict[str, Any] = {}
 SCIENCE_POINTS_CSV = PROJECT_ROOT / "tests" / "fixtures" / "science_points.csv"
 
 FIXTURE_BANDS: list[str] = ["B03", "B04", "B08", "B8A", "B11", SCL_BAND, "AOT"]
-# Bbox covering the presence cluster near Longreach (145.04°E, -21.49°S) plus
-# enough margin to include the absence points spread across tropical QLD.
-FIXTURE_BBOX: list[float] = [138.0, -22.5, 146.5, -14.0]
-FIXTURE_START: str = "2022-07-01"
-FIXTURE_END:   str = "2022-10-31"
+# Element84 sentinel-2-l2a uses common-name asset keys rather than band numbers.
+# This mapping lets fetch_chips resolve the correct href while still writing
+# chips under the canonical band name (B03_<point_id>.tif, etc.) that the
+# extraction stage expects.
+FIXTURE_BAND_ALIAS: dict[str, str] = {
+    "B02": "blue",
+    "B03": "green",
+    "B04": "red",
+    "B05": "rededge1",
+    "B06": "rededge2",
+    "B07": "rededge3",
+    "B08": "nir",
+    "B8A": "nir08",
+    "B09": "nir09",
+    "B11": "swir16",
+    "B12": "swir22",
+    "SCL": "scl",
+    "AOT": "aot",
+}
+# Bbox derived from the actual science point extent (lon 145.036–146.0,
+# lat -21.75 to -20.85) with a small margin. Kept tight so the STAC search
+# only returns tiles that genuinely cover the points — a loose bbox pulls in
+# adjacent tiles (55KBS, 55KBR, etc.) whose UTM grids don't overlap the points,
+# causing every COG read to fail with an out-of-bounds window error.
+# All 80 science points fall within tile 55KCS.
+FIXTURE_BBOX: list[float] = [145.03, -21.76, 146.01, -20.84]
+# Three years chosen to represent distinct rainfall regimes:
+#   2020 — dry year, 2021 — typical, 2025 — wet/recent
+FIXTURE_WINDOWS: list[tuple[str, str]] = [
+    ("2020-07-01", "2020-10-31"),
+    ("2021-07-01", "2021-10-31"),
+    ("2025-07-01", "2025-10-31"),
+]
 FIXTURE_CLOUD_MAX: int = 30
 
 FIXTURE_DIR        = PROJECT_ROOT / "tests" / "fixtures"
@@ -316,13 +344,22 @@ def cmd_load_testdata(args: argparse.Namespace) -> None:
     — separate from the production inputs/ directory so a pipeline run cannot
     overwrite test data.
     """
-    import config as _config
+    # Use STAC constants directly — avoids importing config which requires
+    # BASE_DIR/YEAR env vars that are only needed for a full pipeline run.
+    import types
+    _config = types.SimpleNamespace(
+        STAC_ENDPOINT_ELEMENT84="https://earth-search.aws.element84.com/v1",
+        S2_COLLECTION="sentinel-2-l2a",
+    )
 
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
         stream=sys.stdout,
     )
+
+    from utils.pipeline import setup_gdal_env
+    setup_gdal_env()
 
     if not SCIENCE_POINTS_CSV.exists():
         logger.error("Science points CSV not found: %s", SCIENCE_POINTS_CSV)
@@ -336,18 +373,57 @@ def cmd_load_testdata(args: argparse.Namespace) -> None:
     ]
 
     logger.info("load-testdata: loaded %d points from %s", len(points), SCIENCE_POINTS_CSV)
-    logger.info("load-testdata: searching STAC for fixture items")
+    logger.info("load-testdata: searching STAC for fixture items across %d windows", len(FIXTURE_WINDOWS))
 
-    items = search_sentinel2(
-        bbox=FIXTURE_BBOX,
-        start=FIXTURE_START,
-        end=FIXTURE_END,
-        cloud_cover_max=FIXTURE_CLOUD_MAX,
-        endpoint=_config.STAC_ENDPOINT_ELEMENT84,
-        collection=_config.S2_COLLECTION,
-    )
+    def _search_window(start: str, end: str) -> list:
+        logger.info("  searching %s → %s ...", start, end)
+        results = search_sentinel2(
+            bbox=FIXTURE_BBOX,
+            start=start,
+            end=end,
+            cloud_cover_max=FIXTURE_CLOUD_MAX,
+            endpoint=_config.STAC_ENDPOINT_ELEMENT84,
+            collection=_config.S2_COLLECTION,
+            max_items=500,
+        )
+        logger.info("  %s → %s: %d items", start, end, len(results))
+        return results
+
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+    with _TPE(max_workers=len(FIXTURE_WINDOWS)) as pool:
+        window_results = list(pool.map(
+            lambda w: _search_window(*w), FIXTURE_WINDOWS
+        ))
+
+    seen_ids: set[str] = set()
+    items = []
+    for window_items in window_results:
+        new_items = [it for it in window_items if it.id not in seen_ids]
+        seen_ids.update(it.id for it in new_items)
+        items.extend(new_items)
+
     if not items:
         logger.error("No STAC items found for fixture search parameters.")
+        sys.exit(1)
+
+    # Filter to items whose bbox actually overlaps the point extent.
+    # The STAC bbox search returns any tile intersecting the search bbox, which
+    # includes neighbouring tiles whose pixels don't cover any of our points.
+    # Pruning here avoids thousands of out-of-bounds COG requests.
+    from utils.stac import filter_items_by_bbox
+    point_bbox = [
+        min(lon for _, lon, _ in points) - 0.01,
+        min(lat for _, _, lat in points) - 0.01,
+        max(lon for _, lon, _ in points) + 0.01,
+        max(lat for _, _, lat in points) + 0.01,
+    ]
+    items_before = len(items)
+    items = filter_items_by_bbox(items, point_bbox)
+    logger.info("load-testdata: filtered %d → %d items (bbox overlap with point extent)",
+                items_before, len(items))
+
+    if not items:
+        logger.error("No items overlap the point extent after bbox filter.")
         sys.exit(1)
 
     logger.info("load-testdata: fetching chips for %d items × %d points × %d bands",
@@ -362,6 +438,7 @@ def cmd_load_testdata(args: argparse.Namespace) -> None:
         inputs_dir=FIXTURE_CHIPS_DIR,
         scl_filter=True,
         max_concurrent=32,
+        band_alias=FIXTURE_BAND_ALIAS,
     ))
 
     commit = _current_git_commit()

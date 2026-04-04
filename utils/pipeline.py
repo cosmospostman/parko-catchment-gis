@@ -64,7 +64,7 @@ def setup_gdal_env() -> None:
         "GDAL_HTTP_VERSION": "2",
         "GDAL_HTTP_MULTIPLEX": "YES",
         "CPL_VSIL_CURL_CACHE_SIZE": "67108864",  # 64 MB connection cache
-        "CPL_VSIL_CURL_CHUNK_SIZE": "10485760",  # 10 MB
+        "CPL_VSIL_CURL_CHUNK_SIZE": "262144",  # 256 KB — sufficient for a 5×5 chip window
         "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
     }
     for k, v in gdal_env.items():

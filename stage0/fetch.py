@@ -30,8 +30,12 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Sequence
 
+import warnings
+
 import numpy as np
 import rasterio
+from pyproj import Transformer
+from rasterio.errors import NotGeoreferencedWarning
 from rasterio.windows import Window
 
 from analysis.constants import SCL_BAND, SCL_CLEAR_VALUES
@@ -43,13 +47,16 @@ logger = logging.getLogger(__name__)
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _point_window(transform, lon: float, lat: float, window_px: int) -> Window:
+def _point_window(src, lon: float, lat: float, window_px: int) -> Window:
     """Return a rasterio Window centred on (lon, lat) with side window_px.
 
-    Uses the raster's affine transform to convert geographic coords to
-    pixel coords. Caller is responsible for clamping to raster bounds.
+    Reprojects (lon, lat) from EPSG:4326 into the raster's CRS before
+    applying the affine transform. Caller is responsible for clamping to
+    raster bounds.
     """
-    col, row = ~transform * (lon, lat)
+    t = Transformer.from_crs("EPSG:4326", src.crs, always_xy=True)
+    x, y = t.transform(lon, lat)
+    col, row = ~src.transform * (x, y)
     half = window_px // 2
     return Window(
         col_off=int(col) - half,
@@ -67,7 +74,7 @@ def _read_chip(href: str, lon: float, lat: float, window_px: int) -> np.ndarray 
     """
     try:
         with rasterio.open(href) as src:
-            win = _point_window(src.transform, lon, lat, window_px)
+            win = _point_window(src, lon, lat, window_px)
             # Clamp window to raster bounds
             win = win.intersection(Window(0, 0, src.width, src.height))
             if win.width <= 0 or win.height <= 0:
@@ -80,22 +87,19 @@ def _read_chip(href: str, lon: float, lat: float, window_px: int) -> np.ndarray 
         return None
 
 
-def _scl_has_clear_pixels(arr: np.ndarray) -> bool:
-    """Return True if any pixel in the SCL chip is in SCL_CLEAR_VALUES."""
-    return bool(np.any(np.isin(arr.astype(np.int32), list(SCL_CLEAR_VALUES))))
-
-
 def _write_chip(path: Path, arr: np.ndarray) -> None:
     """Write a 2-D float32 array as a single-band GeoTIFF chip."""
     path.parent.mkdir(parents=True, exist_ok=True)
     h, w = arr.shape
-    with rasterio.open(
-        path, "w",
-        driver="GTiff",
-        height=h, width=w,
-        count=1, dtype="float32",
-    ) as dst:
-        dst.write(arr, 1)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", NotGeoreferencedWarning)
+        with rasterio.open(
+            path, "w",
+            driver="GTiff",
+            height=h, width=w,
+            count=1, dtype="float32",
+        ) as dst:
+            dst.write(arr, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +114,7 @@ async def fetch_chips(
     inputs_dir: Path = Path("inputs/"),
     scl_filter: bool = True,
     max_concurrent: int = 32,
+    band_alias: dict[str, str] | None = None,
 ) -> None:
     """Download COG chips for all (item, band, point) combinations.
 
@@ -129,7 +134,9 @@ async def fetch_chips(
     items:
         pystac.Item objects from a STAC search.
     bands:
-        Band asset keys to download (e.g. ["B03", "B04", "SCL"]).
+        Canonical band names to download (e.g. ["B03", "B04", "SCL"]).
+        These are used as the filename stem — chip files are always written
+        as ``{band}_{point_id}.tif`` using the canonical name.
     window_px:
         Chip side length in pixels. Use 1 for point extraction, larger for
         compositing.
@@ -141,10 +148,17 @@ async def fetch_chips(
     max_concurrent:
         Maximum number of simultaneous in-flight network requests.
         See module docstring for guidance on tuning.
+    band_alias:
+        Optional mapping from canonical band name to the asset key used by
+        the STAC provider (e.g. ``{"B03": "green", "SCL": "scl"}``).
+        When provided, asset lookup uses the alias key while the canonical
+        name is still used for file paths and downstream code.
+        Bands not in the mapping are looked up by their canonical name.
     """
     inputs_dir = Path(inputs_dir)
     sem = asyncio.Semaphore(max_concurrent)
     loop = asyncio.get_running_loop()
+    _alias: dict[str, str] = band_alias or {}
 
     # Use a thread pool sized to max_concurrent — one thread per in-flight request
     executor = ThreadPoolExecutor(max_workers=max_concurrent)
@@ -170,51 +184,81 @@ async def fetch_chips(
         fetched += 1
         return arr
 
-    for item in items:
+    n_items = len(items)
+    log_every = max(1, n_items // 20)  # ~5% increments
+
+    for item_idx, item in enumerate(items, start=1):
         item_id = item.id
         assets = item.assets
 
-        # Ensure SCL is fetched before other bands when scl_filter is active
-        band_order = bands[:]
-        if scl_filter and SCL_BAND in assets and SCL_BAND not in band_order:
-            band_order = [SCL_BAND] + band_order
+        # Pre-filter points to those inside this item's bbox (EPSG:4326).
+        # Avoids opening COGs for points that can't possibly be in the tile.
+        if item.bbox:
+            minx, miny, maxx, maxy = item.bbox
+            item_points = [
+                (pid, lon, lat) for pid, lon, lat in points
+                if minx <= lon <= maxx and miny <= lat <= maxy
+            ]
+        else:
+            item_points = points
 
-        for point_id, lon, lat in points:
-            # SCL pre-filter: fetch SCL chip first, skip acquisition if wholly clouded
-            if scl_filter and SCL_BAND in assets:
-                scl_href = assets[SCL_BAND].href
+        if not item_points:
+            continue
+
+        scl_asset_key = _alias.get(SCL_BAND, SCL_BAND)
+        has_scl = scl_filter and scl_asset_key in assets
+        scl_href = assets[scl_asset_key].href if has_scl else None
+
+        # Collect non-SCL band hrefs once per item (skip missing bands)
+        band_hrefs: list[tuple[str, str]] = []  # (canonical_band, href)
+        for band in bands:
+            if band == SCL_BAND:
+                continue
+            asset_key = _alias.get(band, band)
+            if asset_key not in assets:
+                logger.debug("Band %s (asset key %s) not in item %s assets",
+                             band, asset_key, item_id)
+                continue
+            band_hrefs.append((band, assets[asset_key].href))
+
+        async def process_point(point_id: str, lon: float, lat: float) -> None:
+            nonlocal filtered
+            # SCL pre-filter: fetch or read existing chip, skip if wholly clouded
+            if has_scl:
                 scl_path = inputs_dir / item_id / f"{SCL_BAND}_{point_id}.tif"
                 if scl_path.exists():
-                    # Read existing SCL chip to check clarity
-                    with rasterio.open(scl_path) as src:
-                        scl_arr = src.read(1)
+                    scl_arr = await loop.run_in_executor(
+                        executor, lambda p=scl_path: rasterio.open(p).read(1)
+                    )
                 else:
-                    scl_arr = await fetch_one(item_id, SCL_BAND, point_id, scl_href, lon, lat)
-                if scl_arr is None:
-                    # Try reading from disk (may have been written in fetch_one)
-                    scl_path = inputs_dir / item_id / f"{SCL_BAND}_{point_id}.tif"
-                    if scl_path.exists():
-                        with rasterio.open(scl_path) as src:
-                            scl_arr = src.read(1)
+                    scl_arr = await fetch_one(item_id, SCL_BAND, point_id,
+                                              scl_href, lon, lat)
+                    if scl_arr is None and scl_path.exists():
+                        scl_arr = await loop.run_in_executor(
+                            executor, lambda p=scl_path: rasterio.open(p).read(1)
+                        )
                 if scl_arr is not None and not _scl_has_clear_pixels(scl_arr):
                     filtered += 1
-                    logger.debug(
-                        "Skipping wholly-clouded acquisition %s at %s", item_id, point_id
-                    )
-                    continue
+                    logger.debug("Skipping wholly-clouded acquisition %s at %s",
+                                 item_id, point_id)
+                    return
 
-            # Fetch remaining bands concurrently for this (item, point)
-            tasks = []
-            for band in bands:
-                if band == SCL_BAND:
-                    continue  # already handled above
-                if band not in assets:
-                    logger.debug("Band %s not in item %s assets", band, item_id)
-                    continue
-                href = assets[band].href
-                tasks.append(fetch_one(item_id, band, point_id, href, lon, lat))
+            # Fetch all bands for this point concurrently
+            await asyncio.gather(*[
+                fetch_one(item_id, band, point_id, href, lon, lat)
+                for band, href in band_hrefs
+            ])
 
-            await asyncio.gather(*tasks)
+        # Process all points for this item concurrently
+        await asyncio.gather(*[
+            process_point(pid, lon, lat) for pid, lon, lat in item_points
+        ])
+
+        if item_idx % log_every == 0 or item_idx == n_items:
+            logger.info(
+                "fetch_chips: item %d/%d  fetched=%d  skipped=%d  filtered=%d  errors=%d",
+                item_idx, n_items, fetched, skipped, filtered, errors,
+            )
 
     executor.shutdown(wait=False)
     logger.info(

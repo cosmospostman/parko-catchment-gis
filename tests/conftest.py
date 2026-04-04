@@ -46,20 +46,32 @@ def _git_diff_names(since_commit: str) -> list[str]:
         return []
 
 
+_SCIENCE_DIR = PROJECT_ROOT / "tests" / "science"
+
+
+def _science_tests_requested(config: pytest.Config) -> bool:
+    """Return True if the science test directory is in the collection paths."""
+    args = config.args or []
+    if not args:
+        # Default collection: testpaths from pytest.ini — science/ is not included
+        return False
+    return any(
+        _SCIENCE_DIR == Path(a).resolve() or str(_SCIENCE_DIR) in a
+        for a in args
+    )
+
+
 def pytest_configure(config: pytest.Config) -> None:
     """Warn if fixture test data is missing or stale.
 
-    Missing sentinel → warn (data not yet staged; tests that need real chips
-    will fail with FileNotFoundError rather than a confusing collection error).
-
-    Stale sentinel → warn (pipeline sources changed since load-testdata ran).
-
-    We warn rather than exit so the full unit test suite (which uses synthetic
-    fixtures) continues to run during normal development. Only tests that
-    explicitly require staged chip data will fail when data is absent.
+    Only emitted when science tests are explicitly requested, since unit and
+    integration tests use synthetic data and never need staged chips.
 
     To refresh: python pipelines/train.py load-testdata
     """
+    if not _science_tests_requested(config):
+        return
+
     if not _SENTINEL_FILE.exists():
         print(
             "\n[conftest] WARNING: fixture test data not staged.\n"

@@ -18,6 +18,7 @@ def search_sentinel2(
     cloud_cover_max: int,
     endpoint: str,
     collection: str,
+    max_items: Optional[int] = None,
 ) -> List[Any]:
     """Search a STAC endpoint for Sentinel-2 items."""
     import pystac_client
@@ -28,6 +29,7 @@ def search_sentinel2(
         bbox=bbox,
         datetime=f"{start}/{end}",
         query={"eo:cloud_cover": {"lt": cloud_cover_max}},
+        max_items=max_items,
     )
     items = list(search.items())
     logger.info("S2 STAC search: %d items found", len(items))
