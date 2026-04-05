@@ -40,23 +40,21 @@ python scripts/collect_pixel_observations.py \\
     --start 2020-01-01 --end 2025-12-31 \\
     --out data/longreach_pixels.parquet
 
-# Generic usage with explicit working dir for chip cache:
+# Generic usage:
 python scripts/collect_pixel_observations.py \\
     --bbox LON_MIN,LAT_MIN,LON_MAX,LAT_MAX \\
     --start YYYY-MM-DD --end YYYY-MM-DD \\
     --out path/to/output.parquet \\
-    --chips-dir path/to/chip/cache \\
     --cloud-max 30
 
 Notes
 -----
-- Chip files are cached under --chips-dir and are never re-downloaded.
-  Re-running the script is safe and fast if chips already exist.
+- One bbox-covering patch is fetched per (item, band) — not per point.
+  All points in the bbox are sliced from the same patch in memory, so
+  network requests scale with items×bands, not items×bands×points.
+- No chip files are written to disk. Each run re-fetches from the network.
 - Points are placed on a 10 m UTM grid aligned to the S2 pixel grid,
   one point per pixel inside the bbox.
-- The window_px=1 chip fetch reads the single centre pixel only — no
-  spatial averaging. This is appropriate for a 10 m pixel grid where
-  each point corresponds to exactly one S2 pixel.
 - Rows with no spectral bands (all NaN) are dropped before writing.
 """
 
@@ -78,8 +76,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from analysis.constants import BANDS, SCL_BAND, AOT_BAND, VZA_BAND, SZA_BAND
 from analysis.timeseries.extraction import extract_observations
-from stage0.chip_store import DiskChipStore
-from stage0.fetch import fetch_chips
+from stage0.chip_store import MemoryChipStore
+from stage0.fetch import fetch_patches
 from utils.stac import search_sentinel2
 
 logger = logging.getLogger(__name__)
@@ -207,8 +205,8 @@ def collect(
     start: str,
     end: str,
     out_path: Path,
-    chips_dir: Path,
     cloud_max: int,
+    cache_dir: Path | None = None,
 ) -> None:
     # --- 1. Generate pixel grid -------------------------------------------
     points = make_pixel_grid(bbox_wgs84)
@@ -229,23 +227,24 @@ def collect(
         sys.exit(1)
     logger.info("%d items found", len(items))
 
-    # --- 3. Fetch chips (idempotent) ----------------------------------------
-    chips_dir.mkdir(parents=True, exist_ok=True)
-    logger.info("Fetching chips → %s", chips_dir)
-    asyncio.run(fetch_chips(
+    # --- 3. Fetch patches (one range request per item×band, not per point) --
+    logger.info("Fetching patches for bbox %s", bbox_wgs84)
+    patches = asyncio.run(fetch_patches(
         points=points,
         items=items,
         bands=FETCH_BANDS,
-        window_px=1,          # single-pixel extraction — one point per S2 pixel
-        inputs_dir=chips_dir,
+        bbox_wgs84=bbox_wgs84,
         scl_filter=True,
         band_alias=BAND_ALIAS,
+        max_concurrent=32,
+        cache_dir=cache_dir,
     ))
+    logger.info("Fetched %d (item, band) patches", len(patches))
 
     # --- 4. Extract observations --------------------------------------------
-    store = DiskChipStore(chips_dir)
+    store = MemoryChipStore(patches, point_coords)
     logger.info("Extracting observations ...")
-    observations = extract_observations(items, points, store, bands=BANDS)
+    observations = extract_observations(items, points, store, bands=BANDS, center_px=0)
     logger.info("%d observations extracted", len(observations))
 
     if not observations:
@@ -303,12 +302,13 @@ def _parse_args() -> argparse.Namespace:
         help="Output Parquet file path, e.g. data/longreach_pixels.parquet",
     )
     p.add_argument(
-        "--chips-dir", type=Path, default=None,
-        help="Directory for cached chip files (default: <out>.chips/ next to output)",
-    )
-    p.add_argument(
         "--cloud-max", type=int, default=30,
         help="Maximum scene cloud cover %% (default: 30)",
+    )
+    p.add_argument(
+        "--cache-dir", type=Path, default=None,
+        help="Directory to cache fetched patches as .npz files. Re-runs skip "
+             "already-cached patches. Default: <out>.cache/ next to output.",
     )
     return p.parse_args()
 
@@ -329,15 +329,15 @@ def main() -> None:
         print("ERROR: --bbox must be 'lon_min,lat_min,lon_max,lat_max'", file=sys.stderr)
         sys.exit(1)
 
-    chips_dir = args.chips_dir or args.out.with_suffix("").parent / (args.out.stem + ".chips")
+    cache_dir = args.cache_dir or args.out.parent / (args.out.stem + ".cache")
 
     collect(
         bbox_wgs84=bbox,
         start=args.start,
         end=args.end,
         out_path=args.out,
-        chips_dir=chips_dir,
         cloud_max=args.cloud_max,
+        cache_dir=cache_dir,
     )
 
 

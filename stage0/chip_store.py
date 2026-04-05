@@ -21,6 +21,7 @@ import warnings
 
 import numpy as np
 import rasterio
+from pyproj import Transformer
 from rasterio.errors import NotGeoreferencedWarning
 
 
@@ -82,6 +83,79 @@ class DiskChipStore:
             with rasterio.open(path) as src:
                 arr = src.read(1)  # single-band chip → 2-D array
         return arr
+
+
+# ---------------------------------------------------------------------------
+# MemoryChipStore — in-memory store populated from fetch_patches()
+# ---------------------------------------------------------------------------
+
+class MemoryChipStore:
+    """In-memory ChipStore populated from patch data returned by fetch_patches().
+
+    Satisfies the ChipStore Protocol. Each .get() call reprojects the point's
+    (lon, lat) into the patch CRS, computes the pixel (row, col) in the patch
+    array, and returns a 1×1 ndarray containing that pixel's value.
+
+    This is the efficient counterpart to DiskChipStore for dense point grids
+    within a small bbox — no disk I/O, no per-point chip files.
+
+    Parameters
+    ----------
+    patches:
+        Mapping (item_id, band) → (2D float32 array, Affine transform, rasterio CRS).
+        Produced by fetch_patches(). Cloud-filtered items and missing bands are
+        absent from this dict; .get() raises FileNotFoundError for absent keys.
+    point_coords:
+        Mapping point_id → (lon, lat) in EPSG:4326.
+    """
+
+    def __init__(
+        self,
+        patches: dict[tuple[str, str], tuple[np.ndarray, object, object]],
+        point_coords: dict[str, tuple[float, float]],
+    ) -> None:
+        self._patches = patches
+        # Pre-compute (row, col) for every (item_id, band, point_id) combination.
+        # Bands within an item can have different resolutions (e.g. AOT at 60m
+        # vs spectral bands at 10m), so each (item_id, band) patch has its own
+        # transform and shape and needs its own coordinate projection.
+        self._pixel_coords: dict[tuple[str, str, str], tuple[int, int]] = {}
+
+        crs_transformer: dict[str, Transformer] = {}
+        for (item_id, band), (arr, transform, crs) in patches.items():
+            crs_key = crs.to_string() if hasattr(crs, "to_string") else str(crs)
+            if crs_key not in crs_transformer:
+                crs_transformer[crs_key] = Transformer.from_crs(
+                    "EPSG:4326", crs, always_xy=True
+                )
+            t = crs_transformer[crs_key]
+            inv_transform = ~transform
+            h, w = arr.shape
+            for point_id, (lon, lat) in point_coords.items():
+                x_utm, y_utm = t.transform(lon, lat)
+                col_f, row_f = inv_transform * (x_utm, y_utm)
+                row = max(0, min(int(row_f), h - 1))
+                col = max(0, min(int(col_f), w - 1))
+                self._pixel_coords[(item_id, band, point_id)] = (row, col)
+
+    def get(self, item_id: str, band: str, point_id: str) -> np.ndarray:
+        """Return a 1×1 array containing the pixel value at (item_id, band, point_id).
+
+        Raises
+        ------
+        FileNotFoundError
+            If the (item_id, band) patch is absent — cloud-filtered item or
+            band not present in the STAC item. extract_observations() catches
+            FileNotFoundError for optional bands and uses a neutral default.
+        """
+        key = (item_id, band)
+        if key not in self._patches:
+            raise FileNotFoundError(
+                f"Patch not found: item_id={item_id!r}, band={band!r}"
+            )
+        patch, _, _ = self._patches[key]
+        row, col = self._pixel_coords[(item_id, band, point_id)]
+        return patch[row : row + 1, col : col + 1]
 
 
 # ---------------------------------------------------------------------------

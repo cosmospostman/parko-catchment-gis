@@ -26,7 +26,72 @@ Cropped from the confirmed infestation patch — dense Parkinsonia crowns indivi
 visible at 20cm/px.
 
 - **bbox:** lon [145.4240, 145.4250], lat [-22.7640, -22.7610]
-- **Quicklook:** `outputs/Longreach - test.PNG`
+- **Quicklook:** `outputs/Longreach-infestation-qglobe.png`
+
+### Characterisation (20cm Queensland Globe imagery)
+
+- Individual crowns clearly distinguishable — rounded green canopies against pale gilgai clay
+- High density but not a solid canopy; significant bare soil between crowns
+- Crown diameter approximately 1.5–3 m (~15–30 px at 20cm/px), consistent with mature Parkinsonia
+- Uniform crown size and spacing throughout — a consistent, mature infestation
+- Inter-crown soil is pale/grey gilgai clay — high visible reflectance, will mix into every S2 pixel
+- A cleared track runs through the middle of the scene (thin dark feature)
+- At S2 10m resolution, most pixels will be a mix of Parkinsonia crown and inter-crown gap;
+  pixels crossing the track will have lower canopy fraction
+- The majority of S2 pixels within the bbox contain significant Parkinsonia signal,
+  though a small number of edge pixels or bare patches may not
+
+### S2 dataset size (2020–2025 archive)
+
+- **Pixels:** 374 (11 × 34 on the 10m S2 grid, covering the 110m × 340m bbox)
+- **Observations per pixel:** 383–390 (median 387) over the full 6-year archive
+- **Seasonal cadence:** ~3 usable acquisitions/month in wet season (Dec–Feb peak cloud),
+  ~6/month in dry season (Jun–Oct) — August consistently hits the 5-day S2 revisit ceiling
+- **Total rows:** ~144,800 (point × date)
+- **Source file:** `data/longreach_pixels.parquet` — one row per (pixel, date), all 10 S2 bands plus quality scores
+
+### S2 signal investigation notes
+
+Every S2 pixel in this scene is a spectral mixture of Parkinsonia canopy and bare gilgai
+clay — crown cover is roughly 30–40% of ground area. The signal we are looking for is
+not pure Parkinsonia reflectance but the effect of that canopy fraction on pixel-level
+spectral and temporal behaviour.
+
+**Sub-pixel canopy fraction as a natural gradient**
+
+Pixels vary in canopy fraction depending on where crowns happen to fall relative to the
+10m grid. This creates a natural gradient from high-fraction (strongly Parkinsonia-like)
+to low-fraction (mostly bare clay) within the bbox — without needing to sample external
+negatives. Signal exploration should treat this as a continuum rather than binary
+presence/absence.
+
+**Priority signals to investigate (2020–2025 time series)**
+
+1. **Dry-season NIR stability** — does elevated NIR persist across all dry seasons, or
+   is it variable year to year? Stability across 5 years is a strong discriminator from
+   ephemeral vegetation responses.
+
+2. **Wet/dry seasonal amplitude** — how much does NIR or NDVI swing between wet and dry
+   season compared to surrounding bare/grass pixels? Parkinsonia's deep roots sustain
+   canopy through dry season; grasses collapse. Lower amplitude = more persistent canopy.
+
+3. **Seasonality shape** — the full annual waveform (greenup timing, peak, recession)
+   may be more discriminating than any single-date band value. Parkinsonia greenup
+   likely leads or lags surrounding grass in a consistent, detectable way.
+
+4. **Red-edge ratio (B07/B05)** — measures active chlorophyll independently of canopy
+   structure. Senescent dry-season grasses collapse toward ratio ≈ 1; Parkinsonia
+   retaining active chlorophyll stays elevated.
+
+5. **SWIR water index (B08−B11)/(B08+B11)** — Parkinsonia's deep roots sustain higher
+   canopy water year-round relative to surrounding dry grass and bare soil.
+
+**What crown-level mixing implies for modelling**
+
+A pixel with higher canopy fraction will show stronger signal on all of the above.
+The classifier output will naturally approximate canopy fraction / infestation density
+rather than hard presence/absence — which is the intended "Parkinsonia presence
+probability" output.
 
 ---
 
