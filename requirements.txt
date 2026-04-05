@@ -23,6 +23,7 @@ scikit-learn>=1.4,<2
 
 # Parallel computation
 dask[array,distributed]>=2024.1,<2024.10
+polars>=1.0,<2
 
 # setuptools is required at runtime by stackstac (pkg_resources)
 setuptools>=69,<81

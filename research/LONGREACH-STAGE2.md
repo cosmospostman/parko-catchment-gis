@@ -239,6 +239,71 @@ ground truth) remains the test of that.
 
 ---
 
+### Expansion bbox spatial scoring ✓ COMPLETE
+
+**Script:** `longreach/expansion-map.py`
+**Outputs:** `outputs/longreach-expansion-map/`
+
+The full Stage 2 pipeline was applied to the complete 40,996-pixel expansion bbox
+(~2.7 km × 1.5 km, all 10m S2 pixels exhaustively covered). The logistic regression
+trained on the original 362 infestation and 347 grassland end-member pixels was used
+without modification — no retraining on the expanded population.
+
+#### Results
+
+| Population | n pixels | prob_lr median |
+|---|---|---|
+| Infestation (training bbox) | 362 | 0.949 |
+| Grassland (expansion, non-riparian) | 36,570 | 0.004 |
+| Riparian proxy (top-10% nir_mean of extension) | 4,064 | 0.006 |
+
+Top-decile threshold: prob ≥ 0.639 (4,100 pixels)
+- 311 within the training infestation bbox
+- 3,789 outside the training bbox
+
+Outside-training-bbox distribution: median 0.004, p90 0.600, p99 0.982.
+
+#### Key findings
+
+**Spatial coherence:** High-scoring pixels outside the training bbox cluster spatially
+rather than scatter as noise. This is consistent with genuine Parkinsonia signal at
+locations adjacent to or downstream of the known infestation, rather than artefact.
+
+**Native riparian woodland scores low.** Riparian woodland patches visible in the
+WMS imagery are classified strongly unlikely (low probability) despite the model
+having no native riparian training examples. This suggests `nir_cv` and `rec_p`
+are capturing real mechanistic differences — native riparian canopy apparently lacks
+the combination of deep-root NDVI amplitude and inter-annual NIR stability that
+characterises Parkinsonia. This partially addresses the Priority 5 concern that
+native riparian would be the dominant source of false positives.
+
+**Classifier transfers without retraining.** The Longreach end-member model scores
+the full 40,996-pixel landscape coherently, with low scores in grassland and native
+riparian and high scores concentrated in the known infestation and spatially coherent
+high-scoring clusters elsewhere.
+
+#### Caveats
+
+1. **WMS imagery is ~4 years behind the S2 data.** The Queensland Globe 20cm ortho
+   was captured c. 2020–21; the S2 archive runs to end of 2025. High-scoring pixels
+   with no visible crowns in the WMS background may be genuine post-imagery
+   colonisation rather than false positives.
+
+2. **Native riparian result is promising but unconfirmed.** The WMS imagery is 20cm
+   resolution and 4 years old; species composition of riparian patches is not ground-
+   truthed. Priority 5 (native riparian ground truth) remains necessary before
+   deploying in riparian settings.
+
+3. **Transfer to other sites is ranking, not calibrated probability.** The logistic
+   regression boundary encodes the Longreach feature ranges. At a new site the absolute
+   values of `nir_cv`, `rec_p`, and `re_p10` for both Parkinsonia and background will
+   shift with soil type and climate regime. The ranking should transfer; the threshold
+   for calling a detection will need site-specific calibration (a small number of
+   confirmed-presence and confirmed-absence pixels at the new site). Priority 3
+   (second site) is the test of this.
+
+---
+
 ### Priority 3 — Second site validation (data fetch required)
 
 **What:** Fetch S2 time series for one of the ALA cluster sites — the -22.443, 144.652

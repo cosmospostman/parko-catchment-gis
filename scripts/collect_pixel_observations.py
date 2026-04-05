@@ -118,11 +118,16 @@ def make_pixel_grid(
     bbox_wgs84: list[float],
     utm_crs: str = UTM_CRS,
     resolution_m: float = 10.0,
+    stride: int = 1,
 ) -> list[tuple[str, float, float]]:
     """Generate one point per S2 pixel inside bbox_wgs84, aligned to a 10 m UTM grid.
 
     The grid origin is snapped to the nearest 10 m multiple so that points
     fall at S2 pixel centres rather than between pixels.
+
+    stride > 1 keeps every Nth pixel in both x and y, reducing point count by
+    stride² while preserving uniform spatial coverage. Effective resolution
+    becomes stride × 10 m (e.g. stride=3 → 30 m spacing).
 
     Returns list of (point_id, lon, lat).
     """
@@ -139,8 +144,8 @@ def make_pixel_grid(
     x0_snap = np.floor(x0 / r) * r
     y0_snap = np.floor(y0 / r) * r
 
-    xs = np.arange(x0_snap, x1, r)
-    ys = np.arange(y0_snap, y1, r)
+    xs = np.arange(x0_snap, x1, r)[::stride]
+    ys = np.arange(y0_snap, y1, r)[::stride]
 
     points: list[tuple[str, float, float]] = []
     for i, xi in enumerate(xs):
@@ -150,8 +155,8 @@ def make_pixel_grid(
             points.append((pid, float(lon), float(lat)))
 
     logger.info(
-        "Pixel grid: %d × %d = %d points at %.0f m spacing",
-        len(xs), len(ys), len(points), r,
+        "Pixel grid: %d × %d = %d points at %.0f m spacing (stride=%d)",
+        len(xs), len(ys), len(points), r * stride, stride,
     )
     return points
 
@@ -237,25 +242,44 @@ def collect(
     out_path: Path,
     cloud_max: int,
     cache_dir: Path | None = None,
+    stride: int = 1,
 ) -> None:
     # --- 1. Generate pixel grid -------------------------------------------
-    points = make_pixel_grid(bbox_wgs84)
+    points = make_pixel_grid(bbox_wgs84, stride=stride)
     point_coords = {pid: (lon, lat) for pid, lon, lat in points}
 
-    # --- 2. STAC search ------------------------------------------------------
-    logger.info("STAC search: %s → %s  cloud < %d%%", start, end, cloud_max)
-    items = search_sentinel2(
-        bbox=bbox_wgs84,
-        start=start,
-        end=end,
-        cloud_cover_max=cloud_max,
-        endpoint=STAC_ENDPOINT,
-        collection=S2_COLLECTION,
-    )
+    # --- 2. STAC search (cached) ---------------------------------------------
+    import hashlib, pickle
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    stac_key = hashlib.md5(
+        f"{bbox_wgs84}|{start}|{end}|{cloud_max}".encode()
+    ).hexdigest()
+    stac_cache = cache_dir / f"stac_{stac_key}.pkl"
+
+    if stac_cache.exists():
+        logger.info("STAC search: loading cached result (%s)", stac_cache.name)
+        with stac_cache.open("rb") as fh:
+            items = pickle.load(fh)
+        logger.info("%d items loaded from cache", len(items))
+    else:
+        logger.info("STAC search: %s → %s  cloud < %d%%", start, end, cloud_max)
+        items = search_sentinel2(
+            bbox=bbox_wgs84,
+            start=start,
+            end=end,
+            cloud_cover_max=cloud_max,
+            endpoint=STAC_ENDPOINT,
+            collection=S2_COLLECTION,
+        )
+        if not items:
+            logger.error("No STAC items found — check bbox and date range")
+            sys.exit(1)
+        with stac_cache.open("wb") as fh:
+            pickle.dump(items, fh)
+        logger.info("%d items found, cached to %s", len(items), stac_cache.name)
     if not items:
         logger.error("No STAC items found — check bbox and date range")
         sys.exit(1)
-    logger.info("%d items found", len(items))
 
     # --- 3. Fetch patches (one range request per item×band, not per point) --
     logger.info("Fetching patches for bbox %s", bbox_wgs84)
@@ -354,6 +378,12 @@ def _parse_args() -> argparse.Namespace:
         help="Directory to cache fetched patches as .npz files. Re-runs skip "
              "already-cached patches. Default: <out>.cache/ next to output.",
     )
+    p.add_argument(
+        "--stride", type=int, default=1,
+        help="Keep every Nth pixel in x and y (default: 1 = all pixels). "
+             "stride=3 gives ~30 m spacing and reduces point count by ~9×. "
+             "Applied at grid generation, so fewer patches are fetched too.",
+    )
     return p.parse_args()
 
 
@@ -382,6 +412,7 @@ def main() -> None:
         out_path=args.out,
         cloud_max=args.cloud_max,
         cache_dir=cache_dir,
+        stride=args.stride,
     )
 
 
