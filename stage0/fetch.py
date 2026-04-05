@@ -339,11 +339,12 @@ def _cache_path(cache_dir: Path, item_id: str, band: str) -> Path:
 
 def _load_patch_cache(path: Path) -> tuple[np.ndarray, object, object] | None:
     """Load a cached patch from a .npz file. Returns None if missing or corrupt."""
+    import pickle
     try:
         z = np.load(path, allow_pickle=True)
         arr = z["arr"]
-        transform = z["transform"].item()   # stored as 0-d object array
-        crs = z["crs"].item()
+        transform = pickle.loads(z["transform"].tobytes())
+        crs = pickle.loads(z["crs"].tobytes())
         return arr, transform, crs
     except Exception:
         return None
@@ -351,10 +352,15 @@ def _load_patch_cache(path: Path) -> tuple[np.ndarray, object, object] | None:
 
 def _save_patch_cache(path: Path, data: tuple[np.ndarray, object, object]) -> None:
     """Save a patch to a .npz file, creating parent dirs as needed."""
+    import pickle
     arr, transform, crs = data
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(path, arr=arr, transform=np.array(transform, dtype=object),
-             crs=np.array(crs, dtype=object))
+    np.savez(
+        path,
+        arr=arr,
+        transform=np.frombuffer(pickle.dumps(transform), dtype=np.uint8),
+        crs=np.frombuffer(pickle.dumps(crs), dtype=np.uint8),
+    )
 
 
 async def fetch_patches(

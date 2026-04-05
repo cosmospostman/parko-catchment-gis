@@ -14,6 +14,7 @@ StreamingChipStore : issues COG range requests on demand, no disk required.
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Protocol
 
@@ -115,28 +116,49 @@ class MemoryChipStore:
         point_coords: dict[str, tuple[float, float]],
     ) -> None:
         self._patches = patches
-        # Pre-compute (row, col) for every (item_id, band, point_id) combination.
-        # Bands within an item can have different resolutions (e.g. AOT at 60m
-        # vs spectral bands at 10m), so each (item_id, band) patch has its own
-        # transform and shape and needs its own coordinate projection.
-        self._pixel_coords: dict[tuple[str, str, str], tuple[int, int]] = {}
+        self._point_coords = point_coords
+        # Pixel coords are computed lazily per (item_id, band) on first access.
+        # Pre-computing all (item_id, band, point_id) triples upfront would
+        # require O(patches × points) memory — ~200M entries for a 40k-pixel bbox.
+        # (item_id, band) → (rows: int array, cols: int array) in point_coords order
+        self._pixel_coords: dict[tuple[str, str], tuple[np.ndarray, np.ndarray]] = {}
+        # point_id → position index for O(1) single-point lookup
+        self._point_index: dict[str, int] = {pid: i for i, pid in enumerate(point_coords.keys())}
+        # Precomputed lon/lat arrays in point_coords order for vectorised projection
+        _pids = list(point_coords.keys())
+        self._lons = np.array([point_coords[pid][0] for pid in _pids])
+        self._lats = np.array([point_coords[pid][1] for pid in _pids])
+        # Cache one Transformer per CRS string to avoid repeated construction.
+        self._crs_transformer: dict[str, Transformer] = {}
+        self._lock = threading.Lock()
 
-        crs_transformer: dict[str, Transformer] = {}
-        for (item_id, band), (arr, transform, crs) in patches.items():
+    def _ensure_pixel_coords(self, item_id: str, band: str) -> None:
+        """Compute and cache (row, col) for all points for this (item_id, band)."""
+        key = (item_id, band)
+        with self._lock:
+            if key in self._pixel_coords:
+                return
+            patch, transform, crs = self._patches[key]
+            h, w = patch.shape
             crs_key = crs.to_string() if hasattr(crs, "to_string") else str(crs)
-            if crs_key not in crs_transformer:
-                crs_transformer[crs_key] = Transformer.from_crs(
-                    "EPSG:4326", crs, always_xy=True
-                )
-            t = crs_transformer[crs_key]
-            inv_transform = ~transform
-            h, w = arr.shape
-            for point_id, (lon, lat) in point_coords.items():
-                x_utm, y_utm = t.transform(lon, lat)
-                col_f, row_f = inv_transform * (x_utm, y_utm)
-                row = max(0, min(int(row_f), h - 1))
-                col = max(0, min(int(col_f), w - 1))
-                self._pixel_coords[(item_id, band, point_id)] = (row, col)
+            t = self._crs_transformer.get(crs_key)
+
+        # Compute transformer outside the lock if needed (expensive construction)
+        if t is None:
+            t = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+            with self._lock:
+                self._crs_transformer.setdefault(crs_key, t)
+                t = self._crs_transformer[crs_key]
+
+        # Vectorised projection — CPU work done outside the lock
+        xs, ys = t.transform(self._lons, self._lats)
+        cols_f, rows_f = ~transform * (xs, ys)
+        rows = np.clip(rows_f.astype(np.intp), 0, h - 1)
+        cols = np.clip(cols_f.astype(np.intp), 0, w - 1)
+
+        with self._lock:
+            # Another thread may have computed this while we were working — that's fine
+            self._pixel_coords.setdefault(key, (rows, cols))
 
     def get(self, item_id: str, band: str, point_id: str) -> np.ndarray:
         """Return a 1×1 array containing the pixel value at (item_id, band, point_id).
@@ -153,9 +175,40 @@ class MemoryChipStore:
             raise FileNotFoundError(
                 f"Patch not found: item_id={item_id!r}, band={band!r}"
             )
+        self._ensure_pixel_coords(item_id, band)
+        idx = self._point_index[point_id]
+        with self._lock:
+            rows, cols = self._pixel_coords[key]
         patch, _, _ = self._patches[key]
-        row, col = self._pixel_coords[(item_id, band, point_id)]
-        return patch[row : row + 1, col : col + 1]
+        r, c = int(rows[idx]), int(cols[idx])
+        return patch[r : r + 1, c : c + 1]
+
+    def get_all_points(self, item_id: str, band: str) -> np.ndarray | None:
+        """Return a 1-D float32 array of pixel values for all points, in point_coords order.
+
+        Returns None if the (item_id, band) patch is absent (cloud-filtered or
+        missing band). Values are raw patch values — callers apply scaling.
+        """
+        key = (item_id, band)
+        if key not in self._patches:
+            return None
+        self._ensure_pixel_coords(item_id, band)
+        with self._lock:
+            rows, cols = self._pixel_coords[key]
+        patch, _, _ = self._patches[key]
+        return patch[rows, cols]
+
+    def release_item(self, item_id: str) -> None:
+        """Evict all cached pixel-coord dicts for item_id.
+
+        Call this after processing each item in a streaming loop to keep
+        memory flat — without it, coord dicts accumulate for every (item, band)
+        pair processed so far.
+        """
+        with self._lock:
+            to_delete = [k for k in self._pixel_coords if k[0] == item_id]
+            for k in to_delete:
+                del self._pixel_coords[k]
 
 
 # ---------------------------------------------------------------------------

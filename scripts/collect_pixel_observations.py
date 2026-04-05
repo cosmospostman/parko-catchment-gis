@@ -69,13 +69,14 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 from pyproj import Transformer
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from analysis.constants import BANDS, SCL_BAND, AOT_BAND, VZA_BAND, SZA_BAND
-from analysis.timeseries.extraction import extract_observations
+from analysis.constants import BANDS, SCL_BAND, AOT_BAND, SCL_CLEAR_VALUES
 from stage0.chip_store import MemoryChipStore
 from stage0.fetch import fetch_patches
 from utils.stac import search_sentinel2
@@ -156,43 +157,72 @@ def make_pixel_grid(
 
 
 # ---------------------------------------------------------------------------
-# Observation → DataFrame
+# Vectorised per-item extraction → DataFrame (no Observation objects)
 # ---------------------------------------------------------------------------
 
-def observations_to_dataframe(
-    observations: list,
-    point_coords: dict[str, tuple[float, float]],
-) -> pd.DataFrame:
-    """Convert Observation objects to a flat DataFrame."""
-    rows = []
-    for obs in observations:
-        lon, lat = point_coords.get(obs.point_id, (float("nan"), float("nan")))
-        row: dict = {
-            "point_id":   obs.point_id,
-            "lon":        lon,
-            "lat":        lat,
-            "date":       obs.date.date(),
-            "item_id":    obs.meta.get("item_id", ""),
-            "tile_id":    obs.meta.get("tile_id", ""),
-            "scl_purity": obs.quality.scl_purity,
-            "aot":        obs.quality.aot,
-            "view_zenith": obs.quality.view_zenith,
-            "sun_zenith":  obs.quality.sun_zenith,
-        }
-        for band in BANDS:
-            row[band] = obs.bands.get(band, float("nan"))
-        rows.append(row)
+def extract_item_to_df(
+    item,
+    store: MemoryChipStore,
+    point_ids: list[str],
+    lons: np.ndarray,
+    lats: np.ndarray,
+) -> pd.DataFrame | None:
+    """Extract all usable pixels for one STAC item into a DataFrame.
 
-    if not rows:
-        return pd.DataFrame()
+    Uses store.get_all_points() to fetch entire bands as numpy arrays,
+    avoiding per-point Python loops. Returns None if the item has no
+    clear pixels at all (cloud-filtered).
+    """
+    item_id = item.id
+    tile_id = item.properties.get("s2:mgrs_tile", "")
+    item_date = pd.Timestamp(item.datetime.replace(tzinfo=None))
+    n = len(point_ids)
 
-    col_order = (
-        ["point_id", "lon", "lat", "date", "item_id", "tile_id"]
-        + list(BANDS)
-        + ["scl_purity", "aot", "view_zenith", "sun_zenith"]
-    )
-    df = pd.DataFrame(rows)[col_order]
-    df["date"] = pd.to_datetime(df["date"])
+    # --- SCL: per-point clear-pixel mask ------------------------------------
+    scl_vals = store.get_all_points(item_id, SCL_BAND)
+    if scl_vals is None:
+        return None
+    scl_int = scl_vals.astype(np.int32)
+    clear_mask = np.zeros(n, dtype=bool)
+    for v in SCL_CLEAR_VALUES:
+        clear_mask |= (scl_int == v)
+    if not clear_mask.any():
+        return None
+    scl_purity = clear_mask.astype(np.float32)  # 1×1 chip → purity = 0 or 1
+
+    # --- AOT quality --------------------------------------------------------
+    aot_vals = store.get_all_points(item_id, AOT_BAND)
+    if aot_vals is not None:
+        aot_quality = np.clip(1.0 - aot_vals * 0.001, 0.0, 1.0)
+    else:
+        aot_quality = np.ones(n, dtype=np.float32)
+
+    # --- Spectral bands (surface reflectance = raw / 10000) -----------------
+    band_arrays: dict[str, np.ndarray] = {}
+    for band in BANDS:
+        vals = store.get_all_points(item_id, band)
+        band_arrays[band] = vals / 10000.0 if vals is not None else np.full(n, np.nan, dtype=np.float32)
+
+    # --- Filter to clear pixels only ----------------------------------------
+    idx = np.where(clear_mask)[0]
+    df = pd.DataFrame({
+        "point_id":   np.array(point_ids)[idx],
+        "lon":        lons[idx],
+        "lat":        lats[idx],
+        "date":       item_date,
+        "item_id":    item_id,
+        "tile_id":    tile_id,
+        "scl_purity": scl_purity[idx],
+        "aot":        aot_quality[idx],
+        "view_zenith": np.ones(len(idx), dtype=np.float32),  # not available at earth-search
+        "sun_zenith":  np.ones(len(idx), dtype=np.float32),
+        **{band: band_arrays[band][idx] for band in BANDS},
+    })
+
+    # Drop rows where all spectral bands are NaN
+    if df[list(BANDS)].isna().all(axis=1).all():
+        return None
+
     return df
 
 
@@ -241,36 +271,50 @@ def collect(
     ))
     logger.info("Fetched %d (item, band) patches", len(patches))
 
-    # --- 4. Extract observations --------------------------------------------
+    # --- 4. Extract observations and write Parquet in item-batches -----------
+    # Vectorised: fetch entire band arrays per item via get_all_points(),
+    # apply SCL mask, build DataFrame directly — no per-point Python loops.
     store = MemoryChipStore(patches, point_coords)
-    logger.info("Extracting observations ...")
-    observations = extract_observations(items, points, store, bands=BANDS, center_px=0)
-    logger.info("%d observations extracted", len(observations))
+    point_ids = [pid for pid, _, _ in points]
+    lons_arr = np.array([lon for _, lon, _ in points], dtype=np.float64)
+    lats_arr = np.array([lat for _, _, lat in points], dtype=np.float64)
 
-    if not observations:
+    col_order = (
+        ["point_id", "lon", "lat", "date", "item_id", "tile_id"]
+        + list(BANDS)
+        + ["scl_purity", "aot", "view_zenith", "sun_zenith"]
+    )
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    writer: pq.ParquetWriter | None = None
+    total_rows = 0
+
+    logger.info("Extracting observations (vectorised, %d items) ...", len(items))
+    for i, item in enumerate(items):
+        batch_df = extract_item_to_df(item, store, point_ids, lons_arr, lats_arr)
+        store.release_item(item.id)
+
+        if batch_df is None or batch_df.empty:
+            continue
+
+        table = pa.Table.from_pandas(batch_df[col_order], preserve_index=False)
+        if writer is None:
+            writer = pq.ParquetWriter(out_path, table.schema)
+        writer.write_table(table)
+        total_rows += len(batch_df)
+
+        if (i + 1) % 50 == 0 or (i + 1) == len(items):
+            logger.info("  %d/%d items processed, %d rows written", i + 1, len(items), total_rows)
+
+    if writer is not None:
+        writer.close()
+    else:
         logger.error("No usable observations — all pixels clouded or missing?")
         sys.exit(1)
 
-    # --- 5. Build DataFrame and write Parquet --------------------------------
-    df = observations_to_dataframe(observations, point_coords)
-
-    # Drop rows where all spectral bands are NaN
-    band_cols = list(BANDS)
-    df = df.dropna(subset=band_cols, how="all")
-    logger.info("%d rows after dropping all-NaN band rows", len(df))
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(out_path, index=False)
-    logger.info("Written: %s  (%d rows × %d cols)", out_path, len(df), len(df.columns))
-
-    # Summary
-    n_points   = df["point_id"].nunique()
-    n_dates    = df["date"].nunique()
-    date_range = f"{df['date'].min().date()} → {df['date'].max().date()}"
+    logger.info("Written: %s  (%d rows)", out_path, total_rows)
     print(f"\nDone.")
-    print(f"  Points : {n_points}")
-    print(f"  Dates  : {n_dates}  ({date_range})")
-    print(f"  Rows   : {len(df)}")
+    print(f"  Rows   : {total_rows}")
     print(f"  Output : {out_path}")
 
 
