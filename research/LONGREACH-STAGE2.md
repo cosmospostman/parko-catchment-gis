@@ -15,7 +15,7 @@ summarised as per-pixel annual statistics. Three are independent axes; two are r
 | `rec_p` | Annual NDVI amplitude (p90 − p10, window-free) | 0.00 | 0.087 | Yes |
 | `re_p10` | Annual red-edge low percentile (B07/B05, p10) | 0.00 | — | Yes (baseline) |
 | `swir_p10` | SWIR moisture index annual low percentile | 0.00 | **0.729** | Redundant with re_p10 |
-| `fi_p90_cg` | Contrast-gated annual flowering index p90 | 0.00 | TBD | TBD |
+| `fi_p90_cg` | Contrast-gated annual flowering index p90 | 0.00 (vs grassland and riparian) | TBD | Yes — separates from both grassland and riparian proxy |
 
 `rec_p` and `nir_cv` are partially correlated (r = −0.77) — both reflect deep-root
 canopy persistence — but each passes zero IQR overlap independently, and their
@@ -59,8 +59,10 @@ primarily by NIR CV and NDVI trough.
 3. **Single site.** Every threshold, IQR, and correlation value is from one 820 × 820 m
    patch on gilgai clay floodplain near Longreach. Cross-site transfer is untested.
 
-4. **`fi_p90_cg` riparian test not run.** The flowering analysis closed with this
-   explicitly open.
+4. **`fi_p90_cg` riparian behaviour is now resolved** — see Priority 2 results below.
+   Riparian scores low (median 0.201 vs infestation IQR p25 of 0.343), unlike `re_p10`
+   which scored high for riparian. This makes `fi_p90_cg` the only current feature with
+   zero IQR overlap against both grassland and the riparian proxy class.
 
 ---
 
@@ -197,17 +199,43 @@ calibration limitations above apply to both.
 
 ---
 
-### Priority 2 — fi_p90_cg riparian test (no new data required)
+### Priority 2 — fi_p90_cg riparian test ✓ COMPLETE
 
-**What:** Compute `fi_p90_cg` for the riparian proxy pixels already in the dataset
-(extension pixels at highest nir_mean, used as proxy in the dry-NIR analysis). Compare
-distributions: infestation vs grassland vs riparian proxy.
+**Script:** addition to `longreach/flowering.py`
+**Output:** `outputs/longreach-flowering/fi_p90_riparian_proxy.csv`
 
-**Why second:** The flowering analysis left this explicitly open. It is a quick stats
-addition to `longreach/flowering.py` (the riparian pixel indices are already defined in
-the dry-NIR output parquet). If fi_p90_cg also achieves zero IQR overlap with riparian,
-it becomes a stronger candidate reserve feature. If riparian scores high (as re_p10 did),
-it is redundant with the known limitation.
+#### Results
+
+Riparian proxy: 39 extension pixels at or above the p90 of extension `nir_mean`
+(threshold 0.218), spatially clustered at lat ≈ −22.765 — the water feature identified
+in the dry-NIR analysis as outscoring the Parkinsonia patch on raw NIR.
+
+| Population | n | fi_p90_cg median | IQR [p25, p75] |
+|---|---|---|---|
+| Infestation | 363 | 0.459 | [0.343, 0.625] |
+| Grassland (non-riparian extension) | 347 | 0.105 | [0.030, 0.171] |
+| Riparian proxy | 39 | 0.201 | [0.099, 0.317] |
+
+**IQR overlap:** infestation vs grassland = 0.000; infestation vs riparian = 0.000;
+grassland vs riparian = 0.251 (partial overlap between the two negative classes, expected).
+
+**Key finding:** Riparian proxy scores LOW. Its median (0.201) falls below the infestation
+IQR p25 (0.343). This is the opposite of `re_p10`, which scored high for riparian pixels
+(zero overlap was achieved there by grassland being distinct, not riparian being distinct).
+
+**Why `fi_p90_cg` separates from riparian but `re_p10` does not:** The contrast gate
+conditions on dates when the infestation is genuinely diverging from the extension
+population as a whole. Riparian pixels are *part of* the extension baseline: when riparian
+vegetation spikes (e.g. post-flood greenness), it moves with or ahead of the extension
+mean, suppressing contrast. Infestation-specific flowering or dry-season retention events
+produce positive contrast precisely because non-Parkinsonia extension pixels (including
+riparian) are not spiking that way. So riparian pixels inherently cannot accumulate high
+`fi_p90_cg` scores — the gate is structurally discriminating against them.
+
+**Caveat:** The riparian proxy is 39 pixels from a single water feature, not ground-truthed
+native riparian woodland from multiple sites. The separation may not hold for deep-canopy
+native riparian (coolibah, eucalyptus) at a different site. Priority 5 (native riparian
+ground truth) remains the test of that.
 
 ---
 
@@ -278,7 +306,7 @@ target negative-riparian sample.
 | `nir_cv` | Primary | Dry-season inter-annual stability; drives the main discriminating axis |
 | `rec_p` | Primary | Annual NDVI amplitude; partially correlated with nir_cv but adds independent variance |
 | `re_p10` | Reserve — generalisation only | Redundant at Longreach (adds zero Mahalanobis distance to the nir_cv/rec_p 2D space); retain for sites where the nir_cv/rec_p correlation weakens or soil/climate conditions differ |
-| `fi_p90_cg` | Reserve | Include if Priority 2 confirms riparian separation |
+| `fi_p90_cg` | Reserve — riparian disambiguation | Zero IQR overlap vs both grassland and riparian proxy; the only current feature achieving both simultaneously. Complements `nir_cv`/`rec_p` specifically where riparian confounds are present |
 | `swir_p10` | Reserve — diagnostic | Retain as corroboration; include only if re_p10 degrades at new sites |
 
 **Effective dimensionality at Longreach:** 2D (`nir_cv`, `rec_p`). The 3D feature space

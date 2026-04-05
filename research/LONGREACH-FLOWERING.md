@@ -156,7 +156,8 @@ follows wet-season rain by a fixed lag.
 | `outputs/longreach-flowering/fi_by_spatial_peak.png` | Pixel-level FI_by z-score map at peak acquisition date (infestation / extension side-by-side) |
 | `outputs/longreach-flowering/fi_band_decomposition.png` | Per-band anomaly (B02, B03, B04, B08) on each peak date — mechanism confirmation |
 | `outputs/longreach-flowering/flowering_window_by_year.csv` | Per-year: n_dates, DOY range, peak z-score, peak date |
-| `outputs/longreach-flowering/fi_p90_per_pixel.csv` | Per-pixel `fi_p90` (unrestricted) and `fi_p90_cg` (contrast-gated) |
+| `outputs/longreach-flowering/fi_p90_per_pixel.csv` | Per-pixel `fi_p90` (unrestricted) and `fi_p90_cg` (contrast-gated) for infestation and extension |
+| `outputs/longreach-flowering/fi_p90_riparian_proxy.csv` | Per-pixel `fi_p90` and `fi_p90_cg` for the 39 riparian proxy pixels (extension p90+ nir_mean) |
 
 ## Success criteria
 
@@ -298,16 +299,21 @@ with the infestation on those dates.
 
 **Position in the multi-signal picture:**
 
-| Signal | Discriminates Parkinsonia from grassland | From riparian | Notes |
-|--------|------------------------------------------|---------------|-------|
+| Signal | Discriminates Parkinsonia from grassland | From riparian proxy | Notes |
+|--------|------------------------------------------|---------------------|-------|
 | Dry-season NIR CV | Yes — zero IQR overlap | Partial | Complete |
 | NDVI seasonal recession (rec_mean) | Yes — zero IQR overlap | Yes | Complete |
-| Red-edge p10 (re_p10) | Yes — zero IQR overlap | Partial | Complete |
-| FI_by fi_p90_cg | Yes — zero IQR overlap | TBD | Contrast-gated only |
+| Red-edge p10 (re_p10) | Yes — zero IQR overlap | No — riparian scores high | Complete |
+| FI_by fi_p90_cg | Yes — zero IQR overlap | **Yes — zero IQR overlap** | Complete |
 | Wet/dry amplitude | Yes | Yes | Complete |
 
-**Next step:** Riparian discrimination using fi_p90_cg needs to be evaluated — the
-extension riparian pixels were not separated from Parkinsonia in the red-edge analysis,
-and the same caveat may apply here. The wet/dry amplitude analysis already provides
-three-way separation; fi_p90_cg is a candidate additional feature for the final
-multi-signal feature set.
+**`fi_p90_cg` is the only current feature with zero IQR overlap against both grassland
+and the riparian proxy class.** Riparian proxy median (0.201) falls below the infestation
+IQR p25 (0.343). This is structurally explained by the contrast gate: riparian pixels
+are part of the extension baseline, so when they spike (post-flood greenness) they
+suppress the contrast rather than producing positive contrast — they cannot accumulate
+high `fi_p90_cg` scores by construction.
+
+The caveat from Priority 2: this result rests on 39 pixels from one water feature, not
+ground-truthed native riparian woodland. The separation may not generalise to deep-canopy
+native riparian at other sites (Priority 5, LONGREACH-STAGE2.md).

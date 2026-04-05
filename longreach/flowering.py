@@ -53,7 +53,14 @@ fetch_wms_image = _mod.fetch_wms_image
 # ---------------------------------------------------------------------------
 
 PARQUET_PATH   = PROJECT_ROOT / "data" / "longreach_pixels.parquet"
+DRY_NIR_PATH   = PROJECT_ROOT / "outputs" / "longreach-dry-nir" / "longreach_dry_nir_stats.parquet"
 OUT_DIR        = PROJECT_ROOT / "outputs" / "longreach-flowering"
+
+# Riparian proxy: extension pixels in the top percentile of dry-season NIR mean.
+# These cluster around lat -22.765 in the southern extension (the water feature
+# identified in LONGREACH-DRY-NIR.md as outscoring the Parkinsonia patch on raw NIR).
+# Using p90 of extension nir_mean as the cutoff (~39 pixels).
+RIPARIAN_NIR_PERCENTILE = 90
 
 # Quality filter
 SCL_PURITY_MIN = 0.5
@@ -554,6 +561,157 @@ def build_pixel_p90(inf_anomalies: pd.DataFrame, ext_anomalies: pd.DataFrame,
             f"overlap fraction={frac:.3f}")
 
     return p90
+
+
+def build_riparian_p90(df: pd.DataFrame, ct: pd.DataFrame) -> pd.DataFrame | None:
+    """Compute fi_p90_cg for the riparian proxy pixel subset.
+
+    Riparian proxy: extension pixels whose dry-season mean NIR (from the dry-NIR
+    stats parquet) is in the top RIPARIAN_NIR_PERCENTILE of all extension pixels.
+    These cluster at lat ~-22.765 and outscored the Parkinsonia patch on raw NIR in
+    the dry-NIR analysis, flagged there as the primary confounder.
+
+    Returns a DataFrame with columns [point_id, fi_p90, fi_p90_cg, population]
+    where population == "riparian_proxy", or None if the parquet is missing.
+    """
+    if not DRY_NIR_PATH.exists():
+        log(f"  WARNING: dry-NIR parquet not found at {DRY_NIR_PATH} — skipping riparian test")
+        return None
+
+    dry = pd.read_parquet(DRY_NIR_PATH)
+    ext_dry = dry[~dry["in_hd_bbox"]]
+    threshold = ext_dry["nir_mean"].quantile(RIPARIAN_NIR_PERCENTILE / 100)
+    riparian_ids = set(ext_dry.loc[ext_dry["nir_mean"] >= threshold, "point_id"])
+    log(f"\nRiparian proxy selection:")
+    log(f"  Extension nir_mean p{RIPARIAN_NIR_PERCENTILE} threshold: {threshold:.4f}")
+    log(f"  Riparian proxy pixels selected: {len(riparian_ids)}")
+
+    # Pull time series for these pixels from the main quality-filtered df
+    # (df already has FI_by_z from add_indices + compute_pixel_anomalies)
+    # We need to re-compute pixel anomalies for these pixels as a standalone population
+    rip_df = df[df["point_id"].isin(riparian_ids)].copy()
+    if len(rip_df) == 0:
+        log("  WARNING: no observations found for riparian proxy pixels — skipping")
+        return None
+
+    log(f"  Riparian proxy observations after quality filter: {len(rip_df):,}")
+
+    rip_anomalies = compute_pixel_anomalies(rip_df)
+    rip_anomalies["year"] = rip_anomalies["date"].dt.year
+
+    z_col = f"{PRIMARY_INDEX}_z"
+
+    # Contrast-positive dates (same definition as build_pixel_p90)
+    ct_copy = ct.copy()
+    ct_copy["year"] = ct_copy["date"].dt.year
+    contrast_pos_dates = set(ct_copy.loc[ct_copy["contrast"] > 0, "date"])
+
+    # Unrestricted annual p90, then mean across years
+    annual_p90 = (
+        rip_anomalies.groupby(["point_id", "year"])[z_col]
+        .quantile(0.90)
+        .reset_index()
+        .rename(columns={z_col: "fi_p90_year"})
+    )
+    pixel_p90 = (
+        annual_p90.groupby("point_id")["fi_p90_year"]
+        .mean()
+        .reset_index()
+        .rename(columns={"fi_p90_year": "fi_p90"})
+    )
+
+    # Contrast-gated p90
+    cg_df = rip_anomalies[rip_anomalies["date"].isin(contrast_pos_dates)]
+    if len(cg_df) > 0:
+        annual_p90_cg = (
+            cg_df.groupby(["point_id", "year"])[z_col]
+            .quantile(0.90)
+            .reset_index()
+            .rename(columns={z_col: "fi_p90_cg_year"})
+        )
+        pixel_p90_cg = (
+            annual_p90_cg.groupby("point_id")["fi_p90_cg_year"]
+            .mean()
+            .reset_index()
+            .rename(columns={"fi_p90_cg_year": "fi_p90_cg"})
+        )
+        pixel_p90 = pixel_p90.merge(pixel_p90_cg, on="point_id", how="left")
+    else:
+        pixel_p90["fi_p90_cg"] = np.nan
+
+    pixel_p90["population"] = "riparian_proxy"
+
+    v   = pixel_p90["fi_p90"].dropna()
+    vcg = pixel_p90["fi_p90_cg"].dropna()
+    log(f"  riparian_proxy  n={len(pixel_p90)}  "
+        f"fi_p90 med={v.median():.3f}  p10={v.quantile(0.10):.3f}  p90={v.quantile(0.90):.3f}  "
+        f"fi_p90_cg med={vcg.median():.3f}  p10={vcg.quantile(0.10):.3f}  p90={vcg.quantile(0.90):.3f}")
+
+    return pixel_p90
+
+
+def log_riparian_test(p90: pd.DataFrame, rip_p90: pd.DataFrame) -> None:
+    """Three-way fi_p90_cg comparison: infestation vs grassland vs riparian proxy.
+
+    'Grassland' is the extension minus the riparian proxy pixels.  This isolates
+    the pure grassland signal from the potential riparian confounder already present
+    in the 'extension' population used elsewhere.
+    """
+    log("\n--- Priority 2: fi_p90_cg riparian test ---")
+
+    rip_ids = set(rip_p90["point_id"])
+
+    # Separate extension into grassland (non-riparian) and riparian
+    ext_all  = p90[p90["population"] == "extension"].copy()
+    grass    = ext_all[~ext_all["point_id"].isin(rip_ids)]
+    inf      = p90[p90["population"] == "infestation"]
+
+    populations = [
+        ("infestation",    inf),
+        ("grassland",      grass),
+        ("riparian_proxy", rip_p90),
+    ]
+
+    log(f"\n  {'Population':<16}  {'n':>4}  {'fi_p90_cg med':>13}  "
+        f"{'IQR p25':>9}  {'IQR p75':>9}  {'min':>7}  {'max':>7}")
+    stats = {}
+    for label, sub in populations:
+        v = sub["fi_p90_cg"].dropna()
+        if len(v) == 0:
+            log(f"  {label:<16}  n=0  (no data)")
+            continue
+        p25, p75 = v.quantile(0.25), v.quantile(0.75)
+        stats[label] = {"v": v, "p25": p25, "p75": p75, "med": v.median()}
+        log(f"  {label:<16}  {len(v):>4}  {v.median():>13.3f}  "
+            f"{p25:>9.3f}  {p75:>9.3f}  {v.min():>7.3f}  {v.max():>7.3f}")
+
+    log("\n  IQR overlap matrix (fi_p90_cg):")
+    labels = [l for l, _ in populations if l in stats]
+    for i, a in enumerate(labels):
+        for b in labels[i+1:]:
+            sa, sb = stats[a], stats[b]
+            overlap = max(0, min(sa["p75"], sb["p75"]) - max(sa["p25"], sb["p25"]))
+            span    = max(sa["p75"], sb["p75"]) - min(sa["p25"], sb["p25"])
+            frac    = overlap / span if span > 0 else 1.0
+            log(f"    {a} vs {b}: "
+                f"[{sa['p25']:.3f},{sa['p75']:.3f}] vs [{sb['p25']:.3f},{sb['p75']:.3f}]  "
+                f"overlap fraction={frac:.3f}")
+
+    # Key diagnostic: does riparian score high (like re_p10 did) or low (clean separation)?
+    if "riparian_proxy" in stats and "infestation" in stats:
+        rip_med  = stats["riparian_proxy"]["med"]
+        inf_med  = stats["infestation"]["med"]
+        inf_p25  = stats["infestation"]["p25"]
+        rip_above_inf_iqr = rip_med > inf_p25
+        log(f"\n  Riparian median ({rip_med:.3f}) {'>' if rip_above_inf_iqr else '<='} "
+            f"infestation IQR p25 ({inf_p25:.3f})")
+        if rip_above_inf_iqr:
+            log("  → Riparian scores HIGH: fi_p90_cg is redundant with the known riparian confound")
+        else:
+            log("  → Riparian scores LOW: fi_p90_cg achieves separation from riparian — "
+                "candidate reserve feature")
+
+    log("---------------------------------------------------")
 
 
 def build_band_decomposition(df: pd.DataFrame, inf_anomalies: pd.DataFrame,
@@ -1080,6 +1238,9 @@ def main() -> None:
     p90   = build_pixel_p90(inf_anomalies, ext_anomalies, ct)
     decomp = build_band_decomposition(df, inf_anomalies, windows)
 
+    # Priority 2: riparian proxy test
+    rip_p90 = build_riparian_p90(df, ct)
+
     # Save tabular outputs
     windows_path = OUT_DIR / "flowering_window_by_year.csv"
     windows.to_csv(windows_path, index=False)
@@ -1088,6 +1249,11 @@ def main() -> None:
     p90_path = OUT_DIR / "fi_p90_per_pixel.csv"
     p90.to_csv(p90_path, index=False)
     log(f"Saved fi_p90 per pixel: {p90_path.relative_to(PROJECT_ROOT)}")
+
+    if rip_p90 is not None:
+        rip_path = OUT_DIR / "fi_p90_riparian_proxy.csv"
+        rip_p90.to_csv(rip_path, index=False)
+        log(f"Saved riparian proxy fi_p90: {rip_path.relative_to(PROJECT_ROOT)}")
 
     # Fetch WMS background
     log("\nFetching Queensland Globe WMS background tile...")
@@ -1107,6 +1273,9 @@ def main() -> None:
     plot_band_decomposition(decomp,   OUT_DIR / "fi_band_decomposition.png")
 
     log_success_criteria(inf_anomalies, windows, inf_spatial, decomp)
+
+    if rip_p90 is not None:
+        log_riparian_test(p90, rip_p90)
 
     log("\nDone.")
 
