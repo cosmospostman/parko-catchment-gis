@@ -16,8 +16,7 @@ env/
 htmlcov/
 
 # Data (large files — managed separately)
-data/cache/
-data/working/
+data/
 outputs/
 *.tif
 *.gpkg

@@ -43,12 +43,30 @@ visible at 20cm/px.
 
 ### S2 dataset size (2020–2025 archive)
 
+#### Current fetch (infestation patch only)
+
 - **Pixels:** 374 (11 × 34 on the 10m S2 grid, covering the 110m × 340m bbox)
 - **Observations per pixel:** 383–390 (median 387) over the full 6-year archive
 - **Seasonal cadence:** ~3 usable acquisitions/month in wet season (Dec–Feb peak cloud),
   ~6/month in dry season (Jun–Oct) — August consistently hits the 5-day S2 revisit ceiling
 - **Total rows:** ~144,800 (point × date)
-- **Source file:** `data/longreach_pixels.parquet` — one row per (pixel, date), all 10 S2 bands plus quality scores
+- **Source file:** `data/longreach_pixels.parquet` — one row per (pixel, date)
+- **Schema:** `point_id` (str), `lon`, `lat` (float64), `date` (datetime64), `item_id`, `tile_id` (str), bands `B02 B03 B04 B05 B06 B07 B08 B8A B11 B12` (float64, surface reflectance 0–1), `scl_purity`, `aot`, `view_zenith`, `sun_zenith` (float64)
+
+#### Revised survey area (to be fetched)
+
+The dry-season NIR stability analysis (`longreach/dry-season-nir.py`) showed the current
+bbox is too homogeneous to discriminate canopy-fraction variation — all 374 pixels are
+Parkinsonia-dominated, leaving no grass/bare-soil contrast population.
+
+The survey area will be extended **342 m south** (+34 pixel columns at 10.05 m/pixel
+spacing) to capture open grassland and sparse shrub south of the infestation boundary:
+
+- **Extended bbox:** lon [145.423948, 145.424956], lat [**-22.767104**, -22.761054]
+- **Additional pixels:** ~374 (11 × 34 new columns, same lon extent)
+- **Land cover (from Queensland Globe imagery):** open grassland / sparse shrub, with a
+  small riparian feature near the northern edge of the extension (~lat -22.765)
+- **Reference plot:** `outputs/longreach-dry-nir/bbox_extension.png`
 
 ### S2 signal investigation notes
 
