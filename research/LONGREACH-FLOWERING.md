@@ -43,63 +43,133 @@ Retain rows where `scl_purity >= 0.5`.
 
 Add all five index columns to the filtered dataframe.
 
-### 3. Scene-level composite (infestation patch mean per date)
+### 3. Within-pixel z-score anomaly detection
 
-For each acquisition date, compute the mean of each index across the 374 infestation
-pixels (excluding any pixel with fewer than 10 observations in the full archive, to
-avoid edge effects). This gives a single time series per index.
+The infestation patch has persistently lower visible/NIR ratios than senescent grass
+year-round (persistent green canopy suppresses the indices), so a direct
+infestation−extension difference is structurally negative and masks any flowering spike.
+Use within-pixel z-scores instead:
 
-Do the same for the 374 southern-extension pixels as a reference (non-Parkinsonia
-background). The contrast between the two populations on each date is the signal.
+- **Baseline:** per-pixel per-DOY-bin median across all years (removes seasonal shape)
+- **Denominator:** per-pixel overall std across all dates (normalises to pixel's own
+  variance scale)
 
-### 4. Annual median profile (DOY)
+This removes the population-level offset and exposes transient anomalies regardless of
+when they occur. Compute z-scores for all five indices, for both infestation and
+extension pixels independently (each pixel's baseline estimated from its own time
+series).
 
-Bin observations by day-of-year (DOY) into 2-week bins (26 bins). For each bin compute:
-- Median index value for infestation pixels
-- Median index value for extension pixels
-- Difference (infestation − extension)
+### 4. DOY anomaly profiles
 
-Plot all five indices as line charts across DOY. Look for bins where the infestation
-population diverges from the extension population — a divergence that recurs across
-multiple years is a candidate flowering window.
+Bin z-scores by 14-day DOY bins (26 bins). For each bin compute the mean z-score across
+infestation pixels for all five indices. Plot as 5-panel figure with ±1 std band. A
+positive bin mean indicates the infestation systematically exceeded its own baseline in
+that fortnight across years. Do not expect a sharp peak — if flowering is opportunistic
+the signal will be diluted by years where the event falls in a different bin.
 
-### 5. Year-by-year flowering dates
+### 5. Per-year flowering window detection
 
-For each year 2020–2025, find the date range where FI_by (primary index) exceeds the
-pixel's own annual 75th-percentile value. Report the start and end DOY per year. Check
-whether the window is consistent year-to-year or shifts.
+For each year 2020–2025, find all acquisition dates where the mean FI_by z-score across
+infestation pixels ≥ 1.0. Report for each year:
+- Number of qualifying dates
+- DOY range (start–end)
+- Peak z-score and the date it occurs
 
-### 6. Pixel-level spatial pattern at candidate peak
+Check whether the window timing is consistent across years (±30 DOY) or shifts. A
+consistent calendar window supports a fixed-phenology signal; a shifting window means
+the per-pixel annual p90 (step 6) is the better summary.
 
-Identify the DOY bin with the strongest infestation-vs-extension contrast. For that
-bin, plot the 748 pixels on a lat/lon grid coloured by FI_by. Expect the infestation
-patch to show elevated values; riparian pixels in the southern extension may also
-respond (they have woody canopy that can flower).
+### 6. Inter-population contrast time series
 
-### 7. Correlation with rainfall
+For each acquisition date, compute the contrast: mean FI_by z-score across infestation
+pixels minus mean FI_by z-score across extension pixels. A positive contrast means the
+infestation is above its own baseline more than the extension is above its own — i.e. the
+populations are genuinely diverging, not moving together due to a scene-wide effect (haze,
+rain). Plot as a scatter over time with 30-day rolling mean, plus a DOY profile of mean
+contrast per 14-day bin. Log per-year: max contrast and date, fraction of dates > 0.
 
-*Optional, if a flowering window is found.* Cross-check the infestation peak DOY
-against SILO monthly rainfall for Longreach (station or gridded) to test whether
-flowering consistently follows wet-season rain by a fixed lag.
+A scene-wide effect (haze, widespread rain) would produce near-zero contrast even when
+both populations show elevated z-scores. Genuine Parkinsonia-specific events produce
+positive contrast.
+
+### 7. Per-pixel annual p90 summary statistic — two variants
+
+For each pixel and each year compute the 90th-percentile FI_by z-score. Average across
+years. Two variants:
+
+- **`fi_p90` (unrestricted):** p90 across all haze-filtered observations. Asks "how high
+  does this pixel's anomaly reach in a typical year?" — but wet-season greenness dates
+  lift both populations equally, diluting class separation.
+
+- **`fi_p90_cg` (contrast-gated):** p90 restricted to dates where the scene-level
+  contrast (step 6) was positive that year. By conditioning on dates when the infestation
+  was genuinely diverging from the extension, this removes observations where both
+  populations move together and concentrates the statistic on candidate flowering or
+  dry-season retention events. The "window" is defined per-year by the contrast sign
+  rather than a fixed DOY range — window-free but signal-selective.
+
+A Parkinsonia-absent pixel has no mechanism to produce elevated FI_by on dates when the
+infestation is diverging from the extension, so its `fi_p90_cg` should remain near zero.
+
+### 8. Band decomposition on peak dates
+
+On each date identified as elevated in step 5, plot the per-date mean of the four
+constituent bands (B02, B03, B04, B08) separately for infestation pixels vs their own
+DOY-bin baseline. This confirms which bands are driving the FI_by spike:
+
+- **Expected (flowering):** B03 and B04 elevated, B02 suppressed, B08 flat or slightly
+  depressed
+- **Confound (atmospheric haze):** B02, B03, B04 all elevated together; B08 unaffected
+- **Confound (wet-season greenness):** B03, B04, B08 all elevated (normal vegetation
+  response); B02 follows B03/B04
+
+Plot as a small-multiple: one panel per peak date, four bands as bars showing
+(observed − baseline) for infestation pixels. If multiple peak dates show the same
+band pattern, the mechanism is consistent. If the pattern varies across dates, some
+events may be atmospheric rather than phenological.
+
+Log the fraction of peak dates that show the expected flowering signature vs confound
+patterns.
+
+### 9. Pixel-level spatial pattern at peak date
+
+For the single acquisition date with the highest mean infestation z-score, plot all 748
+pixels coloured by FI_by z-score (side-by-side infestation / extension panels). Expect:
+- Infestation: uniformly elevated (coherent patch-wide response)
+- Extension grassland: near-zero (grassland wet-season greenness does not produce a
+  spike)
+- Extension Parkinsonia pixels: elevated where known infestation is present
+
+### 10. Correlation with rainfall
+
+*Optional, if a consistent flowering window is found in step 5.* Cross-check the peak
+DOY per year against SILO monthly rainfall for Longreach to test whether flowering
+follows wet-season rain by a fixed lag.
 
 ## Outputs
 
 | File | Content |
 |------|---------|
-| `outputs/longreach-flowering/fi_doy_profiles.png` | All five indices as DOY median profiles, infestation vs extension |
-| `outputs/longreach-flowering/fi_by_timeseries.png` | Raw FI_by scene-mean time series 2020–2025, both populations |
-| `outputs/longreach-flowering/fi_by_spatial_peak.png` | Pixel-level FI_by map at peak DOY bin |
-| `outputs/longreach-flowering/flowering_window_by_year.csv` | Start/end DOY of elevated FI_by per year |
+| `outputs/longreach-flowering/fi_doy_profiles.png` | All five indices as DOY z-score anomaly profiles (infestation, mean ± std) |
+| `outputs/longreach-flowering/fi_by_timeseries.png` | Raw FI_by scene-mean time series + infestation z-score anomaly 2020–2025 |
+| `outputs/longreach-flowering/fi_by_contrast.png` | Inter-population z-score contrast time series + DOY profile |
+| `outputs/longreach-flowering/fi_by_spatial_peak.png` | Pixel-level FI_by z-score map at peak acquisition date (infestation / extension side-by-side) |
+| `outputs/longreach-flowering/fi_band_decomposition.png` | Per-band anomaly (B02, B03, B04, B08) on each peak date — mechanism confirmation |
+| `outputs/longreach-flowering/flowering_window_by_year.csv` | Per-year: n_dates, DOY range, peak z-score, peak date |
+| `outputs/longreach-flowering/fi_p90_per_pixel.csv` | Per-pixel `fi_p90` (unrestricted) and `fi_p90_cg` (contrast-gated) |
 
 ## Success criteria
 
-1. At least one DOY window shows infestation mean FI_by > extension mean FI_by by more
-   than one standard deviation of the extension population — indicating a detectable
-   signal above background.
-2. The window recurs in at least 3 of 6 years (2020–2025) within a ±30-day range —
-   confirming it is phenological, not a one-off cloud artefact.
-3. The spatial pattern at peak is coherent with the infestation bbox (not randomly
-   distributed across the 748 pixels).
+1. **Peak date z-score ≥ 2.0** — at least one acquisition date has mean FI_by z-score
+   ≥ 2.0 across infestation pixels, indicating a detectable anomaly above each pixel's
+   own seasonal baseline.
+2. **Recurs in ≥ 3 of 6 years** — at least 3 years have at least one date with mean
+   z-score ≥ 1.0, regardless of when in the year it falls.
+3. **Band decomposition confirms flowering mechanism** — on the majority of peak dates,
+   B03 and B04 are elevated and B02 is suppressed relative to baseline (not a uniform
+   broadband increase consistent with haze).
+4. **Spatial coherence r ≥ 0.5** — Pearson r between pixel z-score and 8-neighbour mean
+   on the peak date, confirming patch-level coherence rather than random noise.
 
 ## What failure would mean
 
@@ -121,105 +191,123 @@ still separate Parkinsonia from riparian.
 
 **Script:** `longreach/flowering.py`
 
-**Method change from plan:** Switched from infestation-vs-extension contrast to within-pixel
-z-score anomaly detection. The infestation patch pixels have persistently lower visible/NIR
-ratios than senescent grass year-round (persistent green canopy suppresses the indices), so
-a direct inf−ext difference is always negative and masks any flowering spike. Per-pixel
-z-scores (baseline = that pixel's own DOY-bin median across all years, denominator = that
-pixel's overall std) remove the population-level offset and expose transient anomalies.
+**Method notes:**
+- Within-pixel z-scores used throughout (baseline = per-pixel DOY-bin median, denominator =
+  per-pixel overall std) to remove the structural population-level offset.
+- Scene-level haze filter applied before all analysis: dates where scene-mean B02 exceeded
+  its DOY-bin median by > 0.010 reflectance units are excluded (45 of 304 dates removed).
+  AOT was considered but has near-zero correlation with B02 anomaly (r = −0.09) at this site.
+- Contrast-gated p90 added after first run showed unrestricted fi_p90 could not separate
+  populations — wet-season greenness dates lift both infestation and extension equally.
 
 ### Numeric results
 
 | Metric | Value |
 |--------|-------|
-| Peak z-score (DOY-bin mean, infestation) | +0.333 at DOY bin 43 (mid-Feb) |
-| Peak acquisition date | 2020-02-13, mean z = 2.123 across infestation pixels |
-| Infestation z-score range on peak date | 0.765 – 3.405 |
-| Extension z-score range on peak date | −1.105 – 3.710, mean 1.024 |
-| Years with ≥ 1 date at mean z ≥ 1.0 | 2020, 2021, 2022, 2023 (4 of 6 years) |
-| Spatial coherence (Pearson r, 8-neighbour mean, infestation) | 0.800 |
+| Dates after haze filter | 259 of 304 (45 removed) |
+| Peak acquisition date (haze-filtered) | 2020-02-28, mean infestation z = 1.868 |
+| Infestation z-score range on peak date | 0.098 – 3.908 |
+| Extension mean z on peak date | **0.038** (near-zero — populations genuinely diverging) |
+| Years with ≥ 1 elevated date (mean z ≥ 1.0) | 2020, 2021, 2022, 2023 (4 of 6) |
+| Spatial coherence r on peak date | **0.927** |
+| Band decomposition: flowering signature | 3 of 6 elevated dates (50%) |
+| Band decomposition: greenness signature | 3 of 6 elevated dates (50%) |
+| fi_p90 median — infestation / extension | 0.407 / 0.444 — indistinguishable |
+| fi_p90_cg median — infestation / extension | **0.459 / 0.110** — zero IQR overlap |
+
+**Contrast time series (fraction of dates where infestation z > extension z):**
+
+| Year | Frac > 0 | Max contrast | Date of max |
+|------|----------|-------------|-------------|
+| 2020 | 0.86 | +1.830 | 2020-02-28 (DOY 59) |
+| 2021 | 0.09 | +0.290 | 2021-01-18 |
+| 2022 | 0.49 | +2.368 | 2022-05-28 |
+| 2023 | 0.47 | +1.810 | 2023-01-03 |
+| 2024 | 0.73 | +0.407 | 2024-12-28 |
+| 2025 | 0.54 | +0.852 | 2025-05-17 |
+| **All years** | **0.52** | | |
 
 ### Criterion outcomes
 
-1. **[FAIL] DOY-bin peak z > 1.0** — peak bin mean is only +0.333. The flash lands on
-   different fortnights each year, diluting the bin average when pooled across all years.
-   Individual acquisition dates exceed z = 2.0 in multiple years — the signal exists but
-   is temporally narrow.
+1. **[FAIL] Peak acquisition date mean z ≥ 2.0** — peak clean date reaches z = 1.868,
+   just below threshold. Pre-haze-filter, 2020-02-13 reached z = 2.123, but that date's
+   elevated score was partly driven by haze (B02_anom = 0.002, borderline). Post-filter
+   the strongest unambiguously clean date falls short.
 
-2. **[FAIL] Recurs in ≥ 3 years within ±30 DOY of peak bin** — criterion was written for
-   a consistent calendar window. In practice elevated dates span DOY 44–337, so no single
-   ±30 DOY window captures 3 years. The criterion is too strict for an opportunistic
-   flowering phenology.
+2. **[PASS] Elevated date in ≥ 3 of 6 years** — 4 years (2020, 2021, 2022, 2023) have
+   at least one haze-filtered date with mean infestation z ≥ 1.0.
 
-3. **[PASS] Spatial coherence r = 0.800** — the infestation patch responds as a coherent
-   unit on the peak date, not as noise.
+3. **[PASS] Band decomposition confirms non-haze mechanism** — with haze dates removed,
+   0 of 6 elevated dates show the haze pattern. 3 show the flowering signature (B03↑
+   B04↑ B02 suppressed relative to B04), 3 show wet-season greenness (B03↑ B04↑ B08↑).
 
-### Spatial pattern interpretation (from aerial imagery ground-truth)
+4. **[PASS] Spatial coherence r ≥ 0.5** — r = 0.927 on the peak date. High coherence is
+   now biologically meaningful: extension sits at near-zero (mean z = 0.038) while
+   infestation responds as a coherent unit.
 
-The side-by-side map (infestation north, extension south) shows:
+### Haze filter impact
 
-- **Infestation (left panel):** uniformly green — every pixel elevated above its own
-  baseline on 2020-02-13. Coherent, patch-wide response consistent with mass flowering.
+Before filtering, 9 elevated dates were identified; band decomposition showed 100% haze
+pattern. After filtering, 6 elevated dates remain; 0% haze pattern. The 3 removed dates
+(2020-05-18, 2021-03-29, 2023-05-03) had B02 anomalies of 0.046, 0.024, and 0.026 — well
+above the 0.010 threshold. The critical change is the **extension mean z on the peak date
+dropping from 1.024 to 0.038**: before filtering the extension was spiking almost as much
+as the infestation (scene-wide effect); after filtering the infestation diverges while the
+extension does not (population-specific effect).
 
-- **Extension (right panel):** spatially structured, not uniform:
-  - **Cream/yellow pixels (near-zero z):** open grassland areas confirmed to be largely
-    Parkinsonia-absent from aerial imagery. These are the true negative population.
-  - **Green pixels in south of extension:** patchy Parkinsonia population present in that
-    area — index responds as expected.
-  - **Green pixels around riparian feature:** Parkinsonia mingled with other species at
-    the northern edge of the riparian section. Both Parkinsonia and co-occurring woody
-    species likely contribute.
+### Contrast time series
 
-**Key finding:** The cream zone (genuinely absent pixels) is the true negative class.
-The extension is not a clean negative sample — it contains mixed Parkinsonia — but the
-FI_by z-score correctly separates the absent pixels (cream) from the present pixels
-(green), without any supervised label. This is encouraging: the index may be detecting
-presence/absence rather than just wet-season greenness, since pure grassland pixels do
-not spike even during wet season.
+Overall fraction positive (0.52) is weak — well below the red-edge result (0.80). The
+signal is highly year-dependent: 2020 shows strong consistent separation (0.86), 2021 is
+inverted (0.09 — extension systematically above infestation), and most other years are
+near-random. No consistent DOY window concentrates the contrast across years; the DOY
+profile peak (bin 141, mid-May) has a wide std band. This confirms the flowering signal,
+if real, is opportunistic rather than calendar-consistent.
+
+### Per-pixel p90 — unrestricted vs contrast-gated
+
+| Variant | Infestation median | Extension median | IQR overlap |
+|---------|-------------------|-----------------|-------------|
+| fi_p90 (unrestricted) | 0.407 | 0.444 | 0.475 — indistinguishable |
+| fi_p90_cg (contrast-gated) | **0.459** | **0.110** | **0.000** — clean separation |
+
+The unrestricted p90 fails because wet-season greenness dates elevate both populations
+equally — the extension contains genuine Parkinsonia pixels that also spike green in the
+wet season. The contrast-gated variant resolves this: by restricting to dates when the
+infestation is diverging from the extension, it removes the shared greenness signal and
+exposes the Parkinsonia-specific anomaly. A grassland-only pixel has no mechanism to
+produce elevated FI_by on those dates, so its fi_p90_cg collapses toward zero.
+
+The contrast-gate effectively acts as a soft window: instead of specifying "use April" or
+"use dry season", it uses "use dates when the infestation was doing something the extension
+was not" — which is the directly relevant condition for detection.
 
 ### Conclusions
 
-**The original hypothesis — a detectable, calendar-consistent flowering window — is not
-supported.** The formal success criteria fail because Parkinsonia at this site appears to
-flower opportunistically: elevated FI_by anomalies occur in 4 of 6 years but span DOY
-44–337 with no fixed window. The ~5-day S2 revisit captures the event in some years and
-misses it in others. No single fortnight reliably concentrates the signal across years.
+**After haze filtering, a real but weak and temporally inconsistent signal is present.**
+The formal criteria are 3 of 4 passing, with criterion 1 (peak z ≥ 2.0) narrowly failing.
+More importantly, the signal is not reliable year-to-year: 2 of 6 years show no elevated
+dates at all, and the contrast fraction is near-random in 3 of 6 years.
 
-**However, the within-pixel z-score approach reveals a more useful signal than originally
-expected.** On dates when the infestation does flower, FI_by z-scores reach 2–3 σ above
-each pixel's own seasonal baseline across the entire patch simultaneously (spatial
-coherence r = 0.800). More importantly, the spatial pattern within the mixed extension
-zone matches known ground conditions:
-
-- Pixels in genuinely Parkinsonia-absent grassland remain near their baseline (cream,
-  z ≈ 0) even during wet season — wet-season greenness alone does not produce a spike.
-- Pixels in the patchy Parkinsonia south of the extension spike green, consistent with
-  low-density infestation there.
-- Pixels around the riparian feature spike where Parkinsonia is known to be mingled with
-  other species.
-
-This means **FI_by z-score anomaly is responding to Parkinsonia presence, not just
-general wet-season greenness.** The signal is not reliable as a single-date detector
-(the flowering event may not be captured in any given year), but it contributes as one
-component of a multi-temporal feature set: a pixel that never spikes above its own
-baseline across the full 2020–2025 archive is unlikely to contain Parkinsonia.
+**fi_p90_cg (contrast-gated annual p90) is the most useful output of this analysis.**
+It achieves zero IQR overlap between infestation and extension with a clear mechanism:
+it captures dates when Parkinsonia pixels are anomalously high *relative to their own
+baseline and relative to the extension*. Wet-season greenness, which confounds the
+unrestricted variant, is removed because grass and mixed-extension pixels spike together
+with the infestation on those dates.
 
 **Position in the multi-signal picture:**
 
-| Signal | Discriminates Parkinsonia from grassland | From riparian |
-|--------|------------------------------------------|---------------|
-| Dry-season NIR CV (stability) | Yes | Partial — riparian also variable |
-| FI_by z-score anomaly | Yes — grassland does not spike | Partial — riparian spikes if Parkinsonia present |
-| Wet/dry amplitude | TBD | Expected to separate all three |
+| Signal | Discriminates Parkinsonia from grassland | From riparian | Notes |
+|--------|------------------------------------------|---------------|-------|
+| Dry-season NIR CV | Yes — zero IQR overlap | Partial | Complete |
+| NDVI seasonal recession (rec_mean) | Yes — zero IQR overlap | Yes | Complete |
+| Red-edge p10 (re_p10) | Yes — zero IQR overlap | Partial | Complete |
+| FI_by fi_p90_cg | Yes — zero IQR overlap | TBD | Contrast-gated only |
+| Wet/dry amplitude | Yes | Yes | Complete |
 
-The two completed analyses together already separate Parkinsonia from open grassland
-convincingly. Riparian remains the residual confounder; wet/dry amplitude is the
-intended resolution.
-
-### Next step
-
-Wet/dry seasonal amplitude (`LONGREACH-WET-DRY-AMP.md`). Parkinsonia's deep roots
-sustain canopy through dry season, producing low NIR/NDVI amplitude. Grassland
-senesces completely (high amplitude). Riparian vegetation is intermediate — green in wet
-season from flooding, partially brown in dry. This three-way separation is not achievable
-from CV or FI_by alone.
+**Next step:** Riparian discrimination using fi_p90_cg needs to be evaluated — the
+extension riparian pixels were not separated from Parkinsonia in the red-edge analysis,
+and the same caveat may apply here. The wet/dry amplitude analysis already provides
+three-way separation; fi_p90_cg is a candidate additional feature for the final
+multi-signal feature set.

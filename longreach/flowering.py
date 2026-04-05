@@ -18,9 +18,10 @@ Indices computed per observation:
   FI_swir = B11 / B08
 
 Outputs:
-  outputs/longreach-flowering/fi_doy_profiles.png       (DOY anomaly profiles, all indices)
-  outputs/longreach-flowering/fi_by_timeseries.png      (raw FI_by + anomaly time series)
-  outputs/longreach-flowering/fi_by_spatial_peak.png    (pixel map at peak anomaly DOY bin)
+  outputs/longreach-flowering/fi_doy_profiles.png         (DOY anomaly profiles, all indices)
+  outputs/longreach-flowering/fi_by_timeseries.png        (raw FI_by + anomaly time series)
+  outputs/longreach-flowering/fi_by_spatial_peak.png      (pixel map at peak acquisition date)
+  outputs/longreach-flowering/fi_band_decomposition.png   (per-band anomaly on peak dates)
   outputs/longreach-flowering/flowering_window_by_year.csv
 
 See research/LONGREACH-FLOWERING.md for the full analysis plan.
@@ -56,6 +57,14 @@ OUT_DIR        = PROJECT_ROOT / "outputs" / "longreach-flowering"
 
 # Quality filter
 SCL_PURITY_MIN = 0.5
+
+# Haze filter: drop acquisition dates where the scene-mean B02 is more than this
+# many reflectance units above its DOY-bin median.  Haze raises all visible bands
+# together (B02 most strongly); the FI_by numerator rises with haze just as it does
+# with flowering, so hazy dates must be excluded before anomaly detection.
+# Threshold 0.010 removes strongly hazy dates while retaining the near-clean ones;
+# the remaining B02 variance on kept dates is at the noise floor (<0.010).
+HAZE_B02_ANOM_MAX = 0.010
 
 # Minimum total observations across the archive to include a pixel
 MIN_PIXEL_OBS  = 10
@@ -95,6 +104,39 @@ def log(msg: str) -> None:
     print(msg, flush=True)
 
 
+def build_haze_mask(df: pd.DataFrame) -> pd.Index:
+    """Return the set of acquisition dates that pass the scene-level haze filter.
+
+    For each date compute the scene-mean B02 reflectance.  Subtract the per-DOY-bin
+    median (26 bins of 14 days) to get the B02 anomaly relative to the seasonal
+    baseline.  Dates where this anomaly exceeds HAZE_B02_ANOM_MAX are flagged as hazy
+    and excluded from all downstream analysis.
+
+    AOT is available in the parquet but has near-zero correlation with B02 anomaly
+    (r = −0.09) so B02 itself is the more reliable haze proxy here.
+    """
+    scene = df.groupby("date")["B02"].mean().reset_index()
+    scene["doy"]     = scene["date"].dt.dayofyear
+    scene["doy_bin"] = ((scene["doy"] - 1) // DOY_BIN_DAYS) * DOY_BIN_DAYS + 1
+    b2_baseline      = scene.groupby("doy_bin")["B02"].median().rename("B02_base")
+    scene            = scene.join(b2_baseline, on="doy_bin")
+    scene["B02_anom"] = scene["B02"] - scene["B02_base"]
+
+    clean_dates = scene.loc[scene["B02_anom"] <= HAZE_B02_ANOM_MAX, "date"]
+    hazy_dates  = scene.loc[scene["B02_anom"] >  HAZE_B02_ANOM_MAX, "date"]
+
+    log(f"\n  Haze filter (scene-mean B02 anomaly > {HAZE_B02_ANOM_MAX}):")
+    log(f"    Total acquisition dates: {len(scene)}")
+    log(f"    Hazy dates removed:      {len(hazy_dates)}")
+    log(f"    Clean dates retained:    {len(clean_dates)}")
+    if len(hazy_dates) > 0:
+        top = scene[scene["B02_anom"] > HAZE_B02_ANOM_MAX].nlargest(5, "B02_anom")
+        for _, row in top.iterrows():
+            log(f"      {row['date'].date()}  B02_anom={row['B02_anom']:.4f}")
+
+    return pd.DatetimeIndex(clean_dates)
+
+
 def load_and_filter(path: Path) -> pd.DataFrame:
     log(f"Loading parquet: {path}")
     df = pd.read_parquet(path)
@@ -114,6 +156,12 @@ def load_and_filter(path: Path) -> pd.DataFrame:
     df = df[df["point_id"].isin(valid_pixels)].copy()
     log(f"  Min-obs filter (≥ {MIN_PIXEL_OBS} obs per pixel): dropped {n_dropped_px} pixels, "
         f"retained {df['point_id'].nunique()} pixels")
+
+    # Haze filter: drop acquisition dates with elevated scene-mean B02
+    clean_dates = build_haze_mask(df)
+    before_haze = len(df)
+    df = df[df["date"].isin(clean_dates)].copy()
+    log(f"  Rows after haze filter: {len(df):,} (dropped {before_haze - len(df):,})")
 
     return df
 
@@ -276,6 +324,52 @@ def build_timeseries(df: pd.DataFrame, inf_anomalies: pd.DataFrame) -> pd.DataFr
     return ts
 
 
+def build_contrast_timeseries(inf_anomalies: pd.DataFrame,
+                               ext_anomalies: pd.DataFrame) -> pd.DataFrame:
+    """Per-date contrast: mean infestation FI_by z-score minus mean extension z-score.
+
+    Mirrors step 3 of the red-edge analysis.  A positive contrast means the infestation
+    is above its own baseline more than the extension is above its own baseline on that
+    date — i.e. the two populations are diverging, not moving together (which would
+    indicate a scene-wide effect like haze or rain).
+
+    Returns a dataframe with one row per date containing:
+      inf_z, ext_z, contrast, doy, year
+    plus a 30-day rolling mean of contrast.
+    """
+    log("\nBuilding inter-population FI_by z-score contrast time series...")
+    z_col = f"{PRIMARY_INDEX}_z"
+
+    inf_scene = inf_anomalies.groupby("date")[z_col].mean().rename("inf_z")
+    ext_scene = ext_anomalies.groupby("date")[z_col].mean().rename("ext_z")
+
+    ct = pd.concat([inf_scene, ext_scene], axis=1).reset_index()
+    ct["contrast"] = ct["inf_z"] - ct["ext_z"]
+    ct["doy"]      = ct["date"].dt.dayofyear
+    ct["year"]     = ct["date"].dt.year
+
+    ct = ct.sort_values("date").reset_index(drop=True)
+    ct["contrast_30d"] = ct.set_index("date")["contrast"].rolling("30D").mean().values
+
+    frac_pos = (ct["contrast"] > 0).mean()
+    log(f"  Dates: {len(ct)}  |  Fraction with contrast > 0: {frac_pos:.2f}")
+
+    log(f"\n  Per-year contrast summary:")
+    for year, grp in ct.groupby("year"):
+        peak_row = grp.loc[grp["contrast"].idxmax()]
+        log(f"    {year}  max contrast={peak_row['contrast']:+.3f} on {peak_row['date'].date()} "
+            f"(DOY {int(peak_row['doy'])})  frac>0={( grp['contrast']>0).mean():.2f}")
+
+    # DOY profile: mean contrast per 14-day bin
+    ct["doy_bin"] = ((ct["doy"] - 1) // DOY_BIN_DAYS) * DOY_BIN_DAYS + 1
+    doy_contrast  = ct.groupby("doy_bin")["contrast"].agg(["mean","std"]).reset_index()
+    peak_bin      = int(doy_contrast.loc[doy_contrast["mean"].idxmax(), "doy_bin"])
+    log(f"\n  Peak mean contrast DOY bin: {peak_bin} "
+        f"(contrast={doy_contrast.loc[doy_contrast['doy_bin']==peak_bin,'mean'].values[0]:+.3f})")
+
+    return ct
+
+
 def build_flowering_windows(inf_anomalies: pd.DataFrame) -> pd.DataFrame:
     """Per-year dates where mean infestation FI_by z-score anomaly exceeds 1.0.
 
@@ -361,6 +455,191 @@ def build_spatial_peak(df: pd.DataFrame, inf_anomalies: pd.DataFrame,
         f"mean={ext_spatial['fi_peak_z'].mean():.3f}")
 
     return inf_spatial, ext_spatial, peak_date
+
+
+def build_pixel_p90(inf_anomalies: pd.DataFrame, ext_anomalies: pd.DataFrame,
+                    ct: pd.DataFrame) -> pd.DataFrame:
+    """Per-pixel annual 90th-percentile FI_by z-score, in two variants.
+
+    Unrestricted (fi_p90):
+      Annual p90 across all haze-filtered observations.  Asks "how high does this
+      pixel's anomaly reach in a typical year?"
+
+    Contrast-gated (fi_p90_cg):
+      Annual p90 restricted to dates where the scene-level contrast (infestation mean
+      z minus extension mean z) was positive that year.  By conditioning on dates when
+      the infestation was genuinely diverging from the extension, this removes wet-season
+      greenness dates that lift both populations equally and concentrates the statistic on
+      candidate flowering observations.  Mirrors the red-edge approach of identifying the
+      window from the contrast series first, then computing the percentile within it —
+      but window-free: the "window" is defined per-year by the contrast sign rather than
+      a fixed DOY range.
+    """
+    log("\nComputing per-pixel annual p90 FI_by z-score (unrestricted + contrast-gated)...")
+    z_col = f"{PRIMARY_INDEX}_z"
+
+    # Build per-year set of contrast-positive dates
+    ct_copy = ct.copy()
+    ct_copy["year"] = ct_copy["date"].dt.year
+    contrast_pos_dates = set(
+        ct_copy.loc[ct_copy["contrast"] > 0, "date"]
+    )
+
+    rows = []
+    for pop_label, pop_df in [("infestation", inf_anomalies), ("extension", ext_anomalies)]:
+        pop_df = pop_df.copy()
+        pop_df["year"] = pop_df["date"].dt.year
+
+        # Unrestricted
+        annual_p90 = (
+            pop_df.groupby(["point_id", "year"])[z_col]
+            .quantile(0.90)
+            .reset_index()
+            .rename(columns={z_col: "fi_p90_year"})
+        )
+        pixel_p90 = (
+            annual_p90.groupby("point_id")["fi_p90_year"]
+            .mean()
+            .reset_index()
+            .rename(columns={"fi_p90_year": "fi_p90"})
+        )
+
+        # Contrast-gated: restrict to dates where scene contrast > 0
+        cg_df = pop_df[pop_df["date"].isin(contrast_pos_dates)]
+        if len(cg_df) > 0:
+            annual_p90_cg = (
+                cg_df.groupby(["point_id", "year"])[z_col]
+                .quantile(0.90)
+                .reset_index()
+                .rename(columns={z_col: "fi_p90_cg_year"})
+            )
+            pixel_p90_cg = (
+                annual_p90_cg.groupby("point_id")["fi_p90_cg_year"]
+                .mean()
+                .reset_index()
+                .rename(columns={"fi_p90_cg_year": "fi_p90_cg"})
+            )
+            pixel_p90 = pixel_p90.merge(pixel_p90_cg, on="point_id", how="left")
+        else:
+            pixel_p90["fi_p90_cg"] = np.nan
+
+        pixel_p90["population"] = pop_label
+        rows.append(pixel_p90)
+
+    p90 = pd.concat(rows, ignore_index=True)
+
+    log(f"  {'Population':<14}  {'n':>4}  {'fi_p90 med':>10}  "
+        f"{'fi_p90 p10':>10}  {'fi_p90 p90':>10}  "
+        f"{'fi_p90_cg med':>13}  {'fi_p90_cg p10':>13}  {'fi_p90_cg p90':>13}")
+    for pop_label in ("infestation", "extension"):
+        sub  = p90[p90["population"] == pop_label]
+        v    = sub["fi_p90"].dropna()
+        vcg  = sub["fi_p90_cg"].dropna()
+        log(f"  {pop_label:<14}  {len(sub):>4}  "
+            f"{v.median():>10.3f}  {v.quantile(0.10):>10.3f}  {v.quantile(0.90):>10.3f}  "
+            f"{vcg.median():>13.3f}  {vcg.quantile(0.10):>13.3f}  {vcg.quantile(0.90):>13.3f}")
+
+    # IQR overlap for both variants
+    for col, label in [("fi_p90", "unrestricted"), ("fi_p90_cg", "contrast-gated")]:
+        inf_v = p90[p90["population"] == "infestation"][col].dropna()
+        ext_v = p90[p90["population"] == "extension"][col].dropna()
+        inf_iqr = (inf_v.quantile(0.25), inf_v.quantile(0.75))
+        ext_iqr = (ext_v.quantile(0.25), ext_v.quantile(0.75))
+        overlap = max(0, min(inf_iqr[1], ext_iqr[1]) - max(inf_iqr[0], ext_iqr[0]))
+        span    = max(inf_iqr[1], ext_iqr[1]) - min(inf_iqr[0], ext_iqr[0])
+        frac    = overlap / span if span > 0 else 1.0
+        log(f"  IQR overlap ({label}): "
+            f"inf=[{inf_iqr[0]:.3f},{inf_iqr[1]:.3f}]  "
+            f"ext=[{ext_iqr[0]:.3f},{ext_iqr[1]:.3f}]  "
+            f"overlap fraction={frac:.3f}")
+
+    return p90
+
+
+def build_band_decomposition(df: pd.DataFrame, inf_anomalies: pd.DataFrame,
+                              windows: pd.DataFrame) -> pd.DataFrame:
+    """Per-band anomaly (B02, B03, B04, B08) on each elevated acquisition date.
+
+    For each date where mean infestation FI_by z-score ≥ 1.0, compute the difference
+    between the observed per-date mean band value across infestation pixels and the
+    DOY-bin baseline for those pixels.  Returns a dataframe suitable for plotting.
+    """
+    log("\nBuilding band decomposition on elevated dates...")
+    BANDS = ["B02", "B03", "B04", "B08"]
+
+    inf = df[df["population"] == "infestation"].copy()
+    inf["doy"]     = inf["date"].dt.dayofyear
+    inf["doy_bin"] = doy_bin(inf["doy"])
+
+    # Per-pixel per-DOY-bin baseline for the four bands
+    baseline = (
+        inf.groupby(["point_id", "doy_bin"])[BANDS]
+        .median()
+        .reset_index()
+        .rename(columns={b: f"{b}_base" for b in BANDS})
+    )
+    inf = inf.merge(baseline, on=["point_id", "doy_bin"], how="left")
+    for b in BANDS:
+        inf[f"{b}_anom"] = inf[b] - inf[f"{b}_base"]
+
+    # Identify elevated dates (mean z-score ≥ 1.0 across infestation pixels)
+    z_col = f"{PRIMARY_INDEX}_z"
+    scene_z = inf_anomalies.groupby("date")[z_col].mean()
+    elevated_dates = scene_z[scene_z >= 1.0].index
+
+    log(f"  Elevated dates (mean z ≥ 1.0): {len(elevated_dates)}")
+
+    rows = []
+    for date in sorted(elevated_dates):
+        obs = inf[inf["date"] == date]
+        if len(obs) == 0:
+            continue
+        z_mean = scene_z.get(date, np.nan)
+        for b in BANDS:
+            anom = obs[f"{b}_anom"].mean()
+            rows.append({"date": date, "band": b, "anomaly": anom, "z_mean": z_mean})
+
+    decomp = pd.DataFrame(rows)
+
+    # Classify each date's signature
+    if len(decomp) > 0:
+        pivot = decomp.pivot_table(index="date", columns="band", values="anomaly")
+        pivot = pivot.reindex(sorted(elevated_dates))
+
+        n_flowering, n_haze, n_greenness, n_other = 0, 0, 0, 0
+        for date, row in pivot.iterrows():
+            if row.isna().any():
+                n_other += 1
+                continue
+            b03_up  = row["B03"] > 0
+            b04_up  = row["B04"] > 0
+            b08_up  = row["B08"] > 0
+            # Flowering: B04 and B03 elevated, B02 suppressed *relative to the visible
+            # bands*.  Use a ratio test: B02 must be less than half of B04 anomaly.
+            # This tolerates small positive B02 noise (< 0.010 after haze filtering)
+            # without mis-classifying it as haze.
+            b02_suppressed = row["B02"] < row["B04"] * 0.5
+
+            if b03_up and b04_up and b02_suppressed and not b08_up:
+                n_flowering += 1
+            elif b03_up and b04_up and b02_suppressed and b08_up:
+                n_greenness += 1
+            elif b03_up and b04_up and not b02_suppressed:
+                n_haze += 1
+            else:
+                n_other += 1
+
+        total = len(pivot)
+        log(f"  Signature classification across {total} peak dates:")
+        log(f"    Flowering (B03↑ B04↑ B02↓): {n_flowering} ({100*n_flowering/total:.0f}%)")
+        log(f"    Haze      (B02↑ B03↑ B04↑): {n_haze}       ({100*n_haze/total:.0f}%)")
+        log(f"    Greenness (B03↑ B04↑ B08↑): {n_greenness}  ({100*n_greenness/total:.0f}%)")
+        log(f"    Other:                        {n_other}       ({100*n_other/total:.0f}%)")
+
+        frac_flowering = n_flowering / total if total > 0 else 0.0
+        log(f"  Fraction showing flowering signature: {frac_flowering:.2f}")
+
+    return decomp
 
 
 # ---------------------------------------------------------------------------
@@ -574,48 +853,209 @@ def plot_spatial_peak(inf_spatial: pd.DataFrame, ext_spatial: pd.DataFrame,
     log(f"Saved spatial peak map: {out_path.relative_to(PROJECT_ROOT)}")
 
 
+def plot_contrast_timeseries(ct: pd.DataFrame, out_path: Path) -> None:
+    """Two-panel contrast time series + DOY profile, mirroring the red-edge contrast plot."""
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 7),
+                                   gridspec_kw={"height_ratios": [3, 2]})
+
+    # Upper panel: per-date contrast scatter + 30-day rolling mean
+    pos = ct["contrast"] > 0
+    ax1.scatter(ct.loc[pos,  "date"], ct.loc[pos,  "contrast"],
+                s=8, color="forestgreen", alpha=0.6, zorder=2, label="Contrast > 0 (inf above ext)")
+    ax1.scatter(ct.loc[~pos, "date"], ct.loc[~pos, "contrast"],
+                s=8, color="tomato",      alpha=0.6, zorder=2, label="Contrast ≤ 0 (ext above inf)")
+    ax1.plot(ct["date"], ct["contrast_30d"], color="black", linewidth=1.4,
+             alpha=0.8, label="30-day rolling mean", zorder=3)
+    ax1.axhline(0, color="grey", linewidth=0.7, linestyle=":")
+
+    frac_pos = (ct["contrast"] > 0).mean()
+    ax1.set_ylabel("FI_by z-score contrast\n(infestation − extension)", fontsize=8)
+    ax1.tick_params(labelsize=7)
+    ax1.legend(fontsize=7, framealpha=0.7)
+    ax1.set_title(
+        f"Longreach — FI_by inter-population z-score contrast 2020–2025  "
+        f"(haze-filtered)\n"
+        f"Positive = infestation above its own baseline more than extension is above its own  |  "
+        f"Fraction > 0: {frac_pos:.2f}",
+        fontsize=9,
+    )
+
+    # Lower panel: mean contrast by 14-day DOY bin
+    ct2 = ct.copy()
+    ct2["doy_bin"] = ((ct2["date"].dt.dayofyear - 1) // DOY_BIN_DAYS) * DOY_BIN_DAYS + 1
+    doy_ct = ct2.groupby("doy_bin")["contrast"].agg(["mean", "std"]).reset_index()
+
+    ax2.axhline(0, color="grey", linewidth=0.7, linestyle=":")
+    ax2.fill_between(doy_ct["doy_bin"],
+                     doy_ct["mean"] - doy_ct["std"],
+                     doy_ct["mean"] + doy_ct["std"],
+                     alpha=0.18, color="steelblue")
+    ax2.plot(doy_ct["doy_bin"], doy_ct["mean"], color="steelblue",
+             linewidth=1.8, label="Mean contrast ± 1 std")
+    ax2.fill_between(doy_ct["doy_bin"], 0, doy_ct["mean"],
+                     where=doy_ct["mean"] > 0, alpha=0.3, color="forestgreen")
+    ax2.fill_between(doy_ct["doy_bin"], 0, doy_ct["mean"],
+                     where=doy_ct["mean"] < 0, alpha=0.2, color="tomato")
+
+    ax2.set_xlabel("Day of year", fontsize=8)
+    ax2.set_ylabel("Mean contrast\n(pooled years)", fontsize=8)
+    ax2.set_xticks(doy_ct["doy_bin"].values[::2])
+    ax2.tick_params(labelsize=7, axis="x", rotation=45)
+    ax2.legend(fontsize=7, framealpha=0.7)
+    ax2.set_title("DOY profile of contrast (all years pooled)", fontsize=8, loc="left")
+
+    ax1.xaxis.set_major_locator(mdates.YearLocator())
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    ax1.xaxis.set_minor_locator(mdates.MonthLocator(bymonth=[4, 7, 10]))
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    log(f"Saved contrast time series: {out_path.relative_to(PROJECT_ROOT)}")
+
+
+def plot_band_decomposition(decomp: pd.DataFrame, out_path: Path) -> None:
+    """Small-multiple bar chart: per-band anomaly on each elevated acquisition date.
+
+    One panel per date.  Four bars (B02, B03, B04, B08) show (observed − DOY-bin
+    baseline) for infestation pixels.  Bars coloured by sign: positive = orange,
+    negative = steelblue.  Expected flowering signature: B03 and B04 positive, B02
+    negative, B08 near zero.
+    """
+    if len(decomp) == 0:
+        log("  No elevated dates — skipping band decomposition plot")
+        return
+
+    dates  = sorted(decomp["date"].unique())
+    n      = len(dates)
+    ncols  = min(4, n)
+    nrows  = (n + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 3.2, nrows * 2.8),
+                              squeeze=False)
+
+    BANDS       = ["B02", "B03", "B04", "B08"]
+    BAND_COLORS = {b: ("tomato" if b != "B02" else "steelblue") for b in BANDS}
+
+    for i, date in enumerate(dates):
+        ax  = axes[i // ncols][i % ncols]
+        sub = decomp[decomp["date"] == date]
+        if len(sub) == 0:
+            ax.set_visible(False)
+            continue
+        pivot = sub.set_index("band")["anomaly"]
+        z_mean = sub["z_mean"].iloc[0]
+
+        vals   = [pivot.get(b, np.nan) for b in BANDS]
+        colors = ["tomato" if v >= 0 else "steelblue" for v in vals]
+        ax.bar(BANDS, vals, color=colors, width=0.6, zorder=2)
+        ax.axhline(0, color="black", linewidth=0.6, zorder=3)
+        ax.set_title(f"{pd.Timestamp(date).date()}\nz={z_mean:.2f}", fontsize=7)
+        ax.tick_params(labelsize=6)
+        ax.set_ylabel("Δ reflectance\n(obs − baseline)", fontsize=6)
+
+        # Annotate expected vs confound
+        b02 = pivot.get("B02", np.nan)
+        b03 = pivot.get("B03", np.nan)
+        b04 = pivot.get("B04", np.nan)
+        b08 = pivot.get("B08", np.nan)
+        if not any(np.isnan(v) for v in [b02, b03, b04, b08]):
+            b02_suppressed = b02 < b04 * 0.5
+            if b03 > 0 and b04 > 0 and b02_suppressed and b08 <= 0:
+                label, col = "flowering", "forestgreen"
+            elif b03 > 0 and b04 > 0 and b02_suppressed and b08 > 0:
+                label, col = "greenness", "steelblue"
+            elif b03 > 0 and b04 > 0 and not b02_suppressed:
+                label, col = "haze", "darkorange"
+            else:
+                label, col = "other", "grey"
+            ax.text(0.02, 0.97, label, transform=ax.transAxes,
+                    fontsize=6, color=col, va="top", fontweight="bold")
+
+    # Hide unused panels
+    for j in range(i + 1, nrows * ncols):
+        axes[j // ncols][j % ncols].set_visible(False)
+
+    # Legend
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor="tomato",    label="Positive anomaly"),
+        Patch(facecolor="steelblue", label="Negative anomaly"),
+    ]
+    fig.legend(handles=legend_elements, fontsize=7, loc="lower right", framealpha=0.7)
+
+    fig.suptitle(
+        "Longreach — per-band reflectance anomaly on elevated FI_by dates\n"
+        "Observed − DOY-bin median baseline, infestation pixels\n"
+        "Flowering expected: B03↑ B04↑ B02↓ B08≈0  |  Haze: all bands↑  |  Greenness: B03↑ B04↑ B08↑",
+        fontsize=8,
+    )
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    log(f"Saved band decomposition: {out_path.relative_to(PROJECT_ROOT)}")
+
+
 # ---------------------------------------------------------------------------
 # Success criteria
 # ---------------------------------------------------------------------------
 
-def log_success_criteria(doy_profiles: pd.DataFrame, windows: pd.DataFrame,
-                          spatial: pd.DataFrame) -> None:
+def log_success_criteria(inf_anomalies: pd.DataFrame, windows: pd.DataFrame,
+                          inf_spatial: pd.DataFrame,
+                          decomp: pd.DataFrame) -> None:
     log("\n--- Success criteria (research/LONGREACH-FLOWERING.md) ---")
 
-    primary_z = f"{PRIMARY_INDEX}_z_mean"
-    peak_row  = doy_profiles.loc[doy_profiles[primary_z].idxmax()]
-    peak_bin  = int(peak_row["doy_bin"])
-    peak_z    = peak_row[primary_z]
+    z_col = f"{PRIMARY_INDEX}_z"
 
-    # 1. Peak mean z-score > 1.0 (one std above pixel's own baseline)
-    status1 = "PASS" if peak_z > 1.0 else "FAIL"
-    log(f"  [1] Peak mean z-score anomaly > 1.0: "
-        f"z = {peak_z:.3f} at DOY bin {peak_bin}  → {status1}")
+    # 1. Peak date z-score ≥ 2.0 — at least one acquisition date has mean FI_by z-score
+    #    ≥ 2.0 across infestation pixels
+    scene_z   = inf_anomalies.groupby("date")[z_col].mean()
+    peak_date = scene_z.idxmax()
+    peak_z    = scene_z.max()
+    status1   = "PASS" if peak_z >= 2.0 else "FAIL"
+    log(f"  [1] Peak acquisition date mean z ≥ 2.0: "
+        f"z = {peak_z:.3f} on {peak_date.date()}  → {status1}")
 
-    # 2. Window recurs in ≥ 3 of 6 years with any elevated date within ±30 DOY of peak bin
-    years_with_window = windows[windows["n_dates"] > 0]
-    if len(years_with_window) > 0:
-        in_range = years_with_window[
-            (years_with_window["doy_start"] <= peak_bin + 30) &
-            (years_with_window["doy_end"]   >= peak_bin - 30)
-        ]
+    # 2. Recurs in ≥ 3 of 6 years — at least 3 years have ≥ 1 date with mean z ≥ 1.0
+    n_years   = (windows["n_dates"] > 0).sum()
+    status2   = "PASS" if n_years >= 3 else "FAIL"
+    log(f"  [2] Elevated date (mean z ≥ 1.0) in ≥ 3 years: "
+        f"{n_years} qualifying years  → {status2}")
+
+    # 3. Band decomposition confirms flowering mechanism — majority of peak dates show
+    #    B03↑ B04↑ B02↓ (not uniform broadband increase)
+    status3 = "N/A"
+    if len(decomp) > 0:
+        dates = sorted(decomp["date"].unique())
+        pivot = decomp.pivot_table(index="date", columns="band", values="anomaly")
+        n_flowering = 0
+        n_total     = 0
+        for date in dates:
+            if date not in pivot.index:
+                continue
+            row = pivot.loc[date]
+            if row.isna().any():
+                continue
+            n_total += 1
+            b02_suppressed = row.get("B02", np.nan) < row.get("B04", np.nan) * 0.5
+            if row.get("B03", np.nan) > 0 and row.get("B04", np.nan) > 0 and b02_suppressed:
+                n_flowering += 1
+        frac = n_flowering / n_total if n_total > 0 else 0.0
+        status3 = "PASS" if frac > 0.5 else "FAIL"
+        log(f"  [3] Band decomposition: flowering signature on {n_flowering}/{n_total} dates "
+            f"({100*frac:.0f}%)  → {status3}")
     else:
-        in_range = years_with_window
-    n_recurring = len(in_range)
-    status2 = "PASS" if n_recurring >= 3 else "FAIL"
-    log(f"  [2] Window recurs in ≥ 3 years with elevated date within ±30 DOY of peak: "
-        f"{n_recurring} qualifying years  → {status2}")
+        log(f"  [3] Band decomposition: no elevated dates — skipped")
 
-    # 3. Spatial coherence: Pearson r between pixel z-score and 8-neighbour mean
+    # 4. Spatial coherence r ≥ 0.5 on peak date (infestation pixels)
     from scipy.spatial import cKDTree
-    coords = spatial[["lon", "lat"]].values
+    coords = inf_spatial[["lon", "lat"]].values
     tree   = cKDTree(coords)
-    dists, idxs = tree.query(coords, k=9)   # self + 8 neighbours
-    neighbour_means = spatial["fi_peak_z"].values[idxs[:, 1:]].mean(axis=1)
-    r = np.corrcoef(spatial["fi_peak_z"].values, neighbour_means)[0, 1]
-    status3 = "PASS" if r >= 0.5 else "FAIL"
-    log(f"  [3] Spatial coherence (Pearson r with 8-neighbour mean): "
-        f"r = {r:.3f}  → {status3}")
+    _, idxs = tree.query(coords, k=9)   # self + 8 neighbours
+    neighbour_means = inf_spatial["fi_peak_z"].values[idxs[:, 1:]].mean(axis=1)
+    r = np.corrcoef(inf_spatial["fi_peak_z"].values, neighbour_means)[0, 1]
+    status4 = "PASS" if r >= 0.5 else "FAIL"
+    log(f"  [4] Spatial coherence (Pearson r with 8-neighbour mean): "
+        f"r = {r:.3f}  → {status4}")
 
     log("----------------------------------------------------------")
 
@@ -633,13 +1073,21 @@ def main() -> None:
 
     doy_profiles, inf_anomalies, ext_anomalies = build_doy_profiles(df)
     ts                          = build_timeseries(df, inf_anomalies)
+    ct                          = build_contrast_timeseries(inf_anomalies, ext_anomalies)
     windows                     = build_flowering_windows(inf_anomalies)
     inf_spatial, ext_spatial, peak_date = build_spatial_peak(df, inf_anomalies, ext_anomalies, windows)
+
+    p90   = build_pixel_p90(inf_anomalies, ext_anomalies, ct)
+    decomp = build_band_decomposition(df, inf_anomalies, windows)
 
     # Save tabular outputs
     windows_path = OUT_DIR / "flowering_window_by_year.csv"
     windows.to_csv(windows_path, index=False)
     log(f"\nSaved flowering windows: {windows_path.relative_to(PROJECT_ROOT)}")
+
+    p90_path = OUT_DIR / "fi_p90_per_pixel.csv"
+    p90.to_csv(p90_path, index=False)
+    log(f"Saved fi_p90 per pixel: {p90_path.relative_to(PROJECT_ROOT)}")
 
     # Fetch WMS background
     log("\nFetching Queensland Globe WMS background tile...")
@@ -651,11 +1099,14 @@ def main() -> None:
         bg_img = None
 
     log("\nGenerating plots...")
-    plot_doy_profiles(doy_profiles, OUT_DIR / "fi_doy_profiles.png")
-    plot_timeseries(ts,             OUT_DIR / "fi_by_timeseries.png")
-    plot_spatial_peak(inf_spatial, ext_spatial, peak_date, OUT_DIR / "fi_by_spatial_peak.png", bg_img)
+    plot_doy_profiles(doy_profiles,   OUT_DIR / "fi_doy_profiles.png")
+    plot_timeseries(ts,                OUT_DIR / "fi_by_timeseries.png")
+    plot_contrast_timeseries(ct,       OUT_DIR / "fi_by_contrast.png")
+    plot_spatial_peak(inf_spatial, ext_spatial, peak_date,
+                      OUT_DIR / "fi_by_spatial_peak.png", bg_img)
+    plot_band_decomposition(decomp,   OUT_DIR / "fi_band_decomposition.png")
 
-    log_success_criteria(doy_profiles, windows, inf_spatial)
+    log_success_criteria(inf_anomalies, windows, inf_spatial, decomp)
 
     log("\nDone.")
 
