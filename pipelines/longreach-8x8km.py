@@ -1,13 +1,15 @@
-"""pipelines/longreach-12x14km.py — Longreach 12×14 km full-scene analysis pipeline.
+"""pipelines/longreach-8x8km.py — Longreach 8×8 km subscene analysis pipeline.
 
 Trains the Parkinsonia classifier on the original Longreach training labels
 (presence/absence sub-bboxes from longreach.yaml), then applies it to all
-pixels in the extended 12×14 km scene (longreach-12x14km.yaml).
+pixels in the 8×8 km subscene (longreach-8x8km.yaml).
+
+Signal params are loaded from longreach-8x8km.yaml (tuned for Longreach).
 
 Usage
 -----
-    python -m pipelines."longreach-12x14km"
-    python -m pipelines."longreach-12x14km" --no-plots
+    python -m pipelines."longreach-8x8km"
+    python -m pipelines."longreach-8x8km" --no-plots
 """
 
 from __future__ import annotations
@@ -23,11 +25,11 @@ from signals import extract_parko_features
 from analysis.classifier import ParkoClassifier
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-OUT_DIR = PROJECT_ROOT / "outputs" / "longreach-12x14km"
+OUT_DIR = PROJECT_ROOT / "outputs" / "longreach-8x8"
 FEATURES = ["nir_cv", "rec_p", "re_p10"]
 
-TRAIN_LOC_ID = "longreach"          # source of sub-bbox training labels
-SCENE_LOC_ID = "longreach-12x14km"  # full scene to score
+TRAIN_LOC_ID = "longreach"        # source of sub-bbox training labels
+SCENE_LOC_ID = "longreach-8x8km"  # full scene to score
 
 
 def label_pixels(features_df: pd.DataFrame, train_loc) -> pd.DataFrame:
@@ -102,23 +104,23 @@ def run(plots: bool = True) -> None:
     print(clf.summary())
 
     # ------------------------------------------------------------------
-    # Score the full 12×14 km scene
+    # Score the 8×8 km scene (tuned params auto-loaded from YAML)
     # ------------------------------------------------------------------
-    print(f"\nLoading full scene pixels from {scene_loc.parquet_path()} ...")
+    print(f"\nLoading scene pixels from {scene_loc.parquet_path()} ...")
     scene_raw = pd.read_parquet(scene_loc.parquet_path())
 
-    print("Extracting features (full scene)...")
+    print("Extracting features (scene, tuned params)...")
     scene_features = extract_parko_features(scene_raw, scene_loc)
 
     # Carry over training labels where pixels overlap the sub-bboxes
     scene_labelled = label_pixels(scene_features, train_loc)
 
-    print("Scoring full scene...")
+    print("Scoring scene...")
     scored = clf.score(scene_labelled)
 
     summarise(scored, scene_loc)
 
-    ranked_path = out_dir / "longreach_12x14km_pixel_ranking.csv"
+    ranked_path = out_dir / "longreach_8x8km_pixel_ranking.csv"
     cols = ["point_id", "lon", "lat", "is_presence", "prob_lr", "rank"] + FEATURES
     scored[[c for c in cols if c in scored.columns]].sort_values("rank").to_csv(
         ranked_path, index=False, float_format="%.4f"
@@ -126,7 +128,7 @@ def run(plots: bool = True) -> None:
     print(f"Saved: {ranked_path}")
 
     if plots:
-        plot_prob_heatmaps(scored, scene_loc, out_dir, stem="longreach_12x14km", wms_width=1024)
+        plot_prob_heatmaps(scored, scene_loc, out_dir, stem="longreach_8x8km", wms_width=1024)
 
 
 if __name__ == "__main__":
