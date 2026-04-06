@@ -177,8 +177,7 @@ class Location:
 
         Returns the output parquet path.
         """
-        sys.path.insert(0, str(_PROJECT_ROOT))
-        from scripts.collect_pixel_observations import collect  # noqa: PLC0415
+        from utils.pixel_collector import collect  # noqa: PLC0415
 
         _out = out_path or self.parquet_path()
         _end = end or date.today().isoformat()

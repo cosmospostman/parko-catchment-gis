@@ -1,4 +1,4 @@
-"""scripts/collect_pixel_observations.py — collect all S2 observations for a bbox.
+"""utils/pixel_collector.py — collect all S2 observations for a bbox.
 
 Fetches every available Sentinel-2 L2A acquisition over a bounding box for a
 given date range and writes a single Parquet file containing one row per
@@ -31,40 +31,13 @@ scl_purity    : float — fraction of clear pixels in the 5×5 chip window
 aot           : float — inverse aerosol optical thickness  (1 = clean air)
 view_zenith   : float — inverse view zenith angle          (1 = nadir)
 sun_zenith    : float — inverse sun zenith angle           (1 = high sun)
-
-Usage
------
-# Longreach high-density infestation patch, full 2020–2025 archive:
-python scripts/collect_pixel_observations.py \\
-    --bbox 145.4240,-22.7640,145.4250,-22.7610 \\
-    --start 2020-01-01 --end 2025-12-31 \\
-    --out data/pixels/longreach/longreach.parquet
-
-# Generic usage:
-python scripts/collect_pixel_observations.py \\
-    --bbox LON_MIN,LAT_MIN,LON_MAX,LAT_MAX \\
-    --start YYYY-MM-DD --end YYYY-MM-DD \\
-    --out path/to/output.parquet \\
-    --cloud-max 30
-
-Notes
------
-- One bbox-covering patch is fetched per (item, band) — not per point.
-  All points in the bbox are sliced from the same patch in memory, so
-  network requests scale with items×bands, not items×bands×points.
-- Patch chips are cached under data/chips/<out-stem>.chips/ and re-used on re-runs.
-- Points are placed on a 10 m UTM grid aligned to the S2 pixel grid,
-  one point per pixel inside the bbox.
-- Rows with no spectral bands (all NaN) are dropped before writing.
 """
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import logging
 import sys
-from datetime import date, datetime
 from pathlib import Path
 
 import numpy as np
@@ -342,79 +315,3 @@ def collect(
     print(f"\nDone.")
     print(f"  Rows   : {total_rows}")
     print(f"  Output : {out_path}")
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Collect all S2 observations for a bbox into a Parquet file.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
-    )
-    p.add_argument(
-        "--bbox", required=True,
-        help="Bounding box as 'lon_min,lat_min,lon_max,lat_max' (EPSG:4326). "
-             "Example: 145.4213,-22.7671,145.4287,-22.7597",
-    )
-    p.add_argument(
-        "--start", default="2020-01-01",
-        help="Start date YYYY-MM-DD (default: 2020-01-01)",
-    )
-    p.add_argument(
-        "--end", default=date.today().isoformat(),
-        help="End date YYYY-MM-DD (default: today)",
-    )
-    p.add_argument(
-        "--out", required=True, type=Path,
-        help="Output Parquet file path, e.g. data/pixels/longreach/longreach.parquet",
-    )
-    p.add_argument(
-        "--cloud-max", type=int, default=30,
-        help="Maximum scene cloud cover %% (default: 30)",
-    )
-    p.add_argument(
-        "--cache-dir", type=Path, default=None,
-        help="Directory to cache fetched patches as .npz files. Re-runs skip "
-             "already-cached patches. Default: data/chips/<out-stem>.chips/",
-    )
-    p.add_argument(
-        "--stride", type=int, default=1,
-        help="Keep every Nth pixel in x and y (default: 1 = all pixels). "
-             "stride=3 gives ~30 m spacing and reduces point count by ~9×. "
-             "Applied at grid generation, so fewer patches are fetched too.",
-    )
-    return p.parse_args()
-
-
-def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s  %(levelname)-8s  %(message)s",
-        stream=sys.stdout,
-    )
-    logging.getLogger("rasterio.session").setLevel(logging.WARNING)
-    logging.getLogger("botocore").setLevel(logging.WARNING)
-
-    args = _parse_args()
-
-    bbox = [float(x) for x in args.bbox.split(",")]
-    if len(bbox) != 4:
-        print("ERROR: --bbox must be 'lon_min,lat_min,lon_max,lat_max'", file=sys.stderr)
-        sys.exit(1)
-
-    collect(
-        bbox_wgs84=bbox,
-        start=args.start,
-        end=args.end,
-        out_path=args.out,
-        cloud_max=args.cloud_max,
-        cache_dir=args.cache_dir,
-        stride=args.stride,
-    )
-
-
-if __name__ == "__main__":
-    main()
