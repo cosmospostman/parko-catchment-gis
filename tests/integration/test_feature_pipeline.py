@@ -67,7 +67,7 @@ from analysis.timeseries.features import (
     assemble_feature_vector,
 )
 from analysis.timeseries.waveform import extract_waveform_features
-from pipelines.chip_store import DiskChipStore
+from pipelines.legacy.chip_store import DiskChipStore
 
 # ---------------------------------------------------------------------------
 # Path to the schema fixture

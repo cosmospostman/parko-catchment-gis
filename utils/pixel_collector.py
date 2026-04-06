@@ -50,8 +50,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from analysis.constants import BANDS, SCL_BAND, AOT_BAND, SCL_CLEAR_VALUES
-from pipelines.chip_store import MemoryChipStore
-from pipelines.fetch import fetch_patches
+from utils.chip_store import MemoryChipStore
+from utils.fetch import fetch_patches
 from utils.stac import search_sentinel2
 
 logger = logging.getLogger(__name__)

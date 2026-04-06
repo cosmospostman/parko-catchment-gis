@@ -16,7 +16,7 @@ import pytest
 import rasterio
 from rasterio.transform import from_bounds
 
-from pipelines.chip_store import DiskChipStore
+from pipelines.legacy.chip_store import DiskChipStore
 
 
 # ---------------------------------------------------------------------------

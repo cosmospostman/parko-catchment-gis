@@ -117,7 +117,7 @@ def observations(science_points: pd.DataFrame) -> dict[str, list]:
     """
     import json
     import pystac
-    from pipelines.chip_store import DiskChipStore
+    from pipelines.legacy.chip_store import DiskChipStore
     from analysis.timeseries.extraction import extract_observations
     from analysis.primitives.quality import ArchiveStats, score_observation
 

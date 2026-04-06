@@ -71,8 +71,8 @@ from analysis.primitives.quality import ArchiveStats, score_observation
 from analysis.timeseries.composite import quality_weighted_composite
 from analysis.timeseries.extraction import extract_observations
 from analysis.timeseries.infer_features import assemble_infer_feature_stack
-from pipelines.chip_store import DiskChipStore
-from pipelines.fetch import fetch_chips
+from pipelines.legacy.chip_store import DiskChipStore
+from pipelines.legacy.fetch import fetch_chips
 from utils.pipeline import _pool_size
 from utils.stac import search_sentinel2
 
