@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-scripts/qglobe-plot — plot bounding boxes and points over Queensland Globe satellite imagery.
+utils/qglobe-plot — plot bounding boxes and points over Queensland Globe satellite imagery.
 
 Fetches a WMS tile from the Queensland Government SISP aerial ortho service
 (LatestStateProgram_AllUsers) and overlays bounding boxes and/or points.
 
 Usage:
-    python scripts/qglobe-plot [--bbox LON_MIN,LAT_MIN,LON_MAX,LAT_MAX]
+    python utils/qglobe-plot [--bbox LON_MIN,LAT_MIN,LON_MAX,LAT_MAX]
                                [--points-csv PATH]
                                [--boxes-csv PATH]
                                [--width PX]

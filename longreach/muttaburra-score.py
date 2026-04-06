@@ -41,7 +41,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import importlib.util as _ilu
 _spec = _ilu.spec_from_file_location(
-    "qglobe_plot", PROJECT_ROOT / "scripts" / "qglobe-plot.py"
+    "qglobe_plot", PROJECT_ROOT / "utils" / "qglobe-plot.py"
 )
 _mod = _ilu.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
