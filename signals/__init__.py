@@ -79,6 +79,9 @@ def extract_parko_features(
     FloweringSignal is excluded — it requires a separate algorithm and is run
     independently via ``FloweringSignal().compute(df, loc)``.
 
+    Site-specific param overrides are loaded automatically from the location's
+    YAML (``signals:`` section) unless explicit Params are passed in.
+
     Parameters
     ----------
     pixel_df:
@@ -86,12 +89,24 @@ def extract_parko_features(
     loc:
         ``utils.location.Location``.
     nir_cv_params, rec_p_params, red_edge_params, swir_params:
-        Optional per-signal Params overrides. Defaults to signal defaults.
+        Optional per-signal Params overrides. If None, site params are loaded
+        from the location YAML via ``load_signal_params``.
 
     Returns
     -------
     DataFrame with columns ``[point_id, lon, lat, nir_cv, rec_p, re_p10, swir_p10]``.
     """
+    from signals._shared import load_signal_params
+
+    if nir_cv_params is None:
+        nir_cv_params = load_signal_params(loc, "nir_cv")
+    if rec_p_params is None:
+        rec_p_params = load_signal_params(loc, "rec_p")
+    if red_edge_params is None:
+        red_edge_params = load_signal_params(loc, "red_edge")
+    if swir_params is None:
+        swir_params = load_signal_params(loc, "swir")
+
     nir_stats = NirCvSignal(nir_cv_params).compute(pixel_df, loc)
     rec_stats = RecPSignal(rec_p_params).compute(pixel_df, loc)
     re_stats = RedEdgeSignal(red_edge_params).compute(pixel_df, loc)

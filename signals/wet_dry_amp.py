@@ -22,8 +22,6 @@ class RecPSignal:
     @dataclass
     class Params:
         quality: QualityParams = field(default_factory=QualityParams)
-        peak_months: frozenset = field(default_factory=lambda: frozenset({3, 4, 5}))
-        trough_months: frozenset = field(default_factory=lambda: frozenset({7, 8, 9}))
 
     def __init__(self, params: RecPSignal.Params | None = None) -> None:
         self.params = params or RecPSignal.Params()

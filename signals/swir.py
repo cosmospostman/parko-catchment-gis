@@ -24,7 +24,7 @@ class SwirSignal:
     @dataclass
     class Params:
         quality: QualityParams = field(default_factory=QualityParams)
-        riparian_percentile: float = 0.90
+        floor_percentile: float = 0.10
 
     def __init__(self, params: SwirSignal.Params | None = None) -> None:
         self.params = params or SwirSignal.Params()
@@ -44,8 +44,10 @@ class SwirSignal:
         df = load_and_filter(pixel_df, p.quality.scl_purity_min)
         df["swir_mi"] = (df["B08"] - df["B11"]) / (df["B08"] + df["B11"])
 
-        stats = annual_percentile(df, "swir_mi", 0.10, p.quality.min_obs_per_year)
-        stats = stats.rename(columns={"swir_mi_p10": "swir_p10"})
+        fp = p.floor_percentile
+        fp_int = int(round(fp * 100))
+        stats = annual_percentile(df, "swir_mi", fp, p.quality.min_obs_per_year)
+        stats = stats.rename(columns={f"swir_mi_p{fp_int}": "swir_p10"})
 
         coords = df[["point_id", "lon", "lat"]].drop_duplicates("point_id")
         stats = stats.merge(coords, on="point_id", how="left")

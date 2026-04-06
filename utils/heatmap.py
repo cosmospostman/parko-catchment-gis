@@ -1,17 +1,24 @@
 """utils/heatmap.py — Parkinsonia probability heatmap plots.
 
-Produces two figures from a scored DataFrame (output of ParkoClassifier.score()):
-  1. Satellite underlay + per-pixel probability overlay
-  2. Black-background probability scatter
-
-Both functions accept an optional WMS image array; if None is passed the
-satellite panel is rendered on a dark background instead (graceful degradation).
+Produces two separate figures from a scored DataFrame (output of ParkoClassifier.score()):
+  1. <stem>_prob_vs_imagery.png  — Queensland Globe satellite underlay + per-pixel overlay
+  2. <stem>_prob_black.png       — Black-background probability scatter
 
 Usage
 -----
 from utils.heatmap import plot_prob_heatmaps
 
 paths = plot_prob_heatmaps(scored_df, loc, out_dir, stem="longreach")
+
+# With annotation overlays (e.g. training bbox):
+paths = plot_prob_heatmaps(
+    scored_df, loc, out_dir, stem="longreach",
+    annotations=[dict(
+        xy=(lon_min, lat_min), width=lon_span, height=lat_span,
+        edgecolor="white", linewidth=1.2, linestyle="--",
+        label="Training: infestation patch",
+    )],
+)
 """
 
 from __future__ import annotations
@@ -23,7 +30,7 @@ import numpy as np
 import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_HALF_DEG = 0.000045   # ~5 m half-width of a pixel square at 10 m resolution
+_HALF_DEG = 0.000045   # ~5 m half-width of a 10 m pixel in degrees
 
 
 def _load_qglobe():
@@ -44,130 +51,178 @@ def _scene_bbox(scored_df: pd.DataFrame, margin: float = 0.00005) -> list[float]
     ]
 
 
+def _marker_size(ax, lon_min: float, lon_max: float) -> float:
+    """Compute scatter marker size (points²) so one marker ≈ one 10 m pixel."""
+    fig = ax.get_figure()
+    ax_width_in = ax.get_window_extent(fig.canvas.get_renderer()).width / fig.dpi
+    lon_span = lon_max - lon_min
+    frac = (2 * _HALF_DEG) / lon_span
+    px_width_pts = frac * ax_width_in * 72
+    return max(px_width_pts ** 2 * 0.5, 1.0)
+
+
+def _apply_annotations(ax, annotations: list[dict]) -> None:
+    """Draw Rectangle annotations and add a legend if any have labels."""
+    import matplotlib.patches as mpatches
+
+    has_label = False
+    for ann in annotations:
+        kw = dict(ann)
+        xy = kw.pop("xy")
+        width = kw.pop("width")
+        height = kw.pop("height")
+        kw.setdefault("fill", False)
+        kw.setdefault("zorder", 4)
+        ax.add_patch(mpatches.Rectangle(xy, width, height, **kw))
+        if "label" in kw:
+            has_label = True
+
+    if has_label:
+        ax.legend(loc="lower right", fontsize=7, framealpha=0.7,
+                  facecolor="black", labelcolor="white", edgecolor="none")
+
+
 def plot_prob_heatmaps(
     scored_df: pd.DataFrame,
     loc,
     out_dir: Path,
     stem: str,
     wms_width: int = 512,
+    annotations: list[dict] | None = None,
 ) -> list[Path]:
-    """Render satellite+overlay and black-background probability heatmaps.
+    """Render two separate probability heatmap figures.
+
+    Figure 1 (<stem>_prob_vs_imagery.png):
+        Queensland Globe 20cm satellite underlay with per-pixel probability
+        colour overlay (small circular dots, one per pixel).
+
+    Figure 2 (<stem>_prob_black.png):
+        Black-background scatter, one dot per pixel, coloured by probability.
 
     Parameters
     ----------
-    scored_df : DataFrame with columns lon, lat, prob_lr, is_presence
-    loc       : Location object (used for title only)
-    out_dir   : directory to write PNGs into
-    stem      : filename prefix, e.g. "longreach" → longreach_prob_vs_imagery.png
-    wms_width : pixel width for WMS tile fetch (default 512)
+    scored_df  : DataFrame with columns lon, lat, prob_lr, is_presence
+    loc        : Location object (used for title)
+    out_dir    : directory to write PNGs into
+    stem       : filename prefix
+    wms_width  : pixel width for WMS tile fetch
+    annotations: optional list of Rectangle annotation dicts. Each dict must
+                 contain ``xy``, ``width``, ``height`` and any valid
+                 ``mpatches.Rectangle`` kwargs (e.g. edgecolor, linestyle, label).
 
     Returns
     -------
     List of Paths written.
     """
+    import matplotlib
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    import matplotlib.patches as mpatches
     import matplotlib.colors as mcolors
 
+    if annotations is None:
+        annotations = []
+
     bbox = _scene_bbox(scored_df)
+    lon_min, lat_min, lon_max, lat_max = bbox
+    n_px = len(scored_df)
+
     try:
         mod = _load_qglobe()
         img = mod.fetch_wms_image(bbox, width_px=wms_width)
     except Exception as exc:
-        print(f"  WARNING: WMS fetch failed ({exc}) — plots will render without imagery")
+        print(f"  WARNING: WMS fetch failed ({exc}) — imagery panel will use dark background")
         img = None
 
-    lon_min, lat_min, lon_max, lat_max = bbox
     cmap = plt.cm.RdYlGn
     norm = mcolors.Normalize(vmin=0, vmax=1)
-    half = _HALF_DEG
-    n_px = len(scored_df)
+
+    aspect = (lon_max - lon_min) / (lat_max - lat_min)
+    fig_h = 10
+    fig_w = max(fig_h * aspect, 4)
+
+    valid = scored_df.dropna(subset=["prob_lr"])
 
     # ------------------------------------------------------------------
-    # Figure 1: satellite underlay + probability overlay (left)
-    #           black-background probability scatter (right)
+    # Figure 1: satellite underlay + dot overlay
     # ------------------------------------------------------------------
-    fig, (ax_img, ax_score) = plt.subplots(1, 2, figsize=(14, 18))
-    fig.suptitle(
-        f"Parkinsonia probability vs Queensland Globe 20cm imagery\n"
-        f"{loc.name}  ({n_px:,} pixels)",
-        fontsize=12,
+    fig1, ax = plt.subplots(figsize=(fig_w, fig_h))
+    fig1.suptitle(
+        f"{loc.name} — Parkinsonia probability\n"
+        f"Queensland Globe 20cm imagery  ({n_px:,} pixels)",
+        fontsize=11,
     )
 
     if img is not None:
-        ax_img.imshow(img, extent=[lon_min, lon_max, lat_min, lat_max],
-                      origin="upper", aspect="auto")
+        ax.imshow(img, extent=[lon_min, lon_max, lat_min, lat_max],
+                  origin="upper", aspect="auto")
     else:
-        ax_img.set_facecolor("#222222")
-    ax_img.set_title("Queensland Globe 20cm + probability overlay", fontsize=10)
+        ax.set_facecolor("#111111")
 
-    for _, row in scored_df.iterrows():
-        if pd.isna(row["prob_lr"]):
-            continue
-        ax_img.add_patch(mpatches.Rectangle(
-            (row["lon"] - half, row["lat"] - half),
-            width=half * 2, height=half * 2,
-            linewidth=0, facecolor=cmap(norm(row["prob_lr"])), alpha=0.55,
-        ))
+    fig1.canvas.draw()
+    s = _marker_size(ax, lon_min, lon_max)
 
-    ax_score.set_facecolor("#222222")
-    ax_score.set_title("Parkinsonia probability score (logistic regression)", fontsize=10)
-    sc = ax_score.scatter(
-        scored_df["lon"], scored_df["lat"],
-        c=scored_df["prob_lr"], cmap=cmap, norm=norm,
-        s=60, marker="s", linewidths=0,
+    ax.scatter(
+        valid["lon"], valid["lat"],
+        c=valid["prob_lr"], cmap=cmap, norm=norm,
+        s=s, marker="o", linewidths=0, alpha=0.7, zorder=2,
     )
-    cb = plt.colorbar(sc, ax=ax_score, fraction=0.03, pad=0.04)
-    cb.set_label("Probability (Parkinsonia)", fontsize=9)
-    for thresh in np.percentile(scored_df["prob_lr"].dropna(), np.arange(10, 100, 10)):
-        cb.ax.axhline(thresh, color="white", linewidth=0.8, linestyle="--")
 
-    for ax in (ax_img, ax_score):
-        ax.set_xlabel("Longitude", fontsize=9)
-        ax.set_ylabel("Latitude", fontsize=9)
-        ax.tick_params(labelsize=8)
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cb = fig1.colorbar(sm, ax=ax, fraction=0.03, pad=0.02)
+    cb.set_label("P(Parkinsonia)", fontsize=9)
 
-    plt.tight_layout()
+    ax.set_xlim(lon_min, lon_max)
+    ax.set_ylim(lat_min, lat_max)
+    ax.set_xlabel("Longitude", fontsize=9)
+    ax.set_ylabel("Latitude", fontsize=9)
+    ax.tick_params(labelsize=8)
+    _apply_annotations(ax, annotations)
+
+    fig1.tight_layout()
     p1 = out_dir / f"{stem}_prob_vs_imagery.png"
-    fig.savefig(p1, dpi=150, bbox_inches="tight")
-    plt.close(fig)
+    fig1.savefig(p1, dpi=150, bbox_inches="tight")
+    plt.close(fig1)
     print(f"Saved: {p1}")
 
     # ------------------------------------------------------------------
-    # Figure 2: top / bottom decile on satellite
+    # Figure 2: black background scatter
     # ------------------------------------------------------------------
-    p90 = scored_df["prob_lr"].quantile(0.90)
-    p10 = scored_df["prob_lr"].quantile(0.10)
+    fig2, ax2 = plt.subplots(figsize=(fig_w, fig_h))
+    fig2.patch.set_facecolor("black")
+    ax2.set_facecolor("black")
+    fig2.suptitle(
+        f"{loc.name} — Parkinsonia probability\n({n_px:,} pixels)",
+        fontsize=11, color="white",
+    )
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 18))
-    fig.suptitle(f"Top vs bottom decile Parkinsonia probability\n{loc.name}", fontsize=12)
+    fig2.canvas.draw()
+    s2 = _marker_size(ax2, lon_min, lon_max)
 
-    for ax, subset, colour, title in [
-        (axes[0], scored_df[scored_df["prob_lr"] >= p90], "#e74c3c",
-         f"Top decile (prob ≥ {p90:.2f}, n={(scored_df['prob_lr'] >= p90).sum():,})"),
-        (axes[1], scored_df[scored_df["prob_lr"] <= p10], "#3498db",
-         f"Bottom decile (prob ≤ {p10:.2f}, n={(scored_df['prob_lr'] <= p10).sum():,})"),
-    ]:
-        if img is not None:
-            ax.imshow(img, extent=[lon_min, lon_max, lat_min, lat_max],
-                      origin="upper", aspect="auto")
-        else:
-            ax.set_facecolor("#222222")
-        for _, row in subset.iterrows():
-            ax.add_patch(mpatches.Rectangle(
-                (row["lon"] - half, row["lat"] - half),
-                width=half * 2, height=half * 2,
-                linewidth=0.5, edgecolor="white", facecolor=colour, alpha=0.65,
-            ))
-        ax.set_title(title, fontsize=10)
-        ax.set_xlabel("Longitude", fontsize=9)
-        ax.set_ylabel("Latitude", fontsize=9)
-        ax.tick_params(labelsize=8)
+    sc = ax2.scatter(
+        valid["lon"], valid["lat"],
+        c=valid["prob_lr"], cmap=cmap, norm=norm,
+        s=s2, marker="o", linewidths=0, zorder=2,
+    )
 
-    plt.tight_layout()
-    p2 = out_dir / f"{stem}_prob_deciles.png"
-    fig.savefig(p2, dpi=150, bbox_inches="tight")
-    plt.close(fig)
+    cb2 = fig2.colorbar(sc, ax=ax2, fraction=0.03, pad=0.02)
+    cb2.set_label("P(Parkinsonia)", fontsize=9, color="white")
+    cb2.ax.yaxis.set_tick_params(color="white")
+    plt.setp(cb2.ax.yaxis.get_ticklabels(), color="white")
+
+    ax2.set_xlim(lon_min, lon_max)
+    ax2.set_ylim(lat_min, lat_max)
+    ax2.set_xlabel("Longitude", fontsize=9, color="white")
+    ax2.set_ylabel("Latitude", fontsize=9, color="white")
+    ax2.tick_params(labelsize=8, colors="white")
+    for spine in ax2.spines.values():
+        spine.set_edgecolor("white")
+    _apply_annotations(ax2, annotations)
+
+    fig2.tight_layout()
+    p2 = out_dir / f"{stem}_prob_black.png"
+    fig2.savefig(p2, dpi=150, bbox_inches="tight", facecolor="black")
+    plt.close(fig2)
     print(f"Saved: {p2}")
 
     return [p1, p2]

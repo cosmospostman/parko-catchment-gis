@@ -22,7 +22,7 @@ class RedEdgeSignal:
     @dataclass
     class Params:
         quality: QualityParams = field(default_factory=QualityParams)
-        riparian_percentile: float = 0.90
+        floor_percentile: float = 0.10
 
     def __init__(self, params: RedEdgeSignal.Params | None = None) -> None:
         self.params = params or RedEdgeSignal.Params()
@@ -42,8 +42,10 @@ class RedEdgeSignal:
         df = load_and_filter(pixel_df, p.quality.scl_purity_min)
         df["re_ratio"] = df["B07"] / df["B05"]
 
-        stats = annual_percentile(df, "re_ratio", 0.10, p.quality.min_obs_per_year)
-        stats = stats.rename(columns={"re_ratio_p10": "re_p10"})
+        fp = p.floor_percentile
+        fp_int = int(round(fp * 100))
+        stats = annual_percentile(df, "re_ratio", fp, p.quality.min_obs_per_year)
+        stats = stats.rename(columns={f"re_ratio_p{fp_int}": "re_p10"})
 
         coords = df[["point_id", "lon", "lat"]].drop_duplicates("point_id")
         stats = stats.merge(coords, on="point_id", how="left")
