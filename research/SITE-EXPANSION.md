@@ -108,7 +108,7 @@ boundary is a clustering artefact. The full 78-record cluster should be used.
 
 ---
 
-### Site 4 — Barcaldine South cluster (Priority 4)
+### Site 4 — Muttaburra (Priority 4)
 
 | Parameter | Value |
 |-----------|-------|
@@ -116,12 +116,17 @@ boundary is a clustering artefact. The full 78-record cluster should be used.
 | ALA records | 37 |
 | Coordinate uncertainty (median) | 1 m |
 | Cluster spread | ~4 km N–S × ~7 km E–W |
-| Proposed fetch bbox | 144.48, −22.58, 144.59, −22.50 |
-| Approximate area | ~11 km × ~9 km |
+| Proposed fetch bbox | 144.548274, −22.546983, 144.567726, −22.529017 |
+| Approximate area | 2 km × 2 km (~40,000 pixels, comparable to Longreach) |
 
 **Why fourth:** High-precision GPS records (1m uncertainty). Small, compact
 cluster. Located ~30 km SW of Site 3 — close enough that the two sites could
 be jointly analysed if both fetch successfully.
+
+**Fetch note:** Bbox is a 2 km × 2 km square centred exactly on the ALA
+centroid (−22.538000, 144.558000), giving ~40,000 S2 pixels and ~1.9 GB raw
+parquet — the same scale as the Longreach expansion fetch. No stride needed;
+fetch at native 10 m resolution.
 
 ---
 
