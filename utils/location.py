@@ -59,6 +59,7 @@ class Location:
     centroid: Optional[tuple[float, float]]  # (lat, lon) or None
     notes: Optional[str]
     sub_bboxes: dict[str, SubBbox] = field(default_factory=dict)
+    signal_params: dict = field(default_factory=dict)  # raw signals: dict from YAML
 
     # ------------------------------------------------------------------
     # Bbox accessors
@@ -228,6 +229,7 @@ def _load_registry(locations_dir: Path = _LOCATIONS_DIR) -> dict[str, Location]:
             centroid=tuple(centroid) if centroid else None,
             notes=data.get("notes"),
             sub_bboxes=sub_bboxes,
+            signal_params=data.get("signals") or {},
         )
     return result
 

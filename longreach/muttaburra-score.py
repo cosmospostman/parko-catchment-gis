@@ -30,7 +30,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import polars as pl
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from sklearn.preprocessing import StandardScaler
@@ -48,18 +47,10 @@ _spec.loader.exec_module(_mod)
 fetch_wms_image = _mod.fetch_wms_image
 
 from utils.location import get as _get_loc
+from signals import extract_parko_features
 
 OUT_DIR = PROJECT_ROOT / "outputs" / "muttaburra"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
-SCL_PURITY_MIN = 0.5
-DRY_MONTHS     = [6, 7, 8, 9, 10]   # semi-arid Qld, same as Longreach
-MIN_OBS_DRY    = 5
-MIN_OBS_ANNUAL = 10
 
 FEATURES = ["nir_cv", "rec_p", "re_p10"]
 
@@ -73,142 +64,17 @@ def log(msg: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 1. Load and quality-filter
+# 1. Load parquet and extract features via signals package
 # ---------------------------------------------------------------------------
 
 log("Loading Muttaburra parquet ...")
-LOAD_COLS = ["point_id", "lon", "lat", "date", "scl_purity", "B04", "B05", "B07", "B08"]
-df = pl.read_parquet(
-    _get_loc("muttaburra").parquet_path(),
-    columns=LOAD_COLS,
-)
-log(f"  {len(df):,} rows  |  {df['point_id'].n_unique():,} pixels")
-
-before = len(df)
-df = df.filter(pl.col("scl_purity") >= SCL_PURITY_MIN)
-log(f"  Quality filter: dropped {before - len(df):,} rows, retained {len(df):,}")
-
-df = (
-    df
-    .drop("scl_purity")
-    .with_columns([
-        pl.col("date").dt.year().cast(pl.Int16).alias("year"),
-        pl.col("date").dt.month().cast(pl.Int8).alias("month"),
-        ((pl.col("B08") - pl.col("B04")) / (pl.col("B08") + pl.col("B04"))).alias("ndvi"),
-        (pl.col("B07") / pl.col("B05")).alias("re_ratio"),
-    ])
-    .drop(["date", "B04", "B05"])
-)
-
-coords = df.select(["point_id", "lon", "lat"]).unique("point_id")
-df = df.drop(["lon", "lat"])
-
-# ---------------------------------------------------------------------------
-# 2. Feature extraction (Polars — parallelised groupby)
-# ---------------------------------------------------------------------------
+loc = _get_loc("muttaburra")
+df = pd.read_parquet(loc.parquet_path())
+log(f"  {len(df):,} rows  |  {df['point_id'].nunique():,} pixels")
 
 log("\nExtracting features ...")
-
-# --- nir_cv ---
-
-dry = df.filter(pl.col("month").is_in(DRY_MONTHS)).select(["point_id", "year", "B08"])
-df  = df.drop("B08")
-
-yr_nir = (
-    dry
-    .group_by(["point_id", "year"])
-    .agg([
-        pl.col("B08").median().alias("nir_yr"),
-        pl.col("B08").count().alias("n_dry"),
-    ])
-    .filter(pl.col("n_dry") >= MIN_OBS_DRY)
-)
-del dry
-
-nir_stats = (
-    yr_nir
-    .group_by("point_id")
-    .agg([
-        pl.col("nir_yr").mean().alias("nir_mean"),
-        pl.col("nir_yr").std().alias("nir_std"),
-        pl.col("nir_yr").count().alias("n_dry_years"),
-    ])
-    .with_columns(
-        (pl.col("nir_std") / pl.col("nir_mean")).alias("nir_cv")
-    )
-)
-del yr_nir
-log(f"  nir_cv: {len(nir_stats):,} pixels with >= {MIN_OBS_DRY} dry obs/year")
-
-# --- rec_p ---
-
-ann = df.select(["point_id", "year", "ndvi"])
-df  = df.drop("ndvi")
-
-ndvi_pcts = (
-    ann
-    .group_by(["point_id", "year"])
-    .agg([
-        pl.col("ndvi").quantile(0.90).alias("p90"),
-        pl.col("ndvi").quantile(0.10).alias("p10"),
-        pl.col("ndvi").count().alias("n_ann"),
-    ])
-    .filter(pl.col("n_ann") >= MIN_OBS_ANNUAL)
-    .with_columns(
-        (pl.col("p90") - pl.col("p10")).alias("rec_p_yr")
-    )
-)
-del ann
-
-rec_stats = (
-    ndvi_pcts
-    .group_by("point_id")
-    .agg([
-        pl.col("rec_p_yr").mean().alias("rec_p"),
-        pl.col("rec_p_yr").count().alias("n_amp_years"),
-    ])
-)
-del ndvi_pcts
-log(f"  rec_p:  {len(rec_stats):,} pixels with >= {MIN_OBS_ANNUAL} obs/year")
-
-# --- re_p10 ---
-
-re = df.select(["point_id", "year", "re_ratio"])
-del df
-
-re_p10_yr = (
-    re
-    .group_by(["point_id", "year"])
-    .agg([
-        pl.col("re_ratio").quantile(0.10).alias("re_p10_yr"),
-        pl.col("re_ratio").count().alias("n_re"),
-    ])
-    .filter(pl.col("n_re") >= MIN_OBS_ANNUAL)
-)
-del re
-
-re_stats = (
-    re_p10_yr
-    .group_by("point_id")
-    .agg(pl.col("re_p10_yr").mean().alias("re_p10"))
-)
-del re_p10_yr
-log(f"  re_p10: {len(re_stats):,} pixels")
-
-# --- Merge and convert to pandas ---
-
-feat_pl = (
-    coords
-    .join(nir_stats.select(["point_id", "nir_cv", "nir_mean", "n_dry_years"]), on="point_id", how="inner")
-    .join(rec_stats.select(["point_id", "rec_p", "n_amp_years"]),              on="point_id", how="inner")
-    .join(re_stats.select(["point_id", "re_p10"]),                             on="point_id", how="inner")
-)
-feat = feat_pl.to_pandas()
-log(f"\n  Feature table: {len(feat):,} pixels with all three features")
-log(f"  n_dry_years — median: {feat['n_dry_years'].median():.1f}  "
-    f"min: {feat['n_dry_years'].min()}  max: {feat['n_dry_years'].max()}")
-log(f"  n_amp_years — median: {feat['n_amp_years'].median():.1f}  "
-    f"min: {feat['n_amp_years'].min()}  max: {feat['n_amp_years'].max()}")
+feat = extract_parko_features(df, loc)
+log(f"  Feature table: {len(feat):,} pixels with all three features")
 
 # ---------------------------------------------------------------------------
 # 3. Train logistic regression on Longreach end-member pixels
@@ -216,19 +82,18 @@ log(f"  n_amp_years — median: {feat['n_amp_years'].median():.1f}  "
 
 log("\nBuilding Longreach training set ...")
 
-orig_amp = pd.read_parquet(
-    PROJECT_ROOT / "outputs" / "longreach-wet-dry-amp" / "longreach_amp_stats.parquet"
-)
-orig_nir = pd.read_parquet(
-    PROJECT_ROOT / "outputs" / "longreach-dry-nir" / "longreach_dry_nir_stats.parquet"
-)
-orig_re  = pd.read_parquet(
-    PROJECT_ROOT / "outputs" / "longreach-red-edge" / "longreach_re_stats.parquet"
-)
+lr_loc   = _get_loc("longreach")
+lr_raw   = pd.read_parquet(lr_loc.parquet_path())
+train_df = extract_parko_features(lr_raw, lr_loc)
 
-train_df = orig_amp[["point_id", "rec_p", "in_hd_bbox", "is_riparian", "is_grassland"]].copy()
-train_df = train_df.merge(orig_nir[["point_id", "nir_cv"]], on="point_id")
-train_df = train_df.merge(orig_re[["point_id",  "re_p10"]], on="point_id")
+HD_LON_MIN, HD_LON_MAX = 145.423948, 145.424956
+HD_LAT_MIN, HD_LAT_MAX = -22.764033, -22.761054
+train_df["in_hd_bbox"] = (
+    train_df["lon"].between(HD_LON_MIN, HD_LON_MAX) &
+    train_df["lat"].between(HD_LAT_MIN, HD_LAT_MAX)
+)
+rip_thresh = train_df.loc[~train_df["in_hd_bbox"], "nir_mean"].quantile(0.90)
+train_df["is_grassland"] = (~train_df["in_hd_bbox"]) & (train_df["nir_mean"] < rip_thresh)
 
 train = train_df[train_df["in_hd_bbox"] | train_df["is_grassland"]].copy()
 y     = train["in_hd_bbox"].astype(int)

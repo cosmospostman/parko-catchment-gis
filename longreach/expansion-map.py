@@ -38,26 +38,18 @@ _spec.loader.exec_module(_mod)
 fetch_wms_image = _mod.fetch_wms_image
 
 from utils.location import get as _get_loc
+from signals import extract_parko_features
 
 OUT_DIR = PROJECT_ROOT / "outputs" / "longreach-expansion-map"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------------------
-# Config — identical thresholds to the Stage 1/2 scripts
+# Config
 # ---------------------------------------------------------------------------
-
-SCL_PURITY_MIN   = 0.5
-DRY_MONTHS       = {6, 7, 8, 9, 10}
-MIN_OBS_DRY      = 5    # (pixel, year) min obs for nir_cv
-MIN_OBS_ANNUAL   = 10   # (pixel, year) min obs for rec_p and re_p10
 
 # Original infestation patch bbox (used to assign training labels)
 HD_LON_MIN, HD_LON_MAX = 145.423948, 145.424956
 HD_LAT_MIN, HD_LAT_MAX = -22.764033, -22.761054
-
-# Southern extension bbox (grassland training population in Stage 1)
-# Pixels south of the infestation patch and not flagged as riparian proxy
-EXT_LAT_MAX = HD_LAT_MIN   # everything south of the infestation patch
 
 FEATURES = ["nir_cv", "rec_p", "re_p10"]
 
@@ -67,100 +59,17 @@ def log(msg: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 1. Load and quality-filter the expansion parquet
+# 1. Load parquet and extract features via signals package
 # ---------------------------------------------------------------------------
 
 log("Loading expansion parquet...")
+loc = _get_loc("longreach")   # same site config (dry months, quality params)
 exp = pd.read_parquet(PROJECT_ROOT / "data" / "pixels" / "longreach-expansion" / "longreach-expansion.parquet")
 log(f"  {len(exp):,} rows  |  {exp['point_id'].nunique():,} pixels")
 
-before = len(exp)
-exp = exp[exp["scl_purity"] >= SCL_PURITY_MIN].copy()
-log(f"  Quality filter: dropped {before - len(exp):,} rows, retained {len(exp):,}")
-
-exp["year"]  = exp["date"].dt.year
-exp["month"] = exp["date"].dt.month
-exp["ndvi"]  = (exp["B08"] - exp["B04"]) / (exp["B08"] + exp["B04"])
-exp["re_ratio"] = exp["B07"] / exp["B05"]
-
-# ---------------------------------------------------------------------------
-# 2. Feature extraction
-# ---------------------------------------------------------------------------
-
 log("\nExtracting features...")
-
-# --- nir_cv: dry-season inter-annual NIR coefficient of variation ---
-
-dry = exp[exp["month"].isin(DRY_MONTHS)].copy()
-dry_counts = dry.groupby(["point_id", "year"])["B08"].count()
-valid_dry = dry_counts[dry_counts >= MIN_OBS_DRY].index
-dry_valid = dry.set_index(["point_id", "year"]).loc[valid_dry].reset_index()
-
-yr_nir = (
-    dry_valid.groupby(["point_id", "year"])["B08"]
-    .median()
-    .rename("nir_yr")
-    .reset_index()
-)
-nir_stats = (
-    yr_nir.groupby("point_id")["nir_yr"]
-    .agg(nir_mean="mean", nir_std="std", n_dry_years="count")
-    .reset_index()
-)
-nir_stats["nir_cv"] = nir_stats["nir_std"] / nir_stats["nir_mean"]
-log(f"  nir_cv: {len(nir_stats):,} pixels with ≥ {MIN_OBS_DRY} dry obs/year")
-
-# --- rec_p: annual NDVI amplitude (p90 − p10), mean across years ---
-
-ann_counts = exp.groupby(["point_id", "year"])["ndvi"].count()
-valid_ann = ann_counts[ann_counts >= MIN_OBS_ANNUAL].index
-ann_valid = exp.set_index(["point_id", "year"]).loc[valid_ann].reset_index()
-
-ndvi_p90 = (
-    ann_valid.groupby(["point_id", "year"])["ndvi"]
-    .quantile(0.90).rename("p90").reset_index()
-)
-ndvi_p10 = (
-    ann_valid.groupby(["point_id", "year"])["ndvi"]
-    .quantile(0.10).rename("p10").reset_index()
-)
-amp = ndvi_p90.merge(ndvi_p10, on=["point_id", "year"])
-amp["rec_p_yr"] = amp["p90"] - amp["p10"]
-
-rec_stats = (
-    amp.groupby("point_id")["rec_p_yr"]
-    .agg(rec_p="mean", n_amp_years="count")
-    .reset_index()
-)
-log(f"  rec_p:  {len(rec_stats):,} pixels with ≥ {MIN_OBS_ANNUAL} obs/year")
-
-# --- re_p10: annual B07/B05 10th-percentile, mean across years ---
-
-re_counts = exp.groupby(["point_id", "year"])["re_ratio"].count()
-valid_re = re_counts[re_counts >= MIN_OBS_ANNUAL].index
-re_valid = exp.set_index(["point_id", "year"]).loc[valid_re].reset_index()
-
-re_p10_yr = (
-    re_valid.groupby(["point_id", "year"])["re_ratio"]
-    .quantile(0.10).rename("re_p10_yr").reset_index()
-)
-re_stats = (
-    re_p10_yr.groupby("point_id")["re_p10_yr"]
-    .mean().rename("re_p10").reset_index()
-)
-log(f"  re_p10: {len(re_stats):,} pixels")
-
-# --- Merge all features with pixel coordinates ---
-
-coords = exp[["point_id", "lon", "lat"]].drop_duplicates("point_id")
-
-feat = (
-    coords
-    .merge(nir_stats[["point_id", "nir_cv", "nir_mean"]], on="point_id", how="inner")
-    .merge(rec_stats[["point_id", "rec_p"]],               on="point_id", how="inner")
-    .merge(re_stats[["point_id",  "re_p10"]],              on="point_id", how="inner")
-)
-log(f"\n  Feature table: {len(feat):,} pixels with all three features")
+feat = extract_parko_features(exp, loc)
+log(f"  Feature table: {len(feat):,} pixels with all three features")
 
 # Flag infestation bbox pixels
 feat["in_hd_bbox"] = (
@@ -181,22 +90,12 @@ log(f"  Infestation bbox pixels in expansion: {feat['in_hd_bbox'].sum()}")
 
 log("\nBuilding training set from original end-member pixels...")
 
-# Load the pre-computed feature stats for the original 748-pixel population.
-# These parquets are written by dry-season-nir.py, wet-dry-amp.py, red-edge.py.
-orig_nir = pd.read_parquet(
-    PROJECT_ROOT / "outputs" / "longreach-dry-nir" / "longreach_dry_nir_stats.parquet"
+orig_raw = pd.read_parquet(loc.parquet_path())
+train_df = extract_parko_features(orig_raw, loc)
+train_df["in_hd_bbox"] = (
+    train_df["lon"].between(HD_LON_MIN, HD_LON_MAX) &
+    train_df["lat"].between(HD_LAT_MIN, HD_LAT_MAX)
 )
-orig_amp = pd.read_parquet(
-    PROJECT_ROOT / "outputs" / "longreach-wet-dry-amp" / "longreach_amp_stats.parquet"
-)
-orig_re = pd.read_parquet(
-    PROJECT_ROOT / "outputs" / "longreach-red-edge" / "longreach_re_stats.parquet"
-)
-
-train_df = orig_amp[["point_id", "rec_p", "is_riparian", "is_grassland"]].copy()
-train_df = train_df.merge(orig_nir[["point_id", "nir_cv"]], on="point_id")
-train_df = train_df.merge(orig_re[["point_id",  "re_p10"]], on="point_id")
-train_df["in_hd_bbox"] = ~train_df["is_grassland"] & ~train_df["is_riparian"]
 
 # Annotate expansion feature table with class flags derived from expansion data
 # (riparian proxy = top-10% nir_mean of non-infestation pixels in expansion)
@@ -210,7 +109,11 @@ n_grass = feat["is_grassland"].sum()
 n_rip   = feat["is_riparian"].sum()
 log(f"  Expansion class flags — Infestation: {n_inf}  |  Grassland: {n_grass}  |  Riparian proxy: {n_rip}")
 
-# Train only on infestation vs grassland end-members (exclude riparian proxy, as in Stage 2)
+# Derive riparian proxy for training set: top-10% nir_mean outside the infestation bbox
+train_rip_thresh = train_df.loc[~train_df["in_hd_bbox"], "nir_mean"].quantile(0.90)
+train_df["is_grassland"] = (~train_df["in_hd_bbox"]) & (train_df["nir_mean"] < train_rip_thresh)
+
+# Train only on infestation vs grassland end-members (exclude riparian proxy)
 train = train_df[train_df["in_hd_bbox"] | train_df["is_grassland"]].copy()
 y = train["in_hd_bbox"].astype(int)
 log(f"  Training pixels — Infestation: {y.sum()}  |  Grassland: {(y == 0).sum()}")
