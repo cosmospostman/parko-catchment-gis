@@ -83,8 +83,8 @@ from analysis.primitives.validation import validate_spatial
 from analysis.timeseries.extraction import extract_observations
 from analysis.timeseries.features import assemble_feature_vector
 from analysis.timeseries.waveform import extract_waveform_features
-from stage0.chip_store import DiskChipStore
-from stage0.fetch import fetch_chips
+from pipelines.chip_store import DiskChipStore
+from pipelines.fetch import fetch_chips
 from utils.pipeline import _pool_size
 from utils.stac import search_sentinel2
 

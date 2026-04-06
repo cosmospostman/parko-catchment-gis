@@ -30,7 +30,7 @@ from rasterio.transform import from_bounds
 
 from analysis.constants import AOT_BAND, SCL_BAND
 from analysis.timeseries.extraction import extract_observations
-from stage0.chip_store import DiskChipStore
+from pipelines.chip_store import DiskChipStore
 
 
 # ---------------------------------------------------------------------------

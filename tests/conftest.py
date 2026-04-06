@@ -26,8 +26,8 @@ _FIXTURE_DIR = PROJECT_ROOT / "tests" / "fixtures"
 _SENTINEL_FILE = _FIXTURE_DIR / ".fixture_commit"
 
 _PIPELINE_SOURCES = [
-    "stage0/fetch.py",
-    "stage0/chip_store.py",
+    "pipelines/fetch.py",
+    "pipelines/chip_store.py",
     "analysis/constants.py",
     "analysis/timeseries/observation.py",
 ]

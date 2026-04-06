@@ -276,8 +276,8 @@ def fetch_observations(
 
     from analysis.primitives.quality import ArchiveStats, score_observation
     from analysis.timeseries.extraction import extract_observations
-    from stage0.chip_store import DiskChipStore
-    from stage0.fetch import fetch_chips
+    from pipelines.chip_store import DiskChipStore
+    from pipelines.fetch import fetch_chips
     from utils.stac import search_sentinel2
 
     cid = cluster["cluster_id"]

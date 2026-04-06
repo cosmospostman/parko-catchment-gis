@@ -33,7 +33,7 @@ from analysis.constants import (
     VZA_BAND,
 )
 from analysis.timeseries.observation import Observation, ObservationQuality
-from stage0.chip_store import ChipStore
+from pipelines.chip_store import ChipStore
 
 logger = logging.getLogger(__name__)
 
