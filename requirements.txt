@@ -33,3 +33,6 @@ requests>=2.31,<3
 
 # Visualization
 matplotlib>=3.8,<4
+
+# Configuration
+pyyaml>=6.0,<7

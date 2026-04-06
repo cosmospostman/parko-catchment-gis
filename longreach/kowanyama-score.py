@@ -53,6 +53,8 @@ _mod = _ilu.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 fetch_wms_image = _mod.fetch_wms_image
 
+from utils.location import get as _get_loc
+
 OUT_DIR = PROJECT_ROOT / "outputs" / "kowanyama"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -80,7 +82,7 @@ def log(msg: str) -> None:
 log("Loading Kowanyama parquet...")
 LOAD_COLS = ["point_id", "lon", "lat", "date", "scl_purity", "B04", "B05", "B07", "B08"]
 df = pl.read_parquet(
-    PROJECT_ROOT / "data" / "kowanyama_pixels.parquet",
+    _get_loc("kowanyama").parquet_path(),
     columns=LOAD_COLS,
 )
 log(f"  {len(df):,} rows  |  {df['point_id'].n_unique():,} pixels")

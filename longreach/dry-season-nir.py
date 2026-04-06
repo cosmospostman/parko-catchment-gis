@@ -36,11 +36,13 @@ _mod  = _ilu.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 fetch_wms_image = _mod.fetch_wms_image
 
+from utils.location import get as _get_loc
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-PARQUET_PATH  = PROJECT_ROOT / "data" / "longreach_pixels.parquet"
+PARQUET_PATH  = _get_loc("longreach").parquet_path()
 OUT_DIR       = PROJECT_ROOT / "outputs" / "longreach-dry-nir"
 
 # Dry season: months 6–10 inclusive

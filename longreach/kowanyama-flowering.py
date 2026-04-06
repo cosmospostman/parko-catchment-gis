@@ -49,6 +49,8 @@ _mod = _ilu.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 fetch_wms_image = _mod.fetch_wms_image
 
+from utils.location import get as _get_loc
+
 OUT_DIR = PROJECT_ROOT / "outputs" / "kowanyama"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -87,7 +89,7 @@ def haversine_m(lat1, lon1, lats, lons):
 
 log("Loading Kowanyama parquet (B02/B03/B04/B08 only)...")
 df = pl.read_parquet(
-    PROJECT_ROOT / "data" / "kowanyama_pixels.parquet",
+    _get_loc("kowanyama").parquet_path(),
     columns=LOAD_COLS,
 )
 log(f"  {len(df):,} rows  |  {df['point_id'].n_unique():,} pixels")
@@ -133,7 +135,7 @@ df = df.drop(["lon", "lat"])
 
 log("\nBuilding haze mask...")
 b02_df = pl.read_parquet(
-    PROJECT_ROOT / "data" / "kowanyama_pixels.parquet",
+    _get_loc("kowanyama").parquet_path(),
     columns=["date", "scl_purity", "B02"],
 ).filter(pl.col("scl_purity") >= SCL_PURITY_MIN).drop("scl_purity")
 

@@ -37,6 +37,8 @@ _mod = _ilu.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 fetch_wms_image = _mod.fetch_wms_image
 
+from utils.location import get as _get_loc
+
 OUT_DIR = PROJECT_ROOT / "outputs" / "longreach-expansion-map"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -69,7 +71,7 @@ def log(msg: str) -> None:
 # ---------------------------------------------------------------------------
 
 log("Loading expansion parquet...")
-exp = pd.read_parquet(PROJECT_ROOT / "data" / "longreach_expansion_pixels.parquet")
+exp = pd.read_parquet(PROJECT_ROOT / "data" / "pixels" / "longreach-expansion" / "longreach-expansion.parquet")
 log(f"  {len(exp):,} rows  |  {exp['point_id'].nunique():,} pixels")
 
 before = len(exp)

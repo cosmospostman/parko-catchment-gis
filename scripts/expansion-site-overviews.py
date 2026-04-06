@@ -1,18 +1,13 @@
-"""Queensland Globe overviews for the 5 expansion site candidates.
+"""Queensland Globe overviews for the expansion site candidates.
 
 Produces one PNG per site (outputs/expansion-site-overviews/site_<N>_*.png):
   - WMS tile fetched at the proposed fetch bbox from SITE-EXPANSION.md
   - ALA occurrence points overlaid (red dots, no label clutter at this scale)
   - Fetch bbox rectangle highlighted
   - Labelled lon/lat grid
-  - Title with site name, ALA record count, and coordinate uncertainty
+  - Title with site name and bbox
 
-Sites 1–5 from SITE-EXPANSION.md (Galilee Basin East):
-  1  Barcaldine corridor      bbox 144.88, -21.55, 145.07, -21.30
-  2  Aramac Road cluster      bbox 145.16, -22.17, 145.24, -22.07
-  3  Jericho area cluster     bbox 144.57, -22.53, 144.80, -22.36
-  4  Barcaldine South cluster bbox 144.48, -22.58, 144.59, -22.50
-  5  Longreach South cluster  bbox 145.41, -22.79, 145.45, -22.75
+Sites are loaded from data/locations/*.yaml via utils.location.
 """
 
 from __future__ import annotations
@@ -45,51 +40,17 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 ALA_PATH = PROJECT_ROOT / "outputs" / "australia_occurrences" / "ala_australia_occurrences.gpkg"
 
 # ---------------------------------------------------------------------------
-# Site definitions (from SITE-EXPANSION.md)
+# Site definitions — loaded from data/locations/*.yaml
 # ---------------------------------------------------------------------------
 
-SITES = [
-    dict(
-        id=1,
-        name="Barcaldine corridor",
-        ala_records=472,
-        coord_uncertainty_m=100,
-        centroid=(-21.438, 145.004),
-        bbox=[144.88, -21.55, 145.07, -21.30],
-    ),
-    dict(
-        id=2,
-        name="Aramac Road cluster",
-        ala_records=109,
-        coord_uncertainty_m=100,
-        centroid=(-22.104, 145.205),
-        bbox=[145.16, -22.17, 145.24, -22.07],
-    ),
-    dict(
-        id=3,
-        name="Jericho area cluster",
-        ala_records=78,
-        coord_uncertainty_m=1,
-        centroid=(-22.452, 144.693),
-        bbox=[144.57, -22.53, 144.80, -22.36],
-    ),
-    dict(
-        id=4,
-        name="Muttaburra",
-        ala_records=37,
-        coord_uncertainty_m=1,
-        centroid=(-22.538, 144.558),
-        bbox=[144.548274, -22.546983, 144.567726, -22.529017],
-    ),
-    dict(
-        id=5,
-        name="Longreach South cluster",
-        ala_records=6,
-        coord_uncertainty_m=13,
-        centroid=(-22.773, 145.428),
-        bbox=[145.41, -22.79, 145.45, -22.75],
-    ),
-]
+from utils.location import all_locations  # noqa: E402
+
+# Exclude longreach (training site) and kowanyama (separate environment).
+_EXCLUDE = {"longreach", "kowanyama"}
+SITES = sorted(
+    [loc for loc in all_locations() if loc.id not in _EXCLUDE],
+    key=lambda l: l.id,
+)
 
 # ---------------------------------------------------------------------------
 # Load ALA points
@@ -115,14 +76,13 @@ def _nice_grid_spacing(span: float, target_lines: int = 6) -> float:
     return 10 * mag
 
 
-for site in SITES:
-    lon_min, lat_min, lon_max, lat_max = site["bbox"]
-    sid = site["id"]
-    name = site["name"]
+for sid, loc in enumerate(SITES, 1):
+    lon_min, lat_min, lon_max, lat_max = loc.bbox
+    name = loc.name
 
     print(f"\nSite {sid} — {name}")
-    print(f"  Fetching WMS tile {site['bbox']} ...")
-    img = fetch_wms_image(site["bbox"], width_px=2048)
+    print(f"  Fetching WMS tile {loc.bbox} ...")
+    img = fetch_wms_image(loc.bbox, width_px=2048)
     print(f"  Tile: {img.shape[1]} × {img.shape[0]} px")
 
     # ALA points inside this bbox
@@ -144,14 +104,9 @@ for site in SITES:
 
     fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=150)
 
-    unc_str = (
-        f"{site['coord_uncertainty_m']} m" if site["coord_uncertainty_m"] < 10
-        else f"~{site['coord_uncertainty_m']} m"
-    )
     fig.suptitle(
-        f"Site {sid} — {name}  (Priority {sid})\n"
-        f"ALA records in bbox: {n_pts} / {site['ala_records']} cluster total  |  "
-        f"coord uncertainty: {unc_str}\n"
+        f"Site {sid} — {name}\n"
+        f"ALA records in bbox: {n_pts}\n"
         f"fetch bbox  lon [{lon_min}, {lon_max}]  lat [{lat_min}, {lat_max}]",
         fontsize=10,
     )
@@ -178,12 +133,15 @@ for site in SITES:
                    label=f"ALA occurrences ({n_pts})")
 
     # ALA centroid marker
-    clat, clon = site["centroid"]
-    ax.scatter([clon], [clat], s=80, color="white", marker="+",
-               linewidths=2.0, zorder=6)
-    ax.scatter([clon], [clat], s=80, color="#e74c3c", marker="+",
-               linewidths=1.0, zorder=7,
-               label=f"ALA centroid ({clat}, {clon})")
+    if loc.centroid:
+        clat, clon = loc.centroid
+        ax.scatter([clon], [clat], s=80, color="white", marker="+",
+                   linewidths=2.0, zorder=6)
+        ax.scatter([clon], [clat], s=80, color="#e74c3c", marker="+",
+                   linewidths=1.0, zorder=7,
+                   label=f"ALA centroid ({clat}, {clon})")
+    else:
+        clat, clon = None, None
 
     # Lon/lat grid
     lon_step = _nice_grid_spacing(lon_span)
@@ -212,10 +170,11 @@ for site in SITES:
                        markeredgecolor="white", markersize=7,
                        label=f"ALA occurrences in bbox ({n_pts})")
         )
-    legend_handles.append(
-        plt.Line2D([0], [0], marker="+", color="#e74c3c", markersize=10,
-                   linewidth=0, label=f"ALA centroid ({clat:.3f}, {clon:.3f})")
-    )
+    if clat is not None:
+        legend_handles.append(
+            plt.Line2D([0], [0], marker="+", color="#e74c3c", markersize=10,
+                       linewidth=0, label=f"ALA centroid ({clat:.3f}, {clon:.3f})")
+        )
     ax.legend(handles=legend_handles, loc="lower right", fontsize=8,
               framealpha=0.8, facecolor="black", labelcolor="white", edgecolor="none")
 

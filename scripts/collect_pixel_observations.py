@@ -38,7 +38,7 @@ Usage
 python scripts/collect_pixel_observations.py \\
     --bbox 145.4240,-22.7640,145.4250,-22.7610 \\
     --start 2020-01-01 --end 2025-12-31 \\
-    --out data/longreach_pixels.parquet
+    --out data/pixels/longreach/longreach.parquet
 
 # Generic usage:
 python scripts/collect_pixel_observations.py \\
@@ -52,7 +52,7 @@ Notes
 - One bbox-covering patch is fetched per (item, band) — not per point.
   All points in the bbox are sliced from the same patch in memory, so
   network requests scale with items×bands, not items×bands×points.
-- No chip files are written to disk. Each run re-fetches from the network.
+- Patch chips are cached under data/chips/<out-stem>.chips/ and re-used on re-runs.
 - Points are placed on a 10 m UTM grid aligned to the S2 pixel grid,
   one point per pixel inside the bbox.
 - Rows with no spectral bands (all NaN) are dropped before writing.
@@ -250,6 +250,8 @@ def collect(
 
     # --- 2. STAC search (cached) ---------------------------------------------
     import hashlib, pickle
+    if cache_dir is None:
+        cache_dir = PROJECT_ROOT / "data" / "chips" / (out_path.stem + ".chips")
     cache_dir.mkdir(parents=True, exist_ok=True)
     stac_key = hashlib.md5(
         f"{bbox_wgs84}|{start}|{end}|{cloud_max}".encode()
@@ -367,7 +369,7 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--out", required=True, type=Path,
-        help="Output Parquet file path, e.g. data/longreach_pixels.parquet",
+        help="Output Parquet file path, e.g. data/pixels/longreach/longreach.parquet",
     )
     p.add_argument(
         "--cloud-max", type=int, default=30,
@@ -376,7 +378,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--cache-dir", type=Path, default=None,
         help="Directory to cache fetched patches as .npz files. Re-runs skip "
-             "already-cached patches. Default: <out>.cache/ next to output.",
+             "already-cached patches. Default: data/chips/<out-stem>.chips/",
     )
     p.add_argument(
         "--stride", type=int, default=1,
@@ -403,15 +405,13 @@ def main() -> None:
         print("ERROR: --bbox must be 'lon_min,lat_min,lon_max,lat_max'", file=sys.stderr)
         sys.exit(1)
 
-    cache_dir = args.cache_dir or args.out.parent / (args.out.stem + ".cache")
-
     collect(
         bbox_wgs84=bbox,
         start=args.start,
         end=args.end,
         out_path=args.out,
         cloud_max=args.cloud_max,
-        cache_dir=cache_dir,
+        cache_dir=args.cache_dir,
         stride=args.stride,
     )
 
