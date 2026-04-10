@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pandas as pd
+import polars as pl
 
 from signals import QualityParams
 from signals._shared import load_and_filter
@@ -39,28 +40,41 @@ class RecPSignal:
         """
         p = self.params
         df = load_and_filter(pixel_df, p.quality.scl_purity_min)
-        df["ndvi"] = (df["B08"] - df["B04"]) / (df["B08"] + df["B04"])
 
-        # Annual (p90 − p10) amplitude per pixel, window-free
-        counts = df.groupby(["point_id", "year"])["ndvi"].count()
-        valid = counts[counts >= p.quality.min_obs_per_year].index
-        df_valid = df.set_index(["point_id", "year"]).loc[valid].reset_index()
-
-        p90 = (df_valid.groupby(["point_id", "year"])["ndvi"]
-               .quantile(0.90).rename("ndvi_p90").reset_index())
-        p10 = (df_valid.groupby(["point_id", "year"])["ndvi"]
-               .quantile(0.10).rename("ndvi_p10").reset_index())
-
-        annual = p90.merge(p10, on=["point_id", "year"])
-        annual["rec_p"] = annual["ndvi_p90"] - annual["ndvi_p10"]
-
-        stats = (
-            annual.groupby("point_id")
-            .agg(rec_p=("rec_p", "mean"), rec_p_std=("rec_p", "std"), n_years=("rec_p", "count"))
-            .reset_index()
+        coords = (
+            df.select(["point_id", "lon", "lat"])
+            .unique("point_id")
+            .to_pandas()
         )
 
-        coords = df[["point_id", "lon", "lat"]].drop_duplicates("point_id")
+        df = df.with_columns([
+            ((pl.col("B08") - pl.col("B04")) / (pl.col("B08") + pl.col("B04"))).alias("ndvi")
+        ])
+
+        # Annual (p90 − p10) amplitude per (pixel, year), filtering sparse years
+        annual = (
+            df.group_by(["point_id", "year"])
+            .agg([
+                pl.col("ndvi").quantile(0.90, interpolation="linear").alias("ndvi_p90"),
+                pl.col("ndvi").quantile(0.10, interpolation="linear").alias("ndvi_p10"),
+                pl.col("ndvi").count().alias("_n_obs"),
+            ])
+            .filter(pl.col("_n_obs") >= p.quality.min_obs_per_year)
+            .with_columns([
+                (pl.col("ndvi_p90") - pl.col("ndvi_p10")).alias("rec_p")
+            ])
+        )
+
+        stats = (
+            annual.group_by("point_id")
+            .agg([
+                pl.col("rec_p").mean(),
+                pl.col("rec_p").std().alias("rec_p_std"),
+                pl.col("rec_p").count().alias("n_years"),
+            ])
+            .to_pandas()
+        )
+
         stats = stats.merge(coords, on="point_id", how="left")
 
         return stats[["point_id", "lon", "lat", "rec_p", "rec_p_std", "n_years"]]

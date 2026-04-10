@@ -1,6 +1,6 @@
 # Science Validation Report
-Generated: 2026-04-04T07:40:59Z
-Commit: ae3003e
+Generated: 2026-04-06T14:29:28Z
+Commit: ebe1a0e
 Points: 40 presence, 40 absence
 
 ## Signal 1: Flowering flush

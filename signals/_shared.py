@@ -5,6 +5,10 @@ Three pure functions used by two or more signal classes:
   annual_percentile — per-pixel per-year percentile, averaged across years
   dry_season_cv     — per-pixel inter-annual CV of dry-season median
 
+All three kernels operate on Polars DataFrames internally for parallel
+groupby/agg performance on large parquets (tens of millions of rows).
+Inputs may be a pandas DataFrame or a Path; outputs are always pandas.
+
 Plus load_signal_params() which reads signal overrides from a Location's YAML
 and returns a populated Params instance merged with the signal's defaults.
 """
@@ -15,6 +19,7 @@ from pathlib import Path
 from typing import Union
 
 import pandas as pd
+import polars as pl
 
 
 # ---------------------------------------------------------------------------
@@ -25,14 +30,14 @@ def load_and_filter(
     path_or_df: Union[Path, pd.DataFrame],
     scl_purity_min: float,
     load_cols: list[str] | None = None,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """Load a pixel parquet (or accept a pre-loaded DataFrame), apply SCL
     purity filter, and add ``year`` / ``month`` integer columns.
 
     Parameters
     ----------
     path_or_df:
-        Path to a parquet file, or an already-loaded DataFrame.
+        Path to a parquet file, or a pandas DataFrame.
     scl_purity_min:
         Minimum ``scl_purity`` fraction to retain a row.
     load_cols:
@@ -41,21 +46,23 @@ def load_and_filter(
 
     Returns
     -------
-    Filtered DataFrame with ``year`` and ``month`` columns added.
+    Polars DataFrame with ``year`` and ``month`` columns added.
     """
     if isinstance(path_or_df, pd.DataFrame):
-        df = path_or_df.copy()
+        df = pl.from_pandas(path_or_df)
     else:
-        df = pd.read_parquet(path_or_df, columns=load_cols)
+        df = pl.read_parquet(path_or_df, columns=load_cols)
 
-    df = df[df["scl_purity"] >= scl_purity_min].copy()
-    df["year"] = df["date"].dt.year
-    df["month"] = df["date"].dt.month
+    df = df.filter(pl.col("scl_purity") >= scl_purity_min)
+    df = df.with_columns([
+        pl.col("date").dt.year().alias("year"),
+        pl.col("date").dt.month().alias("month"),
+    ])
     return df
 
 
 def annual_percentile(
-    df: pd.DataFrame,
+    df: pl.DataFrame,
     value_col: str,
     percentile: float,
     min_obs_per_year: int,
@@ -65,7 +72,7 @@ def annual_percentile(
     Parameters
     ----------
     df:
-        Observation-level DataFrame with ``point_id``, ``year``, and
+        Polars observation-level DataFrame with ``point_id``, ``year``, and
         ``value_col`` columns.
     value_col:
         Column name to compute percentile on.
@@ -76,36 +83,36 @@ def annual_percentile(
 
     Returns
     -------
-    DataFrame with columns ``[point_id, <value_col>_p<n>, n_years]``
+    Pandas DataFrame with columns ``[point_id, <value_col>_p<n>, n_years]``
     where ``<n>`` is the percentile as an integer (e.g. ``re_ratio_p10``).
     """
     n = int(round(percentile * 100))
     out_col = f"{value_col}_p{n}"
 
-    # Drop (pixel, year) pairs with too few observations
-    counts = df.groupby(["point_id", "year"])[value_col].count()
-    valid = counts[counts >= min_obs_per_year].index
-    df_valid = df.set_index(["point_id", "year"]).loc[valid].reset_index()
-
-    # Annual percentile per pixel
+    # Annual percentile per (pixel, year), filtering sparse years
     annual = (
-        df_valid.groupby(["point_id", "year"])[value_col]
-        .quantile(percentile)
-        .rename(out_col)
-        .reset_index()
+        df.group_by(["point_id", "year"])
+        .agg([
+            pl.col(value_col).quantile(percentile, interpolation="linear").alias(out_col),
+            pl.col(value_col).count().alias("_n_obs"),
+        ])
+        .filter(pl.col("_n_obs") >= min_obs_per_year)
     )
 
     # Mean across years + year count
     result = (
-        annual.groupby("point_id")[out_col]
-        .agg(**{out_col: "mean", "n_years": "count"})
-        .reset_index()
+        annual.group_by("point_id")
+        .agg([
+            pl.col(out_col).mean(),
+            pl.col(out_col).count().alias("n_years"),
+        ])
     )
-    return result
+
+    return result.to_pandas()
 
 
 def dry_season_cv(
-    df: pd.DataFrame,
+    df: pl.DataFrame,
     value_col: str,
     dry_months: list[int],
     min_obs_dry: int,
@@ -115,8 +122,8 @@ def dry_season_cv(
     Parameters
     ----------
     df:
-        Observation-level DataFrame with ``point_id``, ``year``, ``month``,
-        and ``value_col`` columns.
+        Polars observation-level DataFrame with ``point_id``, ``year``,
+        ``month``, and ``value_col`` columns.
     value_col:
         Column name to compute CV on (typically ``B08`` for NIR).
     dry_months:
@@ -127,38 +134,35 @@ def dry_season_cv(
 
     Returns
     -------
-    DataFrame with columns
+    Pandas DataFrame with columns
     ``[point_id, <value_col>_mean, <value_col>_std, <value_col>_cv, n_years]``.
     """
-    df_dry = df[df["month"].isin(dry_months)].copy()
+    df_dry = df.filter(pl.col("month").is_in(dry_months))
 
-    # Drop (pixel, year) pairs with too few dry-season observations
-    counts = df_dry.groupby(["point_id", "year"])[value_col].count()
-    valid = counts[counts >= min_obs_dry].index
-    df_valid = df_dry.set_index(["point_id", "year"]).loc[valid].reset_index()
-
-    # Annual dry-season median
+    # Annual dry-season median per (pixel, year), filtering sparse years
     medians = (
-        df_valid.groupby(["point_id", "year"])[value_col]
-        .median()
-        .rename("_annual_med")
-        .reset_index()
+        df_dry.group_by(["point_id", "year"])
+        .agg([
+            pl.col(value_col).median().alias("_annual_med"),
+            pl.col(value_col).count().alias("_n_obs"),
+        ])
+        .filter(pl.col("_n_obs") >= min_obs_dry)
     )
 
     # Inter-annual mean, std, CV
     result = (
-        medians.groupby("point_id")["_annual_med"]
-        .agg(
-            **{
-                f"{value_col}_mean": "mean",
-                f"{value_col}_std": "std",
-                "n_years": "count",
-            }
-        )
-        .reset_index()
+        medians.group_by("point_id")
+        .agg([
+            pl.col("_annual_med").mean().alias(f"{value_col}_mean"),
+            pl.col("_annual_med").std().alias(f"{value_col}_std"),
+            pl.col("_annual_med").count().alias("n_years"),
+        ])
+        .with_columns([
+            (pl.col(f"{value_col}_std") / pl.col(f"{value_col}_mean")).alias(f"{value_col}_cv"),
+        ])
     )
-    result[f"{value_col}_cv"] = result[f"{value_col}_std"] / result[f"{value_col}_mean"]
-    return result
+
+    return result.to_pandas()
 
 
 # ---------------------------------------------------------------------------

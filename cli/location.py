@@ -19,6 +19,7 @@ Examples
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
@@ -76,6 +77,9 @@ def cmd_bbox(args: argparse.Namespace) -> None:
 
 
 def cmd_fetch(args: argparse.Namespace) -> None:
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    logging.getLogger("rasterio").setLevel(logging.WARNING)
+
     try:
         loc = get(args.id)
     except KeyError:

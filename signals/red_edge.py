@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pandas as pd
+import polars as pl
 
 from signals import QualityParams
 from signals._shared import load_and_filter, annual_percentile
@@ -40,14 +41,22 @@ class RedEdgeSignal:
         """
         p = self.params
         df = load_and_filter(pixel_df, p.quality.scl_purity_min)
-        df["re_ratio"] = df["B07"] / df["B05"]
+
+        coords = (
+            df.select(["point_id", "lon", "lat"])
+            .unique("point_id")
+            .to_pandas()
+        )
+
+        df = df.with_columns([
+            (pl.col("B07") / pl.col("B05")).alias("re_ratio")
+        ])
 
         fp = p.floor_percentile
         fp_int = int(round(fp * 100))
         stats = annual_percentile(df, "re_ratio", fp, p.quality.min_obs_per_year)
         stats = stats.rename(columns={f"re_ratio_p{fp_int}": "re_p10"})
 
-        coords = df[["point_id", "lon", "lat"]].drop_duplicates("point_id")
         stats = stats.merge(coords, on="point_id", how="left")
 
         return stats[["point_id", "lon", "lat", "re_p10", "n_years"]]

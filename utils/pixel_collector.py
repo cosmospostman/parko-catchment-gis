@@ -285,31 +285,72 @@ def collect(
     )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    done_path = out_path.with_suffix(".done")
+    partial_path = out_path.with_suffix(".partial.parquet")
+
+    # Load checkpoint: set of item_ids already written
+    done_ids: set[str] = set()
+    resuming = done_path.exists() and out_path.exists()
+    if resuming:
+        done_ids = set(done_path.read_text().splitlines())
+        existing_rows = pq.read_metadata(out_path).num_rows
+        logger.info(
+            "Checkpoint: %d items already done (%d rows), resuming",
+            len(done_ids), existing_rows,
+        )
+
     writer: pq.ParquetWriter | None = None
-    total_rows = 0
+    new_rows = 0
 
     logger.info("Extracting observations (vectorised, %d items) ...", len(items))
     for i, item in enumerate(items):
+        if item.id in done_ids:
+            store.release_item(item.id)
+            continue
+
         batch_df = extract_item_to_df(item, store, point_ids, lons_arr, lats_arr)
         store.release_item(item.id)
 
-        if batch_df is None or batch_df.empty:
-            continue
+        if batch_df is not None and not batch_df.empty:
+            table = pa.Table.from_pandas(batch_df[col_order], preserve_index=False)
+            if writer is None:
+                writer = pq.ParquetWriter(partial_path, table.schema)
+            writer.write_table(table)
+            new_rows += len(batch_df)
 
-        table = pa.Table.from_pandas(batch_df[col_order], preserve_index=False)
-        if writer is None:
-            writer = pq.ParquetWriter(out_path, table.schema)
-        writer.write_table(table)
-        total_rows += len(batch_df)
+        # Mark item done and flush checkpoint after every item
+        done_ids.add(item.id)
+        done_path.write_text("\n".join(done_ids))
 
         if (i + 1) % 50 == 0 or (i + 1) == len(items):
-            logger.info("  %d/%d items processed, %d rows written", i + 1, len(items), total_rows)
+            logger.info("  %d/%d items processed, %d new rows", i + 1, len(items), new_rows)
 
     if writer is not None:
         writer.close()
+
+    # Merge partial into final output
+    if resuming and partial_path.exists():
+        logger.info("Merging checkpoint parquet with new rows (%d) ...", new_rows)
+        merged = pa.concat_tables([
+            pq.read_table(out_path),
+            pq.read_table(partial_path),
+        ])
+        pq.write_table(merged, out_path)
+        partial_path.unlink()
+        total_rows = len(merged)
+    elif partial_path.exists():
+        partial_path.rename(out_path)
+        total_rows = new_rows
     else:
+        # Resumed and all items were already done
+        total_rows = pq.read_metadata(out_path).num_rows if out_path.exists() else 0
+
+    if total_rows == 0:
         logger.error("No usable observations — all pixels clouded or missing?")
         sys.exit(1)
+
+    # Remove checkpoint file on clean completion
+    done_path.unlink(missing_ok=True)
 
     logger.info("Written: %s  (%d rows)", out_path, total_rows)
     print(f"\nDone.")

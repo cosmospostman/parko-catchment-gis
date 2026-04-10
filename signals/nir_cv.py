@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Union
 
 import pandas as pd
+import polars as pl
 
 from signals import QualityParams
 from signals._shared import load_and_filter, dry_season_cv
@@ -48,6 +49,13 @@ class NirCvSignal:
         """
         p = self.params
         df = load_and_filter(pixel_df, p.quality.scl_purity_min)
+
+        coords = (
+            df.select(["point_id", "lon", "lat"])
+            .unique("point_id")
+            .to_pandas()
+        )
+
         stats = dry_season_cv(df, "B08", loc.dry_months, p.quality.min_obs_dry)
         stats = stats.rename(columns={
             "B08_mean": "nir_mean",
@@ -55,8 +63,6 @@ class NirCvSignal:
             "B08_cv": "nir_cv",
         })
 
-        # Attach coordinates
-        coords = df[["point_id", "lon", "lat"]].drop_duplicates("point_id")
         stats = stats.merge(coords, on="point_id", how="left")
 
         col_order = ["point_id", "lon", "lat", "nir_mean", "nir_std", "nir_cv", "n_years"]
@@ -97,7 +103,6 @@ class NirCvSignal:
 
         if out_dir is None:
             from pathlib import Path as _Path
-            import sys
             _root = _Path(__file__).resolve().parent.parent
             out_dir = _root / "outputs" / f"{loc.id}-nir-cv"
         out_dir = Path(out_dir)
