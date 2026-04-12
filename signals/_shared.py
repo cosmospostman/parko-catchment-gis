@@ -18,6 +18,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Union
 
+import numpy as np
 import pandas as pd
 import polars as pl
 
@@ -27,7 +28,7 @@ import polars as pl
 # ---------------------------------------------------------------------------
 
 def load_and_filter(
-    path_or_df: Union[Path, pd.DataFrame],
+    path_or_df: Union[Path, pd.DataFrame, pl.DataFrame],
     scl_purity_min: float,
     load_cols: list[str] | None = None,
 ) -> pl.DataFrame:
@@ -48,7 +49,9 @@ def load_and_filter(
     -------
     Polars DataFrame with ``year`` and ``month`` columns added.
     """
-    if isinstance(path_or_df, pd.DataFrame):
+    if isinstance(path_or_df, pl.DataFrame):
+        df = path_or_df
+    elif isinstance(path_or_df, pd.DataFrame):
         df = pl.from_pandas(path_or_df)
     else:
         df = pl.read_parquet(path_or_df, columns=load_cols)
@@ -163,6 +166,101 @@ def dry_season_cv(
     )
 
     return result.to_pandas()
+
+
+# ---------------------------------------------------------------------------
+# Annual NDVI curve kernel
+# ---------------------------------------------------------------------------
+
+def annual_ndvi_curve(
+    df: pl.DataFrame,
+    smooth_days: int,
+    min_obs_per_year: int,
+) -> pl.DataFrame:
+    """Smoothed per-pixel per-date NDVI, with sparse years flagged.
+
+    Computes NDVI = (B08 - B04) / (B08 + B04), then applies a rolling
+    median over a ``smooth_days`` window within each (point_id, year) group.
+    Years with fewer than ``min_obs_per_year`` clean observations are flagged
+    via an ``is_sparse_year`` boolean column rather than dropped, so callers
+    can decide how to handle them.
+
+    Parameters
+    ----------
+    df:
+        Polars observation-level DataFrame — must already have ``year`` and
+        ``month`` columns (i.e. output of ``load_and_filter``). Must contain
+        ``point_id``, ``date``, ``B08``, ``B04``.
+    smooth_days:
+        Rolling-median window width in days. Applied within each
+        (point_id, year) group sorted by date.
+    min_obs_per_year:
+        Minimum observations per (point_id, year) to mark the year as
+        non-sparse.
+
+    Returns
+    -------
+    Polars DataFrame with columns:
+        ``point_id``, ``date``, ``year``, ``month``, ``doy``,
+        ``ndvi``, ``ndvi_smooth``, ``is_sparse_year``.
+    """
+    # Drop all columns not needed for curve computation before the sort/smooth.
+    # The input frame may carry all band columns (~7 GB for 64M rows); retaining
+    # them through the sort and numpy extraction doubles peak memory.
+    keep = {"point_id", "date", "year", "month", "B08", "B04"}
+    drop_cols = [c for c in df.columns if c not in keep]
+    if drop_cols:
+        df = df.drop(drop_cols)
+
+    df = df.with_columns([
+        ((pl.col("B08") - pl.col("B04")) / (pl.col("B08") + pl.col("B04"))).alias("ndvi"),
+        pl.col("date").dt.ordinal_day().alias("doy"),
+    ])
+
+    # Count observations per (point_id, year) to flag sparse years
+    obs_counts = (
+        df.group_by(["point_id", "year"])
+        .agg(pl.len().alias("_n_obs"))
+    )
+    df = df.join(obs_counts, on=["point_id", "year"], how="left")
+    df = df.with_columns([
+        (pl.col("_n_obs") < min_obs_per_year).alias("is_sparse_year"),
+    ]).drop("_n_obs")
+
+    # Rolling median within each (point_id, year) group, sorted by date.
+    # Polars rolling_median operates over a row-count window; convert
+    # smooth_days to an approximate row count using median S2 cadence (~5 days).
+    #
+    # We sort once, then compute the smoothed series entirely in numpy using
+    # group-boundary splits — no Polars group infrastructure, no list
+    # materialisation, no re-sorting per group. Peak memory stays at ~1× the
+    # input frame size.
+    window_rows = max(3, smooth_days // 5)
+    df = df.sort(["point_id", "year", "date"])
+
+    ndvi_arr = df["ndvi"].to_numpy(allow_copy=True)
+    pid_arr = df["point_id"].to_numpy(allow_copy=True)
+    yr_arr = df["year"].to_numpy(allow_copy=True)
+
+    # Group boundaries: positions where (point_id, year) changes
+    change = np.ones(len(ndvi_arr), dtype=bool)
+    change[1:] = (pid_arr[1:] != pid_arr[:-1]) | (yr_arr[1:] != yr_arr[:-1])
+    starts = np.flatnonzero(change)
+    ends = np.append(starts[1:], len(ndvi_arr))
+
+    from scipy.ndimage import median_filter
+
+    ndvi_smooth = np.empty_like(ndvi_arr)
+    for s, e in zip(starts, ends):
+        # scipy median_filter with 'reflect' mode; center=True equivalent
+        ndvi_smooth[s:e] = median_filter(ndvi_arr[s:e], size=window_rows, mode="nearest")
+
+    return df.with_columns(
+        pl.Series("ndvi_smooth", ndvi_smooth)
+    ).select([
+        "point_id", "date", "year", "month", "doy",
+        "ndvi", "ndvi_smooth", "is_sparse_year",
+    ])
 
 
 # ---------------------------------------------------------------------------

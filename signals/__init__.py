@@ -54,12 +54,14 @@ class QualityParams:
 # Signal classes — imported after QualityParams to avoid circular imports
 # ---------------------------------------------------------------------------
 
-from signals.nir_cv import NirCvSignal          # noqa: E402
-from signals.wet_dry_amp import RecPSignal       # noqa: E402
-from signals.red_edge import RedEdgeSignal       # noqa: E402
-from signals.swir import SwirSignal              # noqa: E402
-from signals.flowering import FloweringSignal    # noqa: E402
-from signals.tuning import sweep_signal          # noqa: E402
+from signals.nir_cv import NirCvSignal                        # noqa: E402
+from signals.wet_dry_amp import RecPSignal                    # noqa: E402
+from signals.red_edge import RedEdgeSignal                    # noqa: E402
+from signals.swir import SwirSignal                           # noqa: E402
+from signals.flowering import FloweringSignal                 # noqa: E402
+from signals.recession import RecessionSensitivitySignal      # noqa: E402
+from signals.greenup import GreenupTimingSignal               # noqa: E402
+from signals.tuning import sweep_signal                       # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +139,8 @@ __all__ = [
     "RedEdgeSignal",
     "SwirSignal",
     "FloweringSignal",
+    "RecessionSensitivitySignal",
+    "GreenupTimingSignal",
     "extract_parko_features",
     "sweep_signal",
 ]
