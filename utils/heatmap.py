@@ -2,7 +2,7 @@
 
 Produces two separate figures from a scored DataFrame (output of ParkoClassifier.score()):
   1. <stem>_prob_vs_imagery.png  — Queensland Globe satellite underlay + per-pixel overlay
-  2. <stem>_prob_black.png       — Black-background probability scatter
+  2. <stem>_prob_black.png       — Black-background probability grid
 
 Usage
 -----
@@ -30,7 +30,7 @@ import numpy as np
 import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_HALF_DEG = 0.000045   # ~5 m half-width of a 10 m pixel in degrees
+_PIXEL_DEG = 0.000100   # Sentinel-2 pixel spacing in degrees (measured from data)
 
 
 def _load_qglobe():
@@ -51,14 +51,50 @@ def _scene_bbox(scored_df: pd.DataFrame, margin: float = 0.00005) -> list[float]
     ]
 
 
-def _marker_size(ax, lon_min: float, lon_max: float) -> float:
-    """Compute scatter marker size (points²) so one marker ≈ one 5 m radius (half a 10 m pixel width)."""
-    fig = ax.get_figure()
-    ax_width_in = ax.get_window_extent(fig.canvas.get_renderer()).width / fig.dpi
+def _prob_grid(
+    valid: pd.DataFrame,
+    lon_min: float, lon_max: float,
+    lat_min: float, lat_max: float,
+    cmap,
+    alpha: float = 0.85,
+) -> np.ndarray:
+    """Rasterise prob_lr values onto a regular lon/lat grid.
+
+    Returns an RGBA array of shape (H, W, 4) aligned to the bbox extent,
+    with transparent cells where no pixel falls.  Each source point maps to
+    exactly one grid cell; if multiple points fall in the same cell (should
+    not happen with 10 m Sentinel-2 data) the mean is used.
+    """
     lon_span = lon_max - lon_min
-    frac = (2 * _HALF_DEG) / lon_span
-    px_width_pts = frac * ax_width_in * 72
-    return max(px_width_pts ** 2 * 0.5 * 0.25 * 0.25, 1.0)
+    lat_span = lat_max - lat_min
+
+    W = max(int(round(lon_span / _PIXEL_DEG)), 1)
+    H = max(int(round(lat_span / _PIXEL_DEG)), 1)
+
+    col_idx = np.clip(
+        ((valid["lon"].values - lon_min) / lon_span * W).astype(int), 0, W - 1
+    )
+    # imshow origin="upper" → row 0 = lat_max
+    row_idx = np.clip(
+        ((lat_max - valid["lat"].values) / lat_span * H).astype(int), 0, H - 1
+    )
+
+    prob = valid["prob_lr"].values
+
+    # Accumulate sum and count to compute mean per cell
+    grid_sum   = np.zeros((H, W), dtype=np.float32)
+    grid_count = np.zeros((H, W), dtype=np.int32)
+    np.add.at(grid_sum,   (row_idx, col_idx), prob)
+    np.add.at(grid_count, (row_idx, col_idx), 1)
+
+    filled = grid_count > 0
+    grid_mean = np.where(filled, grid_sum / np.maximum(grid_count, 1), np.nan)
+
+    rgba = np.zeros((H, W, 4), dtype=np.float32)
+    rgba[filled] = cmap(grid_mean[filled])
+    rgba[filled, 3] = alpha   # set alpha only for populated cells
+
+    return rgba
 
 
 def _apply_annotations(ax, annotations: list[dict]) -> None:
@@ -142,9 +178,10 @@ def plot_prob_heatmaps(
     fig_w = max(fig_h * aspect, 4)
 
     valid = scored_df.dropna(subset=["prob_lr"])
+    extent = [lon_min, lon_max, lat_min, lat_max]
 
     # ------------------------------------------------------------------
-    # Figure 1: satellite underlay + dot overlay
+    # Figure 1: satellite underlay + pixel grid overlay
     # ------------------------------------------------------------------
     fig1, ax = plt.subplots(figsize=(fig_w, fig_h))
     fig1.suptitle(
@@ -154,19 +191,13 @@ def plot_prob_heatmaps(
     )
 
     if img is not None:
-        ax.imshow(img, extent=[lon_min, lon_max, lat_min, lat_max],
-                  origin="upper", aspect="auto")
+        ax.imshow(img, extent=extent, origin="upper", aspect="auto")
     else:
         ax.set_facecolor("#111111")
 
-    fig1.canvas.draw()
-    s = _marker_size(ax, lon_min, lon_max)
-
-    ax.scatter(
-        valid["lon"], valid["lat"],
-        c=valid["prob_lr"], cmap=cmap, norm=norm,
-        s=s, marker="o", linewidths=0, alpha=0.7, zorder=2,
-    )
+    rgba = _prob_grid(valid, lon_min, lon_max, lat_min, lat_max, cmap, alpha=0.75)
+    ax.imshow(rgba, extent=extent, origin="upper", aspect="auto", zorder=2,
+              interpolation="nearest")
 
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
     sm.set_array([])
@@ -187,7 +218,7 @@ def plot_prob_heatmaps(
     print(f"Saved: {p1}")
 
     # ------------------------------------------------------------------
-    # Figure 2: black background scatter
+    # Figure 2: black background pixel grid
     # ------------------------------------------------------------------
     fig2, ax2 = plt.subplots(figsize=(fig_w, fig_h))
     fig2.patch.set_facecolor("black")
@@ -197,16 +228,13 @@ def plot_prob_heatmaps(
         fontsize=11, color="white",
     )
 
-    fig2.canvas.draw()
-    s2 = _marker_size(ax2, lon_min, lon_max)
+    rgba2 = _prob_grid(valid, lon_min, lon_max, lat_min, lat_max, cmap, alpha=1.0)
+    ax2.imshow(rgba2, extent=extent, origin="upper", aspect="auto", zorder=2,
+               interpolation="nearest")
 
-    sc = ax2.scatter(
-        valid["lon"], valid["lat"],
-        c=valid["prob_lr"], cmap=cmap, norm=norm,
-        s=s2, marker="o", linewidths=0, zorder=2,
-    )
-
-    cb2 = fig2.colorbar(sc, ax=ax2, fraction=0.03, pad=0.02)
+    sm2 = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm2.set_array([])
+    cb2 = fig2.colorbar(sm2, ax=ax2, fraction=0.03, pad=0.02)
     cb2.set_label("P(Parkinsonia)", fontsize=9, color="white")
     cb2.ax.yaxis.set_tick_params(color="white")
     plt.setp(cb2.ax.yaxis.get_ticklabels(), color="white")

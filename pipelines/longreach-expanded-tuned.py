@@ -21,6 +21,7 @@ from utils.heatmap import plot_prob_heatmaps
 from signals import extract_parko_features
 from signals._shared import load_signal_params
 from analysis.classifier import ParkoClassifier
+from pipelines.common import label_pixels, summarise, save_pixel_ranking
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OUT_DIR = PROJECT_ROOT / "outputs" / "longreach-expanded-tuned"
@@ -30,44 +31,6 @@ TRAIN_LOC_ID  = "longreach"            # source of parquet + sub-bbox labels
 SCENE_LOC_ID  = "longreach-expansion"  # source of scene parquet + loc metadata
 TUNED_LOC_ID  = "longreach-expansion-tuned"  # carries tuned signal params
 
-
-def label_pixels(features_df: pd.DataFrame, train_loc) -> pd.DataFrame:
-    """Assign is_presence from the training location's presence/absence sub_bboxes."""
-    df = features_df.copy()
-    df["is_presence"] = pd.NA
-
-    for sub in train_loc.sub_bboxes.values():
-        lon_min, lat_min, lon_max, lat_max = sub.bbox
-        mask = (
-            df["lon"].between(lon_min, lon_max) &
-            df["lat"].between(lat_min, lat_max)
-        )
-        if sub.role == "presence":
-            df.loc[mask, "is_presence"] = True
-        elif sub.role == "absence":
-            df.loc[mask, "is_presence"] = False
-
-    return df
-
-
-def summarise(scored_df: pd.DataFrame, scene_loc) -> None:
-    labelled = scored_df[scored_df["is_presence"].notna()]
-    print(f"\n{'='*60}")
-    print(f"Site: {scene_loc.name}  ({len(scored_df):,} pixels)")
-    print(f"{'='*60}")
-
-    if not labelled.empty:
-        print("\nProbability by class (mean / median / std):")
-        for val, label in [(True, "Presence"), (False, "Absence")]:
-            sub = labelled[labelled["is_presence"] == val]["prob_lr"]
-            if not sub.empty:
-                print(f"  {label:10s}  mean={sub.mean():.3f}  median={sub.median():.3f}  std={sub.std():.3f}")
-
-    all_scored = scored_df["prob_lr"].dropna()
-    print(f"\nFull scene  ({len(all_scored):,} scored pixels):")
-    print(f"  mean={all_scored.mean():.3f}  median={all_scored.median():.3f}  std={all_scored.std():.3f}")
-    for pct in (75, 90, 95):
-        print(f"  p{pct}={all_scored.quantile(pct/100):.3f}")
 
 
 def run(plots: bool = True) -> None:
@@ -121,12 +84,7 @@ def run(plots: bool = True) -> None:
 
     summarise(scored, scene_loc)
 
-    ranked_path = out_dir / "longreach_expanded_tuned_pixel_ranking.csv"
-    cols = ["point_id", "lon", "lat", "is_presence", "prob_lr", "rank"] + FEATURES
-    scored[[c for c in cols if c in scored.columns]].sort_values("rank").to_csv(
-        ranked_path, index=False, float_format="%.4f"
-    )
-    print(f"Saved: {ranked_path}")
+    save_pixel_ranking(scored, out_dir / "longreach_expanded_tuned_pixel_ranking.csv", FEATURES)
 
     if plots:
         # Build annotation: white dashed rect marking the training infestation patch

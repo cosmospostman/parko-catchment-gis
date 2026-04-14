@@ -63,6 +63,7 @@ from signals.swir import SwirSignal                           # noqa: E402
 from signals.flowering import FloweringSignal                 # noqa: E402
 from signals.recession import RecessionSensitivitySignal      # noqa: E402
 from signals.greenup import GreenupTimingSignal, GreenupShiftSignal  # noqa: E402
+from signals.integral import NdviIntegralSignal               # noqa: E402
 from signals.tuning import sweep_signal                       # noqa: E402
 
 
@@ -158,6 +159,7 @@ __all__ = [
     "RecessionSensitivitySignal",
     "GreenupTimingSignal",
     "GreenupShiftSignal",
+    "NdviIntegralSignal",
     "extract_parko_features",
     "sweep_signal",
 ]

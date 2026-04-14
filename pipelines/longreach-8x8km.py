@@ -21,58 +21,25 @@ import pandas as pd
 
 from utils.location import get
 from utils.heatmap import plot_prob_heatmaps
-from signals import extract_parko_features
+from signals import extract_parko_features, NdviIntegralSignal
 from analysis.classifier import ParkoClassifier
+from pipelines.common import label_pixels, summarise, save_pixel_ranking
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OUT_DIR = PROJECT_ROOT / "outputs" / "longreach-8x8"
-FEATURES = ["nir_cv", "rec_p", "re_p10"]
+FEATURES = ["nir_cv", "rec_p", "re_p10", "ndvi_integral"]
+
+# Pre-computed NDVI curve — shared with recession/greenup investigations.
+# Build once via research/recession-and-greenup/longreach-recession-greenup.py
+# if not present.
+CURVE_CACHE = (
+    PROJECT_ROOT / "research" / "recession-and-greenup"
+    / "longreach-recession-greenup" / "_cache_ndvi_curve.parquet"
+)
 
 TRAIN_LOC_ID = "longreach"        # source of sub-bbox training labels
 SCENE_LOC_ID = "longreach-8x8km"  # full scene to score
 
-
-def label_pixels(features_df: pd.DataFrame, train_loc) -> pd.DataFrame:
-    """Assign is_presence from the training location's presence/absence sub_bboxes.
-
-    Pixels outside any labelled sub-bbox get NaN — scored but not trained on.
-    """
-    df = features_df.copy()
-    df["is_presence"] = pd.NA
-
-    for sub in train_loc.sub_bboxes.values():
-        lon_min, lat_min, lon_max, lat_max = sub.bbox
-        mask = (
-            df["lon"].between(lon_min, lon_max) &
-            df["lat"].between(lat_min, lat_max)
-        )
-        if sub.role == "presence":
-            df.loc[mask, "is_presence"] = True
-        elif sub.role == "absence":
-            df.loc[mask, "is_presence"] = False
-
-    return df
-
-
-def summarise(scored_df: pd.DataFrame, scene_loc) -> None:
-    """Print per-class probability statistics."""
-    print(f"\n{'='*60}")
-    print(f"Site: {scene_loc.name}  ({len(scored_df):,} pixels)")
-    print(f"{'='*60}")
-
-    labelled = scored_df[scored_df["is_presence"].notna()]
-    if not labelled.empty:
-        print("\nProbability by class (mean / median / std):")
-        for val, label in [(True, "Presence"), (False, "Absence")]:
-            sub = labelled[labelled["is_presence"] == val]["prob_lr"]
-            if not sub.empty:
-                print(f"  {label:10s}  mean={sub.mean():.3f}  median={sub.median():.3f}  std={sub.std():.3f}")
-
-    all_scored = scored_df["prob_lr"].dropna()
-    print(f"\nFull scene  ({len(all_scored):,} scored pixels):")
-    print(f"  mean={all_scored.mean():.3f}  median={all_scored.median():.3f}  std={all_scored.std():.3f}")
-    for pct in (75, 90, 95):
-        print(f"  p{pct}={all_scored.quantile(pct/100):.3f}")
 
 
 def run(plots: bool = True) -> None:
@@ -89,6 +56,14 @@ def run(plots: bool = True) -> None:
 
     print("Extracting features (training set)...")
     train_features = extract_parko_features(train_raw, train_loc)
+
+    if CURVE_CACHE.exists():
+        integral_train = NdviIntegralSignal().compute(None, train_loc, _curve=CURVE_CACHE)
+        train_features = train_features.merge(
+            integral_train[["point_id", "ndvi_integral"]], on="point_id", how="left"
+        )
+    else:
+        print(f"  WARNING: CURVE_CACHE not found — ndvi_integral will be NaN for training set.\n  {CURVE_CACHE}")
 
     print("Labelling training pixels...")
     train_labelled = label_pixels(train_features, train_loc)
@@ -117,6 +92,15 @@ def run(plots: bool = True) -> None:
     print(f"\nExtracting features from {sorted_path.name} (chunked, one row-group at a time)...")
     scene_features = extract_parko_features(sorted_path, scene_loc)
 
+    if CURVE_CACHE.exists():
+        print("Computing ndvi_integral from curve cache...")
+        integral_scene = NdviIntegralSignal().compute(None, scene_loc, _curve=CURVE_CACHE)
+        scene_features = scene_features.merge(
+            integral_scene[["point_id", "ndvi_integral"]], on="point_id", how="left"
+        )
+    else:
+        print(f"  WARNING: CURVE_CACHE not found — ndvi_integral will be NaN.\n  {CURVE_CACHE}")
+
     # Carry over training labels where pixels overlap the sub-bboxes
     scene_labelled = label_pixels(scene_features, train_loc)
 
@@ -125,12 +109,7 @@ def run(plots: bool = True) -> None:
 
     summarise(scored, scene_loc)
 
-    ranked_path = out_dir / "longreach_8x8km_pixel_ranking.csv"
-    cols = ["point_id", "lon", "lat", "is_presence", "prob_lr", "rank"] + FEATURES
-    scored[[c for c in cols if c in scored.columns]].sort_values("rank").to_csv(
-        ranked_path, index=False, float_format="%.4f"
-    )
-    print(f"Saved: {ranked_path}")
+    save_pixel_ranking(scored, out_dir / "longreach_8x8km_pixel_ranking.csv", FEATURES)
 
     if plots:
         plot_prob_heatmaps(scored, scene_loc, out_dir, stem="longreach_8x8km")
