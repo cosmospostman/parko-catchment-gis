@@ -35,3 +35,6 @@ Thumbs.db
 
 # Model cache
 *.pkl
+
+# Parquet cache files
+*.parquet

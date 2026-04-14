@@ -39,7 +39,10 @@ class RecPSignal:
         DataFrame with columns ``[point_id, lon, lat, rec_p, rec_p_std, n_years]``.
         """
         p = self.params
-        df = load_and_filter(pixel_df, p.quality.scl_purity_min)
+        df = load_and_filter(
+            pixel_df, p.quality.scl_purity_min,
+            load_cols=["point_id", "lon", "lat", "date", "scl_purity", "B08", "B04"],
+        )
 
         coords = (
             df.select(["point_id", "lon", "lat"])

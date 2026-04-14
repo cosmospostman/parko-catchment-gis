@@ -103,47 +103,71 @@ class RecessionSensitivitySignal:
         )
         return stats.to_pandas()
 
-    def _recession_slopes(self, curve: pl.DataFrame) -> pd.DataFrame:
+    def _recession_slopes(self, curve: "pl.DataFrame | Path") -> pd.DataFrame:
         """OLS slope of smoothed NDVI vs DOY within the recession window.
 
         Returns one row per (point_id, year) with columns:
             point_id, year, recession_slope, n_recession_obs
         Years with fewer than min_recession_obs are excluded.
 
-        OLS is computed entirely in Polars via list-column arithmetic —
-        no Python loop, no iterrows(), fully vectorised across all groups.
-        slope = Σ(x - x̄)(y - ȳ) / Σ(x - x̄)²
+        OLS is computed entirely in Polars via sufficient-statistic aggregation —
+        no Python UDF, no list columns, fully vectorised across all groups.
+        slope = (n·Σxy - Σx·Σy) / (n·Σx² - (Σx)²)
+
+        ``curve`` may be a ``pl.DataFrame`` or a ``Path`` to a parquet file
+        written by ``annual_ndvi_curve_chunked``.  When a ``Path`` is given,
+        the groupby is collected with ``engine='streaming'`` to avoid loading
+        the full 267M-row curve into RAM.
         """
         p = self.params
         rec_months = list(range(p.recession_start_month, p.recession_end_month + 1))
 
-        rec = curve.filter(
-            pl.col("month").is_in(rec_months) & ~pl.col("is_sparse_year")
-        )
+        if isinstance(curve, Path):
+            rec = (
+                pl.scan_parquet(curve)
+                .filter(pl.col("month").is_in(rec_months) & ~pl.col("is_sparse_year"))
+            )
+            use_streaming = True
+        else:
+            rec = curve.filter(
+                pl.col("month").is_in(rec_months) & ~pl.col("is_sparse_year")
+            )
+            use_streaming = False
 
-        def _ols(row) -> float:
-            x = np.asarray(row["x"], dtype=float)
-            y = np.asarray(row["y"], dtype=float)
-            xm = x.mean()
-            denom = ((x - xm) ** 2).sum()
-            if denom == 0:
-                return float("nan")
-            return float(((x - xm) * (y - y.mean())).sum() / denom)
+        # Collect sufficient statistics per (pixel, year) — streaming-compatible.
+        # OLS slope = (n·Σxy - Σx·Σy) / (n·Σx² - (Σx)²)  — no list columns needed.
+        doy_f = pl.col("doy").cast(pl.Float64)
+        ndvi_f = pl.col("ndvi_smooth").cast(pl.Float64)
 
-        slopes = (
+        agg_lazy = (
             rec.group_by(["point_id", "year"])
             .agg([
-                pl.col("ndvi_smooth").count().alias("n_obs"),
-                pl.col("doy").cast(pl.Float64).alias("x"),
-                pl.col("ndvi_smooth").alias("y"),
+                pl.len().alias("n_obs"),
+                doy_f.sum().alias("sum_x"),
+                (doy_f * doy_f).sum().alias("sum_x2"),
+                ndvi_f.sum().alias("sum_y"),
+                (doy_f * ndvi_f).sum().alias("sum_xy"),
             ])
             .filter(pl.col("n_obs") >= p.min_recession_obs)
-            .with_columns([
-                pl.struct(["x", "y"])
-                  .map_elements(_ols, return_dtype=pl.Float64)
+        )
+
+        if use_streaming:
+            agg = agg_lazy.collect(engine="streaming")
+        else:
+            agg = agg_lazy.collect() if isinstance(agg_lazy, pl.LazyFrame) else agg_lazy
+
+        n = pl.col("n_obs").cast(pl.Float64)
+        slopes = (
+            agg.with_columns([
+                pl.when((n * pl.col("sum_x2") - pl.col("sum_x") ** 2) > 0)
+                  .then(
+                      (n * pl.col("sum_xy") - pl.col("sum_x") * pl.col("sum_y")) /
+                      (n * pl.col("sum_x2") - pl.col("sum_x") ** 2)
+                  )
+                  .otherwise(pl.lit(None, dtype=pl.Float64))
                   .alias("recession_slope"),
             ])
-            .drop(["x", "y"])
+            .drop(["sum_x", "sum_x2", "sum_y", "sum_xy"])
             .rename({"n_obs": "n_recession_obs"})
         )
 
@@ -158,7 +182,7 @@ class RecessionSensitivitySignal:
         pixel_df: pd.DataFrame,
         loc: object,
         _df: pl.DataFrame | None = None,
-        _curve: pl.DataFrame | None = None,
+        _curve: "pl.DataFrame | Path | None" = None,
     ) -> pd.DataFrame:
         """Compute recession sensitivity features per pixel.
 
@@ -172,8 +196,11 @@ class RecessionSensitivitySignal:
             Optional pre-filtered Polars DataFrame (output of
             ``load_and_filter``). If provided, skips the filter step.
         _curve:
-            Optional pre-computed NDVI curve (output of
-            ``annual_ndvi_curve``). If provided, skips the smoothing step.
+            Optional pre-computed NDVI curve.  May be a ``pl.DataFrame``
+            (output of ``annual_ndvi_curve``) or a ``Path`` to a parquet
+            written by ``annual_ndvi_curve_chunked``.  When a ``Path`` is
+            given the recession-slope groupby uses streaming so the full
+            267M-row curve is never loaded into RAM.
 
         Returns
         -------

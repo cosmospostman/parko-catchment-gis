@@ -48,6 +48,106 @@ WMS_URL = (
 WMS_LAYER = "LatestStateProgram_AllUsers"
 MAX_TILE_PX = 4096
 
+# In-process tile cache: (bbox_tuple, width_px) → np.ndarray
+# Avoids redundant WMS fetches when many nearby pixels are inspected in one session.
+_WMS_CACHE: dict[tuple, np.ndarray] = {}
+
+
+class SceneTileCache:
+    """Fetch one large WMS tile covering a scene and serve cropped sub-arrays.
+
+    Typical usage — accumulate all target pixel bboxes, then prefetch once:
+
+        cache = SceneTileCache()
+        for lon, lat in pixels:
+            cache.expand(pixel_bbox(lon, lat))
+        cache.prefetch()                        # one WMS request at MAX_TILE_PX
+
+        # Later, per-pixel:
+        sub = cache.crop(pixel_bbox)            # free — just array slicing
+
+    If ``prefetch()`` has not been called, ``crop()`` falls back to a live
+    fetch via ``fetch_wms_image``.
+    """
+
+    def __init__(self) -> None:
+        self._lon_min: float | None = None
+        self._lat_min: float | None = None
+        self._lon_max: float | None = None
+        self._lat_max: float | None = None
+        self._img: np.ndarray | None = None   # (H, W, 3) uint8
+
+    # ------------------------------------------------------------------
+    # Accumulation
+    # ------------------------------------------------------------------
+
+    def expand(self, bbox: list[float]) -> None:
+        """Expand the scene extent to include bbox [lon_min, lat_min, lon_max, lat_max]."""
+        lon_min, lat_min, lon_max, lat_max = bbox
+        self._lon_min = lon_min if self._lon_min is None else min(self._lon_min, lon_min)
+        self._lat_min = lat_min if self._lat_min is None else min(self._lat_min, lat_min)
+        self._lon_max = lon_max if self._lon_max is None else max(self._lon_max, lon_max)
+        self._lat_max = lat_max if self._lat_max is None else max(self._lat_max, lat_max)
+
+    @property
+    def scene_bbox(self) -> list[float] | None:
+        """Current accumulated bbox, or None if no pixels have been added."""
+        if self._lon_min is None:
+            return None
+        return [self._lon_min, self._lat_min, self._lon_max, self._lat_max]
+
+    # ------------------------------------------------------------------
+    # Fetch
+    # ------------------------------------------------------------------
+
+    def prefetch(self) -> None:
+        """Fetch the accumulated scene bbox at MAX_TILE_PX and cache the result."""
+        if self._lon_min is None:
+            raise RuntimeError("No bboxes accumulated — call expand() first")
+        bbox = self.scene_bbox
+        logger.info(
+            "SceneTileCache: prefetching scene bbox %s at %dpx",
+            [f"{v:.6f}" for v in bbox], MAX_TILE_PX,
+        )
+        self._img = fetch_wms_image(bbox, width_px=MAX_TILE_PX)
+
+    # ------------------------------------------------------------------
+    # Crop
+    # ------------------------------------------------------------------
+
+    def crop(self, bbox: list[float]) -> np.ndarray:
+        """Return the sub-array of the scene tile covering bbox.
+
+        Falls back to a live ``fetch_wms_image`` call if ``prefetch()`` has
+        not been called.
+        """
+        if self._img is None:
+            return fetch_wms_image(bbox, width_px=MAX_TILE_PX)
+
+        lon_min, lat_min, lon_max, lat_max = bbox
+        img_h, img_w = self._img.shape[:2]
+
+        scene_lon_min = self._lon_min
+        scene_lon_max = self._lon_max
+        scene_lat_min = self._lat_min
+        scene_lat_max = self._lat_max
+        scene_lon_span = scene_lon_max - scene_lon_min
+        scene_lat_span = scene_lat_max - scene_lat_min
+
+        # Map bbox lon/lat → pixel indices (origin is top-left, lat decreases downward)
+        x0 = int((lon_min - scene_lon_min) / scene_lon_span * img_w)
+        x1 = int((lon_max - scene_lon_min) / scene_lon_span * img_w)
+        y0 = int((scene_lat_max - lat_max) / scene_lat_span * img_h)
+        y1 = int((scene_lat_max - lat_min) / scene_lat_span * img_h)
+
+        # Clamp to image bounds
+        x0 = max(0, min(x0, img_w - 1))
+        x1 = max(x0 + 1, min(x1, img_w))
+        y0 = max(0, min(y0, img_h - 1))
+        y1 = max(y0 + 1, min(y1, img_h))
+
+        return self._img[y0:y1, x0:x1]
+
 # Overlay colours
 COLOUR_PRESENCE = "#e74c3c"   # red
 COLOUR_ABSENCE  = "#3498db"   # blue
@@ -65,7 +165,15 @@ def fetch_wms_image(bbox: list[float], width_px: int) -> np.ndarray:
     WMS 1.3.0 with CRS=EPSG:4326 uses axis order lat/lon, so BBOX is
     lat_min,lon_min,lat_max,lon_max. This is a common silent failure mode —
     if axis order is wrong you get a valid JPEG of the wrong place.
+
+    Results are cached in-process by (bbox, width_px) so repeated calls for
+    the same tile within a session (e.g. many nearby pixels) are free.
     """
+    cache_key = (tuple(round(v, 8) for v in bbox), width_px)
+    if cache_key in _WMS_CACHE:
+        logger.debug("WMS cache hit for bbox %s", bbox)
+        return _WMS_CACHE[cache_key]
+
     lon_min, lat_min, lon_max, lat_max = bbox
     lon_span = lon_max - lon_min
     lat_span = lat_max - lat_min
@@ -114,6 +222,7 @@ def fetch_wms_image(bbox: list[float], width_px: int) -> np.ndarray:
         )
 
     logger.info("Tile received: %dx%d px", arr.shape[1], arr.shape[0])
+    _WMS_CACHE[cache_key] = arr
     return arr
 
 

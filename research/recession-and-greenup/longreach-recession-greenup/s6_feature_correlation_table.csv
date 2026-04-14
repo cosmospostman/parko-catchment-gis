@@ -1,0 +1,6 @@
+feature,nir_cv,rec_p,re_p10,prob_lr
+recession_slope,-0.4775,-0.9219,-0.6608,-0.3442
+recession_slope_cv,-0.0034,-0.0051,-0.0039,-0.0012
+recession_sensitivity,-0.0114,0.0005,0.0467,0.0179
+peak_doy,-0.3450,-0.3604,-0.1593,0.0078
+peak_doy_cv,0.2061,-0.0103,-0.1013,-0.1682

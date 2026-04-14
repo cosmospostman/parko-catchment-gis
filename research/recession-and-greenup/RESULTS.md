@@ -1,80 +1,99 @@
 # Recession Sensitivity and Greenup Timing — Longreach 8×8 km Results
 
+Data: 2016–2021 Sentinel-2 imagery. This period is appropriate because the presence/absence training patches were drawn from 2021 imagery, so the satellite record is concurrent with the ground-truth labels.
+
+---
+
 ## Stage 1 — Raw NDVI time series
 
-**The waveform is real but messy.** The three classes track each other closely most of the time (s1a), with only moderate separation. The 2023 La Niña year stands out — a very large NDVI spike across all classes that dwarfs the signal in other years. This is the most important observation from Stage 1: **2023 is a structural outlier that will distort any mean computed across years.**
+**The waveform is present and readable, and the three-class separation is real.** s1a (reproduced as s5b with the riparian overlay) shows clear annual cycles across 2016–2021 with consistent class ordering throughout the record.
 
-Observation density (s1b) is surprisingly uniform — there's no severe wet-season gap. Every year has reasonable coverage across all DOY bins, which explains why `min_wet_obs` thresholds had zero effect (Stage 7c). The data is dense enough that the threshold never bites.
+**Presence vs. absence:** Presence sits roughly 0.05–0.10 NDVI units above absence during the April–October dry season in every year without exception. The two classes converge at wet-season peaks — the separation is dry-season specific. This is the axis `rec_p` and `recession_slope` capture.
 
-Smoothing (s1c) behaves well for the high-NDVI presence pixels but the low-NDVI absence pixels show the curves are noisier and more sensitive to window choice. The 15 and 30-day curves are largely similar — the signal is not strongly window-dependent at those scales.
+**Riparian vs. both:** The riparian class is not simply another high-NDVI class. During wet-season flush events (early 2017, late 2019, early 2020), riparian shows distinctly *lower* NDVI spikes than presence, while absence spikes hard. In the dry season, riparian holds a floor similar to presence. The pattern is: high dry-season floor + suppressed wet-season spike. This is ecologically coherent — pixels in or immediately adjacent to the river channel may be partially inundated (low NDVI from water surface) during flood events, while Parkinsonia on the surrounding floodplain gets the flood pulse and flushes green.
+
+**This three-way structure identifies an unmeasured signal axis.** The distinguishing geometry across classes is:
+- Presence: high dry-season floor, strong wet-season spike
+- Absence: low dry-season floor, strong wet-season spike
+- Riparian: high dry-season floor, **suppressed** wet-season spike
+
+The ratio of wet-peak amplitude to dry-season floor — roughly the inverse of what `rec_p` measures — would separate riparian from Parkinsonia in a way that `nir_cv`, `rec_p`, and `recession_slope` all fail to do. None of the existing or proposed signals target this axis explicitly. The 9-pixel riparian sample at Longreach is too small to validate a signal from, but the pattern is a concrete design target for a perennial-river site where the riparian class is larger.
+
+The dry-season gap between presence and absence is most visible from approximately DOY 100–250 (April–September) each year — consistent with the theoretical recession window. The six years are broadly comparable in amplitude, making cross-year statistics meaningful.
+
+Observation density (s1b) is uniform year-round — no severe wet-season cloud gap bites into data availability. Every DOY bin has adequate coverage, which explains why `min_wet_obs` thresholds have zero effect (Stage 7c).
+
+Smoothing (s1c) is well-behaved. The 15-day and 30-day curves are largely indistinguishable for both classes. Window choice is not load-bearing in the 15–30-day range.
 
 ---
 
 ## Stage 2 — NDWI moisture proxy
 
-**This is where the recession sensitivity concept runs into its first structural problem.** The NDWI boxplot (s2a) shows that for most pixels, peak wet-season NDWI sits around −0.35 to −0.45 in most years — these are **dry soil / sparse vegetation values, not water**. The high whiskers reaching to +0.8 to +1.0 are outliers (inundated pixels in wet years). The bulk of the scene never gets wet enough for NDWI to be positive.
+**The NDWI proxy has a structural problem that limits `recession_sensitivity`.** The boxplot (s2a) shows that for the bulk of pixels, peak wet-season NDWI sits around −0.35 to −0.45 in most years — these are dry soil or sparse vegetation values, not open water or saturated soil. The high whiskers reaching +0.75 to +1.0 are inundation outliers from the Thomson River channel itself.
 
-The s2b spatial maps confirm this: only a small footprint (the Thomson River channel itself) shows positive NDWI, and only in 2020, 2021, and 2023. In 2022, 2024, and 2025 the scene is overwhelmingly negative NDWI — the flood-pulse barely reached most pixels.
+The spatial maps (s2b) confirm this: positive NDWI (actual flooding) is confined to a small footprint around the river channel, and only in 2019 and 2020 does this footprint expand meaningfully across the scene. The other years show uniformly negative NDWI scene-wide.
 
-The s2c range map shows that those strongly inundated pixels (the red channel areas) have high NDWI range, which is good — but only 0.2% of pixels have range < 0.05. The bulk of the scene has adequate range, but that range is being driven by year-to-year variation in a very negative baseline, not by the difference between "flooded" and "dry." **The NDWI proxy is not measuring what you thought it was measuring.** It's measuring variation in dry-soil reflectance year to year, not flood-pulse intensity.
+The consequence is that year-to-year variation in NDWI for most pixels is not measuring flood-pulse intensity. It is measuring variation in dry-soil reflectance and sparse canopy cover year to year — a weaker and noisier signal than the flood-pulse proxy the theory assumed. Only 0.2% of pixels have NDWI range < 0.05, so the data is not flat; the problem is that the variation is in the wrong domain (dry negatives, not wet-to-dry transitions).
 
 ---
 
 ## Stage 3 — Recession slopes
 
-**`recession_slope` is highly redundant with `rec_p`.** The correlation is r = −0.928 (s6 heatmap, correlation table). This makes theoretical sense: `rec_p` is the p90–p10 NDVI amplitude, and a steeper recession slope → larger amplitude. They are measuring the same axis — canopy persistence through the dry season — via slightly different arithmetic. You do not gain new information by adding `recession_slope` to a model that already has `rec_p`.
+**`recession_slope` is highly redundant with `rec_p`.** The correlation is r = −0.922 (correlation table). Theoretically this is unsurprising — `rec_p` is the p90–p10 NDVI amplitude, and a steeper recession slope produces a larger amplitude. Both features measure canopy persistence through the dry season via different arithmetic. Adding `recession_slope` to a model that already has `rec_p` does not add a new axis of information.
 
-The per-year violin plots (s3a) show the right direction — presence is consistently less negative than absence in every year — but the distributions overlap heavily. The 2023 spike is visible here too: slopes in 2023 are more positive (less declining) for all classes, presumably because the NDVI was still elevated from the flood peak when the recession window opened.
+The per-year violin plots (s3a) show the right direction: presence is consistently less negative (shallower recession) than absence in every year from 2016–2021. The class medians are clearly separated, with absence roughly twice as negative as presence. The distributions overlap substantially — these are not clean separating features on their own — but the direction is reliable.
 
-**`recession_sensitivity` does not work at this site.** The scatter (s3c) tells the story clearly: the Pearson r between sensitivity and `prob_lr` is only −0.062, and while the trend line slopes slightly in the right direction, the cloud is essentially a vertical smear across the entire r range from −1 to +1. The signal is swamped by estimation noise from six data points. The spatial map (s3d) is salt-and-pepper — no coherent spatial structure.
+**`recession_sensitivity` does not work at this site.** The scatter (s3c) tells the story clearly: Pearson r between sensitivity and `prob_lr` is only 0.018, and the OLS slope is 0.057 — a nearly flat line through a vertical smear spanning the full range from −1 to +1. The signal is swamped by estimation noise from six data points per pixel. The spatial map (s3d) is salt-and-pepper with no coherent spatial structure.
 
-The reason is visible in s3b: when you plot recession slope vs. NDWI peak coloured by `prob_lr`, both presence (green) and absence (red) pixels form the same fan shape — they both show steeper recession when NDWI is low. The theoretical prediction was that presence pixels would be a flat horizontal cloud. They are not. At Longreach, **even Parkinsonia pixels show recession sensitivity to wet season magnitude**, probably because the 8×8 km scene includes a mix of pure and mixed pixels, and because the NDWI proxy is measuring dry-soil reflectance rather than actual flood-pulse variation.
+The mechanism failure is visible in s3b: when recession slope is plotted against NDWI peak (coloured by `prob_lr`), both presence (green) and absence (red) pixels form the same broad fan. The theoretical prediction was that high-`prob_lr` pixels would form a flat horizontal cloud — they do not. At Longreach, Parkinsonia pixels show similar recession sensitivity to wet-season moisture as grassland pixels, likely because the NDWI proxy is not actually measuring the flood-pulse condition the theory assumed.
 
-The riparian proxy (s5a) shows those 9 blue dots scattered throughout the presence+absence cloud — they are not a distinct cluster. Their median recession sensitivity is 0.013 vs. presence 0.43 and absence 0.51 (log line 98), but with only 9 pixels that is not interpretable.
+Riparian proxy statistics (Stage 5): median recession sensitivity for the 9 riparian pixels is 0.013, compared to presence 0.43 and absence 0.51 — directionally consistent with the theory (more decoupled from moisture), but the sample of 9 is too small to interpret.
 
 ---
 
 ## Stage 4 — Peak DOY (greenup timing)
 
-**This signal is noisy but has a hint of real structure.** The per-year strip plots (s4a) show that presence peaks slightly earlier than absence in most years, but the distributions overlap massively. The median SD from s4c is ~39 days for presence vs. ~43 days for absence — a 4-day difference in consistency, which is smaller than the 14-day threshold the research doc flagged as meaningful. Both classes have peak DOY SD well above 30 days, meaning the per-year peak is not reliably located for most pixels.
+**This is the most promising genuinely new signal.** The per-pixel peak DOY standard deviation (s4c) shows a meaningful class separation: presence median SD ≈ 35 days, absence median SD ≈ 51–53 days. This 16-day gap is substantially larger than the 14-day threshold flagged in the theory doc as meaningful. The histograms are shifted — presence pixels are concentrated at lower SD values with a clear mode around 25–35 days, while absence pixels have a broader distribution extending to high SD values.
 
-The annotated curves (s4b) reveal why: **the smoothed NDVI curves for many pixels have broad plateaus rather than sharp peaks**, especially for the high-prob presence pixels. When the curve is flat for 2–3 months, the identified "peak" DOY can land anywhere in that plateau, giving large year-to-year variance not from biology but from algorithm sensitivity. The 2023 curves especially show this — a very high, flat top where the peak algorithm is essentially picking noise.
+The per-year strip plots (s4a) show presence pixels peaking earlier and more consistently than absence in most years. The class medians diverge most strongly in 2017, 2019, and 2021. The separation is not perfect in every year, but the directional signal is consistent.
 
-The spatial map (s4d) shows that most of the scene peaks around DOY 50–100 (February–April), with a band of later-peaking (yellow/orange, DOY 150–250) pixels in what looks like the central-southern gilgai clay area. That structure is spatially coherent, which is reassuring — the feature is capturing real spatial variation, not noise. But the class contrast is weak because the earlier-peaking presence pixels (DOY ~50–80) are not cleanly separated from many absence pixels that also peak early.
+The annotated curves (s4b) reveal the mechanism behind the noise: many high-probability presence pixels have broad NDVI plateaus from roughly DOY 50–200, where the curve is flat enough that the peak-finding algorithm picks slightly different DOYs year to year. This is biology (Parkinsonia maintaining high canopy through the dry season) but it produces algorithmic jitter in the DOY estimate. The wide plateau is itself a meaningful feature — it confirms canopy persistence — but it degrades the precision of a single peak DOY estimate.
 
-The `peak_doy_cv` correlation with `nir_cv` is +0.268 — moderate. Higher nir_cv (more variable NIR = grassland) → higher peak_doy_cv (more variable timing). That's directionally correct.
+The spatial map (s4d) shows spatially coherent structure: a band of earlier-peaking pixels (purple/blue, DOY ~50–100) overlying what appears to be the river corridor and surrounding Parkinsonia-dense areas, surrounded by later-peaking (orange/yellow, DOY ~150–200+) grassland. The coherence is reassuring — the feature is tracking real spatial variation rather than noise.
+
+`peak_doy` correlation with existing features: r = −0.36 with `rec_p` and −0.35 with `nir_cv`. This is moderate correlation but not redundant — there is genuine independent information in the DOY axis.
+
+`peak_doy_cv` correlation with `nir_cv`: r = 0.21. Higher NIR variability (grassland) → higher peak DOY variability. Directionally correct, partially overlapping with `nir_cv`.
 
 ---
 
 ## Stage 5 — Riparian proxy
 
-**The 9-pixel riparian proxy is too small to draw conclusions.** The NDVI time series (s5b) shows their mean closely tracks the presence class — they look like Parkinsonia, not like a distinct perennial water vegetation type. This is consistent with the OVERVIEW.md note that the Longreach extension area doesn't have a true perennial riparian class to test against. The Stage 5 assumption ("Longreach cannot test this") is confirmed.
+**The 9-pixel sample is too small to validate a signal, but the pattern is informative.** The NDVI time series (s5b) — the same data shown in s1a — reveals that riparian pixels are not simply another high-NDVI class. See Stage 1 for the detailed interpretation. The key finding is that riparian holds a dry-season floor comparable to presence but shows a suppressed wet-season spike, distinguishing it from both presence and absence on an axis no existing signal captures.
+
+The riparian proxy statistics from Stage 3 (median recession sensitivity 0.013 vs. presence 0.43 and absence 0.51) are directionally consistent with permanent water access decoupling the recession slope from wet-season forcing, but nine pixels is not enough to draw conclusions. Longreach cannot test the perennial riparian hypothesis at scale — that requires a site where the riparian class is substantially larger.
 
 ---
 
 ## Stage 6 — Feature correlation
 
-Summary of what's new vs. redundant:
-
 | Feature | Most correlated existing | r | Verdict |
 |---|---|---|---|
-| `recession_slope` | `rec_p` | −0.928 | **Redundant** — same axis, different formula |
-| `recession_slope_cv` | anything | <0.02 | **Uninformative** — no correlation with anything including `prob_lr` |
-| `recession_sensitivity` | `re_p10` | +0.089 | **New but weak** — not discriminating at this site |
-| `peak_doy` | `nir_cv` | −0.345 | **Genuinely new** — moderate independence |
-| `peak_doy_cv` | `nir_cv` | +0.268 | **Partially new** — some overlap with nir_cv |
-
-The scatter in s6b confirms this visually — `recession_slope` vs `rec_p` is a tight diagonal; `peak_doy` vs `nir_cv` is a diffuse cloud with no clear structure but also no single dominant axis.
+| `recession_slope` | `rec_p` | −0.922 | **Redundant** — same canopy-persistence axis |
+| `recession_slope_cv` | anything | <0.01 | **Uninformative** — no meaningful correlation with any feature or `prob_lr` |
+| `recession_sensitivity` | `re_p10` | +0.047 | **New information but non-discriminating** — not separating classes at this site |
+| `peak_doy` | `rec_p` | −0.360 | **Genuinely new** — moderate independence from existing features |
+| `peak_doy_cv` | `nir_cv` | +0.206 | **Partially new** — some overlap with `nir_cv` |
 
 ---
 
 ## Stage 7 — Parameter sensitivity
 
-**The recession window finding is important and contradicts the theory doc's prior.** The optimal window is May–October (start=5, end=10), not April–September. The class separation monotonically increases as you push the window later and extend it. This suggests the meaningful recession at Longreach happens later than expected — May onward, and the signal is still present through October. The April default in the spec should be revised to May.
+**The recession window finding is consistent with the theory and important.** The optimal window is May–October (start=5, end=10), with median class separation of 0.00050 — the strongest of all nine combinations. The default April–September from the spec (start=4, end=9) scores 0.00038, about 25% weaker. The improvement from pushing the window later is monotonic: every step from start=3 toward start=5 and from end=8 toward end=10 increases separation. This suggests the meaningful Parkinsonia recession at Longreach is later-season than the April theoretical prior. **The implementation default should be May–October.**
 
-The smoothing window result is benign — 15 vs. 30 days barely changes the SD, confirming the signal is not sensitive to this parameter in the range 15–30 days. Use 21 days as a compromise (slightly smoother than 15, not over-broadening like 45).
+Smoothing window: the peak DOY SD is barely affected by window choice in the 15–45 day range. Presence SD shifts from ~36 days at 15d to ~36 days at 30d and ~36 days at 45d. Absence SD shifts from ~53 to ~51 to ~50 days. The class gap is stable. Window choice is not load-bearing; 30 days is a reasonable default.
 
-The `min_wet_obs=8` result (100% reliable at all thresholds) just means you have many observations per pixel-year at Longreach. This is a non-issue here but may matter at a denser-cloud site.
+`min_wet_obs`: all thresholds up to 8 leave 100% of pixel-years as reliable. Data density at Longreach is not a constraint. This parameter will only matter at sites with heavier cloud cover.
 
 ---
 
@@ -82,12 +101,12 @@ The `min_wet_obs=8` result (100% reliable at all thresholds) just means you have
 
 **What to implement:**
 
-- **`recession_slope` (May–October window):** Implement, but treat it as a potential replacement for or complement to `rec_p`, not an addition. They measure the same thing. `rec_p` is simpler; `recession_slope` is more interpretable. Worth keeping because it degrades more gracefully when the dry season is abbreviated.
+- **`recession_slope` (May–October window):** Implement, but treat as a potential complement or replacement for `rec_p`, not an addition. They measure the same axis. `rec_p` is simpler computationally; `recession_slope` is more interpretable as a physical rate and may degrade more gracefully when the dry season is abbreviated or the growing season boundary shifts. Worth keeping for that flexibility.
 
-- **`recession_sensitivity`:** Do not implement as a production signal for Longreach. The theoretical mechanism (sensitivity to flood-pulse intensity) is not separable from noise with 6 years at this site. May be worth revisiting with 10+ years or at a site with more dramatic inter-annual flood variability (e.g. a true flood-pulse system). **The NDWI proxy is measuring the wrong thing for most pixels** — the bulk of the scene doesn't flood, so year-to-year NDWI variation reflects soil moisture / sparse canopy variation, not the flood event the theory assumed.
+- **`recession_sensitivity`:** Do not implement as a production signal. The NDWI proxy is not measuring the flood-pulse contrast the theory requires for most pixels — the bulk of the scene never floods, so year-to-year NDWI variation reflects soil moisture noise rather than a meaningful wet-season forcing variable. With only six data points per pixel, the per-pixel Pearson r is dominated by estimation noise. May be worth revisiting with 10+ years or at a site with genuine flood-pulse heterogeneity (e.g. a floodplain system where most pixels go from flooded to dry annually).
 
-- **`peak_doy`:** Implement cautiously. It's the most genuinely novel feature (r=−0.35 with `nir_cv`, not redundant), and the spatial map shows real structure. But the per-pixel SD is ~39–43 days — too large for the feature to be reliable at the individual pixel level. It may be useful as a **spatial smoothing target** (neighbourhood mean of peak_doy) rather than raw per-pixel. The 4-day difference in SD between classes is too small to use `peak_doy_cv` as a discriminating feature on its own.
+- **`peak_doy`:** Implement. It is the most genuinely novel feature (r ≈ −0.36 with the closest existing signal, not redundant), the spatial map shows coherent structure, and the class SD gap (35 vs. 51 days) is meaningful. The per-pixel SD is still substantial — most pixels have SD > 14 days — so raw `peak_doy` is noisy at the individual pixel level. Consider using a spatially smoothed version (neighbourhood mean) in the feature pipeline, which would reduce noise while preserving the spatial structure visible in s4d.
 
-- **`peak_doy_cv`:** Lower priority. Partially overlaps with `nir_cv`. Only include if `peak_doy` is included and you want the consistency axis.
+- **`peak_doy_cv`:** Include alongside `peak_doy` if it is implemented. It captures the consistency axis independently of the timing level and partially separates from `nir_cv` (r = 0.21, not redundant). The class separation in SD (s4c) directly motivates this feature.
 
-- **`recession_slope_cv`:** Drop. No correlation with anything.
+- **`recession_slope_cv`:** Drop. No correlation with any existing feature or with `prob_lr`. Uninformative at this site.

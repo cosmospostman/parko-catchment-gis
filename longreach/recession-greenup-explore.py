@@ -34,6 +34,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import gc
 import sys
 from pathlib import Path
 
@@ -52,7 +53,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from utils.location import get
 from signals import NirCvSignal, QualityParams
-from signals._shared import load_and_filter, annual_ndvi_curve
+from signals._shared import load_and_filter, annual_ndvi_curve, annual_ndvi_curve_chunked
 from signals.recession import RecessionSensitivitySignal
 from signals.greenup import GreenupTimingSignal
 
@@ -62,7 +63,13 @@ from signals.greenup import GreenupTimingSignal
 
 SCENE_LOC_ID = "longreach-8x8km"
 RANKING_CSV  = PROJECT_ROOT / "outputs" / "longreach-8x8" / "longreach_8x8km_pixel_ranking.csv"
-OUT_DIR      = PROJECT_ROOT / "outputs" / "longreach-recession-greenup"
+OUT_DIR      = PROJECT_ROOT / "research" / "recession-and-greenup" / "longreach-recession-greenup"
+
+# Confirmed infestation sub-bbox from longreach.yaml — used as the Presence class.
+# Everything else in the 8×8 km scene is treated as scene background (Absence).
+# Assumption: scattered Parkinsonia in the broader scene will disappear into the average;
+# the dense infestation strip should still stand out.
+INFESTATION_BBOX = [145.423948, -22.764033, 145.424956, -22.761054]  # [lon_min, lat_min, lon_max, lat_max]
 
 # Extension sub-bbox from longreach.yaml (the "grassland"/absence training region)
 # used as the pool for deriving the riparian proxy.
@@ -79,7 +86,7 @@ PRESENCE_COLOUR  = CLASS_COLOURS["Presence"]
 ABSENCE_COLOUR   = CLASS_COLOURS["Absence"]
 RIPARIAN_COLOUR  = CLASS_COLOURS["Riparian"]
 
-YEARS = list(range(2020, 2026))
+YEARS = list(range(2016, 2022))
 
 
 def log(msg: str) -> None:
@@ -91,57 +98,94 @@ def log(msg: str) -> None:
 # ---------------------------------------------------------------------------
 
 def load_ranking() -> pd.DataFrame:
-    """Load the 8×8 km pixel ranking CSV with prob_lr, add presence/absence labels."""
+    """Load the 8×8 km pixel ranking CSV and label classes by geometry.
+
+    Presence  — pixels within the confirmed infestation sub-bbox (INFESTATION_BBOX).
+    Absence   — all other pixels in the 8×8 km scene.
+
+    The infestation strip is a dense, confirmed Parkinsonia patch. Scattered
+    Parkinsonia elsewhere in the scene is expected but assumed to be diluted
+    by the broader background, so the strip should still stand out.
+    """
     ranking = pd.read_csv(RANKING_CSV)
-    q10 = ranking["prob_lr"].quantile(0.10)
-    q90 = ranking["prob_lr"].quantile(0.90)
-    ranking["class"] = "middle"
-    ranking.loc[ranking["prob_lr"] >= q90, "class"] = "Presence"
-    ranking.loc[ranking["prob_lr"] <= q10, "class"] = "Absence"
+    lon_min, lat_min, lon_max, lat_max = INFESTATION_BBOX
+    in_strip = (
+        (ranking["lon"] >= lon_min) & (ranking["lon"] <= lon_max) &
+        (ranking["lat"] >= lat_min) & (ranking["lat"] <= lat_max)
+    )
+    ranking["class"] = "Absence"
+    ranking.loc[in_strip, "class"] = "Presence"
     log(f"  Pixel ranking loaded: {len(ranking):,} total | "
-        f"Presence (top 10%): {(ranking['class'] == 'Presence').sum():,} | "
-        f"Absence (bot 10%): {(ranking['class'] == 'Absence').sum():,}")
+        f"Presence (infestation bbox): {in_strip.sum():,} | "
+        f"Absence (rest of scene): {(~in_strip).sum():,}")
     return ranking
 
 
-def load_raw_pixels(loc) -> pl.DataFrame:
-    """Load the raw 8×8 km observation parquet as a Polars DataFrame.
+def sorted_parquet_path(loc) -> Path:
+    """Return the pixel-sorted parquet path (<id>-by-pixel.parquet)."""
+    base = loc.parquet_path()
+    return base.with_name(base.stem + "-by-pixel.parquet")
 
-    Using Polars directly avoids the pandas intermediate copy (~17 GB) and
-    keeps peak memory at ~8 GB for the 64 M-row scene.
+
+def load_raw_pixels(loc) -> pl.DataFrame:
+    """Load the raw 8×8 km observation parquet, selecting only the columns
+    consumed by this script (9 of 20) and downcasting float64 → float32.
+
+    Columns kept:
+      point_id, lon, lat, date, scl_purity — always needed
+      B08  — NirCvSignal (riparian proxy) + NDVI curve
+      B04  — NDVI curve
+      B03, B11 — NDWI (recession signal, stage 2)
+
+    Downcasting lon/lat/band columns from float64 to float32 halves their
+    footprint (~8 GB → ~4 GB for the numeric columns).
     """
+    _LOAD_COLS = [
+        "point_id", "lon", "lat", "date", "scl_purity",
+        "B03", "B04", "B08", "B11",
+    ]
     path = loc.parquet_path()
     log(f"  Loading raw pixels from {path} ...")
-    df = pl.read_parquet(path)
+    df = pl.read_parquet(path, columns=_LOAD_COLS).with_columns([
+        pl.col("lon").cast(pl.Float32),
+        pl.col("lat").cast(pl.Float32),
+        pl.col("B03").cast(pl.Float32),
+        pl.col("B04").cast(pl.Float32),
+        pl.col("B08").cast(pl.Float32),
+        pl.col("B11").cast(pl.Float32),
+        pl.col("scl_purity").cast(pl.Float32),
+    ])
     log(f"    {len(df):,} observations, {df['point_id'].n_unique():,} pixels")
     return df
 
 
-def derive_riparian_proxy(raw_df: pd.DataFrame, loc) -> list[str]:
+def derive_riparian_proxy(raw_df: pl.DataFrame, loc) -> list[str]:
     """Return point_ids for the riparian proxy: top-10% nir_mean within the extension sub-bbox.
 
     Steps:
-    1. Filter raw pixels to the extension bbox.
-    2. Compute dry-season mean B08 (nir_mean) per pixel via NirCvSignal.
+    1. Filter raw pixels to the extension bbox (in Polars, before any heavy compute).
+    2. Compute dry-season mean B08 (nir_mean) per pixel via NirCvSignal on the small subset.
     3. Return top-10% point_ids by nir_mean.
     """
     ext_lon_min, ext_lat_min, ext_lon_max, ext_lat_max = EXT_BBOX
 
-    # Find point_ids in the extension bbox from the scene-level coords
-    nir_sig = NirCvSignal()
-    nir_stats = nir_sig.compute(raw_df, loc)
-
-    in_ext = (
-        nir_stats["lon"].between(ext_lon_min, ext_lon_max) &
-        nir_stats["lat"].between(ext_lat_min, ext_lat_max)
+    # Pre-filter to extension bbox in Polars — avoids running NirCvSignal on 267M rows
+    ext_df = raw_df.filter(
+        (pl.col("lon") >= ext_lon_min) & (pl.col("lon") <= ext_lon_max) &
+        (pl.col("lat") >= ext_lat_min) & (pl.col("lat") <= ext_lat_max)
     )
-    ext_pixels = nir_stats[in_ext].copy()
-    if ext_pixels.empty:
+    n_ext_pixels = ext_df["point_id"].n_unique()
+    log(f"  Extension bbox: {n_ext_pixels} pixels, {len(ext_df):,} observations")
+
+    if n_ext_pixels == 0:
         log("  WARNING: No pixels found in extension bbox — riparian proxy will be empty.")
         return []
 
-    thresh = ext_pixels["nir_mean"].quantile(0.90)
-    rip_ids = ext_pixels.loc[ext_pixels["nir_mean"] >= thresh, "point_id"].tolist()
+    nir_sig = NirCvSignal()
+    nir_stats = nir_sig.compute(ext_df, loc)
+
+    thresh = nir_stats["nir_mean"].quantile(0.90)
+    rip_ids = nir_stats.loc[nir_stats["nir_mean"] >= thresh, "point_id"].tolist()
     log(f"  Riparian proxy: {len(rip_ids)} pixels (top-10% nir_mean in extension bbox, "
         f"threshold = {thresh:.1f})")
     return rip_ids
@@ -157,22 +201,30 @@ def stage1(raw_df, ranking: pd.DataFrame, rip_ids: list[str], loc,
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     pres_ids = ranking.loc[ranking["class"] == "Presence", "point_id"].tolist()
-    abs_ids  = ranking.loc[ranking["class"] == "Absence",  "point_id"].tolist()
+    # Cap absence to bottom-10% prob_lr to avoid materialising the full scene
+    # (640K absence pixels × ~400 obs each ≈ 267M rows → OOM in to_pandas).
+    abs_all  = ranking.loc[ranking["class"] == "Absence"].sort_values("prob_lr", ascending=True)
+    abs_ids  = abs_all.iloc[:max(1, len(abs_all) // 10)]["point_id"].tolist()
 
-    # Filtered observations with year/month
+    # Filtered observations with year/month — pre-filter to relevant point_ids
+    # before converting to pandas to avoid materialising the full 267M-row frame.
     q = QualityParams()
     _filt = df_filt if df_filt is not None else load_and_filter(raw_df, q.scl_purity_min)
-    df = _filt.to_pandas()
+    all_ids = list(set(pres_ids) | set(abs_ids) | set(rip_ids))
+    df = (
+        _filt.filter(pl.col("point_id").is_in(all_ids))
+        .to_pandas()
+    )
     df["ndvi"] = (df["B08"] - df["B04"]) / (df["B08"] + df["B04"])
     df["doy"]  = df["date"].dt.dayofyear
 
     # ------------------------------------------------------------------
-    # Figure 1a — Mean NDVI time series by class (full 2020–2025)
+    # Figure 1a — Mean NDVI time series by class (full 2016–2021)
     # ------------------------------------------------------------------
     log("  Figure 1a: mean NDVI time series by class")
 
     fig, ax = plt.subplots(figsize=(13, 5))
-    fig.suptitle("Longreach 8×8 km — Mean daily NDVI by class (2020–2025)", fontsize=12)
+    fig.suptitle("Longreach 8×8 km — Mean daily NDVI by class (2016–2021)", fontsize=12)
 
     class_spec = [
         ("Presence",  pres_ids,  PRESENCE_COLOUR),
@@ -315,25 +367,25 @@ def stage2(raw_df, ranking: pd.DataFrame, df_filt: pl.DataFrame | None = None) -
 
     q = QualityParams()
     _filt = df_filt if df_filt is not None else load_and_filter(raw_df, q.scl_purity_min)
-    df = _filt.to_pandas()
-    df["ndwi"] = (df["B03"] - df["B11"]) / (df["B03"] + df["B11"])
 
-    # Wet season: Dec (shifted to next year) + Jan + Feb + Mar
-    df["wet_year"] = df["date"].dt.year
-    dec_mask = df["date"].dt.month == 12
-    df.loc[dec_mask, "wet_year"] = df.loc[dec_mask, "date"].dt.year + 1
-
+    # Compute per-pixel per-year peak NDWI entirely in Polars — avoids
+    # materialising the full 267M-row frame as pandas.
     wet_months = [12, 1, 2, 3]
-    wet = df[df["date"].dt.month.isin(wet_months)].copy()
-
-    # Per-pixel per-year peak NDWI
     ndwi_peak = (
-        wet.groupby(["point_id", "wet_year"])["ndwi"]
-        .max()
-        .reset_index()
-        .rename(columns={"ndwi": "ndwi_peak"})
+        _filt
+        .filter(pl.col("month").is_in(wet_months))
+        .with_columns([
+            ((pl.col("B03") - pl.col("B11")) / (pl.col("B03") + pl.col("B11"))).alias("ndwi"),
+            pl.when(pl.col("month") == 12)
+              .then(pl.col("year") + 1)
+              .otherwise(pl.col("year"))
+              .alias("wet_year"),
+        ])
+        .filter(pl.col("wet_year").is_in(YEARS))
+        .group_by(["point_id", "wet_year"])
+        .agg(pl.col("ndwi").max().alias("ndwi_peak"))
+        .to_pandas()
     )
-    ndwi_peak = ndwi_peak[ndwi_peak["wet_year"].isin(YEARS)]
 
     # ------------------------------------------------------------------
     # Figure 2a — Per-year scene-mean wet-season NDWI distribution (boxplot)
@@ -438,7 +490,7 @@ def stage2(raw_df, ranking: pd.DataFrame, df_filt: pl.DataFrame | None = None) -
 def stage3(rec_signal: RecessionSensitivitySignal, raw_df,
            ranking: pd.DataFrame, rip_ids: list[str], loc,
            df_filt: pl.DataFrame | None = None,
-           curve: pl.DataFrame | None = None) -> pd.DataFrame:
+           curve: "pl.DataFrame | Path | None" = None) -> pd.DataFrame:
     """Compute recession features and produce Stage 3 diagnostic figures.
 
     Returns the per-pixel recession stats DataFrame for reuse in later stages.
@@ -625,7 +677,7 @@ def stage3(rec_signal: RecessionSensitivitySignal, raw_df,
 def stage4(green_signal: GreenupTimingSignal, raw_df,
            ranking: pd.DataFrame, rip_ids: list[str], loc,
            df_filt: pl.DataFrame | None = None,
-           curve: pl.DataFrame | None = None) -> pd.DataFrame:
+           curve: "pl.DataFrame | Path | None" = None) -> pd.DataFrame:
     """Compute greenup features and produce Stage 4 diagnostic figures.
 
     Returns per-pixel greenup stats DataFrame.
@@ -638,8 +690,16 @@ def stage4(green_signal: GreenupTimingSignal, raw_df,
 
     p = green_signal.params
     q = p.quality
-    _df = df_filt if df_filt is not None else load_and_filter(raw_df, q.scl_purity_min)
+    # When a pre-computed curve Path is provided, df_filt is not needed by
+    # compute() (coords come from the curve parquet).  Only load it if the
+    # curve is absent and we have a raw_df to load from.
     _curve = curve  # may be None; compute() handles it
+    if _curve is not None:
+        _df = None  # compute() will read coords from the curve parquet
+    elif df_filt is not None:
+        _df = df_filt
+    else:
+        _df = load_and_filter(raw_df, q.scl_purity_min)
 
     log("  Computing GreenupTimingSignal ...")
     green_stats = green_signal.compute(raw_df, loc, _df=_df, _curve=_curve)
@@ -705,7 +765,17 @@ def stage4(green_signal: GreenupTimingSignal, raw_df,
     sample_labels = ["Presence"] * 3 + ["Absence"] * 3
     sample_colours = [PRESENCE_COLOUR] * 3 + [ABSENCE_COLOUR] * 3
 
-    curve_pd = curve.to_pandas()
+    # Load only the 6 sample pixels' curve rows for the annotation plot —
+    # avoids materialising the full 267M-row curve.
+    if isinstance(_curve, Path):
+        curve_pd = (
+            pl.scan_parquet(_curve)
+            .filter(pl.col("point_id").is_in(sample_pids))
+            .collect()
+            .to_pandas()
+        )
+    else:
+        curve_pd = _curve[_curve["point_id"].isin(sample_pids)].to_pandas() if isinstance(_curve, pl.DataFrame) else _curve[_curve["point_id"].isin(sample_pids)]
     year_colours = plt.cm.tab10(np.linspace(0, 0.9, len(YEARS)))
 
     fig, axes = plt.subplots(2, 3, figsize=(15, 8))
@@ -778,6 +848,7 @@ def stage4(green_signal: GreenupTimingSignal, raw_df,
     ax.axvline(30, color="grey", linewidth=1, linestyle=":",  label="30-day threshold")
     ax.set_xlabel("Peak DOY SD (days)", fontsize=10)
     ax.set_ylabel("Pixel count", fontsize=10)
+
     ax.legend(fontsize=9)
     ax.tick_params(labelsize=9)
     plt.tight_layout()
@@ -791,7 +862,8 @@ def stage4(green_signal: GreenupTimingSignal, raw_df,
     log("  Figure 4d: spatial map of peak_doy")
 
     # green_stats already contains lon/lat from the signal's compute() method
-    map_df = green_stats.copy()
+    # Sort so extreme late-peaking pixels are drawn last (on top of the majority).
+    map_df = green_stats.dropna(subset=["peak_doy"]).sort_values("peak_doy")
 
     fig, ax = plt.subplots(figsize=(8, 7))
     fig.suptitle("Longreach — Mean annual NDVI peak DOY\n"
@@ -809,6 +881,71 @@ def stage4(green_signal: GreenupTimingSignal, raw_df,
     fig.savefig(OUT_DIR / "s4d_map_peak_doy.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
     log("    Saved: s4d_map_peak_doy.png")
+
+    # ------------------------------------------------------------------
+    # Figure 4e — Peak DOY histogram: top-20% vs bottom-40% prob_lr
+    # ------------------------------------------------------------------
+    log("  Figure 4e: peak DOY histogram by prob_lr tier")
+
+    doy_df = green_stats[["point_id", "peak_doy"]].dropna().merge(
+        ranking[["point_id", "prob_lr"]], on="point_id", how="left"
+    )
+    q20 = doy_df["prob_lr"].quantile(0.80)
+    q40 = doy_df["prob_lr"].quantile(0.40)
+
+    top20  = doy_df[doy_df["prob_lr"] >= q20]["peak_doy"]
+    bot40  = doy_df[doy_df["prob_lr"] <= q40]["peak_doy"]
+
+    fig, axes = plt.subplots(3, 1, figsize=(9, 10), sharex=False)
+    fig.suptitle(
+        "Longreach — Peak DOY distribution by Parkinsonia probability tier\n"
+        f"Top 20% prob_lr (≥ {q20:.2f})  vs  Bottom 40% prob_lr (≤ {q40:.2f})",
+        fontsize=10,
+    )
+
+    bins_full = range(0, 366, 7)   # weekly buckets, full year
+    bins_tail = range(200, 366, 7) # weekly buckets, tail window
+
+    axes[0].hist(top20, bins=bins_full, color=PRESENCE_COLOUR, alpha=0.8, edgecolor="none")
+    axes[0].set_ylabel("Pixel count", fontsize=9)
+    axes[0].set_title(f"Top 20% Parkinsonia probability  (n={len(top20):,})", fontsize=9)
+    axes[0].tick_params(labelsize=8)
+
+    axes[1].hist(bot40, bins=bins_full, color=ABSENCE_COLOUR, alpha=0.8, edgecolor="none")
+    axes[1].set_ylabel("Pixel count", fontsize=9)
+    axes[1].set_title(f"Bottom 40% Parkinsonia probability  (n={len(bot40):,})", fontsize=9)
+    axes[1].tick_params(labelsize=8)
+
+    # Tail zoom: DOY 200–365, both tiers overlaid
+    top20_tail = top20[top20 >= 200]
+    bot40_tail = bot40[bot40 >= 200]
+    axes[2].hist(bot40_tail, bins=bins_tail, color=ABSENCE_COLOUR,  alpha=0.6,
+                 edgecolor="none", label=f"Bottom 40% (n={len(bot40_tail):,})")
+    axes[2].hist(top20_tail, bins=bins_tail, color=PRESENCE_COLOUR, alpha=0.6,
+                 edgecolor="none", label=f"Top 20% (n={len(top20_tail):,})")
+    axes[2].set_ylabel("Pixel count", fontsize=9)
+    axes[2].set_title("Tail zoom: DOY 200–365", fontsize=9)
+    axes[2].set_xlabel("Mean annual peak DOY", fontsize=9)
+    axes[2].tick_params(labelsize=8)
+    axes[2].legend(fontsize=8)
+
+    month_refs = [(91, "Apr"), (152, "Jun"), (244, "Sep"), (305, "Nov")]
+    for ax in axes[:2]:
+        for doy, lbl in month_refs:
+            ax.axvline(doy, color="grey", linewidth=0.8, linestyle="--", alpha=0.6)
+            ax.text(doy + 2, 0.95, lbl, fontsize=7, color="grey", va="top",
+                    transform=ax.get_xaxis_transform())
+
+    for doy, lbl in month_refs:
+        if doy >= 200:
+            axes[2].axvline(doy, color="grey", linewidth=0.8, linestyle="--", alpha=0.6)
+            axes[2].text(doy + 2, 0.95, lbl, fontsize=7, color="grey", va="top",
+                         transform=axes[2].get_xaxis_transform())
+
+    plt.tight_layout()
+    fig.savefig(OUT_DIR / "s4e_peak_doy_by_prob_tier.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    log("    Saved: s4e_peak_doy_by_prob_tier.png")
 
     return green_stats, per_year
 
@@ -829,7 +966,9 @@ def stage5(rec_stats: pd.DataFrame, paired: pd.DataFrame,
         return
 
     pres_ids = ranking.loc[ranking["class"] == "Presence", "point_id"].tolist()
-    abs_ids  = ranking.loc[ranking["class"] == "Absence",  "point_id"].tolist()
+    # Cap absence to bottom-10% prob_lr (same logic as stage1) to avoid OOM.
+    abs_all  = ranking.loc[ranking["class"] == "Absence"].sort_values("prob_lr", ascending=True)
+    abs_ids  = abs_all.iloc[:max(1, len(abs_all) // 10)]["point_id"].tolist()
 
     # ------------------------------------------------------------------
     # Figure 5a — Recession slope vs. NDWI peak: overlay riparian
@@ -869,7 +1008,11 @@ def stage5(rec_stats: pd.DataFrame, paired: pd.DataFrame,
 
     q = QualityParams()
     _filt = df_filt if df_filt is not None else load_and_filter(raw_df, q.scl_purity_min)
-    df = _filt.to_pandas()
+    all_ids_s5 = list(set(pres_ids) | set(abs_ids) | set(rip_ids))
+    df = (
+        _filt.filter(pl.col("point_id").is_in(all_ids_s5))
+        .to_pandas()
+    )
     df["ndvi"] = (df["B08"] - df["B04"]) / (df["B08"] + df["B04"])
 
     fig, ax = plt.subplots(figsize=(13, 5))
@@ -1030,7 +1173,8 @@ def stage6(rec_stats: pd.DataFrame, green_stats: pd.DataFrame,
 
 def stage7(raw_df, ranking: pd.DataFrame,
            df_filt: pl.DataFrame | None = None,
-           curve_30: pl.DataFrame | None = None) -> None:
+           curve_30: "pl.DataFrame | Path | None" = None,
+           by_pixel_path: Path | None = None) -> None:
     log("\n=== Stage 7: Parameter sensitivity sweep ===")
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1047,8 +1191,14 @@ def stage7(raw_df, ranking: pd.DataFrame,
     end_months   = [8, 9, 10]
     rec_sep_results = []
 
-    # Pre-resolve df/curve for 7a — all sweeps use default smooth_days=30
-    _df_7a = df_filt if df_filt is not None else load_and_filter(raw_df, QualityParams().scl_purity_min)
+    # Pre-resolve df/curve for 7a — all sweeps use default smooth_days=30.
+    # Load df_filt internally so the caller can have cleared its reference
+    # before calling stage7, keeping peak RAM lower.
+    log("  Loading filtered frame for 7a ...")
+    _raw_7a = load_raw_pixels(loc)
+    _df_7a = load_and_filter(_raw_7a, QualityParams().scl_purity_min).drop("scl_purity")
+    del _raw_7a
+    gc.collect()
     _curve_7a = curve_30  # may be None; compute() will build it once if so
 
     for sm in start_months:
@@ -1076,6 +1226,10 @@ def stage7(raw_df, ranking: pd.DataFrame,
                 log(f"    start={sm} end={em}: |median separation| = {sep:.6f}")
             except Exception as exc:
                 log(f"    start={sm} end={em}: ERROR — {exc}")
+
+    # 7a done — free df_filt / _df_7a before 7b's streaming collect.
+    del _df_7a
+    gc.collect()
 
     if rec_sep_results:
         rec_sweep_df = pd.DataFrame(rec_sep_results)
@@ -1114,13 +1268,21 @@ def stage7(raw_df, ranking: pd.DataFrame,
     for sw in smooth_windows:
         params = GreenupTimingSignal.Params(smooth_days=sw)
         sig = GreenupTimingSignal(params)
+        _tmp_curve = None
         try:
-            # Reuse pre-filtered frame; curve must be recomputed per smooth_days
-            df_pl = _df_7a
             if sw == 30 and curve_30 is not None:
                 curve = curve_30
+                _tmp_curve = None
+            elif by_pixel_path is not None:
+                _tmp_curve = OUT_DIR / f"_tmp_curve_{sw}d.parquet"
+                curve = annual_ndvi_curve_chunked(
+                    by_pixel_path, out_path=_tmp_curve,
+                    smooth_days=sw, min_obs_per_year=params.quality.min_obs_per_year,
+                    scl_purity_min=0.0,
+                )
             else:
-                curve = annual_ndvi_curve(df_pl, sw, params.quality.min_obs_per_year)
+                curve = annual_ndvi_curve(_df_7a, sw, params.quality.min_obs_per_year)
+                _tmp_curve = None
             per_year = sig._peak_doy_per_year(curve)
             reliable = per_year[per_year["reliable"]]
             pix_sd = reliable.groupby("point_id")["peak_doy"].std().reset_index()
@@ -1139,6 +1301,9 @@ def stage7(raw_df, ranking: pd.DataFrame,
                     f"{cls_sd.median():.1f} days")
         except Exception as exc:
             log(f"    smooth={sw}d: ERROR — {exc}")
+        finally:
+            if _tmp_curve is not None and _tmp_curve.exists():
+                _tmp_curve.unlink()
 
     if smooth_results:
         smooth_df = pd.DataFrame(smooth_results)
@@ -1173,11 +1338,11 @@ def stage7(raw_df, ranking: pd.DataFrame,
 
     loc = get(SCENE_LOC_ID)
     base_sig = GreenupTimingSignal()
-    # Reuse pre-filtered frame and pre-computed curve_30 if available
-    curve_base = (
-        curve_30 if curve_30 is not None
-        else annual_ndvi_curve(_df_7a, 30, base_sig.params.quality.min_obs_per_year)
-    )
+    # curve_30 is always provided via by_pixel_path in the normal run path;
+    # _df_7a has been deleted above so we cannot fall back to it here.
+    if curve_30 is None:
+        raise RuntimeError("stage7 7c requires curve_30 — no df_filt available after 7a cleanup")
+    curve_base = curve_30
 
     for mwo in min_wet_obs_vals:
         params = GreenupTimingSignal.Params(min_wet_obs=mwo)
@@ -1200,7 +1365,23 @@ def stage7(raw_df, ranking: pd.DataFrame,
 # Main
 # ---------------------------------------------------------------------------
 
-def run(stages: list[int] | None = None, fast: bool = False) -> None:
+def _load_cache(path: Path) -> pl.DataFrame | None:
+    """Return a cached Polars DataFrame, or None if the file does not exist."""
+    if path.exists():
+        log(f"  Cache hit: {path.name}")
+        return pl.read_parquet(path)
+    return None
+
+
+def _save_cache(df: pl.DataFrame | pd.DataFrame, path: Path) -> None:
+    if isinstance(df, pd.DataFrame):
+        df = pl.from_pandas(df)
+    df.write_parquet(path)
+    log(f"  Cache written: {path.name}")
+
+
+def run(stages: list[int] | None = None, fast: bool = False,
+        no_cache: bool = False) -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     all_stages = stages is None
@@ -1210,65 +1391,151 @@ def run(stages: list[int] | None = None, fast: bool = False) -> None:
     log("Loading scene location and data ...")
     loc = get(SCENE_LOC_ID)
     ranking = load_ranking()
-    raw_df  = load_raw_pixels(loc)
 
-    log("Deriving riparian proxy pixels ...")
-    rip_ids = derive_riparian_proxy(raw_df, loc)
-
-    # Pre-compute filtered frame and default-smoothed curve once — shared by
-    # all stages that use smooth_days=30 (the default for both signals).
-    log("Pre-computing shared filtered frame and NDVI curve ...")
     _q = QualityParams()
-    df_filt  = load_and_filter(raw_df, _q.scl_purity_min)
-    log(f"  load_and_filter done: {len(df_filt):,} rows", )
-    curve_30 = annual_ndvi_curve(df_filt, 30, _q.min_obs_per_year)
-    log(f"  annual_ndvi_curve done: {len(curve_30):,} rows")
+    _curve_cache = OUT_DIR / "_cache_ndvi_curve.parquet"
+    _by_pixel    = sorted_parquet_path(loc)
+
+    # --- NDVI curve ----------------------------------------------------------
+    # annual_ndvi_curve_chunked writes the curve to _curve_cache and returns
+    # the path.  Signals and stages receive the Path and use scan_parquet with
+    # streaming — the 267M-row curve is never loaded fully into RAM.
+    log("Pre-computing NDVI curve ...")
+    if not no_cache and _curve_cache.exists():
+        curve_30 = _curve_cache
+        log(f"  NDVI curve loaded from cache: {_curve_cache.name}")
+    else:
+        log(f"  Computing annual_ndvi_curve_chunked from {_by_pixel.name} ...")
+        curve_30 = annual_ndvi_curve_chunked(
+            _by_pixel, out_path=_curve_cache, smooth_days=30,
+            min_obs_per_year=_q.min_obs_per_year,
+            scl_purity_min=0.0,  # parquet is pre-filtered; all scl_purity == 1.0
+        )
+        log(f"  NDVI curve written: {_curve_cache.name}")
+
+    # --- Shared filtered frame -----------------------------------------------
+    # Loaded after the curve is cached. load_raw_pixels already downcasts
+    # float64 → float32, so df_filt settles at ~13 GB rather than ~22 GB.
+    log("Loading shared filtered frame ...")
+    raw_df  = load_raw_pixels(loc)
+    df_filt = load_and_filter(raw_df, _q.scl_purity_min)
+    del raw_df
+    log(f"  load_and_filter done: {len(df_filt):,} rows")
+
+    # --- Riparian proxy ------------------------------------------------------
+    # Derived from df_filt while scl_purity is still present (NirCvSignal needs
+    # it internally).  Drop scl_purity afterwards — it is not used by any stage.
+    log("Deriving riparian proxy pixels ...")
+    rip_ids = derive_riparian_proxy(df_filt, loc)
+    df_filt = df_filt.drop("scl_purity")
 
     # Instantiate signals with defaults
     rec_signal   = RecessionSensitivitySignal()
     green_signal = GreenupTimingSignal()
 
+    _rec_cache        = OUT_DIR / "_cache_rec_stats.parquet"
+    _paired_cache     = OUT_DIR / "_cache_paired.parquet"
+    _green_cache      = OUT_DIR / "_cache_green_stats.parquet"
+    _per_year_g_cache = OUT_DIR / "_cache_per_year_green.parquet"
+
+    def _require_rec():
+        nonlocal rec_stats, paired
+        if rec_stats is not None and paired is not None:
+            return
+        log("  Stage requires recession stats — computing ...")
+        rec_stats, paired = stage3(rec_signal, None, ranking, rip_ids, loc,
+                                   df_filt=df_filt, curve=curve_30)
+        _save_cache(rec_stats, _rec_cache)
+        _save_cache(paired, _paired_cache)
+
+    def _require_green():
+        nonlocal green_stats, per_year_green, df_filt
+        if green_stats is not None and per_year_green is not None:
+            return
+        log("  Stage requires greenup stats — computing ...")
+        # Stage 4 only needs the curve Path — free df_filt before the
+        # streaming collect to avoid OOM (13 GB frame vs 267M-row curve).
+        # We must drop ALL references so the GC can reclaim the memory.
+        # Reload df_filt afterward if any later stage still needs it.
+        _need_df_after = df_filt is not None
+        df_filt = None
+        gc.collect()
+        green_stats, per_year_green = stage4(green_signal, None, ranking, rip_ids, loc,
+                                             df_filt=None, curve=curve_30)
+        _save_cache(green_stats, _green_cache)
+        _save_cache(per_year_green, _per_year_g_cache)
+        if _need_df_after:
+            log("  Reloading shared filtered frame after greenup compute ...")
+            _raw = load_raw_pixels(loc)
+            df_filt = load_and_filter(_raw, _q.scl_purity_min).drop("scl_purity")
+            del _raw
+            gc.collect()
+
     rec_stats = paired = green_stats = per_year_green = None
 
+    # Pre-load signal caches if available (skipped in stage 7 which varies params)
+    if not no_cache:
+        if (cached := _load_cache(_rec_cache)) is not None:
+            rec_stats = cached.to_pandas()
+        if (cached := _load_cache(_paired_cache)) is not None:
+            paired = cached.to_pandas()
+        if (cached := _load_cache(_green_cache)) is not None:
+            green_stats = cached.to_pandas()
+        if (cached := _load_cache(_per_year_g_cache)) is not None:
+            per_year_green = cached.to_pandas()
+
     if run_stage(1):
-        stage1(raw_df, ranking, rip_ids, loc, df_filt=df_filt)
+        stage1(None, ranking, rip_ids, loc, df_filt=df_filt)
 
     if run_stage(2):
-        stage2(raw_df, ranking, df_filt=df_filt)
+        stage2(None, ranking, df_filt=df_filt)
 
     if run_stage(3):
-        rec_stats, paired = stage3(rec_signal, raw_df, ranking, rip_ids, loc,
+        rec_stats, paired = stage3(rec_signal, None, ranking, rip_ids, loc,
                                    df_filt=df_filt, curve=curve_30)
+        _save_cache(rec_stats, _rec_cache)
+        _save_cache(paired, _paired_cache)
 
     if run_stage(4):
-        green_stats, per_year_green = stage4(green_signal, raw_df, ranking, rip_ids, loc,
-                                             df_filt=df_filt, curve=curve_30)
+        # Stage 4 only needs the curve Path (coords embedded) — df_filt not
+        # required.  Drop ALL references before the streaming collect so the
+        # OOM-causing 13 GB frame is reclaimed.  Reload afterward if needed.
+        _need_df_after_4 = any(run_stage(s) for s in [5, 7])
+        del df_filt
+        gc.collect()
+
+        green_stats, per_year_green = stage4(green_signal, None, ranking, rip_ids, loc,
+                                             df_filt=None, curve=curve_30)
+        _save_cache(green_stats, _green_cache)
+        _save_cache(per_year_green, _per_year_g_cache)
+
+        if _need_df_after_4:
+            log("  Reloading shared filtered frame after greenup compute ...")
+            _raw = load_raw_pixels(loc)
+            df_filt = load_and_filter(_raw, _q.scl_purity_min).drop("scl_purity")
+            del _raw
+            gc.collect()
+        else:
+            df_filt = None  # type: ignore[assignment]
 
     if run_stage(5):
-        if rec_stats is None or paired is None:
-            log("  Stage 5 requires Stage 3 — recomputing recession stats ...")
-            rec_stats, paired = stage3(rec_signal, raw_df, ranking, rip_ids, loc,
-                                       df_filt=df_filt, curve=curve_30)
-        if green_stats is None:
-            log("  Stage 5 requires Stage 4 — recomputing greenup stats ...")
-            green_stats, per_year_green = stage4(green_signal, raw_df, ranking, rip_ids, loc,
-                                                 df_filt=df_filt, curve=curve_30)
-        stage5(rec_stats, paired, green_stats, per_year_green, raw_df, ranking, rip_ids,
+        _require_rec()
+        _require_green()
+        stage5(rec_stats, paired, green_stats, per_year_green, None, ranking, rip_ids,
                df_filt=df_filt)
 
     if run_stage(6):
-        if rec_stats is None:
-            log("  Stage 6 requires Stage 3 — recomputing recession stats ...")
-            rec_stats, paired = stage3(rec_signal, raw_df, ranking, rip_ids, loc,
-                                       df_filt=df_filt, curve=curve_30)
-        if green_stats is None:
-            log("  Stage 6 requires Stage 4 — recomputing greenup stats ...")
-            green_stats, per_year_green = stage4(green_signal, raw_df, ranking, rip_ids, loc,
-                                                 df_filt=df_filt, curve=curve_30)
+        _require_rec()
+        _require_green()
         stage6(rec_stats, green_stats, ranking)
 
     if run_stage(7) and not fast:
-        stage7(raw_df, ranking, df_filt=df_filt, curve_30=curve_30)
+        # stage7 loads df_filt internally for 7a and frees it before 7b.
+        # Don't pass df_filt from here — keeping it alive in this frame
+        # would defeat the memory-freeing inside stage7.
+        df_filt = None  # type: ignore[assignment]
+        gc.collect()
+        stage7(None, ranking, df_filt=None, curve_30=curve_30, by_pixel_path=_by_pixel)
     elif run_stage(7) and fast:
         log("\n=== Stage 7: skipped (--fast) ===")
 
@@ -1287,5 +1554,9 @@ if __name__ == "__main__":
         "--fast", action="store_true",
         help="Skip Stage 7 parameter sweep (slower, runs multiple signal computations).",
     )
+    parser.add_argument(
+        "--no-cache", action="store_true",
+        help="Ignore cached intermediates and recompute from raw parquet.",
+    )
     args = parser.parse_args()
-    run(stages=args.stage, fast=args.fast)
+    run(stages=args.stage, fast=args.fast, no_cache=args.no_cache)

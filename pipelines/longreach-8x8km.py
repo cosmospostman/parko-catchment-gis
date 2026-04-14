@@ -106,11 +106,16 @@ def run(plots: bool = True) -> None:
     # ------------------------------------------------------------------
     # Score the 8×8 km scene (tuned params auto-loaded from YAML)
     # ------------------------------------------------------------------
-    print(f"\nLoading scene pixels from {scene_loc.parquet_path()} ...")
-    scene_raw = pd.read_parquet(scene_loc.parquet_path())
+    scene_path = scene_loc.parquet_path()
+    sorted_path = scene_path.with_name(scene_path.stem + "-by-pixel.parquet")
+    if not sorted_path.exists():
+        from signals._shared import sort_parquet_by_pixel
+        print(f"\nSorting {scene_path.name} by pixel (one-time, ~2 min)...")
+        sort_parquet_by_pixel(scene_path, sorted_path)
+        print(f"Saved: {sorted_path}")
 
-    print("Extracting features (scene, tuned params)...")
-    scene_features = extract_parko_features(scene_raw, scene_loc)
+    print(f"\nExtracting features from {sorted_path.name} (chunked, one row-group at a time)...")
+    scene_features = extract_parko_features(sorted_path, scene_loc)
 
     # Carry over training labels where pixels overlap the sub-bboxes
     scene_labelled = label_pixels(scene_features, train_loc)
@@ -128,7 +133,7 @@ def run(plots: bool = True) -> None:
     print(f"Saved: {ranked_path}")
 
     if plots:
-        plot_prob_heatmaps(scored, scene_loc, out_dir, stem="longreach_8x8km", wms_width=1024)
+        plot_prob_heatmaps(scored, scene_loc, out_dir, stem="longreach_8x8km")
 
 
 if __name__ == "__main__":

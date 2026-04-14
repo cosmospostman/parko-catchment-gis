@@ -40,7 +40,10 @@ class RedEdgeSignal:
         DataFrame with columns ``[point_id, lon, lat, re_p10, n_years]``.
         """
         p = self.params
-        df = load_and_filter(pixel_df, p.quality.scl_purity_min)
+        df = load_and_filter(
+            pixel_df, p.quality.scl_purity_min,
+            load_cols=["point_id", "lon", "lat", "date", "scl_purity", "B07", "B05"],
+        )
 
         coords = (
             df.select(["point_id", "lon", "lat"])

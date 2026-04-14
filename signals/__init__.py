@@ -34,6 +34,8 @@ features = extract_parko_features(df, loc)
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Union
 
 import pandas as pd
 
@@ -60,7 +62,7 @@ from signals.red_edge import RedEdgeSignal                    # noqa: E402
 from signals.swir import SwirSignal                           # noqa: E402
 from signals.flowering import FloweringSignal                 # noqa: E402
 from signals.recession import RecessionSensitivitySignal      # noqa: E402
-from signals.greenup import GreenupTimingSignal               # noqa: E402
+from signals.greenup import GreenupTimingSignal, GreenupShiftSignal  # noqa: E402
 from signals.tuning import sweep_signal                       # noqa: E402
 
 
@@ -69,7 +71,7 @@ from signals.tuning import sweep_signal                       # noqa: E402
 # ---------------------------------------------------------------------------
 
 def extract_parko_features(
-    pixel_df: pd.DataFrame,
+    pixel_df: Union[pd.DataFrame, Path],
     loc: object,
     nir_cv_params: NirCvSignal.Params | None = None,
     rec_p_params: RecPSignal.Params | None = None,
@@ -87,7 +89,8 @@ def extract_parko_features(
     Parameters
     ----------
     pixel_df:
-        Raw observation parquet loaded for this location.
+        Raw observation parquet loaded for this location, or a Path to the
+        parquet file (preferred for large files — avoids loading into RAM).
     loc:
         ``utils.location.Location``.
     nir_cv_params, rec_p_params, red_edge_params, swir_params:
@@ -98,7 +101,7 @@ def extract_parko_features(
     -------
     DataFrame with columns ``[point_id, lon, lat, nir_cv, rec_p, re_p10, swir_p10]``.
     """
-    from signals._shared import load_signal_params
+    from signals._shared import load_signal_params, compute_features_chunked
 
     if nir_cv_params is None:
         nir_cv_params = load_signal_params(loc, "nir_cv")
@@ -108,6 +111,19 @@ def extract_parko_features(
         red_edge_params = load_signal_params(loc, "red_edge")
     if swir_params is None:
         swir_params = load_signal_params(loc, "swir")
+
+    # When given a Path, use the memory-efficient single-pass chunked path.
+    # When given a DataFrame (small training set), use the per-signal path.
+    if isinstance(pixel_df, Path):
+        return compute_features_chunked(
+            path=pixel_df,
+            scl_purity_min=nir_cv_params.quality.scl_purity_min,
+            dry_months=loc.dry_months,
+            min_obs_per_year=nir_cv_params.quality.min_obs_per_year,
+            min_obs_dry=nir_cv_params.quality.min_obs_dry,
+            re_floor_percentile=red_edge_params.floor_percentile,
+            swir_floor_percentile=swir_params.floor_percentile,
+        )
 
     nir_stats = NirCvSignal(nir_cv_params).compute(pixel_df, loc)
     rec_stats = RecPSignal(rec_p_params).compute(pixel_df, loc)
@@ -141,6 +157,7 @@ __all__ = [
     "FloweringSignal",
     "RecessionSensitivitySignal",
     "GreenupTimingSignal",
+    "GreenupShiftSignal",
     "extract_parko_features",
     "sweep_signal",
 ]

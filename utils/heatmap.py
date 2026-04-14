@@ -52,13 +52,13 @@ def _scene_bbox(scored_df: pd.DataFrame, margin: float = 0.00005) -> list[float]
 
 
 def _marker_size(ax, lon_min: float, lon_max: float) -> float:
-    """Compute scatter marker size (points²) so one marker ≈ one 10 m pixel."""
+    """Compute scatter marker size (points²) so one marker ≈ one 5 m radius (half a 10 m pixel width)."""
     fig = ax.get_figure()
     ax_width_in = ax.get_window_extent(fig.canvas.get_renderer()).width / fig.dpi
     lon_span = lon_max - lon_min
     frac = (2 * _HALF_DEG) / lon_span
     px_width_pts = frac * ax_width_in * 72
-    return max(px_width_pts ** 2 * 0.5, 1.0)
+    return max(px_width_pts ** 2 * 0.5 * 0.25 * 0.25, 1.0)
 
 
 def _apply_annotations(ax, annotations: list[dict]) -> None:
@@ -87,7 +87,6 @@ def plot_prob_heatmaps(
     loc,
     out_dir: Path,
     stem: str,
-    wms_width: int = 512,
     annotations: list[dict] | None = None,
 ) -> list[Path]:
     """Render two separate probability heatmap figures.
@@ -105,7 +104,6 @@ def plot_prob_heatmaps(
     loc        : Location object (used for title)
     out_dir    : directory to write PNGs into
     stem       : filename prefix
-    wms_width  : pixel width for WMS tile fetch
     annotations: optional list of Rectangle annotation dicts. Each dict must
                  contain ``xy``, ``width``, ``height`` and any valid
                  ``mpatches.Rectangle`` kwargs (e.g. edgecolor, linestyle, label).
@@ -128,7 +126,10 @@ def plot_prob_heatmaps(
 
     try:
         mod = _load_qglobe()
-        img = mod.fetch_wms_image(bbox, width_px=wms_width)
+        cache = mod.SceneTileCache()
+        cache.expand(bbox)
+        cache.prefetch()
+        img = cache._img
     except Exception as exc:
         print(f"  WARNING: WMS fetch failed ({exc}) — imagery panel will use dark background")
         img = None
@@ -181,7 +182,7 @@ def plot_prob_heatmaps(
 
     fig1.tight_layout()
     p1 = out_dir / f"{stem}_prob_vs_imagery.png"
-    fig1.savefig(p1, dpi=150, bbox_inches="tight")
+    fig1.savefig(p1, dpi=800, bbox_inches="tight")
     plt.close(fig1)
     print(f"Saved: {p1}")
 
@@ -221,7 +222,7 @@ def plot_prob_heatmaps(
 
     fig2.tight_layout()
     p2 = out_dir / f"{stem}_prob_black.png"
-    fig2.savefig(p2, dpi=150, bbox_inches="tight", facecolor="black")
+    fig2.savefig(p2, dpi=800, bbox_inches="tight", facecolor="black")
     plt.close(fig2)
     print(f"Saved: {p2}")
 

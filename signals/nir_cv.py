@@ -48,7 +48,10 @@ class NirCvSignal:
         DataFrame with columns ``[point_id, lon, lat, nir_mean, nir_std, nir_cv, n_years]``.
         """
         p = self.params
-        df = load_and_filter(pixel_df, p.quality.scl_purity_min)
+        df = load_and_filter(
+            pixel_df, p.quality.scl_purity_min,
+            load_cols=["point_id", "lon", "lat", "date", "scl_purity", "B08"],
+        )
 
         coords = (
             df.select(["point_id", "lon", "lat"])
