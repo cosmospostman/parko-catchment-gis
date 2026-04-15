@@ -1,0 +1,15 @@
+# Kowanyama — Mitchell River delta, Gulf of Carpentaria. Out-of-distribution test.
+name: "Kowanyama"
+centroid: null
+bbox: [141.47528, -15.51051, 141.66922, -15.41736]  # [lon_min, lat_min, lon_max, lat_max]
+dry_months: [5, 6, 7, 8, 9, 10]  # monsoonal — one month earlier than inland sites
+signals:
+  nir_cv:
+    min_obs_dry: 3
+  flowering:
+    haze_b02_anom_max: 0.012
+
+notes: >
+  Mitchell River delta, Gulf of Carpentaria. Monsoonal climate. Dense riparian
+  infestation visible in WMS imagery. Out-of-distribution transfer test relative
+  to the Galilee Basin East training sites.

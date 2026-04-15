@@ -1,0 +1,8 @@
+# Barcaldine corridor — largest ALA cluster, diffuse infestation ~530 km².
+name: "Barcaldine corridor"
+centroid: [-21.438, 145.004]  # [lat, lon]
+bbox: [144.88, -21.55, 145.07, -21.30]  # [lon_min, lat_min, lon_max, lat_max]
+dry_months: [6, 7, 8, 9, 10]
+notes: >
+  Largest ALA cluster in the Galilee Basin East (~530 km²). Diffuse infestation
+  across multiple land-cover types. Key cross-environment transfer test.

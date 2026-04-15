@@ -1,0 +1,25 @@
+# Longreach — 8 km × 8 km subscene centred on the Thomson River infestation core.
+name: "Longreach 8x8km"
+centroid: [-22.7403, 145.440]  # [lat, lon] — approximate centre of target region
+bbox: [145.401, -22.776, 145.479, -22.704]  # [lon_min, lat_min, lon_max, lat_max] — approx 8 km × 8 km
+dry_months: [6, 7, 8, 9, 10]
+sub_bboxes:
+  presence:
+    label: "Presence — Thomson River infestation core"
+    role: presence
+    bbox: [145.4239, -22.7640, 145.4250, -22.7610]  # [lon_min, lat_min, lon_max, lat_max]
+  absence:
+    label: "Absence — riparian corridor south of infestation"
+    role: absence
+    bbox: [145.4239, -22.7672, 145.4250, -22.7640]  # [lon_min, lat_min, lon_max, lat_max]
+signals:
+  red_edge:
+    floor_percentile: 0.84   # tuned: peak separability at Longreach
+  flowering:
+    haze_b02_anom_max: 0.010
+    doy_bin_days: 14
+notes: >
+  Subscene bbox cropped to the dense Parkinsonia infestation core visible in the
+  Thomson River riparian corridor. Approximately 8 km (E–W) × 8 km (N–S), centred
+  near the confirmed infestation centroid. Training labels (sub_bboxes) match
+  data/locations/longreach.yaml.

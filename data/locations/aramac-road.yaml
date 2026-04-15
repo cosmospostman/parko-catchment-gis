@@ -1,0 +1,6 @@
+# Aramac Road cluster — compact cluster, similar scale to Longreach.
+name: "Aramac Road cluster"
+centroid: [-22.104, 145.205]  # [lat, lon]
+bbox: [145.16, -22.17, 145.24, -22.07]  # [lon_min, lat_min, lon_max, lat_max]
+dry_months: [6, 7, 8, 9, 10]
+notes: "Compact cluster, similar scale to Longreach. First cross-site validation target."

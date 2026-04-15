@@ -16,7 +16,7 @@ env/
 htmlcov/
 
 # Data (large files — managed separately)
-data/
+data/*
 outputs/
 *.tif
 *.gpkg
@@ -25,6 +25,9 @@ outputs/
 
 # Keep fixtures and small test data
 !tests/fixtures/
+
+# Keep location configs
+!data/locations/
 
 # Logs
 *.log

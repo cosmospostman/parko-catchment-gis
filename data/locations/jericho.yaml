@@ -1,0 +1,8 @@
+# Jericho area cluster — GPS-logged field survey, highest spatial precision.
+name: "Jericho area cluster"
+centroid: [-22.452, 144.693]  # [lat, lon]
+bbox: [144.57, -22.53, 144.80, -22.36]  # [lon_min, lat_min, lon_max, lat_max]
+dry_months: [6, 7, 8, 9, 10]
+notes: >
+  GPS-logged field survey records (1 m coordinate uncertainty). Riparian corridor
+  pattern. Highest spatial precision in the Galilee Basin East dataset.
