@@ -73,6 +73,10 @@ def compute_features_chunked(
     rec_p_percentile: float = 0.10,
     re_floor_percentile: float = 0.10,
     swir_floor_percentile: float = 0.10,
+    year_from: int | None = None,
+    year_to: int | None = None,
+    curve_out_path: Path | None = None,
+    smooth_days: int = 30,
 ) -> pd.DataFrame:
     """Compute all four Parkinsonia signal features in a single row-group pass.
 
@@ -99,6 +103,15 @@ def compute_features_chunked(
     rec_p_percentile, re_floor_percentile, swir_floor_percentile:
         Percentile overrides (default 0.10 for floor signals; rec_p uses
         p90-p10 amplitude, not a configurable percentile).
+    year_from, year_to:
+        Optional inclusive year bounds. Observations outside this range are
+        dropped before any aggregation.
+    curve_out_path:
+        If provided, the smoothed NDVI curve is written to this path in the
+        same row-group pass (no second scan needed for ndvi_integral).
+    smooth_days:
+        Rolling-median window for the NDVI curve (only used when
+        ``curve_out_path`` is given).
 
     Returns
     -------
@@ -106,18 +119,25 @@ def compute_features_chunked(
     ``[point_id, lon, lat, nir_cv, rec_p, re_p10, swir_p10]``.
     """
     import pyarrow.parquet as pq
+    from scipy.ndimage import median_filter
 
     LOAD_COLS = ["point_id", "lon", "lat", "date", "scl_purity",
                  "B04", "B05", "B07", "B08", "B11"]
 
     re_n  = int(round(re_floor_percentile * 100))
     sw_n  = int(round(swir_floor_percentile * 100))
+    window_rows = max(3, smooth_days // 5)
 
     pf = pq.ParquetFile(path)
     n_rg = pf.metadata.num_row_groups
     parts: list[pd.DataFrame] = []
+    curve_writer = None
+    print(f"  [chunked] {path.name}: {n_rg} row groups, {pf.metadata.num_rows:,} rows total")
 
     for rg_idx in range(n_rg):
+        if rg_idx % max(1, n_rg // 10) == 0:
+            pct = 100 * rg_idx // n_rg
+            print(f"  [chunked] row group {rg_idx + 1}/{n_rg} ({pct}%)", flush=True)
         table = pf.read_row_groups([rg_idx], columns=LOAD_COLS)
         chunk = pl.from_arrow(table)
         del table
@@ -133,6 +153,13 @@ def compute_features_chunked(
                 ((pl.col("B08") - pl.col("B11")) / (pl.col("B08") + pl.col("B11"))).alias("swir_mi"),
             ])
         )
+
+        if year_from is not None:
+            chunk = chunk.filter(pl.col("year") >= year_from)
+        if year_to is not None:
+            chunk = chunk.filter(pl.col("year") <= year_to)
+        if chunk.is_empty():
+            continue
 
         # nir_cv: dry-season B08 inter-annual CV — reduce to (pixel, year) first
         nir_annual = (
@@ -198,9 +225,118 @@ def compute_features_chunked(
             .to_pandas()
         )
         parts.append(chunk_result)
-        del chunk, annual, nir_annual, nir_stats, pixel_stats
+        del annual, nir_annual, nir_stats, pixel_stats
+
+        # Optionally emit smoothed NDVI curve in the same pass
+        if curve_out_path is not None:
+            obs_counts = (
+                chunk.group_by(["point_id", "year"])
+                .agg(pl.len().alias("_n_obs"))
+            )
+            curve_chunk = (
+                chunk
+                .with_columns(pl.col("date").dt.ordinal_day().alias("doy"))
+                .join(obs_counts, on=["point_id", "year"], how="left")
+                .with_columns((pl.col("_n_obs") < min_obs_per_year).alias("is_sparse_year"))
+                .drop("_n_obs")
+                .sort(["point_id", "year", "date"])
+            )
+
+            ndvi_arr = curve_chunk["ndvi"].to_numpy(allow_copy=True)
+            pid_arr  = curve_chunk["point_id"].to_numpy(allow_copy=True)
+            yr_arr   = curve_chunk["year"].to_numpy(allow_copy=True)
+
+            change = np.ones(len(ndvi_arr), dtype=bool)
+            change[1:] = (pid_arr[1:] != pid_arr[:-1]) | (yr_arr[1:] != yr_arr[:-1])
+            starts = np.flatnonzero(change)
+            ends   = np.append(starts[1:], len(ndvi_arr))
+
+            ndvi_smooth = np.empty_like(ndvi_arr)
+            for s, e in zip(starts, ends):
+                ndvi_smooth[s:e] = median_filter(ndvi_arr[s:e], size=window_rows, mode="nearest")
+
+            curve_result = (
+                curve_chunk
+                .with_columns(pl.Series("ndvi_smooth", ndvi_smooth))
+                .select(["point_id", "lon", "lat", "date", "year", "month", "doy",
+                         "ndvi", "ndvi_smooth", "is_sparse_year"])
+            )
+            arrow_table = curve_result.to_arrow()
+            if curve_writer is None:
+                curve_writer = pq.ParquetWriter(str(curve_out_path), arrow_table.schema)
+            curve_writer.write_table(arrow_table)
+            del curve_chunk, curve_result, arrow_table
+
+        del chunk
+
+    if curve_writer is not None:
+        curve_writer.close()
 
     return pd.concat(parts, ignore_index=True)
+
+
+def is_pixel_sorted(path: Path, n_check: int = 2) -> bool:
+    """Return True if ``path`` is pixel-sorted (no point_id overlap between adjacent row groups).
+
+    Checks the first ``n_check`` pairs of adjacent row groups.  A file with
+    only one row group is trivially sorted.
+    """
+    import pyarrow.parquet as pq
+
+    pf = pq.ParquetFile(path)
+    n_rg = pf.metadata.num_row_groups
+    if n_rg <= 1:
+        return True
+
+    pairs = min(n_check, n_rg - 1)
+    for i in range(pairs):
+        ids_a = set(
+            pl.from_arrow(pf.read_row_groups([i],     columns=["point_id"]))["point_id"].to_list()
+        )
+        ids_b = set(
+            pl.from_arrow(pf.read_row_groups([i + 1], columns=["point_id"]))["point_id"].to_list()
+        )
+        if ids_a & ids_b:
+            return False
+    return True
+
+
+def ensure_pixel_sorted(path: Path, row_group_size: int = 5_000_000) -> Path:
+    """Return a pixel-sorted version of ``path``, sorting it first if needed.
+
+    If the parquet is already pixel-sorted the original path is returned
+    unchanged.  Otherwise a ``<stem>-by-pixel.parquet`` sibling is written (or
+    reused if it already exists) and its path is returned.
+
+    Parameters
+    ----------
+    path:
+        Path to the candidate parquet file.
+    row_group_size:
+        Target rows per row group passed to ``sort_parquet_by_pixel``.
+
+    Returns
+    -------
+    Path to a pixel-sorted parquet (may equal ``path``).
+    """
+    if is_pixel_sorted(path):
+        print(f"  [sort-check] {path.name}: already pixel-sorted")
+        return path
+
+    sorted_path = path.with_name(path.stem + "-by-pixel.parquet")
+    if sorted_path.exists():
+        print(f"  [sort-check] {path.name}: using cached pixel-sorted file → {sorted_path.name}")
+        return sorted_path
+
+    import pyarrow.parquet as pq
+    n_rg = pq.ParquetFile(path).metadata.num_row_groups
+    print(
+        f"  [sort-check] {path.name}: not pixel-sorted ({n_rg} row groups) — "
+        f"sorting to {sorted_path.name} (this runs once) ..."
+    )
+    sort_parquet_by_pixel(path, sorted_path, row_group_size=row_group_size)
+    print(f"  [sort-check] sort complete → {sorted_path.name}")
+    return sorted_path
 
 
 def sort_parquet_by_pixel(src: Path, dst: Path, row_group_size: int = 5_000_000) -> None:
@@ -351,6 +487,8 @@ def annual_ndvi_curve_chunked(
     smooth_days: int,
     min_obs_per_year: int,
     scl_purity_min: float = 0.0,
+    year_from: int | None = None,
+    year_to: int | None = None,
 ) -> "Path":
     """Like ``annual_ndvi_curve`` but reads a pixel-sorted parquet row-group
     by row-group, writing results incrementally to ``out_path`` rather than
@@ -377,6 +515,8 @@ def annual_ndvi_curve_chunked(
     scl_purity_min:
         Rows with ``scl_purity < scl_purity_min`` are dropped before
         processing.  Pass 0.0 to skip (e.g. if the parquet is pre-filtered).
+    year_from, year_to:
+        Optional inclusive year bounds applied before curve computation.
 
     Returns
     -------
@@ -408,6 +548,13 @@ def annual_ndvi_curve_chunked(
             pl.col("date").dt.month().alias("month"),
             pl.col("date").dt.ordinal_day().alias("doy"),
         ]).drop(["B08", "B04"])
+
+        if year_from is not None:
+            chunk = chunk.filter(pl.col("year") >= year_from)
+        if year_to is not None:
+            chunk = chunk.filter(pl.col("year") <= year_to)
+        if chunk.is_empty():
+            continue
 
         # Flag sparse years within this chunk
         obs_counts = (
@@ -573,6 +720,7 @@ def load_signal_params(loc: object, signal: str) -> object:
     from signals.red_edge import RedEdgeSignal
     from signals.swir import SwirSignal
     from signals.flowering import FloweringSignal
+    from signals.integral import NdviIntegralSignal
     from signals import QualityParams
 
     _signal_map = {
@@ -581,6 +729,7 @@ def load_signal_params(loc: object, signal: str) -> object:
         "red_edge": RedEdgeSignal,
         "swir": SwirSignal,
         "flowering": FloweringSignal,
+        "ndvi_integral": NdviIntegralSignal,
     }
 
     if signal not in _signal_map:

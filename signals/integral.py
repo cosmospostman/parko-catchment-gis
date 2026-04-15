@@ -240,6 +240,54 @@ class NdviIntegralSignal:
         ]
         return stats_pl.select(col_order).to_pandas()
 
+    def compute_from_path(
+        self,
+        path: Path,
+        loc: object,
+        year_from: int | None = None,
+        year_to: int | None = None,
+    ) -> pd.DataFrame:
+        """Memory-efficient compute for large pixel-sorted parquets.
+
+        Uses ``annual_ndvi_curve_chunked`` to build the NDVI curve row-group
+        by row-group (peak RAM ≈ one row group), writes it to a temp file, then
+        aggregates with streaming.  Never loads the full dataset into RAM.
+
+        Parameters
+        ----------
+        path:
+            Path to a pixel-sorted parquet file.
+        loc:
+            ``utils.location.Location``.
+        year_from, year_to:
+            Optional inclusive year bounds applied before curve computation.
+
+        Returns
+        -------
+        Same columns as ``compute()``.
+        """
+        import tempfile
+        from signals._shared import annual_ndvi_curve_chunked
+
+        p = self.params
+
+        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
+            curve_path = Path(f.name)
+
+        try:
+            annual_ndvi_curve_chunked(
+                sorted_parquet_path=path,
+                out_path=curve_path,
+                smooth_days=p.smooth_days,
+                min_obs_per_year=p.quality.min_obs_per_year,
+                scl_purity_min=p.quality.scl_purity_min,
+                year_from=year_from,
+                year_to=year_to,
+            )
+            return self.compute(pixel_df=None, loc=loc, _curve=curve_path)
+        finally:
+            curve_path.unlink(missing_ok=True)
+
     def diagnose(
         self,
         pixel_df: pd.DataFrame | None,

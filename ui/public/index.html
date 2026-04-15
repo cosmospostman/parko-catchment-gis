@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Parko GIS</title>
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.css" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      display: flex;
+      height: 100vh;
+      font-family: system-ui, sans-serif;
+      font-size: 13px;
+      background: #1a1a1a;
+      color: #e0e0e0;
+    }
+
+    #sidebar {
+      width: 240px;
+      flex-shrink: 0;
+      display: flex;
+      flex-direction: column;
+      background: #242424;
+      border-right: 1px solid #333;
+      overflow: hidden;
+    }
+
+    #sidebar h1 {
+      padding: 12px 14px;
+      font-size: 14px;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      border-bottom: 1px solid #333;
+      color: #f0f0f0;
+    }
+
+    #location-list {
+      list-style: none;
+      overflow-y: auto;
+      flex: 1;
+    }
+
+    #location-list li {
+      padding: 8px 14px;
+      cursor: pointer;
+      border-bottom: 1px solid #2d2d2d;
+      line-height: 1.4;
+      transition: background 0.1s;
+    }
+
+    #location-list li:hover {
+      background: #2e2e2e;
+    }
+
+    #location-list li.active {
+      background: #1e3a5f;
+    }
+
+    #location-list li .loc-name {
+      font-weight: 500;
+      color: #d0d0d0;
+    }
+
+    #location-list li .loc-id {
+      font-size: 11px;
+      color: #666;
+      margin-top: 1px;
+    }
+
+    #map {
+      flex: 1;
+    }
+
+    .maplibregl-popup-content {
+      background: #242424;
+      color: #e0e0e0;
+      border: 1px solid #444;
+      border-radius: 6px;
+      padding: 10px 12px;
+      font-size: 12px;
+      max-width: 280px;
+    }
+
+    .maplibregl-popup-tip {
+      border-top-color: #444;
+    }
+
+    .popup-title {
+      font-weight: 600;
+      font-size: 13px;
+      margin-bottom: 6px;
+      color: #f0f0f0;
+    }
+
+    .popup-row {
+      display: flex;
+      gap: 6px;
+      margin-bottom: 3px;
+    }
+
+    .popup-label {
+      color: #888;
+      min-width: 52px;
+    }
+
+    .popup-notes {
+      margin-top: 6px;
+      color: #aaa;
+      font-style: italic;
+      line-height: 1.4;
+    }
+
+    .role-badge {
+      display: inline-block;
+      padding: 1px 6px;
+      border-radius: 3px;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .role-presence { background: #14532d; color: #86efac; }
+    .role-absence  { background: #7f1d1d; color: #fca5a5; }
+    .role-survey   { background: #713f12; color: #fde68a; }
+    .role-location { background: #1e3a5f; color: #93c5fd; }
+  </style>
+</head>
+<body>
+  <div id="sidebar">
+    <h1>Parko GIS</h1>
+    <ul id="location-list"></ul>
+  </div>
+  <div id="map"></div>
+  <script src="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

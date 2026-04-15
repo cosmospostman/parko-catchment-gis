@@ -17,8 +17,6 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-import pandas as pd
-
 from utils.location import get
 from utils.heatmap import plot_prob_heatmaps
 from signals import extract_parko_features
@@ -27,27 +25,44 @@ from pipelines.common import label_pixels, summarise, save_pixel_ranking
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OUT_DIR = PROJECT_ROOT / "outputs" / "basalt-3x3"
-FEATURES = ["nir_cv", "rec_p", "re_p10"]
+FEATURES = ["nir_cv", "rec_p", "re_p10", "ndvi_integral"]
 
-TRAIN_LOC_ID = "longreach"       # source of sub-bbox training labels
+TRAIN_LOC_ID = "longreach"          # source of sub-bbox training labels
+TRAIN_DATA_ID = "longreach-8x8km"  # pixel data for training (wider scene, more years)
 SCENE_LOC_ID = "basalt-3x3km"   # full scene to score
 
 
 
-def run(plots: bool = True) -> None:
+def run(plots: bool = True, year_from: int | None = None, year_to: int | None = None) -> None:
     train_loc = get(TRAIN_LOC_ID)
+    train_data_loc = get(TRAIN_DATA_ID)
     scene_loc = get(SCENE_LOC_ID)
     out_dir = OUT_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ------------------------------------------------------------------
-    # Train on the original Longreach labels
-    # ------------------------------------------------------------------
-    print(f"Loading training pixels from {train_loc.parquet_path()} ...")
-    train_raw = pd.read_parquet(train_loc.parquet_path())
+    if year_from is not None or year_to is not None:
+        label = f"{year_from or '?'}–{year_to or '?'}"
+        print(f"Filtering to years {label}")
 
-    print("Extracting features (training set)...")
-    train_features = extract_parko_features(train_raw, train_loc)
+    # ------------------------------------------------------------------
+    # Train on the longreach-8x8km pixels, labelled by longreach sub-bboxes
+    # ------------------------------------------------------------------
+    # Pre-filter to the union of training sub-bboxes so we only load the ~700
+    # labelled pixels rather than the full 8×8 km scene (~380,000 pixels).
+    sub_bboxes = list(train_loc.sub_bboxes.values())
+    train_bbox = (
+        min(s.bbox[0] for s in sub_bboxes),  # lon_min
+        min(s.bbox[1] for s in sub_bboxes),  # lat_min
+        max(s.bbox[2] for s in sub_bboxes),  # lon_max
+        max(s.bbox[3] for s in sub_bboxes),  # lat_max
+    )
+    print(f"Loading training pixels from {train_data_loc.parquet_path()} ...")
+    print(f"Extracting features (training set, bbox={train_bbox})...")
+    train_features = extract_parko_features(
+        train_data_loc.parquet_path(), train_data_loc,
+        year_from=year_from, year_to=year_to,
+        bbox=train_bbox,
+    )
 
     print("Labelling training pixels...")
     train_labelled = label_pixels(train_features, train_loc)
@@ -58,7 +73,11 @@ def run(plots: bool = True) -> None:
     print("Fitting classifier...")
     train_set = train_labelled[train_labelled["is_presence"].notna()].copy()
     train_set["is_presence"] = train_set["is_presence"].astype(bool)
-    clf = ParkoClassifier(features=FEATURES)
+    active_features = [f for f in FEATURES if train_set[f].notna().any()]
+    if len(active_features) < len(FEATURES):
+        dropped = [f for f in FEATURES if f not in active_features]
+        print(f"  Warning: dropping all-null features from classifier: {dropped}")
+    clf = ParkoClassifier(features=active_features)
     clf.fit(train_set, label_col="is_presence")
     print(clf.summary())
 
@@ -66,10 +85,11 @@ def run(plots: bool = True) -> None:
     # Score the 3×3 km scene (tuned params auto-loaded from YAML)
     # ------------------------------------------------------------------
     print(f"\nLoading scene pixels from {scene_loc.parquet_path()} ...")
-    scene_raw = pd.read_parquet(scene_loc.parquet_path())
-
     print("Extracting features (scene, tuned params)...")
-    scene_features = extract_parko_features(scene_raw, scene_loc)
+    scene_features = extract_parko_features(
+        scene_loc.parquet_path(), scene_loc,
+        year_from=year_from, year_to=year_to,
+    )
 
     # Carry over training labels where pixels overlap the sub-bboxes
     scene_labelled = label_pixels(scene_features, train_loc)
@@ -82,11 +102,15 @@ def run(plots: bool = True) -> None:
     save_pixel_ranking(scored, out_dir / "basalt_3x3km_pixel_ranking.csv", FEATURES)
 
     if plots:
-        plot_prob_heatmaps(scored, scene_loc, out_dir, stem="basalt_3x3km", wms_width=1024)
+        plot_prob_heatmaps(scored, scene_loc, out_dir, stem="basalt_3x3km")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--no-plots", action="store_true")
+    parser.add_argument("--year-from", type=int, default=None, metavar="YEAR",
+                        help="Ignore observations before this year (inclusive)")
+    parser.add_argument("--year-to", type=int, default=None, metavar="YEAR",
+                        help="Ignore observations after this year (inclusive)")
     args = parser.parse_args()
-    run(plots=not args.no_plots)
+    run(plots=not args.no_plots, year_from=args.year_from, year_to=args.year_to)

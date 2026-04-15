@@ -152,11 +152,12 @@ def _infer_value_col(signal_cls: type) -> str:
     """Return the primary value column name for a signal class."""
     # Map by class name — avoids importing each signal at module load time
     _map = {
-        "NirCvSignal":      "nir_cv",
-        "RecPSignal":       "rec_p",
-        "RedEdgeSignal":    "re_p10",
-        "SwirSignal":       "swir_p10",
-        "FloweringSignal":  "fi_p90_cg",
+        "NirCvSignal":          "nir_cv",
+        "RecPSignal":           "rec_p",
+        "RedEdgeSignal":        "re_p10",
+        "SwirSignal":           "swir_p10",
+        "FloweringSignal":      "fi_p90_cg",
+        "NdviIntegralSignal":   "ndvi_integral",
     }
     name = signal_cls.__name__
     if name not in _map:

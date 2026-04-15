@@ -78,8 +78,12 @@ def extract_parko_features(
     rec_p_params: RecPSignal.Params | None = None,
     red_edge_params: RedEdgeSignal.Params | None = None,
     swir_params: SwirSignal.Params | None = None,
+    ndvi_integral_params: NdviIntegralSignal.Params | None = None,
+    year_from: int | None = None,
+    year_to: int | None = None,
+    bbox: tuple[float, float, float, float] | None = None,
 ) -> pd.DataFrame:
-    """Compute all four tabular signal features and join into one per-pixel table.
+    """Compute all tabular signal features and join into one per-pixel table.
 
     FloweringSignal is excluded — it requires a separate algorithm and is run
     independently via ``FloweringSignal().compute(df, loc)``.
@@ -94,13 +98,22 @@ def extract_parko_features(
         parquet file (preferred for large files — avoids loading into RAM).
     loc:
         ``utils.location.Location``.
-    nir_cv_params, rec_p_params, red_edge_params, swir_params:
+    nir_cv_params, rec_p_params, red_edge_params, swir_params, ndvi_integral_params:
         Optional per-signal Params overrides. If None, site params are loaded
         from the location YAML via ``load_signal_params``.
+    bbox:
+        Optional ``(lon_min, lat_min, lon_max, lat_max)`` spatial filter.
+        When provided and ``pixel_df`` is a Path, only rows within this bbox
+        are loaded into memory before feature extraction — use this when the
+        parquet covers a much larger area than the pixels you actually need
+        (e.g. extracting training pixels from a small sub-bbox inside a large
+        scene parquet).  The in-memory DataFrame path is used, so the parquet
+        does not need to be pixel-sorted.
 
     Returns
     -------
-    DataFrame with columns ``[point_id, lon, lat, nir_cv, rec_p, re_p10, swir_p10]``.
+    DataFrame with columns
+    ``[point_id, lon, lat, nir_cv, rec_p, re_p10, swir_p10, ndvi_integral]``.
     """
     from signals._shared import load_signal_params, compute_features_chunked
 
@@ -112,41 +125,96 @@ def extract_parko_features(
         red_edge_params = load_signal_params(loc, "red_edge")
     if swir_params is None:
         swir_params = load_signal_params(loc, "swir")
+    if ndvi_integral_params is None:
+        ndvi_integral_params = load_signal_params(loc, "ndvi_integral")
 
-    # When given a Path, use the memory-efficient single-pass chunked path.
-    # When given a DataFrame (small training set), use the per-signal path.
-    if isinstance(pixel_df, Path):
-        return compute_features_chunked(
-            path=pixel_df,
-            scl_purity_min=nir_cv_params.quality.scl_purity_min,
-            dry_months=loc.dry_months,
-            min_obs_per_year=nir_cv_params.quality.min_obs_per_year,
-            min_obs_dry=nir_cv_params.quality.min_obs_dry,
-            re_floor_percentile=red_edge_params.floor_percentile,
-            swir_floor_percentile=swir_params.floor_percentile,
+    # When given a Path + bbox, scan row-by-row-group, filter to bbox, then use
+    # the in-memory DataFrame path — avoids sorting a huge parquet when only a
+    # small sub-region is needed (e.g. training pixels from a tiny sub-bbox).
+    if isinstance(pixel_df, Path) and bbox is not None:
+        import pyarrow.parquet as pq
+        import polars as pl
+        lon_min, lat_min, lon_max, lat_max = bbox
+        pf = pq.ParquetFile(pixel_df)
+        n_rg = pf.metadata.num_row_groups
+        print(
+            f"  [bbox-filter] scanning {pixel_df.name} ({n_rg} row groups) "
+            f"for bbox {bbox} ..."
         )
+        parts_pd = []
+        for rg_idx in range(n_rg):
+            chunk = pl.from_arrow(pf.read_row_groups([rg_idx]))
+            filtered = chunk.filter(
+                (pl.col("lon") >= lon_min) & (pl.col("lon") <= lon_max) &
+                (pl.col("lat") >= lat_min) & (pl.col("lat") <= lat_max)
+            )
+            if not filtered.is_empty():
+                parts_pd.append(filtered.to_pandas())
+        pixel_df = pd.concat(parts_pd, ignore_index=True) if parts_pd else pd.DataFrame()
+        n_px = pixel_df["point_id"].nunique() if len(pixel_df) else 0
+        print(f"  [bbox-filter] {n_px:,} pixels retained")
+        # pixel_df is now a DataFrame — fall through to the per-signal path below
+
+    # When given a Path (full scene), use the memory-efficient chunked path.
+    # When given a DataFrame (small/pre-filtered set), use the per-signal path.
+    if isinstance(pixel_df, Path):
+        from signals._shared import ensure_pixel_sorted
+        pixel_df = ensure_pixel_sorted(pixel_df)
+
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
+            curve_path = Path(f.name)
+        try:
+            base = compute_features_chunked(
+                path=pixel_df,
+                scl_purity_min=nir_cv_params.quality.scl_purity_min,
+                dry_months=loc.dry_months,
+                min_obs_per_year=nir_cv_params.quality.min_obs_per_year,
+                min_obs_dry=nir_cv_params.quality.min_obs_dry,
+                re_floor_percentile=red_edge_params.floor_percentile,
+                swir_floor_percentile=swir_params.floor_percentile,
+                year_from=year_from,
+                year_to=year_to,
+                curve_out_path=curve_path,
+                smooth_days=ndvi_integral_params.smooth_days,
+            )
+            integral_stats = NdviIntegralSignal(ndvi_integral_params).compute(
+                pixel_df=None, loc=loc, _curve=curve_path,
+            )
+        finally:
+            curve_path.unlink(missing_ok=True)
+        return base.merge(integral_stats[["point_id", "ndvi_integral"]], on="point_id", how="left")
+
+    if year_from is not None or year_to is not None:
+        yr = pixel_df["date"].dt.year
+        if year_from is not None:
+            pixel_df = pixel_df[yr >= year_from]
+        if year_to is not None:
+            pixel_df = pixel_df[yr <= year_to]
 
     nir_stats = NirCvSignal(nir_cv_params).compute(pixel_df, loc)
     rec_stats = RecPSignal(rec_p_params).compute(pixel_df, loc)
     re_stats = RedEdgeSignal(red_edge_params).compute(pixel_df, loc)
     swir_stats = SwirSignal(swir_params).compute(pixel_df, loc)
+    integral_stats = NdviIntegralSignal(ndvi_integral_params).compute(pixel_df, loc)
 
     result = (
         nir_stats[["point_id", "lon", "lat", "nir_cv"]]
         .merge(rec_stats[["point_id", "rec_p"]], on="point_id", how="outer")
         .merge(re_stats[["point_id", "re_p10"]], on="point_id", how="outer")
         .merge(swir_stats[["point_id", "swir_p10"]], on="point_id", how="outer")
+        .merge(integral_stats[["point_id", "ndvi_integral"]], on="point_id", how="outer")
     )
 
     # Fill lon/lat from any signal that has them (outer join may leave gaps)
-    for stats_df in [rec_stats, re_stats, swir_stats]:
+    for stats_df in [rec_stats, re_stats, swir_stats, integral_stats]:
         missing = result["lon"].isna()
         if missing.any():
             coords = stats_df[["point_id", "lon", "lat"]].set_index("point_id")
             result.loc[missing, "lon"] = result.loc[missing, "point_id"].map(coords["lon"])
             result.loc[missing, "lat"] = result.loc[missing, "point_id"].map(coords["lat"])
 
-    return result[["point_id", "lon", "lat", "nir_cv", "rec_p", "re_p10", "swir_p10"]]
+    return result[["point_id", "lon", "lat", "nir_cv", "rec_p", "re_p10", "swir_p10", "ndvi_integral"]]
 
 
 __all__ = [
