@@ -1,0 +1,9 @@
+{
+  "imports": {
+    "@std/yaml": "jsr:@std/yaml",
+    "@std/path": "jsr:@std/path",
+    "@std/http/file-server": "jsr:@std/http/file-server",
+    "@std/fs": "jsr:@std/fs",
+    "@std/encoding/hex": "jsr:@std/encoding/hex"
+  }
+}

@@ -256,101 +256,192 @@ def collect(
         logger.error("No STAC items found — check bbox and date range")
         sys.exit(1)
 
-    # --- 3. Fetch patches (one range request per item×band, not per point) --
-    logger.info("Fetching patches for bbox %s", bbox_wgs84)
-    patches = asyncio.run(fetch_patches(
-        points=points,
-        items=items,
-        bands=FETCH_BANDS,
-        bbox_wgs84=bbox_wgs84,
-        scl_filter=True,
-        band_alias=BAND_ALIAS,
-        max_concurrent=32,
-        cache_dir=cache_dir,
-    ))
-    logger.info("Fetched %d (item, band) patches", len(patches))
-
-    # --- 4. Extract observations and write Parquet in item-batches -----------
-    # Vectorised: fetch entire band arrays per item via get_all_points(),
-    # apply SCL mask, build DataFrame directly — no per-point Python loops.
-    store = MemoryChipStore(patches, point_coords)
-    point_ids = [pid for pid, _, _ in points]
-    lons_arr = np.array([lon for _, lon, _ in points], dtype=np.float64)
-    lats_arr = np.array([lat for _, _, lat in points], dtype=np.float64)
-
     col_order = (
         ["point_id", "lon", "lat", "date", "item_id", "tile_id"]
         + list(BANDS)
         + ["scl_purity", "aot", "view_zenith", "sun_zenith"]
     )
 
+    # --- 3+4. Plan shards, then fetch only if needed -------------------------
+    # Shard planning uses only the points list and item count — no patches needed.
+    # If all shards are already complete we skip fetch_patches entirely.
+    shard_row_budget = 200_000_000
+
+    rc_to_points: dict[str, list[tuple[str, float, float]]] = {}
+    for pid, lon, lat in points:
+        rc = pid.split("_")[1]
+        rc_to_points.setdefault(rc, []).append((pid, lon, lat))
+    sorted_rcs = sorted(rc_to_points.keys())
+
+    rows_per_point = len(items)
+    shards: list[list[tuple[str, float, float]]] = []
+    current_shard: list[tuple[str, float, float]] = []
+    current_shard_rows = 0
+    for rc in sorted_rcs:
+        rc_points = rc_to_points[rc]
+        rc_rows = len(rc_points) * rows_per_point
+        if current_shard and current_shard_rows + rc_rows > shard_row_budget:
+            shards.append(current_shard)
+            current_shard = []
+            current_shard_rows = 0
+        current_shard.extend(rc_points)
+        current_shard_rows += rc_rows
+    if current_shard:
+        shards.append(current_shard)
+
+    n_shards = len(shards)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    done_path = out_path.with_suffix(".done")
-    partial_path = out_path.with_suffix(".partial.parquet")
 
-    # Load checkpoint: set of item_ids already written
-    done_ids: set[str] = set()
-    resuming = done_path.exists() and out_path.exists()
-    if resuming:
-        done_ids = set(done_path.read_text().splitlines())
-        existing_rows = pq.read_metadata(out_path).num_rows
+    def _shard_path(idx: int) -> Path:
+        return out_path.with_name(f"{out_path.stem}.shard{idx:03d}.parquet")
+
+    all_shards_done = all(
+        _shard_path(i).exists() and _shard_path(i).with_suffix(".done").exists()
+        for i in range(n_shards)
+    )
+
+    if all_shards_done:
+        logger.info("All %d shards already complete — skipping fetch", n_shards)
+        patches = {}
+    else:
         logger.info(
-            "Checkpoint: %d items already done (%d rows), resuming",
-            len(done_ids), existing_rows,
+            "%d row-coords → %d shards (~%d coords/shard, budget %dM rows/shard)",
+            len(sorted_rcs), n_shards,
+            len(sorted_rcs) // n_shards if n_shards else 0,
+            shard_row_budget // 1_000_000,
         )
+        logger.info("Fetching patches for bbox %s", bbox_wgs84)
+        patches = asyncio.run(fetch_patches(
+            points=points,
+            items=items,
+            bands=FETCH_BANDS,
+            bbox_wgs84=bbox_wgs84,
+            scl_filter=True,
+            band_alias=BAND_ALIAS,
+            max_concurrent=32,
+            cache_dir=cache_dir,
+        ))
+        logger.info("Fetched %d (item, band) patches", len(patches))
 
-    writer: pq.ParquetWriter | None = None
-    new_rows = 0
+    shard_paths: list[Path] = []
 
-    logger.info("Extracting observations (vectorised, %d items) ...", len(items))
-    for i, item in enumerate(items):
-        if item.id in done_ids:
-            store.release_item(item.id)
+    for shard_idx, shard_points in enumerate(shards):
+        shard_path = _shard_path(shard_idx)
+        done_path = shard_path.with_suffix(".done")
+
+        if shard_path.exists() and done_path.exists():
+            logger.info("Shard %d/%d already complete, skipping", shard_idx + 1, n_shards)
+            shard_paths.append(shard_path)
             continue
 
-        batch_df = extract_item_to_df(item, store, point_ids, lons_arr, lats_arr)
-        store.release_item(item.id)
+        logger.info(
+            "Shard %d/%d: %d points ...", shard_idx + 1, n_shards, len(shard_points)
+        )
 
-        if batch_df is not None and not batch_df.empty:
-            table = pa.Table.from_pandas(batch_df[col_order], preserve_index=False)
-            if writer is None:
-                writer = pq.ParquetWriter(partial_path, table.schema)
-            writer.write_table(table)
-            new_rows += len(batch_df)
+        shard_point_ids = [pid for pid, _, _ in shard_points]
+        shard_lons = np.array([lon for _, lon, _ in shard_points], dtype=np.float64)
+        shard_lats = np.array([lat for _, _, lat in shard_points], dtype=np.float64)
 
-        # Mark item done and flush checkpoint after every item
-        done_ids.add(item.id)
-        done_path.write_text("\n".join(done_ids))
+        # Fresh MemoryChipStore scoped to this shard's points — keeps proj_cache small
+        shard_store = MemoryChipStore(patches, {pid: (lon, lat) for pid, lon, lat in shard_points})
 
-        if (i + 1) % 50 == 0 or (i + 1) == len(items):
-            logger.info("  %d/%d items processed, %d new rows", i + 1, len(items), new_rows)
+        # Per-shard checkpoint: item ids already written for this shard
+        done_ids: set[str] = set()
+        if done_path.exists():
+            done_ids = set(done_path.read_text().splitlines())
 
-    if writer is not None:
-        writer.close()
+        writer: pq.ParquetWriter | None = None
+        shard_rows = 0
+        done_fh = done_path.open("a")
 
-    # Merge partial into final output
-    if resuming and partial_path.exists():
-        logger.info("Merging checkpoint parquet with new rows (%d) ...", new_rows)
-        merged = pa.concat_tables([
-            pq.read_table(out_path),
-            pq.read_table(partial_path),
-        ])
-        pq.write_table(merged, out_path)
-        partial_path.unlink()
-        total_rows = len(merged)
-    elif partial_path.exists():
-        partial_path.rename(out_path)
-        total_rows = new_rows
-    else:
-        # Resumed and all items were already done
-        total_rows = pq.read_metadata(out_path).num_rows if out_path.exists() else 0
+        for i, item in enumerate(items):
+            if item.id in done_ids:
+                shard_store.release_item(item.id)
+                continue
+
+            batch_df = extract_item_to_df(item, shard_store, shard_point_ids, shard_lons, shard_lats)
+            shard_store.release_item(item.id)
+
+            if batch_df is not None and not batch_df.empty:
+                table = pa.Table.from_pandas(batch_df[col_order], preserve_index=False)
+                if writer is None:
+                    writer = pq.ParquetWriter(shard_path, table.schema)
+                writer.write_table(table)
+                shard_rows += len(batch_df)
+
+            done_ids.add(item.id)
+            done_fh.write(item.id + "\n")
+            done_fh.flush()
+
+            if (i + 1) % 50 == 0 or (i + 1) == len(items):
+                logger.info(
+                    "  shard %d/%d  item %d/%d  %d rows",
+                    shard_idx + 1, n_shards, i + 1, len(items), shard_rows,
+                )
+
+        done_fh.close()
+        if writer is not None:
+            writer.close()
+        # Mark shard complete with a sentinel line
+        done_path.open("a").write("__done__\n")
+        shard_paths.append(shard_path)
+        logger.info("  shard %d/%d complete: %d rows", shard_idx + 1, n_shards, shard_rows)
+
+    # --- 5. Sort each shard by point_id, then concatenate → pixel-sorted output -
+    # Release the patches dict before concat — it can be several GB in RAM.
+    del patches
+
+    # Each shard covers a disjoint set of row-coords, so the shards are already
+    # pixel-disjoint from each other.  Within each shard rows are item-ordered
+    # (not pixel-ordered), so we must sort by point_id before concatenating.
+    #
+    # We use sort_parquet_by_pixel() on each shard in turn (single-pass, bounded
+    # RAM) writing to a <stem>_sorted.parquet sibling, then concatenate those
+    # sorted intermediates row-group-by-row-group into the final output.
+    # Original shard files are preserved.
+    from signals._shared import sort_parquet_by_pixel
+
+    sorted_shard_paths: list[Path] = []
+    for shard_idx, sp in enumerate(shard_paths):
+        sorted_sp = sp.with_name(sp.stem + "_sorted.parquet")
+        if sorted_sp.exists():
+            logger.info(
+                "  shard %d/%d sorted file already exists, reusing: %s",
+                shard_idx + 1, n_shards, sorted_sp.name,
+            )
+        else:
+            logger.info(
+                "  sorting shard %d/%d → %s ...", shard_idx + 1, n_shards, sorted_sp.name
+            )
+            sort_parquet_by_pixel(sp, sorted_sp, row_group_size=5_000_000)
+            logger.info("  shard %d/%d sorted", shard_idx + 1, n_shards)
+        sorted_shard_paths.append(sorted_sp)
+
+    logger.info("Concatenating %d sorted shards → %s ...", n_shards, out_path.name)
+    final_writer: pq.ParquetWriter | None = None
+    total_rows = 0
+    for sorted_sp in sorted_shard_paths:
+        pf = pq.ParquetFile(sorted_sp)
+        schema = pf.schema_arrow
+        n_rg = pf.metadata.num_row_groups
+        for rg_idx in range(n_rg):
+            tbl = pf.read_row_group(rg_idx)
+            if final_writer is None:
+                final_writer = pq.ParquetWriter(out_path, schema)
+            final_writer.write_table(tbl)
+            total_rows += len(tbl)
+        del pf
+
+    if final_writer is not None:
+        final_writer.close()
+
+    # Clean up sorted intermediates (original shards are kept)
+    for sorted_sp in sorted_shard_paths:
+        sorted_sp.unlink(missing_ok=True)
 
     if total_rows == 0:
         logger.error("No usable observations — all pixels clouded or missing?")
         sys.exit(1)
-
-    # Remove checkpoint file on clean completion
-    done_path.unlink(missing_ok=True)
 
     logger.info("Written: %s  (%d rows)", out_path, total_rows)
     print(f"\nDone.")

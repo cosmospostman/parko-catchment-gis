@@ -27,13 +27,41 @@
       overflow: hidden;
     }
 
-    #sidebar h1 {
-      padding: 12px 14px;
+    #sidebar-header {
+      padding: 10px 14px;
+      border-bottom: 1px solid #333;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    #sidebar-header h1 {
       font-size: 14px;
       font-weight: 600;
       letter-spacing: 0.02em;
-      border-bottom: 1px solid #333;
       color: #f0f0f0;
+      flex-shrink: 0;
+    }
+
+    #mode-select {
+      flex: 1;
+      background: #1a1a1a;
+      color: #d0d0d0;
+      border: 1px solid #444;
+      border-radius: 4px;
+      padding: 3px 6px;
+      font-size: 12px;
+      cursor: pointer;
+      min-width: 0;
+    }
+
+    /* ---- Locations panel ---- */
+
+    #panel-locations {
+      display: flex;
+      flex-direction: column;
+      flex: 1;
+      overflow: hidden;
     }
 
     #location-list {
@@ -50,13 +78,8 @@
       transition: background 0.1s;
     }
 
-    #location-list li:hover {
-      background: #2e2e2e;
-    }
-
-    #location-list li.active {
-      background: #1e3a5f;
-    }
+    #location-list li:hover { background: #2e2e2e; }
+    #location-list li.active { background: #1e3a5f; }
 
     #location-list li .loc-name {
       font-weight: 500;
@@ -69,9 +92,160 @@
       margin-top: 1px;
     }
 
-    #map {
+    /* ---- BBox panel ---- */
+
+    #panel-bbox {
+      display: none;
+      flex-direction: column;
       flex: 1;
+      padding: 12px 14px;
+      gap: 10px;
+      overflow-y: auto;
     }
+
+    #panel-bbox .hint {
+      color: #888;
+      line-height: 1.5;
+      font-size: 12px;
+    }
+
+    #bbox-coords {
+      background: #1a1a1a;
+      border: 1px solid #333;
+      border-radius: 4px;
+      padding: 10px;
+      display: none;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    #bbox-coords .coord-label {
+      font-size: 11px;
+      color: #666;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    #bbox-coords .coord-value {
+      font-family: monospace;
+      font-size: 12px;
+      color: #c0c0c0;
+      word-break: break-all;
+    }
+
+    #bbox-coords .yaml-snippet {
+      margin-top: 4px;
+      background: #111;
+      border-radius: 3px;
+      padding: 7px 8px;
+      font-family: monospace;
+      font-size: 11px;
+      color: #86efac;
+      white-space: pre;
+      overflow-x: auto;
+    }
+
+    #btn-copy {
+      background: #1e3a5f;
+      color: #93c5fd;
+      border: 1px solid #2a4f7a;
+      border-radius: 4px;
+      padding: 5px 10px;
+      font-size: 12px;
+      cursor: pointer;
+      text-align: center;
+      transition: background 0.1s;
+    }
+    #btn-copy:hover { background: #254a70; }
+    #btn-copy.copied { background: #14532d; color: #86efac; border-color: #1a6b35; }
+
+    #btn-clear {
+      background: none;
+      color: #666;
+      border: 1px solid #333;
+      border-radius: 4px;
+      padding: 5px 10px;
+      font-size: 12px;
+      cursor: pointer;
+      text-align: center;
+      transition: background 0.1s;
+    }
+    #btn-clear:hover { background: #2e2e2e; color: #aaa; }
+
+    /* ---- Imagery info section (bottom of sidebar) ---- */
+
+    #ranking-section {
+      border-top: 1px solid #333;
+      padding: 10px 14px;
+      flex-shrink: 0;
+    }
+
+    #imagery-info {
+      border-top: 1px solid #333;
+      padding: 10px 14px;
+      flex-shrink: 0;
+      min-height: 0;
+    }
+
+    #imagery-info .section-label,
+    #ranking-section .section-label {
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #555;
+      margin-bottom: 6px;
+    }
+
+    #imagery-info .irow,
+    #ranking-section .irow {
+      display: flex;
+      gap: 6px;
+      margin-bottom: 4px;
+      align-items: baseline;
+    }
+
+    #imagery-info .ikey,
+    #ranking-section .ikey {
+      font-size: 11px;
+      color: #555;
+      min-width: 44px;
+      flex-shrink: 0;
+    }
+
+    #layer-select,
+    #ranking-select,
+    #colormap-select {
+      flex: 1;
+      background: #1a1a1a;
+      color: #d0d0d0;
+      border: 1px solid #444;
+      border-radius: 4px;
+      padding: 3px 4px;
+      font-size: 11px;
+      cursor: pointer;
+      min-width: 0;
+    }
+
+    #imagery-info .ival {
+      font-size: 12px;
+      color: #b0b0b0;
+      line-height: 1.3;
+      word-break: break-word;
+    }
+
+    #imagery-info .ival.mono {
+      font-family: monospace;
+      font-size: 11px;
+    }
+
+    #imagery-info .ival.dim { color: #444; font-style: italic; }
+
+    /* ---- Map ---- */
+
+    #map { flex: 1; }
+
+    /* ---- Popups ---- */
 
     .maplibregl-popup-content {
       background: #242424;
@@ -83,9 +257,7 @@
       max-width: 280px;
     }
 
-    .maplibregl-popup-tip {
-      border-top-color: #444;
-    }
+    .maplibregl-popup-tip { border-top-color: #444; }
 
     .popup-title {
       font-weight: 600;
@@ -100,10 +272,7 @@
       margin-bottom: 3px;
     }
 
-    .popup-label {
-      color: #888;
-      min-width: 52px;
-    }
+    .popup-label { color: #888; min-width: 52px; }
 
     .popup-notes {
       margin-top: 6px;
@@ -125,13 +294,93 @@
     .role-absence  { background: #7f1d1d; color: #fca5a5; }
     .role-survey   { background: #713f12; color: #fde68a; }
     .role-location { background: #1e3a5f; color: #93c5fd; }
+    .role-score-bbox { background: #3b0764; color: #d8b4fe; }
+
+    #colormap-swatch {
+      display: inline-block;
+      width: 52px;
+      height: 10px;
+      border-radius: 2px;
+      flex-shrink: 0;
+      align-self: center;
+    }
   </style>
 </head>
 <body>
   <div id="sidebar">
-    <h1>Parko GIS</h1>
-    <ul id="location-list"></ul>
+    <div id="sidebar-header">
+      <h1>Parko GIS</h1>
+      <select id="mode-select">
+        <option value="locations">Locations</option>
+        <option value="bbox">BBox</option>
+      </select>
+    </div>
+
+    <!-- Locations panel -->
+    <div id="panel-locations">
+      <ul id="location-list"></ul>
+    </div>
+
+    <!-- BBox draw panel -->
+    <div id="panel-bbox">
+      <p class="hint">Click and drag on the map to draw a bounding box.</p>
+      <div id="bbox-coords">
+        <div class="coord-label">bbox (lon_min, lat_min, lon_max, lat_max)</div>
+        <div class="coord-value" id="bbox-raw"></div>
+        <div class="yaml-snippet" id="bbox-yaml"></div>
+        <button id="btn-copy">Copy bbox</button>
+        <button id="btn-clear">Clear</button>
+      </div>
+    </div>
+
+    <!-- Rankings overlay -->
+    <div id="ranking-section">
+      <div class="section-label">rankings</div>
+      <div class="irow">
+        <span class="ikey">run</span>
+        <select id="ranking-select">
+          <option value="">— none —</option>
+        </select>
+      </div>
+      <div class="irow">
+        <span class="ikey">opacity</span>
+        <input type="range" id="ranking-opacity" min="0" max="100" value="60"
+               style="flex:1; accent-color:#22c55e;" />
+      </div>
+      <div class="irow">
+        <span class="ikey">color</span>
+        <select id="colormap-select">
+          <option value="rdylgn">RdYlGn</option>
+          <option value="plasma">Plasma</option>
+          <option value="viridis">Viridis</option>
+        </select>
+        <span id="colormap-swatch"></span>
+      </div>
+    </div>
+
+    <!-- Imagery info — always visible at bottom -->
+    <div id="imagery-info">
+      <div class="section-label">Imagery</div>
+      <div class="irow">
+        <span class="ikey">layer</span>
+        <select id="layer-select">
+          <option value="LatestStateProgram_QGovSISPUsers">Latest aerial (QGlobe)</option>
+          <option value="LatestStateProgram_AllUsers">Latest aerial (public)</option>
+          <option value="LatestSatelliteWOS_AllUsers">Latest satellite (Planet)</option>
+          <option value="EarliestAerialOrtho_AllUsers">Earliest aerial</option>
+        </select>
+      </div>
+      <div class="irow">
+        <span class="ikey">captured</span>
+        <span class="ival" id="ii-date"><span class="dim">hover map</span></span>
+      </div>
+      <div class="irow">
+        <span class="ikey">dataset</span>
+        <span class="ival mono" id="ii-name"><span class="dim">—</span></span>
+      </div>
+    </div>
   </div>
+
   <div id="map"></div>
   <script src="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.js"></script>
   <script src="app.js"></script>

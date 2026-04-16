@@ -77,7 +77,8 @@ def compute_features_chunked(
     year_to: int | None = None,
     curve_out_path: Path | None = None,
     smooth_days: int = 30,
-) -> pd.DataFrame:
+    compute_ndvi_integral: bool = False,
+) -> "pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]":
     """Compute all four Parkinsonia signal features in a single row-group pass.
 
     Requires the parquet to be sorted by ``point_id`` (pixel-sorted) so that
@@ -109,14 +110,28 @@ def compute_features_chunked(
     curve_out_path:
         If provided, the smoothed NDVI curve is written to this path in the
         same row-group pass (no second scan needed for ndvi_integral).
+        Deprecated in favour of ``compute_ndvi_integral=True``, which avoids
+        writing a large intermediate file.
     smooth_days:
-        Rolling-median window for the NDVI curve (only used when
-        ``curve_out_path`` is given).
+        Rolling-median window for the NDVI curve (used when
+        ``curve_out_path`` is given or ``compute_ndvi_integral=True``).
+    compute_ndvi_integral:
+        If True, also compute per-pixel-per-year ndvi_smooth mean (and
+        is_sparse_year flag) in the same pass and return it as a second
+        DataFrame alongside the base features.  No temp file is written —
+        only the small per-(pixel,year) aggregates are accumulated.
+        When True, returns ``(base_df, integral_yearly_df)`` where
+        ``integral_yearly_df`` has columns
+        ``[point_id, year, ndvi_mean, n_obs, is_sparse_year]``.
 
     Returns
     -------
-    Pandas DataFrame with columns
-    ``[point_id, lon, lat, nir_cv, rec_p, re_p10, swir_p10]``.
+    If ``compute_ndvi_integral`` is False (default):
+        Pandas DataFrame with columns
+        ``[point_id, lon, lat, nir_cv, rec_p, re_p10, swir_p10]``.
+    If ``compute_ndvi_integral`` is True:
+        Tuple ``(base_df, integral_yearly_df)`` — base_df as above, plus
+        ``integral_yearly_df`` with per-(pixel,year) ndvi stats.
     """
     import pyarrow.parquet as pq
     from scipy.ndimage import median_filter
@@ -131,8 +146,11 @@ def compute_features_chunked(
     pf = pq.ParquetFile(path)
     n_rg = pf.metadata.num_row_groups
     parts: list[pd.DataFrame] = []
+    integral_parts: list[pd.DataFrame] = []
     curve_writer = None
     print(f"  [chunked] {path.name}: {n_rg} row groups, {pf.metadata.num_rows:,} rows total")
+
+    tail_buf: pl.DataFrame | None = None  # rows of a split pixel carried from previous rg
 
     for rg_idx in range(n_rg):
         if rg_idx % max(1, n_rg // 10) == 0:
@@ -141,6 +159,22 @@ def compute_features_chunked(
         table = pf.read_row_groups([rg_idx], columns=LOAD_COLS)
         chunk = pl.from_arrow(table)
         del table
+
+        # Re-attach rows of any pixel that was split at the previous row group boundary
+        if tail_buf is not None:
+            if chunk["point_id"][0] == tail_buf["point_id"][0]:
+                chunk = pl.concat([tail_buf, chunk])
+            tail_buf = None
+
+        # Peel off the last pixel — it may continue into the next row group
+        if rg_idx < n_rg - 1:
+            last_pid = chunk["point_id"][-1]
+            tail_mask = chunk["point_id"] == last_pid
+            tail_buf = chunk.filter(tail_mask)
+            chunk = chunk.filter(~tail_mask)
+
+        if chunk.is_empty():
+            continue
 
         chunk = (
             chunk
@@ -227,8 +261,8 @@ def compute_features_chunked(
         parts.append(chunk_result)
         del annual, nir_annual, nir_stats, pixel_stats
 
-        # Optionally emit smoothed NDVI curve in the same pass
-        if curve_out_path is not None:
+        # Compute NDVI curve and handle curve_out_path / compute_ndvi_integral
+        if curve_out_path is not None or compute_ndvi_integral:
             obs_counts = (
                 chunk.group_by(["point_id", "year"])
                 .agg(pl.len().alias("_n_obs"))
@@ -255,24 +289,48 @@ def compute_features_chunked(
             for s, e in zip(starts, ends):
                 ndvi_smooth[s:e] = median_filter(ndvi_arr[s:e], size=window_rows, mode="nearest")
 
-            curve_result = (
-                curve_chunk
-                .with_columns(pl.Series("ndvi_smooth", ndvi_smooth))
-                .select(["point_id", "lon", "lat", "date", "year", "month", "doy",
-                         "ndvi", "ndvi_smooth", "is_sparse_year"])
-            )
-            arrow_table = curve_result.to_arrow()
-            if curve_writer is None:
-                curve_writer = pq.ParquetWriter(str(curve_out_path), arrow_table.schema)
-            curve_writer.write_table(arrow_table)
-            del curve_chunk, curve_result, arrow_table
+            curve_with_smooth = curve_chunk.with_columns(pl.Series("ndvi_smooth", ndvi_smooth))
+
+            if curve_out_path is not None:
+                curve_result = curve_with_smooth.select(
+                    ["point_id", "lon", "lat", "date", "year", "month", "doy",
+                     "ndvi", "ndvi_smooth", "is_sparse_year"]
+                )
+                arrow_table = curve_result.to_arrow()
+                if curve_writer is None:
+                    curve_writer = pq.ParquetWriter(str(curve_out_path), arrow_table.schema)
+                curve_writer.write_table(arrow_table)
+                del curve_result, arrow_table
+
+            if compute_ndvi_integral:
+                # Accumulate only the tiny per-(pixel,year) aggregates — no raw curve written
+                integral_chunk = (
+                    curve_with_smooth
+                    .group_by(["point_id", "year"])
+                    .agg([
+                        pl.col("ndvi_smooth").mean().alias("ndvi_mean"),
+                        pl.len().alias("n_obs"),
+                        pl.col("is_sparse_year").first().alias("is_sparse_year"),
+                    ])
+                    .to_pandas()
+                )
+                integral_parts.append(integral_chunk)
+                del integral_chunk
+
+            del curve_chunk, curve_with_smooth
 
         del chunk
 
     if curve_writer is not None:
         curve_writer.close()
 
-    return pd.concat(parts, ignore_index=True)
+    base_df = pd.concat(parts, ignore_index=True)
+    if compute_ndvi_integral:
+        integral_yearly_df = pd.concat(integral_parts, ignore_index=True) if integral_parts else pd.DataFrame(
+            columns=["point_id", "year", "ndvi_mean", "n_obs", "is_sparse_year"]
+        )
+        return base_df, integral_yearly_df
+    return base_df
 
 
 def is_pixel_sorted(path: Path, n_check: int = 2) -> bool:
@@ -325,8 +383,12 @@ def ensure_pixel_sorted(path: Path, row_group_size: int = 5_000_000) -> Path:
 
     sorted_path = path.with_name(path.stem + "-by-pixel.parquet")
     if sorted_path.exists():
-        print(f"  [sort-check] {path.name}: using cached pixel-sorted file → {sorted_path.name}")
-        return sorted_path
+        if sorted_path.stat().st_size == 0:
+            print(f"  [sort-check] {sorted_path.name}: 0-byte file (previous crash?) — deleting and re-sorting")
+            sorted_path.unlink()
+        else:
+            print(f"  [sort-check] {path.name}: using cached pixel-sorted file → {sorted_path.name}")
+            return sorted_path
 
     import pyarrow.parquet as pq
     n_rg = pq.ParquetFile(path).metadata.num_row_groups
@@ -339,13 +401,24 @@ def ensure_pixel_sorted(path: Path, row_group_size: int = 5_000_000) -> Path:
     return sorted_path
 
 
-def sort_parquet_by_pixel(src: Path, dst: Path, row_group_size: int = 5_000_000) -> None:
-    """Write a copy of ``src`` sorted by ``point_id`` using DuckDB.
+def sort_parquet_by_pixel(
+    src: Path,
+    dst: Path,
+    row_group_size: int = 5_000_000,
+    ram_budget_gb: float = 20.0,
+) -> None:
+    """Write a copy of ``src`` sorted by ``point_id`` using an in-memory multi-pass sort.
 
-    DuckDB spills to disk during the external sort, so this works even when the
-    file is larger than available RAM. The sorted file is written to ``dst``.
-    Row groups of ``row_group_size`` observations ensure each group contains
-    complete per-pixel histories (no cross-group splits).
+    Algorithm:
+    1. Discover all unique row-coords by scanning ``point_id`` (column-only read).
+    2. Divide coords into passes that fit within ``ram_budget_gb``.
+    3. For each pass: scan all source row groups once, accumulate rows for the
+       target coords in RAM, sort by ``point_id``, append to output.
+
+    No temp files are written — all sorting is in RAM.  The source file is read
+    sequentially (compressed, ~50 MB/rg) which is fast and cache-friendly.
+
+    Peak RAM ≈ one pass worth of buckets (≤ ``ram_budget_gb``).
 
     Parameters
     ----------
@@ -354,23 +427,127 @@ def sort_parquet_by_pixel(src: Path, dst: Path, row_group_size: int = 5_000_000)
     dst:
         Destination path for the pixel-sorted parquet.
     row_group_size:
-        Target rows per row group. Default 5M rows ≈ 1 GB RAM per chunk.
+        Target rows per row group in the output.
+    ram_budget_gb:
+        How many GB of RAM to use per pass for in-memory buckets.
     """
-    import duckdb
-    import tempfile
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import pyarrow.compute as pc
 
-    con = duckdb.connect()
-    con.execute("SET memory_limit='16GB'")
-    with tempfile.TemporaryDirectory(prefix="duckdb_sort_") as tmp:
-        con.execute(f"SET temp_directory='{tmp}'")
-        con.execute(f"""
-            COPY (
-                SELECT * FROM read_parquet('{src}')
-                ORDER BY point_id
+    pf = pq.ParquetFile(src)
+    schema = pf.schema_arrow
+    n_rg = pf.metadata.num_row_groups
+
+    # ── Step 1: discover all unique row-coords (point_id column only) ─────
+    print(f"  [sort] scanning {n_rg} row groups for unique row-coords ...", flush=True)
+    all_coords: set[str] = set()
+    for i in range(n_rg):
+        tbl = pf.read_row_group(i, columns=["point_id"])
+        ids = tbl.column("point_id")
+        row_coords = pc.list_flatten(pc.list_slice(pc.split_pattern(ids, "_"), 1, 2))
+        all_coords.update(pc.unique(row_coords).to_pylist())
+        if i % 400 == 0:
+            print(f"  [sort] coord scan: {i}/{n_rg}, {len(all_coords)} coords so far", flush=True)
+
+    sorted_coords = sorted(all_coords)
+    n_coords = len(sorted_coords)
+
+    # ── Step 2: divide coords into passes ─────────────────────────────────
+    total_rows = pf.metadata.num_rows
+    bytes_per_row = 130  # empirical: ~130 B/row uncompressed for this schema
+    rows_per_coord = total_rows / n_coords
+    bytes_per_coord = rows_per_coord * bytes_per_row
+    coords_per_pass = max(1, int(ram_budget_gb * 1e9 / bytes_per_coord))
+    passes = [sorted_coords[i:i + coords_per_pass] for i in range(0, n_coords, coords_per_pass)]
+    print(
+        f"  [sort] {n_coords} coords, ~{bytes_per_coord/1e6:.0f} MB/coord, "
+        f"{coords_per_pass} coords/pass → {len(passes)} passes",
+        flush=True,
+    )
+
+    # ── Step 3: multi-pass scan → sort → write ────────────────────────────
+    out_writer: "pq.ParquetWriter | None" = None
+    try:
+        out_writer = pq.ParquetWriter(str(dst), schema, compression="snappy")
+
+        for pass_idx, pass_coords in enumerate(passes):
+            coord_set = set(pass_coords)
+            buckets: dict[str, list[pa.Table]] = {c: [] for c in pass_coords}
+
+            print(
+                f"  [sort] pass {pass_idx+1}/{len(passes)}: "
+                f"scanning {n_rg} row groups for {len(pass_coords)} coords ...",
+                flush=True,
             )
-            TO '{dst}'
-            (FORMAT PARQUET, ROW_GROUP_SIZE {row_group_size})
-        """)
+            for i in range(n_rg):
+                batch = pf.read_row_group(i)
+                ids = batch.column("point_id")
+                row_coords = pc.list_flatten(pc.list_slice(pc.split_pattern(ids, "_"), 1, 2))
+
+                # Filter to only rows whose coord is in this pass
+                in_pass = pc.is_in(row_coords, value_set=pa.array(list(coord_set)))
+                if not pc.any(in_pass).as_py():
+                    continue
+                batch = batch.filter(in_pass)
+                row_coords = row_coords.filter(in_pass)
+
+                # Split into per-coord buckets
+                unique_in_batch = pc.unique(row_coords).to_pylist()
+                if len(unique_in_batch) == 1:
+                    buckets[unique_in_batch[0]].append(batch)
+                else:
+                    for coord in unique_in_batch:
+                        mask = pc.equal(row_coords, coord)
+                        buckets[coord].append(batch.filter(mask))
+
+                if i % 400 == 0:
+                    print(f"  [sort] pass {pass_idx+1}: {i}/{n_rg} row groups", flush=True)
+
+            # Sort each coord bucket and write to output.
+            # We accumulate whole row-coord tables and write one row group per
+            # coord — never slicing mid-pixel — so adjacent row groups always
+            # contain disjoint point_id sets (pixel-sorted invariant holds).
+            pending: list[pa.Table] = []
+            pending_rows = 0
+
+            def _flush() -> None:
+                nonlocal pending_rows
+                if not pending:
+                    return
+                # Write each coord table as its own row group so we never split
+                # a pixel across a row-group boundary.
+                for tbl in pending:
+                    out_writer.write_table(tbl)
+                pending.clear()
+                pending_rows = 0
+
+            for coord in pass_coords:
+                chunks = buckets.pop(coord)
+                if not chunks:
+                    continue
+                bucket_tbl = pa.concat_tables(chunks)
+                order = pc.sort_indices(bucket_tbl, sort_keys=[("point_id", "ascending")])
+                bucket_tbl = bucket_tbl.take(order)
+                pending.append(bucket_tbl)
+                pending_rows += len(bucket_tbl)
+                if pending_rows >= row_group_size:
+                    _flush()
+
+            _flush()
+            print(f"  [sort] pass {pass_idx+1}/{len(passes)} done", flush=True)
+
+        out_writer.close()
+
+    except Exception:
+        if out_writer is not None:
+            try:
+                out_writer.close()
+            except Exception:
+                pass
+        if dst.exists():
+            dst.unlink()
+        raise
 
 
 def annual_percentile(
@@ -532,12 +709,28 @@ def annual_ndvi_curve_chunked(
 
     window_rows = max(3, smooth_days // 5)
     pf = pq.ParquetFile(sorted_parquet_path)
+    n_rg = pf.metadata.num_row_groups
     writer = None
 
-    for rg_idx in range(pf.metadata.num_row_groups):
+    tail_buf: pl.DataFrame | None = None  # rows of a split pixel carried from previous rg
+
+    for rg_idx in range(n_rg):
         table = pf.read_row_groups([rg_idx], columns=LOAD_COLS)
         chunk = pl.from_arrow(table)
         del table
+
+        # Re-attach rows of any pixel that was split at the previous row group boundary
+        if tail_buf is not None:
+            if chunk["point_id"][0] == tail_buf["point_id"][0]:
+                chunk = pl.concat([tail_buf, chunk])
+            tail_buf = None
+
+        # Peel off the last pixel — it may continue into the next row group
+        if rg_idx < n_rg - 1:
+            last_pid = chunk["point_id"][-1]
+            tail_mask = chunk["point_id"] == last_pid
+            tail_buf = chunk.filter(tail_mask)
+            chunk = chunk.filter(~tail_mask)
 
         if scl_purity_min > 0.0:
             chunk = chunk.filter(pl.col("scl_purity") >= scl_purity_min).drop("scl_purity")

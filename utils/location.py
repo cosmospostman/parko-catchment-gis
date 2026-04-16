@@ -60,6 +60,7 @@ class Location:
     notes: Optional[str]
     sub_bboxes: dict[str, SubBbox] = field(default_factory=dict)
     signal_params: dict = field(default_factory=dict)  # raw signals: dict from YAML
+    score_bbox: Optional[list[float]] = None            # if set, restrict scoring to this bbox
 
     # ------------------------------------------------------------------
     # Bbox accessors
@@ -230,6 +231,7 @@ def _load_registry(locations_dir: Path = _LOCATIONS_DIR) -> dict[str, Location]:
             notes=data.get("notes"),
             sub_bboxes=sub_bboxes,
             signal_params=data.get("signals") or {},
+            score_bbox=data.get("score_bbox"),
         )
     return result
 

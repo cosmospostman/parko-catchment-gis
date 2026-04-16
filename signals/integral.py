@@ -135,6 +135,7 @@ class NdviIntegralSignal:
         loc: object,
         _df: "pl.DataFrame | None" = None,
         _curve: "pl.DataFrame | Path | None" = None,
+        _per_year: "pd.DataFrame | None" = None,
     ) -> pd.DataFrame:
         """Compute NDVI integral features per pixel.
 
@@ -142,7 +143,7 @@ class NdviIntegralSignal:
         ----------
         pixel_df:
             Raw observation parquet loaded for this location, or None if
-            ``_curve`` is provided.
+            ``_curve`` or ``_per_year`` is provided.
         loc:
             ``utils.location.Location``.
         _df:
@@ -154,6 +155,13 @@ class NdviIntegralSignal:
             written by ``annual_ndvi_curve_chunked``.  When a ``Path`` is
             given the groupby uses streaming so the full curve is never
             loaded into RAM.
+        _per_year:
+            Optional pre-aggregated per-(pixel,year) DataFrame with columns
+            ``[point_id, year, ndvi_mean, n_obs, is_sparse_year]`` — the
+            output produced by ``compute_features_chunked`` when
+            ``compute_ndvi_integral=True``.  Skips ``_integral_per_year``
+            entirely.  No ``lon``/``lat`` columns are needed here; coords
+            are taken from ``loc`` or left as NaN.
 
         Returns
         -------
@@ -166,25 +174,30 @@ class NdviIntegralSignal:
         """
         p = self.params
 
-        if _curve is not None:
+        if _per_year is not None:
+            # Pre-aggregated per-(pixel,year) frame from compute_features_chunked.
+            # Convert is_sparse_year → reliable; no coords available here.
+            per_year_pl = pl.from_pandas(_per_year).with_columns(
+                (~pl.col("is_sparse_year")).alias("reliable")
+            ).drop("is_sparse_year")
+            coords_pl = None
+        elif _curve is not None:
             curve = _curve
             if isinstance(curve, Path):
-                coords = (
+                coords_pl = (
                     pl.scan_parquet(curve)
                     .select(["point_id", "lon", "lat"])
                     .unique("point_id")
                     .collect()
-                    .to_pandas()
                 )
             else:
-                coords = curve.select(["point_id", "lon", "lat"]).unique("point_id").to_pandas()
+                coords_pl = curve.select(["point_id", "lon", "lat"]).unique("point_id")
+            per_year_pl = pl.from_pandas(self._integral_per_year(curve))
         else:
             df = _df if _df is not None else load_and_filter(pixel_df, p.quality.scl_purity_min)
-            coords = df.select(["point_id", "lon", "lat"]).unique("point_id").to_pandas()
+            coords_pl = df.select(["point_id", "lon", "lat"]).unique("point_id")
             curve = annual_ndvi_curve(df, p.smooth_days, p.quality.min_obs_per_year)
-
-        per_year = self._integral_per_year(curve)
-        per_year_pl = pl.from_pandas(per_year)
+            per_year_pl = pl.from_pandas(self._integral_per_year(curve))
 
         min_years = p.min_years
 
@@ -230,8 +243,13 @@ class NdviIntegralSignal:
             )
         )
 
-        coords_pl = pl.from_pandas(coords)
-        stats_pl = stats_pl.join(coords_pl, on="point_id", how="left")
+        if coords_pl is not None:
+            stats_pl = stats_pl.join(coords_pl, on="point_id", how="left")
+        else:
+            stats_pl = stats_pl.with_columns([
+                pl.lit(None, dtype=pl.Float64).alias("lon"),
+                pl.lit(None, dtype=pl.Float64).alias("lat"),
+            ])
 
         col_order = [
             "point_id", "lon", "lat",

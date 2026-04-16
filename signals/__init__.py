@@ -161,28 +161,22 @@ def extract_parko_features(
         from signals._shared import ensure_pixel_sorted
         pixel_df = ensure_pixel_sorted(pixel_df)
 
-        import tempfile
-        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
-            curve_path = Path(f.name)
-        try:
-            base = compute_features_chunked(
-                path=pixel_df,
-                scl_purity_min=nir_cv_params.quality.scl_purity_min,
-                dry_months=loc.dry_months,
-                min_obs_per_year=nir_cv_params.quality.min_obs_per_year,
-                min_obs_dry=nir_cv_params.quality.min_obs_dry,
-                re_floor_percentile=red_edge_params.floor_percentile,
-                swir_floor_percentile=swir_params.floor_percentile,
-                year_from=year_from,
-                year_to=year_to,
-                curve_out_path=curve_path,
-                smooth_days=ndvi_integral_params.smooth_days,
-            )
-            integral_stats = NdviIntegralSignal(ndvi_integral_params).compute(
-                pixel_df=None, loc=loc, _curve=curve_path,
-            )
-        finally:
-            curve_path.unlink(missing_ok=True)
+        base, integral_yearly_df = compute_features_chunked(
+            path=pixel_df,
+            scl_purity_min=nir_cv_params.quality.scl_purity_min,
+            dry_months=loc.dry_months,
+            min_obs_per_year=nir_cv_params.quality.min_obs_per_year,
+            min_obs_dry=nir_cv_params.quality.min_obs_dry,
+            re_floor_percentile=red_edge_params.floor_percentile,
+            swir_floor_percentile=swir_params.floor_percentile,
+            year_from=year_from,
+            year_to=year_to,
+            smooth_days=ndvi_integral_params.smooth_days,
+            compute_ndvi_integral=True,
+        )
+        integral_stats = NdviIntegralSignal(ndvi_integral_params).compute(
+            pixel_df=None, loc=loc, _per_year=integral_yearly_df,
+        )
         return base.merge(integral_stats[["point_id", "ndvi_integral"]], on="point_id", how="left")
 
     if year_from is not None or year_to is not None:
