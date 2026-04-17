@@ -115,7 +115,6 @@ function loadLocations(): GeoJSON.FeatureCollection {
 const PUBLIC_LAYERS = new Set([
   "LatestStateProgram_AllUsers",
   "LatestSatelliteWOS_AllUsers",
-  "EarliestAerialOrtho_AllUsers",
 ]);
 
 const QGLOBE_LAYERS = new Set([
@@ -230,6 +229,8 @@ async function fetchAndCache(upstreamUrl: string, cachePath: string, extraHeader
 
   const upstream = await fetch(upstreamUrl, { headers: extraHeaders });
   if (!upstream.ok || !upstream.body) {
+    if (upstream.status === 404) return new Response(null, { status: 204 });
+    console.error(`Upstream tile error ${upstream.status} for ${upstreamUrl.split("?")[0]}`);
     return new Response("Upstream error", { status: 502 });
   }
 
@@ -402,6 +403,22 @@ async function handler(req: Request): Promise<Response> {
       console.error("Failed to load locations:", err);
       return new Response(JSON.stringify({ error: "Failed to load locations" }), {
         status: 500,
+        headers: { "content-type": "application/json" },
+      });
+    }
+  }
+
+  if (url.pathname === "/api/sightings") {
+    const sightingsPath = join(__dirname, "..", "outputs", "ala_cache", "ala_sightings.geojson");
+    try {
+      const data = await Deno.readFile(sightingsPath);
+      return new Response(data, {
+        headers: { "content-type": "application/json" },
+      });
+    } catch (err) {
+      console.error("Failed to load sightings:", err);
+      return new Response(JSON.stringify({ error: "Sightings file not found. Run: python analysis/export_sightings_geojson.py" }), {
+        status: 404,
         headers: { "content-type": "application/json" },
       });
     }

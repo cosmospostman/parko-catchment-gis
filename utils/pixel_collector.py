@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -50,7 +51,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from analysis.constants import BANDS, SCL_BAND, AOT_BAND, SCL_CLEAR_VALUES
-from utils.chip_store import MemoryChipStore
+from utils.chip_store import CachedNpzChipStore, MemoryChipStore
 from utils.fetch import fetch_patches
 from utils.stac import search_sentinel2
 
@@ -62,7 +63,15 @@ logger = logging.getLogger(__name__)
 
 STAC_ENDPOINT = "https://earth-search.aws.element84.com/v1"
 S2_COLLECTION  = "sentinel-2-l2a"
-UTM_CRS        = "EPSG:32755"   # WGS 84 / UTM zone 55S — covers eastern Australia
+
+
+def _utm_crs_for_bbox(bbox_wgs84: list[float]) -> str:
+    """Return the UTM CRS EPSG code for the centre longitude of a WGS84 bbox."""
+    lon_centre = (bbox_wgs84[0] + bbox_wgs84[2]) / 2
+    lat_centre = (bbox_wgs84[1] + bbox_wgs84[3]) / 2
+    zone = int((lon_centre + 180) / 6) + 1
+    epsg = 32600 + zone if lat_centre >= 0 else 32700 + zone
+    return f"EPSG:{epsg}"
 
 # earth-search asset key aliases for S2 L2A
 BAND_ALIAS: dict[str, str] = {
@@ -89,7 +98,7 @@ FETCH_BANDS = BANDS + [SCL_BAND, AOT_BAND]   # VZA/SZA not available at earth-se
 
 def make_pixel_grid(
     bbox_wgs84: list[float],
-    utm_crs: str = UTM_CRS,
+    utm_crs: str | None = None,
     resolution_m: float = 10.0,
     stride: int = 1,
 ) -> list[tuple[str, float, float]]:
@@ -105,6 +114,8 @@ def make_pixel_grid(
     Returns list of (point_id, lon, lat).
     """
     lon_min, lat_min, lon_max, lat_max = bbox_wgs84
+    if utm_crs is None:
+        utm_crs = _utm_crs_for_bbox(bbox_wgs84)
 
     to_utm  = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
     to_wgs  = Transformer.from_crs(utm_crs, "EPSG:4326", always_xy=True)
@@ -144,6 +155,8 @@ def extract_item_to_df(
     point_ids: list[str],
     lons: np.ndarray,
     lats: np.ndarray,
+    apply_nbar: bool = True,
+    utm_crs: str = "EPSG:32755",
 ) -> pd.DataFrame | None:
     """Extract all usable pixels for one STAC item into a DataFrame.
 
@@ -181,6 +194,36 @@ def extract_item_to_df(
         vals = store.get_all_points(item_id, band)
         band_arrays[band] = vals / 10000.0 if vals is not None else np.full(n, np.nan, dtype=np.float32)
 
+    # --- NBAR c-factor correction (optional) --------------------------------
+    angles = None
+    if apply_nbar:
+        from utils.granule_angles import get_item_angles
+        from utils.nbar import c_factor as compute_cf
+        angles = get_item_angles(item, lons, lats, utm_crs=utm_crs, bands=list(BANDS))
+        if angles is not None:
+            for band in BANDS:
+                if band not in angles or band_arrays[band] is None:
+                    continue
+                a = angles[band]
+                raa = a["saa"] - a["vaa"]
+                cf = compute_cf(a["sza"], a["vza"], raa, band)
+                band_arrays[band] = np.clip(band_arrays[band] * cf, 0.0, 1.0)
+        # If angles is None (fetch failed), band_arrays are left uncorrected
+
+    # --- Zenith quality columns ---------------------------------------------
+    if angles is not None:
+        sza_mean = np.mean(
+            [angles[b]["sza"] for b in BANDS if b in angles], axis=0
+        ).astype(np.float32)
+        vza_mean = np.mean(
+            [angles[b]["vza"] for b in BANDS if b in angles], axis=0
+        ).astype(np.float32)
+        sun_zenith_col  = np.clip(1.0 - sza_mean / 90.0, 0.0, 1.0)
+        view_zenith_col = np.clip(1.0 - vza_mean / 90.0, 0.0, 1.0)
+    else:
+        sun_zenith_col  = np.ones(n, dtype=np.float32)
+        view_zenith_col = np.ones(n, dtype=np.float32)
+
     # --- Filter to clear pixels only ----------------------------------------
     idx = np.where(clear_mask)[0]
     df = pd.DataFrame({
@@ -192,8 +235,8 @@ def extract_item_to_df(
         "tile_id":    tile_id,
         "scl_purity": scl_purity[idx],
         "aot":        aot_quality[idx],
-        "view_zenith": np.ones(len(idx), dtype=np.float32),  # not available at earth-search
-        "sun_zenith":  np.ones(len(idx), dtype=np.float32),
+        "view_zenith": view_zenith_col[idx],
+        "sun_zenith":  sun_zenith_col[idx],
         **{band: band_arrays[band][idx] for band in BANDS},
     })
 
@@ -216,9 +259,11 @@ def collect(
     cloud_max: int,
     cache_dir: Path | None = None,
     stride: int = 1,
+    apply_nbar: bool = True,
 ) -> None:
     # --- 1. Generate pixel grid -------------------------------------------
-    points = make_pixel_grid(bbox_wgs84, stride=stride)
+    utm_crs = _utm_crs_for_bbox(bbox_wgs84)
+    points = make_pixel_grid(bbox_wgs84, utm_crs=utm_crs, stride=stride)
     point_coords = {pid: (lon, lat) for pid, lon, lat in points}
 
     # --- 2. STAC search (cached) ---------------------------------------------
@@ -302,7 +347,6 @@ def collect(
 
     if all_shards_done:
         logger.info("All %d shards already complete — skipping fetch", n_shards)
-        patches = {}
     else:
         logger.info(
             "%d row-coords → %d shards (~%d coords/shard, budget %dM rows/shard)",
@@ -310,18 +354,32 @@ def collect(
             len(sorted_rcs) // n_shards if n_shards else 0,
             shard_row_budget // 1_000_000,
         )
-        logger.info("Fetching patches for bbox %s", bbox_wgs84)
-        patches = asyncio.run(fetch_patches(
-            points=points,
-            items=items,
-            bands=FETCH_BANDS,
-            bbox_wgs84=bbox_wgs84,
-            scl_filter=True,
-            band_alias=BAND_ALIAS,
-            max_concurrent=32,
-            cache_dir=cache_dir,
-        ))
-        logger.info("Fetched %d (item, band) patches", len(patches))
+        # Check how many items are already fully cached on disk
+        from utils.fetch import _cache_path
+        uncached_items = [
+            item for item in items
+            if not all(
+                _cache_path(cache_dir, item.id, band).exists()
+                for band in FETCH_BANDS
+            )
+        ]
+        if uncached_items:
+            logger.info(
+                "Fetching %d/%d items not yet in cache for bbox %s",
+                len(uncached_items), len(items), bbox_wgs84,
+            )
+            asyncio.run(fetch_patches(
+                points=points,
+                items=uncached_items,
+                bands=FETCH_BANDS,
+                bbox_wgs84=bbox_wgs84,
+                scl_filter=True,
+                band_alias=BAND_ALIAS,
+                max_concurrent=32,
+                cache_dir=cache_dir,
+            ))
+        else:
+            logger.info("All %d items already in cache — no network fetch needed", len(items))
 
     shard_paths: list[Path] = []
 
@@ -342,42 +400,69 @@ def collect(
         shard_lons = np.array([lon for _, lon, _ in shard_points], dtype=np.float64)
         shard_lats = np.array([lat for _, _, lat in shard_points], dtype=np.float64)
 
-        # Fresh MemoryChipStore scoped to this shard's points — keeps proj_cache small
-        shard_store = MemoryChipStore(patches, {pid: (lon, lat) for pid, lon, lat in shard_points})
+        shard_point_coords = {pid: (lon, lat) for pid, lon, lat in shard_points}
 
         # Per-shard checkpoint: item ids already written for this shard
         done_ids: set[str] = set()
         if done_path.exists():
             done_ids = set(done_path.read_text().splitlines())
 
+        pending_items = [item for item in items if item.id not in done_ids]
+
         writer: pq.ParquetWriter | None = None
         shard_rows = 0
         done_fh = done_path.open("a")
 
-        for i, item in enumerate(items):
-            if item.id in done_ids:
-                shard_store.release_item(item.id)
-                continue
+        # --- Concurrent item processing --------------------------------------
+        # N_WORKERS threads each process one item at a time: load .npz from
+        # disk, fetch granule XML (HTTP), run c-factor, build DataFrame.
+        # Disk reads and HTTP fetches release the GIL so threads genuinely
+        # run in parallel.  Results are placed on an output queue in
+        # submission order (via a per-item Future) so the writer stays serial.
+        #
+        # Memory bound: at most N_WORKERS items' patches live in RAM at once.
 
-            batch_df = extract_item_to_df(item, shard_store, shard_point_ids, shard_lons, shard_lats)
-            shard_store.release_item(item.id)
+        N_WORKERS = 8
 
-            if batch_df is not None and not batch_df.empty:
-                table = pa.Table.from_pandas(batch_df[col_order], preserve_index=False)
-                if writer is None:
-                    writer = pq.ParquetWriter(shard_path, table.schema)
-                writer.write_table(table)
-                shard_rows += len(batch_df)
+        def _process_item(_item) -> tuple | None:
+            """Run in a worker thread. Returns (item_id, df | None)."""
+            store = CachedNpzChipStore(
+                cache_dir=cache_dir,
+                point_coords=shard_point_coords,
+                bands=FETCH_BANDS,
+            )
+            df = extract_item_to_df(
+                _item, store, shard_point_ids, shard_lons, shard_lats,
+                apply_nbar=apply_nbar, utm_crs=utm_crs,
+            )
+            store.release_item(_item.id)
+            return (_item.id, df)
 
-            done_ids.add(item.id)
-            done_fh.write(item.id + "\n")
-            done_fh.flush()
+        with ThreadPoolExecutor(max_workers=N_WORKERS) as pool:
+            # Submit all items; keep futures in order for checkpoint tracking
+            futures = {pool.submit(_process_item, item): item for item in pending_items}
 
-            if (i + 1) % 50 == 0 or (i + 1) == len(items):
-                logger.info(
-                    "  shard %d/%d  item %d/%d  %d rows",
-                    shard_idx + 1, n_shards, i + 1, len(items), shard_rows,
-                )
+            i = 0
+            for fut in as_completed(futures):
+                item_id, batch_df = fut.result()
+
+                if batch_df is not None and not batch_df.empty:
+                    table = pa.Table.from_pandas(batch_df[col_order], preserve_index=False)
+                    if writer is None:
+                        writer = pq.ParquetWriter(shard_path, table.schema)
+                    writer.write_table(table)
+                    shard_rows += len(batch_df)
+
+                done_ids.add(item_id)
+                done_fh.write(item_id + "\n")
+                done_fh.flush()
+
+                i += 1
+                if i % 50 == 0 or i == len(pending_items):
+                    logger.info(
+                        "  shard %d/%d  item %d/%d  %d rows",
+                        shard_idx + 1, n_shards, i, len(pending_items), shard_rows,
+                    )
 
         done_fh.close()
         if writer is not None:
@@ -388,9 +473,6 @@ def collect(
         logger.info("  shard %d/%d complete: %d rows", shard_idx + 1, n_shards, shard_rows)
 
     # --- 5. Sort each shard by point_id, then concatenate → pixel-sorted output -
-    # Release the patches dict before concat — it can be several GB in RAM.
-    del patches
-
     # Each shard covers a disjoint set of row-coords, so the shards are already
     # pixel-disjoint from each other.  Within each shard rows are item-ordered
     # (not pixel-ordered), so we must sort by point_id before concatenating.
@@ -447,3 +529,45 @@ def collect(
     print(f"\nDone.")
     print(f"  Rows   : {total_rows}")
     print(f"  Output : {out_path}")
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import argparse
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+
+    parser = argparse.ArgumentParser(
+        description="Collect Sentinel-2 L2A pixel observations for a named location."
+    )
+    parser.add_argument("--location", required=True, help="Location name (matches data/locations/*.yaml)")
+    parser.add_argument("--start",    required=True, help="Start date YYYY-MM-DD")
+    parser.add_argument("--end",      required=True, help="End date YYYY-MM-DD")
+    parser.add_argument("--cloud-max", type=int, default=80, help="Max cloud cover %% (default 80)")
+    parser.add_argument("--stride",    type=int, default=1,  help="Pixel stride (default 1)")
+    parser.add_argument("--no-nbar",   action="store_true",  help="Disable BRDF NBAR c-factor correction")
+    parser.add_argument("--out",       default=None,         help="Output parquet path (default data/pixels/<location>.parquet)")
+    args = parser.parse_args()
+
+    from utils.location import get as get_location
+
+    try:
+        loc = get_location(args.location)
+    except KeyError:
+        print(f"ERROR: unknown location '{args.location}'", file=sys.stderr)
+        sys.exit(1)
+
+    loc.fetch(
+        out_path=Path(args.out) if args.out else None,
+        start=args.start,
+        end=args.end,
+        cloud_max=args.cloud_max,
+        stride=args.stride,
+        apply_nbar=not args.no_nbar,
+    )

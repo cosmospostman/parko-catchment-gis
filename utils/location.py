@@ -155,6 +155,11 @@ class Location:
         """Canonical fetch chip cache: data/pixels/<id>/<id>.chips/"""
         return _PROJECT_ROOT / "data" / "pixels" / self.id / f"{self.id}.chips"
 
+    def calibration_path(self) -> Path | None:
+        """Return the tile harmonisation correction table path if it exists, else None."""
+        p = _PROJECT_ROOT / "data" / "calibration" / f"{self.id}.parquet"
+        return p if p.exists() else None
+
     def cache_dir(self) -> Path:
         """Alias for chips_path() — passed as cache_dir to collect()."""
         return self.chips_path()
@@ -171,6 +176,7 @@ class Location:
         cloud_max: int = 30,
         cache_dir: Optional[Path] = None,
         stride: int = 1,
+        apply_nbar: bool = True,
     ) -> Path:
         """Fetch Sentinel-2 pixel observations for this location.
 
@@ -195,6 +201,7 @@ class Location:
             cloud_max=cloud_max,
             cache_dir=_cache,
             stride=stride,
+            apply_nbar=apply_nbar,
         )
         return _out
 

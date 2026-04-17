@@ -171,6 +171,93 @@ class MemoryChipStore:
                 del self._item_band_proj_key[k]
 
 
+class CachedNpzChipStore:
+    """ChipStore backed by the .npz patch cache written by fetch_patches().
+
+    Loads each item's band arrays on demand when first accessed, then evicts
+    them on release_item() — keeping at most one item's worth of patches in RAM
+    at any time instead of the full collection.
+
+    Parameters
+    ----------
+    cache_dir : Path
+        Directory written by fetch_patches() with layout
+        ``{cache_dir}/{item_id}/{band}.npz``.
+    point_coords : dict[str, tuple[float, float]]
+        Mapping point_id → (lon, lat) in EPSG:4326.
+    bands : list[str]
+        Canonical band names to load (e.g. FETCH_BANDS).
+    """
+
+    def __init__(
+        self,
+        cache_dir: Path,
+        point_coords: dict[str, tuple[float, float]],
+        bands: list[str],
+    ) -> None:
+        self._cache_dir = cache_dir
+        self._bands = bands
+        self._point_coords = point_coords
+        _pids = list(point_coords.keys())
+        self._lons = np.array([point_coords[pid][0] for pid in _pids])
+        self._lats = np.array([point_coords[pid][1] for pid in _pids])
+        # Live patches for the current item: band → (arr, transform, crs)
+        self._live: dict[str, tuple[np.ndarray, object, object]] = {}
+        self._live_item: str | None = None
+        # Reuse Transformer instances across items that share a CRS
+        self._transformers: dict[str, Transformer] = {}
+        # Pixel coords cache keyed by (crs_key, transform_tuple, h, w)
+        self._proj_cache: dict[tuple, tuple[np.ndarray, np.ndarray]] = {}
+
+    def _load_item(self, item_id: str) -> None:
+        if self._live_item == item_id:
+            return
+        # Evict previous item
+        self._live.clear()
+        self._live_item = item_id
+        from utils.fetch import _cache_path, _load_patch_cache
+        for band in self._bands:
+            path = _cache_path(self._cache_dir, item_id, band)
+            data = _load_patch_cache(path)
+            if data is not None:
+                self._live[band] = data
+
+    def _pixel_coords(self, band: str) -> tuple[np.ndarray, np.ndarray] | None:
+        if band not in self._live:
+            return None
+        arr, transform, crs = self._live[band]
+        h, w = arr.shape
+        crs_key = crs.to_string() if hasattr(crs, "to_string") else str(crs)
+        proj_key = (crs_key, tuple(transform), h, w)
+        if proj_key not in self._proj_cache:
+            t = self._transformers.get(crs_key)
+            if t is None:
+                t = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+                self._transformers[crs_key] = t
+            xs, ys = t.transform(self._lons, self._lats)
+            cols_f, rows_f = ~transform * (xs, ys)
+            rows = np.clip(rows_f.astype(np.intp), 0, h - 1)
+            cols = np.clip(cols_f.astype(np.intp), 0, w - 1)
+            self._proj_cache[proj_key] = (rows, cols)
+        return self._proj_cache[proj_key]
+
+    def get_all_points(self, item_id: str, band: str) -> np.ndarray | None:
+        """Return a 1-D float32 array of pixel values for all points, or None if missing."""
+        self._load_item(item_id)
+        coords = self._pixel_coords(band)
+        if coords is None:
+            return None
+        rows, cols = coords
+        arr, _, _ = self._live[band]
+        return arr[rows, cols]
+
+    def release_item(self, item_id: str) -> None:
+        """Evict the live item from memory."""
+        if self._live_item == item_id:
+            self._live.clear()
+            self._live_item = None
+
+
 class DiskChipStore:
     """Reads chips from the inputs/ directory populated by a Stage 0 fetch run.
 

@@ -78,6 +78,7 @@ def compute_features_chunked(
     curve_out_path: Path | None = None,
     smooth_days: int = 30,
     compute_ndvi_integral: bool = False,
+    calibration_path: Path | None = None,
 ) -> "pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]":
     """Compute all four Parkinsonia signal features in a single row-group pass.
 
@@ -136,15 +137,31 @@ def compute_features_chunked(
     import pyarrow.parquet as pq
     from scipy.ndimage import median_filter
 
-    LOAD_COLS = ["point_id", "lon", "lat", "date", "scl_purity",
-                 "B04", "B05", "B07", "B08", "B11"]
-
     re_n  = int(round(re_floor_percentile * 100))
     sw_n  = int(round(swir_floor_percentile * 100))
     window_rows = max(3, smooth_days // 5)
 
     pf = pq.ParquetFile(path)
     n_rg = pf.metadata.num_row_groups
+
+    _schema_names = set(pf.schema_arrow.names)
+    LOAD_COLS = ["point_id", "lon", "lat", "date", "scl_purity",
+                 "B04", "B05", "B07", "B08", "B11"]
+    if "tile_id" in _schema_names:
+        LOAD_COLS = ["point_id", "lon", "lat", "date", "tile_id", "scl_purity",
+                     "B04", "B05", "B07", "B08", "B11"]
+
+    # Load correction table once — None if no calibration_path or file absent
+    from utils.tile_harmonisation import load_corrections
+    corrections = load_corrections(calibration_path) if calibration_path else None
+    if corrections:
+        _corr_df = pl.DataFrame([
+            {"tile_id": t, "band": b, "year": y, "scale": s}
+            for (t, b, y), s in corrections.items()
+        ])
+    else:
+        _corr_df = None
+
     parts: list[pd.DataFrame] = []
     integral_parts: list[pd.DataFrame] = []
     curve_writer = None
@@ -176,17 +193,39 @@ def compute_features_chunked(
         if chunk.is_empty():
             continue
 
-        chunk = (
-            chunk
-            .filter(pl.col("scl_purity") >= scl_purity_min)
-            .with_columns([
-                pl.col("date").dt.year().alias("year"),
-                pl.col("date").dt.month().alias("month"),
-                ((pl.col("B08") - pl.col("B04")) / (pl.col("B08") + pl.col("B04"))).alias("ndvi"),
-                (pl.col("B07") / pl.col("B05")).alias("re_ratio"),
-                ((pl.col("B08") - pl.col("B11")) / (pl.col("B08") + pl.col("B11"))).alias("swir_mi"),
-            ])
-        )
+        chunk = chunk.filter(pl.col("scl_purity") >= scl_purity_min)
+
+        # Stage 1 — temporal columns (needed as join key for corrections)
+        chunk = chunk.with_columns([
+            pl.col("date").dt.year().alias("year"),
+            pl.col("date").dt.month().alias("month"),
+        ])
+
+        # Stage 2 — apply tile corrections (join on tile_id + year)
+        if _corr_df is not None and "tile_id" in chunk.columns:
+            for band in ["B04", "B05", "B07", "B08", "B11"]:
+                band_corr = (
+                    _corr_df.filter(pl.col("band") == band)
+                    .select(["tile_id", "year", "scale"])
+                )
+                chunk = (
+                    chunk
+                    .join(band_corr, on=["tile_id", "year"], how="left")
+                    .with_columns(
+                        pl.when(pl.col("scale").is_not_null())
+                          .then(pl.col(band) * pl.col("scale"))
+                          .otherwise(pl.col(band))
+                          .alias(band)
+                    )
+                    .drop("scale")
+                )
+
+        # Stage 3 — derived bands (use corrected B04/B05/B07/B08/B11)
+        chunk = chunk.with_columns([
+            ((pl.col("B08") - pl.col("B04")) / (pl.col("B08") + pl.col("B04"))).alias("ndvi"),
+            (pl.col("B07") / pl.col("B05")).alias("re_ratio"),
+            ((pl.col("B08") - pl.col("B11")) / (pl.col("B08") + pl.col("B11"))).alias("swir_mi"),
+        ])
 
         if year_from is not None:
             chunk = chunk.filter(pl.col("year") >= year_from)
@@ -405,7 +444,7 @@ def sort_parquet_by_pixel(
     src: Path,
     dst: Path,
     row_group_size: int = 5_000_000,
-    ram_budget_gb: float = 20.0,
+    ram_budget_gb: float = 8.0,
 ) -> None:
     """Write a copy of ``src`` sorted by ``point_id`` using an in-memory multi-pass sort.
 
@@ -455,7 +494,16 @@ def sort_parquet_by_pixel(
 
     # ── Step 2: divide coords into passes ─────────────────────────────────
     total_rows = pf.metadata.num_rows
-    bytes_per_row = 130  # empirical: ~130 B/row uncompressed for this schema
+    # Measure actual uncompressed bytes/row from Parquet metadata.
+    # Apply a 2× overhead factor: PyArrow in-memory tables carry dict
+    # metadata, validity bitmaps, and string offsets above the raw bytes.
+    meta = pf.metadata
+    total_uncompressed = sum(
+        meta.row_group(i).column(j).total_uncompressed_size
+        for i in range(meta.num_row_groups)
+        for j in range(meta.num_columns)
+    )
+    bytes_per_row = (total_uncompressed / total_rows * 2.0) if total_rows else 260
     rows_per_coord = total_rows / n_coords
     bytes_per_coord = rows_per_coord * bytes_per_row
     coords_per_pass = max(1, int(ram_budget_gb * 1e9 / bytes_per_coord))

@@ -6,7 +6,7 @@ Usage
   python cli/location.py info <id>
   python cli/location.py bbox <id>
   python cli/location.py fetch <id> [--start YYYY-MM-DD] [--end YYYY-MM-DD]
-                                     [--cloud-max N] [--stride N]
+                                     [--cloud-max N] [--stride N] [--no-nbar]
 
 Examples
 --------
@@ -91,6 +91,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
         end=args.end,
         cloud_max=args.cloud_max,
         stride=args.stride,
+        apply_nbar=not args.no_nbar,
     )
     print(f"Written: {out}")
 
@@ -118,6 +119,8 @@ def main() -> None:
                     help="Max cloud cover %% (default: 30)")
     pf.add_argument("--stride", type=int, default=1,
                     help="Pixel grid stride, 1=every pixel (default: 1)")
+    pf.add_argument("--no-nbar", action="store_true",
+                    help="Disable BRDF NBAR c-factor correction")
 
     args = p.parse_args()
     {"list": cmd_list, "info": cmd_info, "bbox": cmd_bbox, "fetch": cmd_fetch}[args.cmd](args)

@@ -16,7 +16,6 @@ const map = new maplibregl.Map({
 const LAYERS = {
   LatestStateProgram_AllUsers:  'LatestStateProgram_AllUsers',
   LatestSatelliteWOS_AllUsers:  'LatestSatelliteWOS_AllUsers',
-  EarliestAerialOrtho_AllUsers: 'EarliestAerialOrtho_AllUsers',
 };
 
 let activeLayer = 'LatestStateProgram_QGovSISPUsers';
@@ -51,6 +50,7 @@ map.on('load', () => {
   map.addLayer({ id: 'qld-globe-layer', type: 'raster', source: 'qld-globe' });
 
   loadLocations();
+  loadSightings();
 });
 
 document.getElementById('layer-select').addEventListener('change', (e) => {
@@ -157,6 +157,76 @@ function loadLocations() {
 }
 
 // ---------------------------------------------------------------------------
+// Sightings layer
+// ---------------------------------------------------------------------------
+
+function loadSightings() {
+  fetch('/api/sightings')
+    .then(r => {
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r.json();
+    })
+    .then(geojson => {
+      map.addSource('sightings', { type: 'geojson', data: geojson });
+      map.addLayer({
+        id: 'sightings-layer',
+        type: 'circle',
+        source: 'sightings',
+        layout: { visibility: 'none' },
+        paint: {
+          'circle-radius': 4,
+          'circle-color': '#f97316',
+          'circle-opacity': 0.75,
+          'circle-stroke-width': 0.5,
+          'circle-stroke-color': '#fff',
+        },
+      });
+
+      const count = geojson.features?.length ?? 0;
+      const el = document.getElementById('sightings-count');
+      if (el) el.textContent = count.toLocaleString();
+
+      map.on('click', 'sightings-layer', (e) => {
+        const feat = e.features[0];
+        if (!feat) return;
+        popup.setLngLat(e.lngLat).setHTML(buildSightingPopupHtml(feat.properties)).addTo(map);
+      });
+      map.on('mouseenter', 'sightings-layer', () => { map.getCanvas().style.cursor = 'pointer'; });
+      map.on('mouseleave', 'sightings-layer', () => { map.getCanvas().style.cursor = ''; });
+    })
+    .catch(err => console.error('Failed to load sightings:', err));
+}
+
+function buildSightingPopupHtml(p) {
+  const date = p.eventDate || (p.year ? `${p.year}${p.month ? '-' + String(p.month).padStart(2, '0') : ''}` : null);
+  const observer = p.recordedBy && p.recordedBy !== 'None' && p.recordedBy !== 'null' ? p.recordedBy : null;
+  const source = p.dataResourceName || null;
+  const basis = p.basisOfRecord
+    ? p.basisOfRecord.replace(/_/g, ' ').toLowerCase().replace(/^\w/, c => c.toUpperCase())
+    : null;
+  const uncertainty = p.coordinateUncertaintyInMeters != null
+    ? `±${Math.round(p.coordinateUncertaintyInMeters)} m`
+    : null;
+  const qaWarning = p.spatiallyValid === false || p.spatiallyValid === 'false'
+    ? `<div class="popup-notes" style="color:#f87171;">⚠ Spatially invalid record</div>`
+    : '';
+
+  const row = (label, val) => val
+    ? `<div class="popup-row"><span class="popup-label">${label}</span><span>${val}</span></div>`
+    : '';
+
+  return `
+    <div class="popup-title">ALA sighting</div>
+    ${row('date', date)}
+    ${row('observer', observer)}
+    ${row('source', source)}
+    ${row('basis', basis)}
+    ${row('uncertainty', uncertainty)}
+    ${qaWarning}
+  `;
+}
+
+// ---------------------------------------------------------------------------
 // Sidebar — Locations panel
 // ---------------------------------------------------------------------------
 
@@ -191,6 +261,7 @@ const popup = new maplibregl.Popup({ closeButton: true, closeOnClick: false, max
 
 function formatBbox(bbox) {
   if (!bbox) return '—';
+  if (typeof bbox === 'string') bbox = JSON.parse(bbox);
   return `${bbox[0].toFixed(5)}, ${bbox[1].toFixed(5)}, ${bbox[2].toFixed(5)}, ${bbox[3].toFixed(5)}`;
 }
 
@@ -340,11 +411,23 @@ function commitBbox(a, b) {
 
   const btn = document.getElementById('btn-copy');
   btn.onclick = () => {
-    navigator.clipboard.writeText(yaml).then(() => {
+    const done = () => {
       btn.textContent = 'Copied!';
       btn.classList.add('copied');
       setTimeout(() => { btn.textContent = 'Copy bbox'; btn.classList.remove('copied'); }, 1500);
-    });
+    };
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(yaml).then(done);
+    } else {
+      const ta = document.createElement('textarea');
+      ta.value = yaml;
+      ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+      done();
+    }
   };
 }
 
@@ -444,6 +527,12 @@ document.getElementById('ranking-opacity').addEventListener('input', (e) => {
   currentRankingOpacity = Number(e.target.value) / 100;
   if (map.getLayer('ranking-layer')) {
     map.setPaintProperty('ranking-layer', 'raster-opacity', currentRankingOpacity);
+  }
+});
+
+document.getElementById('sightings-toggle').addEventListener('change', (e) => {
+  if (map.getLayer('sightings-layer')) {
+    map.setLayoutProperty('sightings-layer', 'visibility', e.target.checked ? 'visible' : 'none');
   }
 });
 

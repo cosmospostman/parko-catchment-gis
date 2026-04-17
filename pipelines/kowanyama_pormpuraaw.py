@@ -44,7 +44,10 @@ def run(plots: bool = True) -> None:
     train_raw = pd.read_parquet(train_loc.parquet_path())
 
     print("Extracting features (training set)...")
-    train_features = extract_parko_features(train_raw, train_loc)
+    train_features = extract_parko_features(
+        train_raw, train_loc,
+        calibration_path=train_loc.calibration_path(),
+    )
 
     print("Labelling training pixels...")
     train_labelled = label_pixels(train_features, train_loc)
@@ -71,7 +74,11 @@ def run(plots: bool = True) -> None:
     # pixels over 10, while the 54LWH-only south sits at ~9.25.  The resulting patchy
     # 2026 inclusion creates visible north-south stripes in the output.  Capping at
     # 2025 removes the partial year uniformly across the scene.
-    scene_features = extract_parko_features(scene_path, scene_loc, year_to=2025)
+    scene_features = extract_parko_features(
+        scene_path, scene_loc,
+        year_to=2025,
+        calibration_path=scene_loc.calibration_path(),
+    )
 
     # No training labels exist for Kowanyama — all pixels will be unlabelled
     scene_labelled = label_pixels(scene_features, train_loc)
