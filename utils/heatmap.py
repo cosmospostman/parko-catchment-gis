@@ -57,8 +57,9 @@ def _prob_grid(
     lat_min: float, lat_max: float,
     cmap,
     alpha: float = 0.85,
+    prob_col: str = "prob_lr",
 ) -> np.ndarray:
-    """Rasterise prob_lr values onto a regular lon/lat grid.
+    """Rasterise probability values onto a regular lon/lat grid.
 
     Returns an RGBA array of shape (H, W, 4) aligned to the bbox extent,
     with transparent cells where no pixel falls.  Each source point maps to
@@ -79,7 +80,7 @@ def _prob_grid(
         ((lat_max - valid["lat"].values) / lat_span * H).astype(int), 0, H - 1
     )
 
-    prob = valid["prob_lr"].values
+    prob = valid[prob_col].values
 
     # Accumulate sum and count to compute mean per cell
     grid_sum   = np.zeros((H, W), dtype=np.float32)
@@ -124,6 +125,7 @@ def plot_prob_heatmaps(
     out_dir: Path,
     stem: str,
     annotations: list[dict] | None = None,
+    prob_col: str = "prob_lr",
 ) -> list[Path]:
     """Render two separate probability heatmap figures.
 
@@ -136,13 +138,14 @@ def plot_prob_heatmaps(
 
     Parameters
     ----------
-    scored_df  : DataFrame with columns lon, lat, prob_lr, is_presence
+    scored_df  : DataFrame with columns lon, lat, <prob_col>, is_presence
     loc        : Location object (used for title)
     out_dir    : directory to write PNGs into
     stem       : filename prefix
     annotations: optional list of Rectangle annotation dicts. Each dict must
                  contain ``xy``, ``width``, ``height`` and any valid
                  ``mpatches.Rectangle`` kwargs (e.g. edgecolor, linestyle, label).
+    prob_col   : name of the probability column (default: "prob_lr")
 
     Returns
     -------
@@ -177,7 +180,7 @@ def plot_prob_heatmaps(
     fig_h = 10
     fig_w = max(fig_h * aspect, 4)
 
-    valid = scored_df.dropna(subset=["prob_lr"])
+    valid = scored_df.dropna(subset=[prob_col])
     extent = [lon_min, lon_max, lat_min, lat_max]
 
     # ------------------------------------------------------------------
@@ -195,7 +198,7 @@ def plot_prob_heatmaps(
     else:
         ax.set_facecolor("#111111")
 
-    rgba = _prob_grid(valid, lon_min, lon_max, lat_min, lat_max, cmap, alpha=0.75)
+    rgba = _prob_grid(valid, lon_min, lon_max, lat_min, lat_max, cmap, alpha=0.75, prob_col=prob_col)
     ax.imshow(rgba, extent=extent, origin="upper", aspect="auto", zorder=2,
               interpolation="nearest")
 
@@ -228,7 +231,7 @@ def plot_prob_heatmaps(
         fontsize=11, color="white",
     )
 
-    rgba2 = _prob_grid(valid, lon_min, lon_max, lat_min, lat_max, cmap, alpha=1.0)
+    rgba2 = _prob_grid(valid, lon_min, lon_max, lat_min, lat_max, cmap, alpha=1.0, prob_col=prob_col)
     ax2.imshow(rgba2, extent=extent, origin="upper", aspect="auto", zorder=2,
                interpolation="nearest")
 

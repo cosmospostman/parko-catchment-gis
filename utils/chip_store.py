@@ -302,5 +302,4 @@ class DiskChipStore:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", NotGeoreferencedWarning)
             with rasterio.open(path) as src:
-                arr = src.read(1)  # single-band chip → 2-D array
-        return arr
+                return src.read(1)

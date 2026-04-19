@@ -2,10 +2,48 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 
+from tam.config import TAMConfig
 from tam.dataset import N_BANDS, MAX_SEQ_LEN
+
+
+def _doy_encoding(doy: torch.Tensor, d_model: int) -> torch.Tensor:
+    """Circular sinusoidal DOY encoding.
+
+    DOY is periodic (day 365 ≈ day 1), so we project onto sin/cos of the
+    annual cycle and harmonics rather than using learned embeddings.  Padding
+    positions (doy == 0) are left as the zero vector.
+
+    Parameters
+    ----------
+    doy : (B, T) int64, values 1–365; 0 = padding
+    d_model : must be even
+
+    Returns
+    -------
+    (B, T, d_model) float32
+    """
+    B, T = doy.shape
+    device = doy.device
+
+    # Number of sin/cos pairs — fills d_model dimensions
+    n_pairs = d_model // 2
+
+    # Angular frequencies: ω_k = 2π·k / 365  for k = 1 … n_pairs
+    k = torch.arange(1, n_pairs + 1, dtype=torch.float32, device=device)  # (n_pairs,)
+    omega = 2.0 * math.pi * k / 365.0                                     # (n_pairs,)
+
+    angle = doy.float().unsqueeze(-1) * omega.unsqueeze(0).unsqueeze(0)   # (B, T, n_pairs)
+
+    enc = torch.cat([torch.sin(angle), torch.cos(angle)], dim=-1)         # (B, T, d_model)
+
+    # Zero out padding positions so they don't contribute to attention
+    enc = enc * (doy != 0).float().unsqueeze(-1)
+    return enc
 
 
 class TAMClassifier(nn.Module):
@@ -14,14 +52,14 @@ class TAMClassifier(nn.Module):
     Architecture
     ------------
     band_proj  : Linear(N_BANDS, d_model)
-    doy_embed  : Embedding(366, d_model)  — learned DOY positional encoding, 0=padding
+    doy_enc    : circular sinusoidal DOY encoding (no learnable params)
     encoder    : TransformerEncoder (num_layers × TransformerEncoderLayer)
     pool       : mean over non-padded positions
     head       : Linear(d_model, 1) → sigmoid
 
     Parameters
     ----------
-    d_model        : model dimension (projection + DOY embedding size)
+    d_model        : model dimension (must be even for circular DOY encoding)
     n_heads        : number of attention heads (must divide d_model)
     n_layers       : number of encoder layers
     d_ff           : feedforward hidden dimension inside each encoder layer
@@ -30,19 +68,20 @@ class TAMClassifier(nn.Module):
 
     def __init__(
         self,
-        d_model: int = 64,
-        n_heads: int = 4,
-        n_layers: int = 2,
-        d_ff: int = 128,
-        dropout: float = 0.1,
+        d_model:  int   = 64,
+        n_heads:  int   = 4,
+        n_layers: int   = 2,
+        d_ff:     int   = 128,
+        dropout:  float = 0.1,
     ) -> None:
         super().__init__()
         self.d_model  = d_model
         self.n_heads  = n_heads
         self.n_layers = n_layers
+        self.d_ff     = d_ff
+        self.dropout  = dropout
 
         self.band_proj = nn.Linear(N_BANDS, d_model)
-        self.doy_embed = nn.Embedding(366, d_model, padding_idx=0)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -62,7 +101,7 @@ class TAMClassifier(nn.Module):
         key_padding_mask: torch.Tensor,   # (B, T)  bool, True=padding
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return (prob, logit), each shape (B,)."""
-        x = self.band_proj(bands) + self.doy_embed(doy)   # (B, T, d_model)
+        x = self.band_proj(bands) + _doy_encoding(doy, self.d_model)  # (B, T, d_model)
         x = self.encoder(x, src_key_padding_mask=key_padding_mask)
 
         # Mean pool over non-padded positions
@@ -89,7 +128,7 @@ class TAMClassifier(nn.Module):
         """
         self.eval()
         with torch.no_grad():
-            x = self.band_proj(bands) + self.doy_embed(doy)   # (1, T, d_model)
+            x = self.band_proj(bands) + _doy_encoding(doy, self.d_model)  # (1, T, d_model)
 
             attn_weights: list[torch.Tensor] = []
             for layer in self.encoder.layers:
@@ -114,11 +153,21 @@ class TAMClassifier(nn.Module):
     # ------------------------------------------------------------------
     def config(self) -> dict:
         return {
-            "d_model":  self.d_model,
-            "n_heads":  self.n_heads,
-            "n_layers": self.n_layers,
-            "d_ff":     self.encoder.layers[0].linear1.out_features,
-            "dropout":  self.encoder.layers[0].dropout.p,
-            "n_bands":  N_BANDS,
-            "max_seq_len": MAX_SEQ_LEN,
+            "d_model":       self.d_model,
+            "n_heads":       self.n_heads,
+            "n_layers":      self.n_layers,
+            "d_ff":          self.d_ff,
+            "dropout":       self.dropout,
+            "n_bands":       N_BANDS,
+            "max_seq_len":   MAX_SEQ_LEN,
         }
+
+    @classmethod
+    def from_config(cls, cfg: TAMConfig) -> "TAMClassifier":
+        return cls(
+            d_model=cfg.d_model,
+            n_heads=cfg.n_heads,
+            n_layers=cfg.n_layers,
+            d_ff=cfg.d_ff,
+            dropout=cfg.dropout,
+        )

@@ -22,7 +22,7 @@ from analysis.constants import BANDS
 
 BAND_COLS: list[str] = list(BANDS)   # B02 B03 B04 B05 B06 B07 B08 B8A B11 B12
 N_BANDS: int = len(BAND_COLS)        # 10
-MAX_SEQ_LEN: int = 128
+MAX_SEQ_LEN: int = 128       # canonical value lives in TAMConfig; kept here for model.py import
 MIN_OBS_PER_YEAR: int = 8
 
 
@@ -77,7 +77,14 @@ class TAMDataset(Dataset):
         band_std: np.ndarray | None = None,
         scl_purity_min: float = 0.5,
         min_obs_per_year: int = MIN_OBS_PER_YEAR,
+        doy_jitter: int = 0,
+        band_noise_std: float = 0.0,
     ) -> None:
+        # doy_jitter: max ±days to shift all observations in a window (training only).
+        # A single offset is drawn per __getitem__ call and applied uniformly so
+        # relative timing between observations is preserved.  Set 0 to disable.
+        # band_noise_std: std of Gaussian noise added to normalised band values per
+        # observation independently (training only).  Set 0.0 to disable.
         df = pixel_df.copy()
 
         # SCL filter
@@ -110,6 +117,7 @@ class TAMDataset(Dataset):
             self._windows.append((pid, int(yr), grp.reset_index(drop=True)))
 
         self._labels = labels
+        self._doy_jitter = doy_jitter
 
     # ------------------------------------------------------------------
     def __len__(self) -> int:
@@ -126,9 +134,14 @@ class TAMDataset(Dataset):
         bands = np.zeros((MAX_SEQ_LEN, N_BANDS), dtype=np.float32)
         bands[:n] = normed
 
-        # DOY — derive from date column
+        # DOY — derive from date column, optionally jitter for training augmentation
         dates = pd.to_datetime(grp["date"].values[:n])
         doy_vals = dates.day_of_year.values.astype(np.int64)
+        if self._doy_jitter > 0:
+            offset = np.random.randint(-self._doy_jitter, self._doy_jitter + 1)
+            # Clamp to 1–365 rather than wrapping: wrapping would reorder observations
+            # that straddle the year boundary, misaligning the band and DOY sequences.
+            doy_vals = np.clip(doy_vals + offset, 1, 365)
 
         doy = np.zeros(MAX_SEQ_LEN, dtype=np.int64)
         doy[:n] = doy_vals

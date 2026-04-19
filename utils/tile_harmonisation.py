@@ -75,7 +75,7 @@ def calibrate(
     import concurrent.futures
     import pyarrow.parquet as pq
 
-    LOAD_COLS = ["point_id", "date", "item_id"] + bands
+    LOAD_COLS = ["point_id", "date", "tile_id"] + bands
 
     # Benchmarked on this dataset: 4 workers gives ~4x speedup on both IO and
     # CPU phases; beyond 6 there is no further gain.  Use separate ParquetFile
@@ -98,9 +98,7 @@ def calibrate(
 
     def _read_tile_col(rg_idx: int) -> pl.DataFrame:
         return pl.from_arrow(
-            _pfs[rg_idx % N_WORKERS].read_row_groups([rg_idx], columns=["item_id"])
-        ).with_columns(
-            pl.col("item_id").str.split("_").list.get(1).alias("tile_id")
+            _pfs[rg_idx % N_WORKERS].read_row_groups([rg_idx], columns=["tile_id"])
         )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=N_WORKERS) as ex:
@@ -134,8 +132,6 @@ def calibrate(
     def _process_rg(rg_idx: int) -> RgResult:
         chunk = pl.from_arrow(
             _pfs[rg_idx % N_WORKERS].read_row_groups([rg_idx], columns=LOAD_COLS)
-        ).with_columns(
-            pl.col("item_id").str.split("_").list.get(1).alias("tile_id")
         )
 
         chunk = chunk.filter(pl.col("tile_id").is_in(relevant_tiles))

@@ -26,6 +26,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from pipelines.common import label_pixels, save_pixel_ranking, summarise
 from signals._shared import ensure_pixel_sorted
+from tam.config import TAMConfig
 from tam.dataset import TAMDataset, collate_fn, BAND_COLS
 from tam.model import TAMClassifier
 from tam.train import train_tam, load_tam
@@ -233,15 +234,18 @@ def run(
         logger.info("Loaded %d observations for %d labeled pixels", len(pixel_df), pixel_df["point_id"].nunique())
 
         logger.info("Training TAM ...")
+        cfg = TAMConfig(
+            n_epochs=n_epochs,
+            patience=patience,
+            scl_purity_min=scl_purity_min,
+        )
         model, band_mean, band_std = (
             train_tam(
                 pixel_df=pixel_df,
                 labels=labels,
                 pixel_coords=pixel_coords,
                 out_dir=out_dir,
-                n_epochs=n_epochs,
-                patience=patience,
-                scl_purity_min=scl_purity_min,
+                cfg=cfg,
                 device=device,
             ),
             *_load_band_stats(out_dir),
@@ -267,14 +271,13 @@ def run(
     )
 
     # Rank (1 = highest probability)
-    scored["prob_lr"] = scored["prob_tam"]   # heatmap compatibility
     scored["rank"] = scored["prob_tam"].rank(ascending=False, method="first").astype("Int64")
 
     # --- Outputs ------------------------------------------------------------
     stem = f"tam_{loc.id}" + (f"_{tile_id}" if tile_id else "")
     summarise(scored, loc)
     save_pixel_ranking(scored, out_dir / "tam_pixel_ranking.csv", features=["prob_tam"])
-    plot_prob_heatmaps(scored.dropna(subset=["prob_lr"]), loc, out_dir, stem=stem)
+    plot_prob_heatmaps(scored.dropna(subset=["prob_tam"]), loc, out_dir, stem=stem, prob_col="prob_tam")
     logger.info("Done — outputs in %s", out_dir)
 
 

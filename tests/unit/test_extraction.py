@@ -200,9 +200,9 @@ def test_center_pixel_extracted(tmp_path):
     item = _make_item()
     # SCL: all clear
     _write_chip(tmp_path / item.id / f"{SCL_BAND}_{POINT_ID}.tif", _const_chip(4.0))
-    # Band chip: all zeros except the center pixel
+    # Band chip: all zeros except the center pixel (DN value; code divides by 10000)
     data = np.zeros((5, 5), dtype=np.float32)
-    data[2, 2] = 0.12345
+    data[2, 2] = 1234.5  # 1234.5 / 10000 = 0.12345
     _write_chip(tmp_path / item.id / f"B03_{POINT_ID}.tif", data)
 
     store = DiskChipStore(inputs_dir=tmp_path)
@@ -241,8 +241,8 @@ def test_scl_purity_is_fraction_of_clear_pixels(tmp_path):
 def test_aot_quality_inverted_from_center_pixel(tmp_path):
     item = _make_item()
     _write_clear_scene(tmp_path, item.id, POINT_ID, ["B03"])
-    # AOT chip: all 0.2
-    _write_chip(tmp_path / item.id / f"{AOT_BAND}_{POINT_ID}.tif", _const_chip(0.2))
+    # AOT chip: DN value 200 → 200 * 0.001 = 0.2 → quality = 1.0 - 0.2 = 0.8
+    _write_chip(tmp_path / item.id / f"{AOT_BAND}_{POINT_ID}.tif", _const_chip(200.0))
 
     store = DiskChipStore(inputs_dir=tmp_path)
     result = extract_observations([item], [POINT], store, bands=["B03"])

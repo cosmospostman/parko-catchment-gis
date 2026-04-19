@@ -228,18 +228,20 @@ def _run_pipeline(
 # Test fixtures
 # ---------------------------------------------------------------------------
 
-@pytest.fixture()
-def presence_result(tmp_path):
+@pytest.fixture(scope="module")
+def presence_result(tmp_path_factory):
     """Run full pipeline for a presence point and return the feature vector."""
+    tmp_path = tmp_path_factory.mktemp("presence")
     structural = {"HAND": 1.2, "dist_to_water": 180.0}
     items = _build_items_and_chips(tmp_path, "pt_presence", _write_presence_scene)
     result = _run_pipeline(tmp_path, "pt_presence", items, structural)
     return result
 
 
-@pytest.fixture()
-def three_point_results(tmp_path):
+@pytest.fixture(scope="module")
+def three_point_results(tmp_path_factory):
     """Run full pipeline for three points (2 presence, 1 absence) and return list."""
+    tmp_path = tmp_path_factory.mktemp("three_points")
     structural = {"HAND": 1.5, "dist_to_water": 200.0}
     results = []
     for i, (pid, writer) in enumerate([
