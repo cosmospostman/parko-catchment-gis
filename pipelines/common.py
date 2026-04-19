@@ -8,24 +8,42 @@ import pandas as pd
 
 
 def label_pixels(features_df: pd.DataFrame, train_loc) -> pd.DataFrame:
-    """Assign is_presence from the training location's presence/absence sub_bboxes.
+    """Assign is_presence from labeled regions or a Location's sub_bboxes.
+
+    Accepts either:
+    - A Location object (uses sub_bboxes with role "presence"/"absence")
+    - A list of TrainingRegion objects (uses bbox + label "presence"/"absence")
 
     Returns a copy of features_df with an is_presence column (True / False / NaN).
-    Pixels outside any labelled sub-bbox get NaN — scored but not trained on.
+    Pixels outside any labelled bbox get NaN — scored but not trained on.
     """
     df = features_df.copy()
     df["is_presence"] = pd.NA
 
-    for sub in train_loc.sub_bboxes.values():
-        lon_min, lat_min, lon_max, lat_max = sub.bbox
-        mask = (
-            df["lon"].between(lon_min, lon_max) &
-            df["lat"].between(lat_min, lat_max)
-        )
-        if sub.role == "presence":
-            df.loc[mask, "is_presence"] = True
-        elif sub.role == "absence":
-            df.loc[mask, "is_presence"] = False
+    if isinstance(train_loc, list):
+        # TrainingRegion list path
+        for region in train_loc:
+            lon_min, lat_min, lon_max, lat_max = region.bbox
+            mask = (
+                df["lon"].between(lon_min, lon_max) &
+                df["lat"].between(lat_min, lat_max)
+            )
+            if region.label == "presence":
+                df.loc[mask, "is_presence"] = True
+            elif region.label == "absence":
+                df.loc[mask, "is_presence"] = False
+    else:
+        # Location object path
+        for sub in train_loc.sub_bboxes.values():
+            lon_min, lat_min, lon_max, lat_max = sub.bbox
+            mask = (
+                df["lon"].between(lon_min, lon_max) &
+                df["lat"].between(lat_min, lat_max)
+            )
+            if sub.role == "presence":
+                df.loc[mask, "is_presence"] = True
+            elif sub.role == "absence":
+                df.loc[mask, "is_presence"] = False
 
     return df
 
