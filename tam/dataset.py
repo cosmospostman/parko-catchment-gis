@@ -166,7 +166,7 @@ class TAMDataset(Dataset):
     # ------------------------------------------------------------------
     @property
     def band_stats(self) -> tuple[np.ndarray, np.ndarray]:
-        return self.band_mean, self.band_std
+        return self.band_mean.copy(), self.band_std.copy()
 
     def unique_pixels(self) -> list[str]:
         seen: set[str] = set()
