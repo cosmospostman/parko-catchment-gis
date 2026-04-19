@@ -1,9 +1,9 @@
-name: "S2 Tile 54LWJ"
-bbox: [140.99982, -15.46501, 142.02332, -14.47009]  # [lon_min, lat_min, lon_max, lat_max]
-dry_months: [5, 6, 7, 8, 9, 10]
+# name: "S2 Tile 54LWJ"
+# bbox: [140.99982, -15.46501, 142.02332, -14.47009]  # [lon_min, lat_min, lon_max, lat_max]
+# dry_months: [5, 6, 7, 8, 9, 10]
 
-notes: >
-  Full footprint of Sentinel-2 MGRS tile 54LWJ. Covers the northern portion of
-  the Kowanyama scene only (southern boundary at lat -15.465). Used for
-  diagnosing inter-tile calibration offsets — north of -15.46 both tiles agree;
-  south of -15.46 54LWH and 54LWJ diverge significantly in B05/B07 and NDVI.
+# notes: >
+#   Full footprint of Sentinel-2 MGRS tile 54LWJ. Covers the northern portion of
+#   the Kowanyama scene only (southern boundary at lat -15.465). Used for
+#   diagnosing inter-tile calibration offsets — north of -15.46 both tiles agree;
+#   south of -15.46 54LWH and 54LWJ diverge significantly in B05/B07 and NDVI.

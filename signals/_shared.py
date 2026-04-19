@@ -79,6 +79,7 @@ def compute_features_chunked(
     smooth_days: int = 30,
     compute_ndvi_integral: bool = False,
     calibration_path: Path | None = None,
+    tile_id: str | None = None,
 ) -> "pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]":
     """Compute all four Parkinsonia signal features in a single row-group pass.
 
@@ -150,6 +151,8 @@ def compute_features_chunked(
     if "tile_id" in _schema_names:
         LOAD_COLS = ["point_id", "lon", "lat", "date", "tile_id", "scl_purity",
                      "B04", "B05", "B07", "B08", "B11"]
+    if tile_id is not None and "item_id" in _schema_names and "item_id" not in LOAD_COLS:
+        LOAD_COLS = LOAD_COLS + ["item_id"]
 
     # Load correction table once — None if no calibration_path or file absent
     from utils.tile_harmonisation import load_corrections
@@ -227,6 +230,13 @@ def compute_features_chunked(
             ((pl.col("B08") - pl.col("B11")) / (pl.col("B08") + pl.col("B11"))).alias("swir_mi"),
         ])
 
+        if tile_id is not None:
+            if "item_id" in chunk.columns:
+                chunk = chunk.filter(
+                    pl.col("item_id").str.split("_").list.get(1) == tile_id
+                )
+            elif "tile_id" in chunk.columns:
+                chunk = chunk.filter(pl.col("tile_id") == tile_id)
         if year_from is not None:
             chunk = chunk.filter(pl.col("year") >= year_from)
         if year_to is not None:

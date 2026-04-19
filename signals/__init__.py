@@ -65,6 +65,7 @@ from signals.recession import RecessionSensitivitySignal      # noqa: E402
 from signals.greenup import GreenupTimingSignal, GreenupShiftSignal  # noqa: E402
 from signals.integral import NdviIntegralSignal               # noqa: E402
 from signals.tuning import sweep_signal                       # noqa: E402
+from signals.scl_composition import SclCompositionSignal      # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +84,7 @@ def extract_parko_features(
     year_to: int | None = None,
     bbox: tuple[float, float, float, float] | None = None,
     calibration_path: Path | None = None,
+    tile_id: str | None = None,
 ) -> pd.DataFrame:
     """Compute all tabular signal features and join into one per-pixel table.
 
@@ -181,6 +183,7 @@ def extract_parko_features(
             smooth_days=ndvi_integral_params.smooth_days,
             compute_ndvi_integral=True,
             calibration_path=calibration_path,
+            tile_id=tile_id,
         )
         integral_stats = NdviIntegralSignal(ndvi_integral_params).compute(
             pixel_df=None, loc=loc, _per_year=integral_yearly_df,
@@ -237,4 +240,5 @@ __all__ = [
     "NdviIntegralSignal",
     "extract_parko_features",
     "sweep_signal",
+    "SclCompositionSignal",
 ]

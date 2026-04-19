@@ -258,13 +258,19 @@ async function handleWmsTile(req: Request, layer: string): Promise<Response> {
 }
 
 async function handleRestTile(layer: string, z: string, x: string, y: string): Promise<Response> {
-  const token = await getQGlobeToken();
-  const upstreamUrl = `${tileBase(layer)}/${z}/${y}/${x}?token=${token}`;
-  // Cache key based on layer + z/x/y (no token — it changes)
   const cacheInput = `${layer}/tile/${z}/${x}/${y}`;
   const buf = await crypto.subtle.digest("SHA-1", new TextEncoder().encode(cacheInput));
   const key = encodeHex(new Uint8Array(buf));
   const cachePath = join(WMS_CACHE_DIR, key + ".jpg");
+  // Serve from cache without needing a token
+  try {
+    const cached = await Deno.readFile(cachePath);
+    return new Response(cached, {
+      headers: { "content-type": "image/jpeg", "x-tile-cache": "HIT", "cache-control": "public, max-age=86400" },
+    });
+  } catch { /* cache miss */ }
+  const token = await getQGlobeToken();
+  const upstreamUrl = `${tileBase(layer)}/${z}/${y}/${x}?token=${token}`;
   return fetchAndCache(upstreamUrl, cachePath);
 }
 

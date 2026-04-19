@@ -28,6 +28,7 @@ B8A           : float — NIR narrow
 B11           : float — SWIR 1.6 µm
 B12           : float — SWIR 2.2 µm
 scl_purity    : float — fraction of clear pixels in the 5×5 chip window
+scl           : int8  — raw SCL class value (4=vegetation, 5=bare soil, 6=water, 7=unclassified, 11=snow/ice)
 aot           : float — inverse aerosol optical thickness  (1 = clean air)
 view_zenith   : float — inverse view zenith angle          (1 = nadir)
 sun_zenith    : float — inverse sun zenith angle           (1 = high sun)
@@ -234,6 +235,7 @@ def extract_item_to_df(
         "item_id":    item_id,
         "tile_id":    tile_id,
         "scl_purity": scl_purity[idx],
+        "scl":        scl_int[idx].astype(np.int8),
         "aot":        aot_quality[idx],
         "view_zenith": view_zenith_col[idx],
         "sun_zenith":  sun_zenith_col[idx],
@@ -301,10 +303,32 @@ def collect(
         logger.error("No STAC items found — check bbox and date range")
         sys.exit(1)
 
+    # Deduplicate items: keep only one granule per (date, satellite, tile).
+    # A bbox that straddles two adjacent S2 processing granules (e.g. _0_L2A
+    # and _1_L2A from the same overpass) will otherwise produce duplicate
+    # (point_id, date) rows with slightly different resampled band values.
+    # Item IDs follow the pattern S2X_TTTTTT_YYYYMMDD_N_L2A where N is the
+    # granule index — we strip it to get a canonical per-overpass key.
+    import re as _re
+    _granule_re = _re.compile(r"_\d+_L2A$")
+    seen: set[tuple] = set()
+    deduped_items = []
+    for item in items:
+        key = _granule_re.sub("", item.id)
+        if key not in seen:
+            seen.add(key)
+            deduped_items.append(item)
+    if len(deduped_items) < len(items):
+        logger.info(
+            "Deduplicated STAC items: %d → %d (removed %d duplicate granules)",
+            len(items), len(deduped_items), len(items) - len(deduped_items),
+        )
+    items = deduped_items
+
     col_order = (
         ["point_id", "lon", "lat", "date", "item_id", "tile_id"]
         + list(BANDS)
-        + ["scl_purity", "aot", "view_zenith", "sun_zenith"]
+        + ["scl_purity", "scl", "aot", "view_zenith", "sun_zenith"]
     )
 
     # --- 3+4. Plan shards, then fetch only if needed -------------------------
@@ -469,7 +493,8 @@ def collect(
             writer.close()
         # Mark shard complete with a sentinel line
         done_path.open("a").write("__done__\n")
-        shard_paths.append(shard_path)
+        if shard_path.exists():
+            shard_paths.append(shard_path)
         logger.info("  shard %d/%d complete: %d rows", shard_idx + 1, n_shards, shard_rows)
 
     # --- 5. Sort each shard by point_id, then concatenate → pixel-sorted output -
@@ -484,19 +509,23 @@ def collect(
     from signals._shared import sort_parquet_by_pixel
 
     sorted_shard_paths: list[Path] = []
-    for shard_idx, sp in enumerate(shard_paths):
+    for shard_idx in range(n_shards):
+        sp = _shard_path(shard_idx)
         sorted_sp = sp.with_name(sp.stem + "_sorted.parquet")
         if sorted_sp.exists():
             logger.info(
                 "  shard %d/%d sorted file already exists, reusing: %s",
                 shard_idx + 1, n_shards, sorted_sp.name,
             )
-        else:
+        elif sp.exists():
             logger.info(
                 "  sorting shard %d/%d → %s ...", shard_idx + 1, n_shards, sorted_sp.name
             )
             sort_parquet_by_pixel(sp, sorted_sp, row_group_size=5_000_000)
             logger.info("  shard %d/%d sorted", shard_idx + 1, n_shards)
+        else:
+            logger.warning("  shard %d/%d: neither unsorted nor sorted parquet found, skipping", shard_idx + 1, n_shards)
+            continue
         sorted_shard_paths.append(sorted_sp)
 
     logger.info("Concatenating %d sorted shards → %s ...", n_shards, out_path.name)
@@ -542,6 +571,7 @@ if __name__ == "__main__":
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    logging.getLogger("rasterio").setLevel(logging.WARNING)
 
     parser = argparse.ArgumentParser(
         description="Collect Sentinel-2 L2A pixel observations for a named location."

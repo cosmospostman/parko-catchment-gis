@@ -31,10 +31,12 @@ TRAIN_LOC_ID = "pormpuraaw"   # source of sub-bbox training labels
 SCENE_LOC_ID = "kowanyama"    # scene to score
 
 
-def run(plots: bool = True) -> None:
+def run(plots: bool = True, tile_id: str | None = None) -> None:
     train_loc = get(TRAIN_LOC_ID)
     scene_loc = get(SCENE_LOC_ID)
     out_dir = OUT_DIR
+    if tile_id:
+        out_dir = out_dir / f"tile-{tile_id.lower()}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
@@ -67,7 +69,8 @@ def run(plots: bool = True) -> None:
     # ------------------------------------------------------------------
     scene_path = scene_loc.parquet_path()
 
-    print(f"\nExtracting features from {scene_path.name} (chunked, one row-group at a time)...")
+    tile_msg = f" (tile {tile_id} only)" if tile_id else ""
+    print(f"\nExtracting features from {scene_path.name} (chunked, one row-group at a time){tile_msg}...")
     # year_to=2025: the parquet extends into 2026 (partial wet-season data from a later
     # STAC fetch).  That partial year straddles the min_obs_per_year=10 threshold —
     # the 54LWJ tile adds just enough observations north of ~-15.465 to tip all those
@@ -78,6 +81,7 @@ def run(plots: bool = True) -> None:
         scene_path, scene_loc,
         year_to=2025,
         calibration_path=scene_loc.calibration_path(),
+        tile_id=tile_id,
     )
 
     # No training labels exist for Kowanyama — all pixels will be unlabelled
@@ -96,14 +100,17 @@ def run(plots: bool = True) -> None:
     scored = clf.score(scene_labelled)
 
     summarise(scored, scene_loc, show_scene_percentiles=True)
-    save_pixel_ranking(scored, out_dir / "kowanyama_pormpuraaw_pixel_ranking.csv", FEATURES)
+    stem = f"kowanyama_pormpuraaw_tile_{tile_id.lower()}" if tile_id else "kowanyama_pormpuraaw"
+    save_pixel_ranking(scored, out_dir / f"{stem}_pixel_ranking.csv", FEATURES)
 
     if plots:
-        plot_prob_heatmaps(scored, scene_loc, out_dir, stem="kowanyama_pormpuraaw")
+        plot_prob_heatmaps(scored, scene_loc, out_dir, stem=stem)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--no-plots", action="store_true")
+    parser.add_argument("--tile", metavar="TILE_ID",
+                        help="Restrict scene observations to a single S2 tile (e.g. 54LWH)")
     args = parser.parse_args()
-    run(plots=not args.no_plots)
+    run(plots=not args.no_plots, tile_id=args.tile)

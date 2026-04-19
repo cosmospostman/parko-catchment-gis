@@ -287,3 +287,185 @@ def plot_distributions(
     except Exception as exc:
         print(f"  WARNING: plot_distributions failed ({exc})", flush=True)
         return None
+
+
+# ---------------------------------------------------------------------------
+# SCL class composition
+# ---------------------------------------------------------------------------
+
+_MONTH_LABELS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+_SCL_LAYERS = [
+    ("scl_water", "Water",     "#4393c3"),
+    ("scl_veg",   "Vegetation","#4dac26"),
+    ("scl_bare",  "Bare soil", "#8c510a"),
+    ("scl_other", "Other",     "#bababa"),
+]
+
+
+def plot_scl_timeseries(
+    ts_df: "pd.DataFrame",
+    title: str,
+    out_path: "Path | None" = None,
+) -> "plt.Figure | None":
+    """Stacked area chart of SCL class fractions over actual time.
+
+    Aggregates all pixels: median fraction per (year, month) with IQR shading.
+    X-axis is calendar date; layers stacked bottom-up: water, vegetation,
+    bare soil, other.
+
+    Parameters
+    ----------
+    ts_df:
+        Output of ``SclCompositionSignal.compute_timeseries()``.  Long-format
+        with columns ``[point_id, year, month, scl_veg, scl_bare, scl_water, scl_other]``.
+    title:
+        Figure title.
+    out_path:
+        If given, figure is saved here and the axes are closed.
+    """
+    if ts_df is None or ts_df.empty:
+        return None
+
+    try:
+        from datetime import date as _date
+
+        col_names = [c for c, _, _ in _SCL_LAYERS]
+
+        periods = ts_df[["year", "month"]].drop_duplicates().sort_values(["year", "month"])
+        xs = [_date(int(r.year), int(r.month), 15) for r in periods.itertuples()]
+
+        medians = {c: [] for c in col_names}
+        q25     = {c: [] for c in col_names}
+        q75     = {c: [] for c in col_names}
+
+        for r in periods.itertuples():
+            sub = ts_df[(ts_df["year"] == r.year) & (ts_df["month"] == r.month)]
+            for col in col_names:
+                vals = sub[col].dropna()
+                medians[col].append(vals.median() if len(vals) else 0.0)
+                q25[col].append(np.percentile(vals, 25) if len(vals) else 0.0)
+                q75[col].append(np.percentile(vals, 75) if len(vals) else 0.0)
+
+        fig, ax = plt.subplots(figsize=(12, 4))
+
+        bottoms_med = np.zeros(len(xs))
+
+        for col, label, color in _SCL_LAYERS:
+            med = np.array(medians[col])
+            lo  = np.array(q25[col])
+            hi  = np.array(q75[col])
+
+            ax.fill_between(xs, bottoms_med + lo, bottoms_med + hi,
+                            color=color, alpha=0.20, linewidth=0)
+            ax.fill_between(xs, bottoms_med, bottoms_med + med,
+                            color=color, alpha=0.75, label=label, linewidth=0)
+
+            bottoms_med += med
+
+        ax.set_ylim(0, 1)
+        ax.set_ylabel("Fraction of observations", fontsize=9)
+        ax.set_title(title, fontsize=10)
+        ax.tick_params(axis="x", labelsize=8)
+        ax.tick_params(axis="y", labelsize=8)
+        ax.legend(loc="upper right", fontsize=8, framealpha=0.8)
+        fig.tight_layout()
+
+        if out_path is not None:
+            fig.savefig(out_path, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+
+        return fig
+
+    except Exception as exc:
+        print(f"  WARNING: plot_scl_timeseries failed ({exc})", flush=True)
+        return None
+
+
+def plot_scl_composition(
+    monthly_df: "pd.DataFrame",
+    title: str,
+    out_path: "Path | None" = None,
+) -> "plt.Figure | None":
+    """Stacked area chart of monthly SCL class fractions, summarised across pixels.
+
+    Aggregates all pixels: median fraction per (month, class) with IQR shading.
+    Layers stacked bottom-up: water, vegetation, bare soil, other.
+
+    Parameters
+    ----------
+    monthly_df:
+        Output of ``SclCompositionSignal.compute()``.  Long-format with columns
+        ``[point_id, month, scl_veg, scl_bare, scl_water, scl_other]``.
+    title:
+        Figure title.
+    out_path:
+        If given, figure is saved here and the axes are closed.
+
+    Returns
+    -------
+    The Figure, or None if plotting failed or ``monthly_df`` is empty.
+    """
+    if monthly_df is None or monthly_df.empty:
+        return None
+
+    try:
+        import numpy as np
+
+        months = list(range(1, 13))
+        cols = [c for _, _, _ in _SCL_LAYERS]
+        col_names = [c for c, _, _ in _SCL_LAYERS]
+
+        # Median and IQR per month across all pixels
+        medians = {c: [] for c in col_names}
+        q25     = {c: [] for c in col_names}
+        q75     = {c: [] for c in col_names}
+
+        for m in months:
+            sub = monthly_df[monthly_df["month"] == m]
+            for col in col_names:
+                vals = sub[col].dropna()
+                medians[col].append(vals.median() if len(vals) else 0.0)
+                q25[col].append(np.percentile(vals, 25) if len(vals) else 0.0)
+                q75[col].append(np.percentile(vals, 75) if len(vals) else 0.0)
+
+        fig, ax = plt.subplots(figsize=(9, 4))
+        x = np.arange(1, 13)
+
+        bottoms_med = np.zeros(12)
+        bottoms_q25 = np.zeros(12)
+        bottoms_q75 = np.zeros(12)
+
+        for col, label, color in _SCL_LAYERS:
+            med = np.array(medians[col])
+            lo  = np.array(q25[col])
+            hi  = np.array(q75[col])
+
+            ax.fill_between(x, bottoms_med + lo, bottoms_med + hi,
+                            color=color, alpha=0.20, linewidth=0)
+            ax.fill_between(x, bottoms_med, bottoms_med + med,
+                            color=color, alpha=0.75, label=label, linewidth=0)
+
+            bottoms_med += med
+            bottoms_q25 += lo
+            bottoms_q75 += hi
+
+        ax.set_xlim(1, 12)
+        ax.set_ylim(0, 1)
+        ax.set_xticks(x)
+        ax.set_xticklabels(_MONTH_LABELS, fontsize=8)
+        ax.set_ylabel("Fraction of observations", fontsize=9)
+        ax.set_title(title, fontsize=10)
+        ax.legend(loc="upper right", fontsize=8, framealpha=0.8)
+        fig.tight_layout()
+
+        if out_path is not None:
+            fig.savefig(out_path, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+
+        return fig
+
+    except Exception as exc:
+        print(f"  WARNING: plot_scl_composition failed ({exc})", flush=True)
+        return None
