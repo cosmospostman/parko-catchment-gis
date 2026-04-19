@@ -45,13 +45,17 @@ def _score_chunk(
     model: TAMClassifier,
     band_mean: np.ndarray,
     band_std: np.ndarray,
-    pixel_probs: dict[str, list[float]],
+    pixel_year_probs: dict[str, dict[int, list[float]]],
     scl_purity_min: float,
     min_obs_per_year: int,
     batch_size: int,
     device: str,
 ) -> None:
-    """Score one in-memory chunk and accumulate results into pixel_probs (in-place)."""
+    """Score one in-memory chunk and accumulate results into pixel_year_probs (in-place).
+
+    pixel_year_probs maps point_id -> {year -> [prob, ...]} so that the caller
+    can apply year-weighted aggregation after all chunks are processed.
+    """
     ds = TAMDataset(
         chunk, labels=None,
         band_mean=band_mean, band_std=band_std,
@@ -68,8 +72,44 @@ def _score_chunk(
                 batch["doy"].to(device),
                 batch["mask"].to(device),
             )
-            for pid, p in zip(batch["point_id"], prob.cpu().numpy()):
-                pixel_probs.setdefault(pid, []).append(float(p))
+            for pid, year, p in zip(batch["point_id"], batch["year"], prob.cpu().numpy()):
+                year_int = int(year)
+                pixel_year_probs.setdefault(pid, {}).setdefault(year_int, []).append(float(p))
+
+
+def aggregate_year_probs(
+    pixel_year_probs: dict[str, dict[int, list[float]]],
+    end_year: int,
+    decay: float = 0.7,
+) -> pd.DataFrame:
+    """Aggregate per-(pixel, year) probabilities into a single score per pixel.
+
+    Each year's mean probability is weighted by exp(-decay * (end_year - year)),
+    so years closer to end_year receive higher weight. This makes the score
+    reflect current presence while still benefiting from multi-year signal.
+
+    Parameters
+    ----------
+    pixel_year_probs:
+        Maps point_id -> {year -> [prob, ...]}
+    end_year:
+        The reference year (typically the last year of the inference window).
+    decay:
+        Exponential decay rate (per year back from end_year). Default 0.7
+        gives ~12% relative weight to a year 3 years old vs the current year.
+    """
+    records = []
+    for pid, year_probs in pixel_year_probs.items():
+        total_w = 0.0
+        total_wp = 0.0
+        for yr, probs in year_probs.items():
+            w = float(np.exp(-decay * (end_year - yr)))
+            total_w += w
+            total_wp += w * float(np.mean(probs))
+        records.append({"point_id": pid, "prob_tam": total_wp / total_w if total_w > 0 else 0.0})
+    if not records:
+        return pd.DataFrame(columns=["point_id", "prob_tam"])
+    return pd.DataFrame(records)
 
 
 def score_pixels_chunked(
@@ -82,11 +122,13 @@ def score_pixels_chunked(
     batch_size: int = 256,
     device: str | None = None,
     tile_id: str | None = None,
+    end_year: int | None = None,
+    decay: float = 0.7,
 ) -> pd.DataFrame:
     """Score all pixels in parquet one row-group at a time to bound peak RAM.
 
     Returns a DataFrame with columns: point_id, prob_tam
-    (mean probability across years with sufficient observations).
+    (exponentially decay-weighted mean probability across years, anchored at end_year).
     """
     import pyarrow.parquet as pq
 
@@ -96,7 +138,7 @@ def score_pixels_chunked(
 
     pf = pq.ParquetFile(parquet)
     n_rg = pf.metadata.num_row_groups
-    pixel_probs: dict[str, list[float]] = {}
+    pixel_year_probs: dict[str, dict[int, list[float]]] = {}
     tile_prefix = f"_{tile_id}_" if tile_id else None
     read_cols = ["point_id", "date", "scl_purity"] + (["item_id"] if tile_id else []) + BAND_COLS
     leftover: pd.DataFrame = pd.DataFrame()
@@ -106,7 +148,9 @@ def score_pixels_chunked(
         if tile_prefix:
             chunk = chunk[chunk["item_id"].str.contains(tile_prefix, regex=False)]
         chunk = chunk[chunk["scl_purity"] >= scl_purity_min]
-        chunk["year"] = pd.to_datetime(chunk["date"]).dt.year
+        dates = pd.to_datetime(chunk["date"])
+        chunk["year"] = dates.dt.year
+        chunk["doy"]  = dates.dt.day_of_year
 
         # Prepend any pixels that straddled the previous row-group boundary
         if not leftover.empty:
@@ -125,20 +169,19 @@ def score_pixels_chunked(
 
         if chunk.empty:
             continue
-        _score_chunk(chunk, model, band_mean, band_std, pixel_probs,
+        _score_chunk(chunk, model, band_mean, band_std, pixel_year_probs,
                      scl_purity_min, min_obs_per_year, batch_size, device)
-        logger.info("Scored row group %d/%d  (%d pixels so far)", rg + 1, n_rg, len(pixel_probs))
+        logger.info("Scored row group %d/%d  (%d pixels so far)", rg + 1, n_rg, len(pixel_year_probs))
 
     # Flush any remaining leftover (last pixel in file)
     if not leftover.empty:
-        _score_chunk(leftover, model, band_mean, band_std, pixel_probs,
+        _score_chunk(leftover, model, band_mean, band_std, pixel_year_probs,
                      scl_purity_min, min_obs_per_year, batch_size, device)
 
-    records = [
-        {"point_id": pid, "prob_tam": float(np.mean(probs))}
-        for pid, probs in pixel_probs.items()
-    ]
-    return pd.DataFrame(records)
+    inferred_end_year = end_year or max(
+        yr for yp in pixel_year_probs.values() for yr in yp
+    )
+    return aggregate_year_probs(pixel_year_probs, end_year=inferred_end_year, decay=decay)
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +197,8 @@ def run(
     device: str | None = None,
     tile_id: str | None = None,
     checkpoint_dir: Path | None = None,
+    end_year: int | None = None,
+    decay: float = 0.7,
 ) -> None:
     loc = get_location(location_id)
     parquet = loc.parquet_path()
@@ -230,7 +275,9 @@ def run(
                 chunks.append(pdf)
         pixel_df = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
         pixel_df = pixel_df[pixel_df["scl_purity"] >= scl_purity_min]
-        pixel_df["year"] = pd.to_datetime(pixel_df["date"]).dt.year
+        _dates = pd.to_datetime(pixel_df["date"])
+        pixel_df["year"] = _dates.dt.year
+        pixel_df["doy"]  = _dates.dt.day_of_year
         logger.info("Loaded %d observations for %d labeled pixels", len(pixel_df), pixel_df["point_id"].nunique())
 
         logger.info("Training TAM ...")
@@ -262,6 +309,7 @@ def run(
     scores = score_pixels_chunked(
         parquet, model, band_mean, band_std,
         scl_purity_min=scl_purity_min, device=device, tile_id=tile_id,
+        end_year=end_year, decay=decay,
     )
 
     # Merge with coords + labels
@@ -305,6 +353,8 @@ if __name__ == "__main__":
     parser.add_argument("--device",     default=None, help="cpu / cuda (auto-detect if omitted)")
     parser.add_argument("--tile",        default=None, help="Restrict to one S2 tile_id (e.g. 54LWH)")
     parser.add_argument("--checkpoint",  default=None, help="Load checkpoint from this dir instead of the default output dir")
+    parser.add_argument("--end-year",    type=int, default=None, help="Reference year for recency weighting (default: latest year in data)")
+    parser.add_argument("--decay",       type=float, default=0.7, help="Exponential decay rate per year back from end-year (default 0.7)")
     args = parser.parse_args()
 
     run(
@@ -316,4 +366,6 @@ if __name__ == "__main__":
         device=args.device,
         tile_id=args.tile,
         checkpoint_dir=Path(args.checkpoint) if args.checkpoint else None,
+        end_year=args.end_year,
+        decay=args.decay,
     )

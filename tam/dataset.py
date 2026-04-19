@@ -85,14 +85,15 @@ class TAMDataset(Dataset):
         # relative timing between observations is preserved.  Set 0 to disable.
         # band_noise_std: std of Gaussian noise added to normalised band values per
         # observation independently (training only).  Set 0.0 to disable.
-        df = pixel_df.copy()
+        df = pixel_df
 
         # SCL filter
         if "scl_purity" in df.columns:
             df = df[df["scl_purity"] >= scl_purity_min]
 
-        # Drop rows with NaN in any band
-        df = df.dropna(subset=BAND_COLS)
+        # Drop rows with NaN in any band (skip scan if data is clean)
+        if df[BAND_COLS].isna().any().any():
+            df = df.dropna(subset=BAND_COLS)
 
         # Restrict to labeled pixels when labels provided
         if labels is not None:
@@ -108,13 +109,21 @@ class TAMDataset(Dataset):
         self.band_mean = band_mean.astype(np.float32)
         self.band_std  = band_std.astype(np.float32)
 
-        # Build index: list of (point_id, year, obs_df) for each valid window
-        self._windows: list[tuple[str, int, pd.DataFrame]] = []
+        # Build index: pre-extract bands and DOY as numpy arrays to avoid
+        # pandas overhead in __getitem__ (called from DataLoader workers on CPU).
+        self._windows: list[tuple[str, int, np.ndarray, np.ndarray]] = []
         for (pid, yr), grp in df.groupby(["point_id", "year"], sort=False):
             grp = grp.sort_values("date")
             if len(grp) < min_obs_per_year:
                 continue
-            self._windows.append((pid, int(yr), grp.reset_index(drop=True)))
+            n = min(len(grp), MAX_SEQ_LEN)
+            raw = grp[BAND_COLS].values[:n].astype(np.float32)
+            bands_np = (raw - self.band_mean) / self.band_std
+            if "doy" in grp.columns:
+                doy_np = grp["doy"].values[:n].astype(np.int32)
+            else:
+                doy_np = pd.to_datetime(grp["date"].values[:n]).day_of_year.values.astype(np.int32)
+            self._windows.append((pid, int(yr), bands_np, doy_np))
 
         self._labels = labels
         self._doy_jitter = doy_jitter
@@ -124,19 +133,13 @@ class TAMDataset(Dataset):
         return len(self._windows)
 
     def __getitem__(self, idx: int) -> TAMSample:
-        pid, yr, grp = self._windows[idx]
-        n = min(len(grp), MAX_SEQ_LEN)
-
-        # Band values — normalise, clip to [0, 1] physical range for safety
-        raw = grp[BAND_COLS].values[:n].astype(np.float32)
-        normed = (raw - self.band_mean) / self.band_std
+        pid, yr, bands_np, doy_np = self._windows[idx]
+        n = len(bands_np)
 
         bands = np.zeros((MAX_SEQ_LEN, N_BANDS), dtype=np.float32)
-        bands[:n] = normed
+        bands[:n] = bands_np
 
-        # DOY — derive from date column, optionally jitter for training augmentation
-        dates = pd.to_datetime(grp["date"].values[:n])
-        doy_vals = dates.day_of_year.values.astype(np.int64)
+        doy_vals = doy_np.astype(np.int64)
         if self._doy_jitter > 0:
             offset = np.random.randint(-self._doy_jitter, self._doy_jitter + 1)
             # Clamp to 1–365 rather than wrapping: wrapping would reorder observations
@@ -171,7 +174,7 @@ class TAMDataset(Dataset):
     def unique_pixels(self) -> list[str]:
         seen: set[str] = set()
         out: list[str] = []
-        for pid, _, _ in self._windows:
+        for pid, _, _b, _d in self._windows:
             if pid not in seen:
                 seen.add(pid)
                 out.append(pid)
