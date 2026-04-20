@@ -27,7 +27,7 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from pipelines.common import label_pixels, save_pixel_ranking, summarise
+from tam.utils import label_pixels, save_pixel_ranking, summarise
 from signals._shared import ensure_pixel_sorted
 from tam.core.config import TAMConfig
 from tam.core.dataset import BAND_COLS

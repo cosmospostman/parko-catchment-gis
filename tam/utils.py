@@ -1,5 +1,3 @@
-"""pipelines/common.py — Shared helpers used by all pipeline scripts."""
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -21,7 +19,6 @@ def label_pixels(features_df: pd.DataFrame, train_loc) -> pd.DataFrame:
     df["is_presence"] = pd.NA
 
     if isinstance(train_loc, list):
-        # TrainingRegion list path
         for region in train_loc:
             lon_min, lat_min, lon_max, lat_max = region.bbox
             mask = (
@@ -33,7 +30,6 @@ def label_pixels(features_df: pd.DataFrame, train_loc) -> pd.DataFrame:
             elif region.label == "absence":
                 df.loc[mask, "is_presence"] = False
     else:
-        # Location object path
         for sub in train_loc.sub_bboxes.values():
             lon_min, lat_min, lon_max, lat_max = sub.bbox
             mask = (
