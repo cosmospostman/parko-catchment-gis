@@ -30,6 +30,7 @@ import pickle
 import re as _re
 
 from training.regions import TrainingRegion, load_regions, select_regions
+from utils.location import tile_chips_path
 from utils.s2_tiles import bbox_to_tile_ids
 from utils.stac import search_sentinel2
 
@@ -234,7 +235,7 @@ def ensure_training_pixels(
                 "Collecting region %s: bbox=%s  window=%s→%s",
                 region.id, region.bbox, start, end,
             )
-            cache_dir = _TRAINING_DIR / "chips" / region.id
+            cache_dir = tile_chips_path(tile_id)
             collect(
                 bbox_wgs84=list(region.bbox),
                 start=start,

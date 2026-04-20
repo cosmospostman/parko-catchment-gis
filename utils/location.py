@@ -34,6 +34,11 @@ _LOCATIONS_DIR = Path(__file__).parent.parent / "data" / "locations"
 _PROJECT_ROOT = Path(__file__).parent.parent
 
 
+def tile_chips_path(tile_id: str) -> Path:
+    """Shared chip cache directory for an S2 tile: data/pixels/{tile_id}/{tile_id}.chips/"""
+    return _PROJECT_ROOT / "data" / "pixels" / tile_id / f"{tile_id}.chips"
+
+
 @dataclass(frozen=True)
 class SubBbox:
     label: str
@@ -166,7 +171,16 @@ class Location:
         return p if p.exists() else None
 
     def cache_dir(self) -> Path:
-        """Alias for chips_path() — passed as cache_dir to collect()."""
+        """Chip cache dir for this location.
+
+        Single-tile locations return the shared tile-level chips path so that
+        training and inference pipelines naturally share the same cache tree.
+        Multi-tile locations fall back to the per-location chips path.
+        """
+        from utils.s2_tiles import bbox_to_tile_ids  # noqa: PLC0415
+        tile_ids = bbox_to_tile_ids(tuple(self.bbox))  # type: ignore[arg-type]
+        if len(tile_ids) == 1:
+            return tile_chips_path(tile_ids[0])
         return self.chips_path()
 
     # ------------------------------------------------------------------
