@@ -135,7 +135,7 @@ function loadLocations() {
         type: 'fill',
         source: 'locations',
         filter: ['==', ['get', 'role'], 'location'],
-        paint: { 'fill-color': '#2e1065', 'fill-opacity': 0.15 },
+        paint: { 'fill-color': '#7c3aed', 'fill-opacity': 0 },
       });
 
       map.addLayer({
@@ -162,7 +162,7 @@ function loadLocations() {
         paint: {
           'line-color': [
             'match', ['get', 'role'],
-            'location', '#c4b5fd',
+            'location', '#7c3aed',
             COLOR_EXPR,
           ],
           'line-width': ['match', ['get', 'role'], 'location', 3, 2],
@@ -319,11 +319,14 @@ function buildCatchmentsSidebar(geojson) {
 
   for (const feat of geojson.features) {
     const name = feat.properties?.name ?? feat.properties?.id ?? 'Catchment';
-    const coords = feat.geometry?.coordinates?.[0];
-    if (!coords) continue;
-
-    const lngs = coords.map(c => c[0]);
-    const lats = coords.map(c => c[1]);
+    const geom = feat.geometry;
+    if (!geom) continue;
+    const rings = geom.type === 'MultiPolygon'
+      ? geom.coordinates.flat(1)
+      : geom.coordinates;
+    const allPts = rings.flat(1);
+    const lngs = allPts.map(c => c[0]);
+    const lats = allPts.map(c => c[1]);
     const bbox = [Math.min(...lngs), Math.min(...lats), Math.max(...lngs), Math.max(...lats)];
 
     const item = document.createElement('div');

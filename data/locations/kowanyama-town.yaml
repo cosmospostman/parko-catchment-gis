@@ -1,0 +1,14 @@
+# Kowanyama town area — smaller bbox centred on the town itself
+name: "Kowanyama Town"
+centroid: null
+bbox: [141.669329, -15.530804, 141.833942, -15.417604]  # [lon_min, lat_min, lon_max, lat_max]
+dry_months: [5, 6, 7, 8, 9, 10]  # monsoonal — one month earlier than inland sites
+signals:
+  nir_cv:
+    min_obs_dry: 3
+  flowering:
+    haze_b02_anom_max: 0.012
+
+notes: >
+  Town-centred subset of the Kowanyama site. Same monsoonal climate as the
+  broader Mitchell River delta location.

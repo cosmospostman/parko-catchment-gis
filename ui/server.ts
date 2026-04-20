@@ -547,8 +547,12 @@ async function handler(req: Request): Promise<Response> {
       for (const entry of Deno.readDirSync(catchmentsDir)) {
         if (!entry.name.endsWith(".geojson")) continue;
         const raw = Deno.readTextFileSync(join(catchmentsDir, entry.name));
-        const feat = JSON.parse(raw) as GeoJSON.Feature;
-        features.push(feat);
+        const parsed = JSON.parse(raw);
+        if (parsed.type === "FeatureCollection") {
+          features.push(...parsed.features);
+        } else {
+          features.push(parsed as GeoJSON.Feature);
+        }
       }
       const fc: GeoJSON.FeatureCollection = { type: "FeatureCollection", features };
       return new Response(JSON.stringify(fc), {
