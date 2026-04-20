@@ -148,12 +148,12 @@ regions:
   # ---------------------------------------------------------------------------
   # Nardoo
   # ---------------------------------------------------------------------------
-  - id: nardoo_presence
-    name: "Nardoo — presence"
-    label: presence
-    bbox: [139.827548, -18.763523, 139.834458, -18.758597]
-    year: 2025
-    tags: [monsoonal]
+  # - id: nardoo_presence  # removed — presence-only site, no local absence
+  #   name: "Nardoo — presence"
+  #   label: presence
+  #   bbox: [139.827548, -18.763523, 139.834458, -18.758597]
+  #   year: 2025
+  #   tags: [monsoonal]
 
   # ---------------------------------------------------------------------------
   # Maria Downs — Gulf savanna (monsoonal)

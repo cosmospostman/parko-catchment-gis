@@ -13,7 +13,7 @@ EXPERIMENT = Experiment(
         "frenchs_absence_riparian_woodland", "frenchs_absence_riparian", "frenchs_absence_savanna",
         "maria_downs_presence", "maria_downs_absence",
         "mitchell_river_absence",
-        "nardoo_presence",
+        # "nardoo_presence",  # removed — presence-only site, no local absence
         "norman_road_presence_1", "norman_road_presence_2",
         "norman_road_presence_3", "norman_road_presence_4",
         "norman_road_absence_1", "norman_road_absence_2",
