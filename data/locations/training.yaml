@@ -251,26 +251,26 @@ regions:
   # ---------------------------------------------------------------------------
   # Stonehenge — commented out: patches too small (<100px each), insufficient signal
   # ---------------------------------------------------------------------------
-  - id: stonehenge_presence1
-    name: "Stonehenge — presence 1"
-    label: presence
-    bbox: [143.277469, -24.317308, 143.277813, -24.316723]
-    year: 2025
-    tags: [arid]
+  # - id: stonehenge_presence1  # removed — patches too small (<100px each)
+  #   name: "Stonehenge — presence 1"
+  #   label: presence
+  #   bbox: [143.277469, -24.317308, 143.277813, -24.316723]
+  #   year: 2025
+  #   tags: [arid]
 
-  - id: stonehenge_presence_2
-    name: "Stonehenge — presence 2"
-    label: presence
-    bbox: [143.282798, -24.316613, 143.283324, -24.315800]
-    year: 2025
-    tags: [arid]
+  # - id: stonehenge_presence_2  # removed — patches too small (<100px each)
+  #   name: "Stonehenge — presence 2"
+  #   label: presence
+  #   bbox: [143.282798, -24.316613, 143.283324, -24.315800]
+  #   year: 2025
+  #   tags: [arid]
 
-  - id: stonehenge_presence_3
-    name: "Stonehenge — presence 3"
-    label: presence
-    bbox: [143.286742, -24.313390, 143.287147, -24.312574]
-    year: 2025
-    tags: [arid]
+  # - id: stonehenge_presence_3  # removed — patches too small (<100px each)
+  #   name: "Stonehenge — presence 3"
+  #   label: presence
+  #   bbox: [143.286742, -24.313390, 143.287147, -24.312574]
+  #   year: 2025
+  #   tags: [arid]
 
   # - id: stonehenge_presence_4  # added after 0.855 run
   #   name: "Stonehenge — presence 4"
@@ -293,23 +293,23 @@ regions:
   #   year: 2025
   #   tags: [arid]
 
-  - id: stonehenge_absence1
-    name: "Stonehenge — absence 1"
-    label: absence
-    bbox: [143.284499, -24.319792, 143.284968, -24.319146]
-    year: 2025
-    tags: [arid]
+  # - id: stonehenge_absence1  # removed — patches too small (<100px each)
+  #   name: "Stonehenge — absence 1"
+  #   label: absence
+  #   bbox: [143.284499, -24.319792, 143.284968, -24.319146]
+  #   year: 2025
+  #   tags: [arid]
 
-  - id: stonehenge_absence_2
-    name: "Stonehenge — absence 2"
-    label: absence
-    bbox: [143.284249, -24.314355, 143.285214, -24.313305]
-    year: 2025
-    tags: [arid]
+  # - id: stonehenge_absence_2  # removed — patches too small (<100px each)
+  #   name: "Stonehenge — absence 2"
+  #   label: absence
+  #   bbox: [143.284249, -24.314355, 143.285214, -24.313305]
+  #   year: 2025
+  #   tags: [arid]
 
-  - id: stonehenge_absence_3
-    name: "Stonehenge — absence 3"
-    label: absence
-    bbox: [143.274128, -24.312269, 143.275729, -24.310612]
-    year: 2025
-    tags: [arid]
+  # - id: stonehenge_absence_3  # removed — patches too small (<100px each)
+  #   name: "Stonehenge — absence 3"
+  #   label: absence
+  #   bbox: [143.274128, -24.312269, 143.275729, -24.310612]
+  #   year: 2025
+  #   tags: [arid]

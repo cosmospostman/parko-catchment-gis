@@ -6,8 +6,7 @@ from tam.core.experiment import Experiment
 EXPERIMENT = Experiment(
     name="v1_spectral",
     region_ids=[
-        "lake_mueller_presence", "lake_mueller_presence_2",
-        # "lake_mueller_presence_3",  # added after 0.855 run
+        "lake_mueller_presence", "lake_mueller_presence_2", "lake_mueller_presence_3",
         # "lake_mueller_presence_mixed",  # removed — noisy labels (Parkinsonia mixed with native canopy)
         "lake_mueller_absence",
         "barcoorah_presence", "barcoorah_absence_lake", "barcoorah_absence_woodland",
@@ -21,9 +20,9 @@ EXPERIMENT = Experiment(
         "norman_road_presence_3", "norman_road_presence_4",
         "norman_road_absence_1", "norman_road_absence_2",
         # "rockhampton_presence_1", "rockhampton_presence_2",  # removed — uncertain labels (swamp context)
-        "stonehenge_presence1", "stonehenge_presence_2", "stonehenge_presence_3",
-        # "stonehenge_presence_4", "stonehenge_presence_5", "stonehenge_presence_6",  # added after 0.855 run
-        "stonehenge_absence1", "stonehenge_absence_2", "stonehenge_absence_3",
+        # stonehenge removed — patches too small (<100px each)
+        # "stonehenge_presence1", "stonehenge_presence_2", "stonehenge_presence_3",
+        # "stonehenge_absence1", "stonehenge_absence_2", "stonehenge_absence_3",
     ],
     feature_cols=ALL_FEATURE_COLS,
     model_kwargs={},
