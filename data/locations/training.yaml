@@ -1,0 +1,263 @@
+# data/locations/training.yaml
+#
+# National training regions for TAM (Temporal Attention Model).
+# Each region defines a labeled bbox used to source training pixels.
+#
+# Schema
+# ------
+# id          : str        — unique slug, used for region selection and index lookup
+# name        : str        — human-readable description
+# label       : str        — "presence" | "absence"
+# bbox        : [lon_min, lat_min, lon_max, lat_max]  (EPSG:4326)
+# year        : int | null — optional; if set, only observations in [year-5, year]
+#                            are used for training (guards against post-clearance imagery)
+# tags        : list[str]  — optional; for documentation/filtering reference
+# notes       : str        — optional; field survey context, data quality notes
+#
+# Pixel data is fetched per S2 tile (transparent to this file).
+# The pixel collector resolves each bbox → intersecting tile IDs and writes
+# to data/training/tiles/{tile_id}.parquet, with a sidecar index at
+# data/training/index.parquet mapping region_id → tile_ids.
+#
+# Experiment scripts select regions by listing their IDs:
+#   regions: [lake_mueller_presence, lake_mueller_absence, barcoorah_presence, frenchs_presence_1]
+
+regions:
+
+  # ---------------------------------------------------------------------------
+  # Barcoorah
+  # ---------------------------------------------------------------------------
+  - id: barcoorah_presence
+    name: "Barcoorah — presence"
+    label: presence
+    bbox: [145.372762, -22.518720, 145.373829, -22.517807]
+    year: 2021
+    tags: [arid]
+
+  - id: barcoorah_absence_lake
+    name: "Barcoorah — absence (lake)"
+    label: absence
+    bbox: [145.351399, -22.513143, 145.353667, -22.511048]
+    year: 2021
+    tags: [arid]
+
+  - id: barcoorah_absence_woodland
+    name: "Barcoorah — absence (land)"
+    label: absence
+    bbox: [145.374643, -22.519700, 145.376248, -22.518517]
+    year: 2021
+    tags: [arid, woodland]
+
+  # ---------------------------------------------------------------------------
+  # Frenchs — Cape York Peninsula (monsoonal, savanna-riparian)
+  # ---------------------------------------------------------------------------
+  - id: frenchs_presence_1
+    name: "Frenchs — presence sth"
+    label: presence
+    bbox: [141.539634, -15.808447, 141.541670, -15.806446]
+    year: 2023
+    tags: [monsoonal, savanna, riparian]
+    notes: >
+      Parkinsonia mixed with savanna, south of scene. Cape York Peninsula.
+      ~485 pixels at 10 m resolution (bbox area; fewer after SCL filtering).
+
+  - id: frenchs_presence_2
+    name: "Frenchs — presence nth"
+    label: presence
+    bbox: [141.540181, -15.799743, 141.541919, -15.797536]
+    year: 2023
+    tags: [monsoonal, savanna, riparian]
+    notes: >
+      Parkinsonia mixed with savanna, central scene. Cape York Peninsula.
+      ~457 pixels at 10 m resolution (bbox area; fewer after SCL filtering).
+
+  - id: frenchs_absence_mangrove
+    name: "Frenchs — absence (mangrove)"
+    label: absence
+    bbox: [141.509248, -15.831114, 141.510647, -15.829227]
+    year: 2023
+    tags: [monsoonal, mangrove]
+
+  - id: frenchs_absence_ocean
+    name: "Frenchs — absence (ocean)"
+    label: absence
+    bbox: [141.489420, -15.455648, 141.491504, -15.453639]
+    year: 2023
+    tags: [monsoonal, ocean]
+
+  - id: frenchs_absence_riparian_woodland
+    name: "Frenchs — absence (riparian)"
+    label: absence
+    bbox: [141.690580, -15.400245, 141.695970, -15.398123]
+    year: 2023
+    tags: [monsoonal, riparian, woodland]
+
+  - id: frenchs_absence_riparian
+    name: "Frenchs — absence (riparian native)"
+    label: absence
+    bbox: [141.54113, -15.77579, 141.54292, -15.77448]
+    year: 2023
+    tags: [monsoonal, riparian]
+
+  - id: frenchs_absence_savanna
+    name: "Frenchs — absence (savanna)"
+    label: absence
+    bbox: [141.551999, -15.802930, 141.557016, -15.798478]
+    year: 2023
+    tags: [monsoonal, savanna]
+
+  # ---------------------------------------------------------------------------
+  # Lake Mueller — Thomson River riparian corridor (GPS-logged field survey)
+  # ---------------------------------------------------------------------------
+  - id: lake_mueller_presence
+    name: "Lake Mueller — presence"
+    label: presence
+    bbox: [145.4239, -22.7640, 145.4250, -22.7610]
+    year: 2021
+    tags: [arid, riparian, gps_surveyed]
+    notes: >
+      Primary presence site. GPS-logged field survey. Dense Parkinsonia infestation
+      along the Thomson River. ~377 pixels at 10 m resolution (bbox area; fewer after SCL filtering).
+
+  - id: lake_mueller_presence_2
+    name: "Lake Mueller — presence 2"
+    label: presence
+    bbox: [145.426260, -22.764256, 145.427817, -22.763297]
+    year: 2021
+    tags: [arid, riparian, gps_surveyed]
+
+  - id: lake_mueller_absence
+    name: "Lake Mueller — absence"
+    label: absence
+    bbox: [145.418601, -22.767940, 145.420651, -22.766007]
+    year: 2021
+    tags: [arid, riparian, gps_surveyed]
+    notes: >
+      Absence site. Lake Mueller area. Confirmed absence region.
+
+  # ---------------------------------------------------------------------------
+  # Mitchell River — Cape York Peninsula (monsoonal, riparian)
+  # ---------------------------------------------------------------------------
+  - id: mitchell_river_absence
+    name: "Mitchell River — absence (riparian)"
+    label: absence
+    bbox: [142.147479, -15.806283, 142.154527, -15.796256]
+    year: 2025
+    tags: [monsoonal, riparian]
+
+  # ---------------------------------------------------------------------------
+  # Nardoo
+  # ---------------------------------------------------------------------------
+  - id: nardoo_presence
+    name: "Nardoo — presence"
+    label: presence
+    bbox: [139.827548, -18.763523, 139.834458, -18.758597]
+    year: 2025
+    tags: [monsoonal]
+
+  # ---------------------------------------------------------------------------
+  # Norman Road — Gulf savanna (monsoonal)
+  # ---------------------------------------------------------------------------
+  - id: norman_road_presence_1
+    name: "Norman Road — presence 1"
+    label: presence
+    bbox: [141.647945, -20.397868, 141.649492, -20.396426]
+    year: 2025
+    tags: [monsoonal]
+
+  - id: norman_road_presence_2
+    name: "Norman Road — presence 2"
+    label: presence
+    bbox: [141.606199, -20.495882, 141.608053, -20.494299]
+    year: 2025
+    tags: [monsoonal]
+
+  - id: norman_road_presence_3  # removed — possible label noise
+    name: "Norman Road — presence 3"
+    label: presence
+    bbox: [141.471105, -20.316546, 141.473597, -20.312332]
+    year: 2025
+    tags: [monsoonal]
+
+  - id: norman_road_presence_4
+    name: "Norman Road — presence 4"
+    label: presence
+    bbox: [141.476711, -20.313112, 141.478064, -20.307877]
+    year: 2025
+    tags: [monsoonal]
+
+  - id: norman_road_absence_1  # removed — possible label noise
+    name: "Norman Road — absence 1"
+    label: absence
+    bbox: [141.609776, -20.501779, 141.612291, -20.499608]
+    year: 2025
+    tags: [monsoonal]
+
+  - id: norman_road_absence_2  # removed — possible label noise
+    name: "Norman Road — absence 2"
+    label: absence
+    bbox: [141.429584, -20.412734, 141.432358, -20.410367]
+    year: 2025
+    tags: [monsoonal]
+
+  # ---------------------------------------------------------------------------
+  # Rockhampton
+  # ---------------------------------------------------------------------------
+  # - id: rockhampton_presence_1  # removed — uncertain labels (swamp context)
+  #   name: "Rockhampton — presence 1"
+  #   label: presence
+  #   bbox: [150.445023, -23.373323, 150.448526, -23.371305]
+  #   year: 2025
+  #   tags: [subtropical]
+
+  # - id: rockhampton_presence_2  # removed — uncertain labels (swamp context)
+  #   name: "Rockhampton — presence 2"
+  #   label: presence
+  #   bbox: [150.441733, -23.372233, 150.444983, -23.370562]
+  #   year: 2025
+  #   tags: [subtropical]
+
+  # ---------------------------------------------------------------------------
+  # Stonehenge
+  # ---------------------------------------------------------------------------
+  - id: stonehenge_presence1
+    name: "Stonehenge — presence 1"
+    label: presence
+    bbox: [143.277469, -24.317308, 143.277813, -24.316723]
+    year: 2025
+    tags: [arid]
+
+  - id: stonehenge_presence_2
+    name: "Stonehenge — presence 2"
+    label: presence
+    bbox: [143.282798, -24.316613, 143.283324, -24.315800]
+    year: 2025
+    tags: [arid]
+
+  - id: stonehenge_presence_3
+    name: "Stonehenge — presence 3"
+    label: presence
+    bbox: [143.286742, -24.313390, 143.287147, -24.312574]
+    year: 2025
+    tags: [arid]
+
+  - id: stonehenge_absence1
+    name: "Stonehenge — absence 1"
+    label: absence
+    bbox: [143.284499, -24.319792, 143.284968, -24.319146]
+    year: 2025
+    tags: [arid]
+
+  - id: stonehenge_absence_2
+    name: "Stonehenge — absence 2"
+    label: absence
+    bbox: [143.284249, -24.314355, 143.285214, -24.313305]
+    year: 2025
+    tags: [arid]
+
+  - id: stonehenge_absence_3
+    name: "Stonehenge — absence 3"
+    label: absence
+    bbox: [143.274128, -24.312269, 143.275729, -24.310612]
+    year: 2025
+    tags: [arid]
