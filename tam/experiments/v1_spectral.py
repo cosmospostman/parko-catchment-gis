@@ -11,6 +11,7 @@ EXPERIMENT = Experiment(
         "frenchs_presence_1", "frenchs_presence_2",
         "frenchs_absence_mangrove", "frenchs_absence_ocean",
         "frenchs_absence_riparian_woodland", "frenchs_absence_riparian", "frenchs_absence_savanna",
+        "maria_downs_presence", "maria_downs_absence",
         "mitchell_river_absence",
         "nardoo_presence",
         "norman_road_presence_1", "norman_road_presence_2",

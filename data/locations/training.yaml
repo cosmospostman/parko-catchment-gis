@@ -156,6 +156,23 @@ regions:
     tags: [monsoonal]
 
   # ---------------------------------------------------------------------------
+  # Maria Downs — Gulf savanna (monsoonal)
+  # ---------------------------------------------------------------------------
+  - id: maria_downs_presence
+    name: "Maria Downs — presence"
+    label: presence
+    bbox: [141.829279, -20.346781, 141.836420, -20.340582]
+    year: 2025
+    tags: [monsoonal]
+
+  - id: maria_downs_absence
+    name: "Maria Downs — absence"
+    label: absence
+    bbox: [141.820453, -20.354505, 141.831232, -20.349521]
+    year: 2025
+    tags: [monsoonal]
+
+  # ---------------------------------------------------------------------------
   # Norman Road — Gulf savanna (monsoonal)
   # ---------------------------------------------------------------------------
   - id: norman_road_presence_1
