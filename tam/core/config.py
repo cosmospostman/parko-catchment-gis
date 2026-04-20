@@ -8,10 +8,10 @@ from dataclasses import asdict, dataclass
 @dataclass
 class TAMConfig:
     # Model architecture
-    d_model:  int   = 64
+    d_model:  int   = 32
     n_heads:  int   = 4
-    n_layers: int   = 2
-    d_ff:     int   = 128
+    n_layers: int   = 1
+    d_ff:     int   = 64
     dropout:  float = 0.3
 
     # Data (mirrors dataset.py constants — change both together)
