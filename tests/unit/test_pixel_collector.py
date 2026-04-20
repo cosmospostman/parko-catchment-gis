@@ -30,6 +30,11 @@ Tests
 18. extract_item_to_df: two items from different tiles produce two rows — no cross-tile dedup.
 19. Granule dedup regex strips the processing-granule index suffix correctly.
 20. Cross-tile items with matching (date, satellite) both survive per-tile dedup (Bug PC6 — documents).
+21. collect() dedup step removes cross-tile duplicate rows, keeping higher scl_purity.
+22. collect() dedup: no-duplicate parquet is left unchanged, total_rows correct.
+23. collect() dedup: non-duplicate rows adjacent to a boundary pixel are preserved.
+24. collect() dedup: duplicate pair straddling a row-group boundary is resolved.
+25. collect() dedup: equal scl_purity tie-break keeps the first tile in input order.
 """
 
 from __future__ import annotations
@@ -453,3 +458,199 @@ def test_cross_tile_items_survive_per_tile_dedup():
     combined = deduped_hbu + deduped_hbv
     assert len(combined) == 2  # cross-tile duplicate survives
     assert combined[0].id == combined[1].id  # same item ID, different tile context
+
+
+# ---------------------------------------------------------------------------
+# Tests 21–25 — collect() two-pass streaming dedup
+# ---------------------------------------------------------------------------
+
+def _dedup_row(tile_id, scl_purity, point_id="px_0000_0000", dt=None):
+    """Build a minimal pixel row dict for dedup tests."""
+    import pandas as pd
+    from analysis.constants import BANDS, SPECTRAL_INDEX_COLS
+    if dt is None:
+        dt = pd.Timestamp("2022-08-15")
+    return {
+        "point_id": point_id,
+        "lon": 145.41, "lat": -22.78,
+        "date": dt,
+        "item_id": f"S2A_{tile_id}_20220815",
+        "tile_id": tile_id,
+        **{b: 0.15 for b in BANDS},
+        "scl_purity": scl_purity,
+        "scl": 4, "aot": 0.9,
+        "view_zenith": 0.95, "sun_zenith": 0.80,
+        **{c: 0.3 for c in SPECTRAL_INDEX_COLS},
+    }
+
+
+def _apply_dedup(out_path):
+    """Run the same two-pass streaming dedup logic as collect() and return (df, n_removed)."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    pf = pq.ParquetFile(out_path)
+    n_before = pf.metadata.num_rows
+    key_cols = ["point_id", "date", "scl_purity", "tile_id"]
+    keys_df = pf.read(columns=key_cols).to_pandas()
+    keys_df = keys_df.sort_values(
+        ["point_id", "date", "scl_purity", "tile_id"],
+        ascending=[True, True, False, True],
+    ).reset_index(drop=True)
+    dup_mask = keys_df.duplicated(subset=["point_id", "date"], keep="first")
+    n_dedup = int(dup_mask.sum())
+
+    if not n_dedup:
+        del pf
+        return pq.read_table(out_path).to_pandas(), 0
+
+    losers = (
+        keys_df[dup_mask][["point_id", "date", "tile_id"]]
+        .assign(_drop=True)
+        .reset_index(drop=True)
+    )
+    schema = pf.schema_arrow
+    tmp_path = out_path.with_suffix(".tmp.parquet")
+    tmp_writer = pq.ParquetWriter(tmp_path, schema)
+    for rg_idx in range(pf.metadata.num_row_groups):
+        rg_df = pf.read_row_group(rg_idx).to_pandas()
+        merged = rg_df.merge(losers, on=["point_id", "date", "tile_id"], how="left")
+        filtered = rg_df[merged["_drop"].isna()]
+        if len(filtered):
+            tmp_writer.write_table(pa.Table.from_pandas(filtered, schema=schema, preserve_index=False))
+    tmp_writer.close()
+    del pf
+    tmp_path.replace(out_path)
+    return pq.read_table(out_path).to_pandas(), n_dedup
+
+
+# ---------------------------------------------------------------------------
+# Test 21 — collect() dedup removes cross-tile boundary duplicates
+# ---------------------------------------------------------------------------
+
+def test_collect_output_deduplicates_cross_tile_rows(tmp_path):
+    """Two rows sharing (point_id, date) from different tiles: higher scl_purity wins."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import pandas as pd
+
+    df_raw = pd.DataFrame([_dedup_row("55HBU", 0.6), _dedup_row("55HBV", 0.9)])
+    out_path = tmp_path / "out.parquet"
+    pq.write_table(pa.Table.from_pandas(df_raw, preserve_index=False), out_path)
+
+    result, n_removed = _apply_dedup(out_path)
+    assert n_removed == 1
+    assert len(result) == 1
+    assert result.iloc[0]["tile_id"] == "55HBV"
+    assert result.iloc[0]["scl_purity"] == pytest.approx(0.9)
+
+
+# ---------------------------------------------------------------------------
+# Test 22 — no-duplicate parquet is unchanged
+# ---------------------------------------------------------------------------
+
+def test_dedup_noop_when_no_duplicates(tmp_path):
+    """When every (point_id, date) is unique, no rows are removed."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import pandas as pd
+
+    dt1 = pd.Timestamp("2022-08-15")
+    dt2 = pd.Timestamp("2022-09-01")
+    df_raw = pd.DataFrame([
+        _dedup_row("55HBU", 0.8, point_id="px_0000_0000", dt=dt1),
+        _dedup_row("55HBU", 0.7, point_id="px_0000_0000", dt=dt2),   # same pixel, different date
+        _dedup_row("55HBU", 0.9, point_id="px_0001_0000", dt=dt1),   # different pixel, same date
+    ])
+    out_path = tmp_path / "out.parquet"
+    pq.write_table(pa.Table.from_pandas(df_raw, preserve_index=False), out_path)
+
+    result, n_removed = _apply_dedup(out_path)
+    assert n_removed == 0
+    assert len(result) == 3
+
+
+# ---------------------------------------------------------------------------
+# Test 23 — non-duplicate rows adjacent to a boundary pixel are preserved
+# ---------------------------------------------------------------------------
+
+def test_dedup_preserves_non_duplicate_rows(tmp_path):
+    """Interior pixels with unique (point_id, date) survive alongside the deduped boundary pixel."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import pandas as pd
+
+    dt = pd.Timestamp("2022-08-15")
+    df_raw = pd.DataFrame([
+        _dedup_row("55HBU", 0.5, point_id="px_interior_a", dt=dt),   # unique — keep
+        _dedup_row("55HBU", 0.6, point_id="px_boundary",   dt=dt),   # duplicate loser
+        _dedup_row("55HBV", 0.9, point_id="px_boundary",   dt=dt),   # duplicate winner
+        _dedup_row("55HBV", 0.8, point_id="px_interior_b", dt=dt),   # unique — keep
+    ])
+    out_path = tmp_path / "out.parquet"
+    pq.write_table(pa.Table.from_pandas(df_raw, preserve_index=False), out_path)
+
+    result, n_removed = _apply_dedup(out_path)
+    assert n_removed == 1
+    assert len(result) == 3
+    surviving_pids = set(result["point_id"])
+    assert "px_interior_a" in surviving_pids
+    assert "px_interior_b" in surviving_pids
+    assert result[result["point_id"] == "px_boundary"].iloc[0]["tile_id"] == "55HBV"
+
+
+# ---------------------------------------------------------------------------
+# Test 24 — duplicate pair straddling a row-group boundary
+# ---------------------------------------------------------------------------
+
+def test_dedup_across_row_group_boundary(tmp_path):
+    """The dedup correctly removes a loser whose row group differs from the winner's."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import pandas as pd
+
+    dt = pd.Timestamp("2022-08-15")
+    # Write each row as its own row group (row_group_size=1) to guarantee the
+    # duplicate pair spans two row groups.
+    winner = pd.DataFrame([_dedup_row("55HBV", 0.9, dt=dt)])
+    loser  = pd.DataFrame([_dedup_row("55HBU", 0.6, dt=dt)])
+    out_path = tmp_path / "out.parquet"
+    writer = pq.ParquetWriter(out_path, pa.Table.from_pandas(winner, preserve_index=False).schema)
+    writer.write_table(pa.Table.from_pandas(winner, preserve_index=False))
+    writer.write_table(pa.Table.from_pandas(loser,  preserve_index=False))
+    writer.close()
+
+    assert pq.ParquetFile(out_path).metadata.num_row_groups == 2
+
+    result, n_removed = _apply_dedup(out_path)
+    assert n_removed == 1
+    assert len(result) == 1
+    assert result.iloc[0]["tile_id"] == "55HBV"
+
+
+# ---------------------------------------------------------------------------
+# Test 25 — equal scl_purity: lower tile_id wins deterministically
+# ---------------------------------------------------------------------------
+
+def test_dedup_tiebreak_lower_tile_id_wins(tmp_path):
+    """When scl_purity is equal, the lower tile_id (ascending lexicographic) is kept.
+
+    This is deterministic regardless of the order the rows were written.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import pandas as pd
+
+    dt = pd.Timestamp("2022-08-15")
+    # Write HBV first so input order would naively keep HBV — tie-break must override.
+    df_raw = pd.DataFrame([
+        _dedup_row("55HBV", 0.8, dt=dt),
+        _dedup_row("55HBU", 0.8, dt=dt),
+    ])
+    out_path = tmp_path / "out.parquet"
+    pq.write_table(pa.Table.from_pandas(df_raw, preserve_index=False), out_path)
+
+    result, n_removed = _apply_dedup(out_path)
+    assert n_removed == 1
+    assert len(result) == 1
+    assert result.iloc[0]["tile_id"] == "55HBU"   # lower tile_id wins

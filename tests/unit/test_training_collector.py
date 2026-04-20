@@ -22,6 +22,7 @@ Tests
 14. _region_parquet_path: path ends with tiles/regions/{region_id}.parquet.
 15. Tile-grouping loop: a region straddling two tiles appears under both buckets.
 16. Per-tile dedup does not remove cross-tile items with matching ids (Bug TC6 — documents).
+17. Cross-tile boundary pixel produces only one row after (point_id, date) dedup.
 """
 
 from __future__ import annotations
@@ -263,3 +264,47 @@ def test_within_tile_dedup_does_not_remove_cross_tile_items():
     combined = deduped_hbu + deduped_hbv
     assert len(combined) == 2
     assert deduped_hbu[0].id == deduped_hbv[0].id  # same item ID, different tile context
+
+
+# ---------------------------------------------------------------------------
+# Test 17 — cross-tile boundary pixel deduplicated in combined output
+# ---------------------------------------------------------------------------
+
+def test_cross_tile_boundary_pixel_deduplicated_in_output():
+    """A pixel appearing in two tile parquets (cross-tile boundary) produces
+    only one row in a combined output after (point_id, date) dedup."""
+    import pandas as pd
+
+    from analysis.constants import BANDS, SPECTRAL_INDEX_COLS
+
+    pid = "boundary_region_0000_0000"
+    dt  = pd.Timestamp("2022-08-15")
+
+    def _row(tile_id, scl_purity):
+        return {
+            "point_id": pid,
+            "lon": 145.15, "lat": -22.95,
+            "date": dt,
+            "item_id": f"S2A_{tile_id}_20220815",
+            "tile_id": tile_id,
+            **{b: 0.12 for b in BANDS},
+            "scl_purity": scl_purity,
+            "scl": 4, "aot": 0.85,
+            "view_zenith": 0.9, "sun_zenith": 0.8,
+            **{c: 0.25 for c in SPECTRAL_INDEX_COLS},
+        }
+
+    df_hbu = pd.DataFrame([_row("55HBU", 0.7)])
+    df_hbv = pd.DataFrame([_row("55HBV", 0.95)])
+    combined_raw = pd.concat([df_hbu, df_hbv], ignore_index=True)
+
+    df_dedup = (
+        combined_raw
+        .sort_values(["point_id", "date", "scl_purity"], ascending=[True, True, False])
+        .drop_duplicates(subset=["point_id", "date"], keep="first")
+        .sort_values(["point_id", "date"])
+        .reset_index(drop=True)
+    )
+
+    assert len(df_dedup) == 1
+    assert df_dedup.iloc[0]["tile_id"] == "55HBV"

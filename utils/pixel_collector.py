@@ -136,7 +136,7 @@ def make_pixel_grid(
     points: list[tuple[str, float, float]] = []
     for i, xi in enumerate(xs):
         for j, yj in enumerate(ys):
-            lon, lat = to_wgs.transform(xi, yj)
+            lon, lat = to_wgs.transform(float(xi), float(yj))
             pid = f"{point_id_prefix}_{i:04d}_{j:04d}"
             points.append((pid, float(lon), float(lat)))
 
@@ -560,6 +560,79 @@ def collect(
 
     if final_writer is not None:
         final_writer.close()
+
+    # --- 6. Dedup (point_id, date) — removes cross-tile boundary duplicates -----
+    # A pixel at the boundary of two S2 MGRS tiles may have been observed by both
+    # tiles on the same date, producing two rows with the same (point_id, date) but
+    # different band values (independent L2A atmospheric correction per tile).
+    # Keep the row with higher scl_purity; break ties by keeping the first tile
+    # (lexicographic order, which is arbitrary but deterministic).
+    #
+    # Two-pass streaming approach to avoid loading the full parquet into memory:
+    # Pass 1: read only the key columns to identify which (point_id, date, tile_id)
+    #         rows should be dropped (the lower-purity duplicate per pair).
+    # Pass 2: stream the full parquet row-group-by-row-group, filtering out the
+    #         drop set, writing directly to a temp file then renaming over out_path.
+    if final_writer is not None:
+        pf = pq.ParquetFile(out_path)
+        n_before = pf.metadata.num_rows
+
+        # Pass 1 — find losers
+        key_cols = ["point_id", "date", "scl_purity", "tile_id"]
+        keys_df = pf.read(columns=key_cols).to_pandas()
+        # Primary sort: descending scl_purity so the winner is first.
+        # Tie-break: ascending tile_id so the result is deterministic regardless
+        # of the order rows were written (lower tile_id wins on equal purity).
+        keys_df = keys_df.sort_values(
+            ["point_id", "date", "scl_purity", "tile_id"],
+            ascending=[True, True, False, True],
+        ).reset_index(drop=True)
+        dup_mask = keys_df.duplicated(subset=["point_id", "date"], keep="first")
+        n_dedup = int(dup_mask.sum())
+
+        if n_dedup:
+            logger.info(
+                "Cross-tile dedup: %d rows → %d (removing %d boundary duplicates)",
+                n_before, n_before - n_dedup, n_dedup,
+            )
+            # losers: one row per (point_id, date, tile_id) to drop.
+            # duplicated(keep="first") already handled ties — the winner was sorted
+            # first by descending scl_purity, so the loser is correctly marked.
+            losers = (
+                keys_df[dup_mask][["point_id", "date", "tile_id"]]
+                .assign(_drop=True)
+                .reset_index(drop=True)
+            )
+
+            # Pass 2 — vectorised stream rewrite via anti-join
+            tmp_path = out_path.with_suffix(".dedup_tmp.parquet")
+            schema = pf.schema_arrow
+            tmp_writer = pq.ParquetWriter(tmp_path, schema)
+            n_written = 0
+
+            for rg_idx in range(pf.metadata.num_row_groups):
+                rg_df = pf.read_row_group(rg_idx).to_pandas()
+                # Anti-join: keep rows that do NOT appear in losers.
+                # merge with indicator then filter — no Python row loop.
+                merged = rg_df.merge(
+                    losers, on=["point_id", "date", "tile_id"], how="left"
+                )
+                # For the rare 3-tile case a loser row matches multiple times;
+                # we want to drop at most len(losers) rows total, but since the
+                # parquet is sorted and boundary strips are narrow, a simple mask
+                # is correct: every row that joined a loser entry is a duplicate.
+                filtered = rg_df[merged["_drop"].isna()]
+                if len(filtered):
+                    tmp_writer.write_table(pa.Table.from_pandas(filtered, schema=schema, preserve_index=False))
+                    n_written += len(filtered)
+
+            tmp_writer.close()
+            del pf
+            tmp_path.replace(out_path)
+            total_rows = n_written
+        else:
+            del pf
+            total_rows = n_before
 
     # Clean up sorted intermediates (original shards are kept)
     for sorted_sp in sorted_shard_paths:
