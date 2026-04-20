@@ -24,6 +24,10 @@ const QGLOBE_LAYERS = new Set([
   'LatestStateProgram_QGovSISPUsers',
 ]);
 
+const DIRECT_TILE_URLS = {
+  EsriWorldImagery: 'https://services.arcgisonline.com/arcgis/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+};
+
 function tileUrl(layerName) {
   return `/tile/${layerName}/{z}/{x}/{y}`;
 }
@@ -36,6 +40,7 @@ function wmsUrl(layerName) {
 }
 
 function layerUrl(layerName) {
+  if (DIRECT_TILE_URLS[layerName]) return DIRECT_TILE_URLS[layerName];
   return QGLOBE_LAYERS.has(layerName) ? tileUrl(layerName) : wmsUrl(layerName);
 }
 
@@ -55,9 +60,10 @@ map.on('load', () => {
 
 document.getElementById('layer-select').addEventListener('change', (e) => {
   activeLayer = e.target.value;
-  // Swap tile URL by removing and re-adding the source
-  map.removeLayer('qld-globe-layer');
-  map.removeSource('qld-globe');
+  try {
+    map.removeLayer('qld-globe-layer');
+    map.removeSource('qld-globe');
+  } catch (_) { /* in-flight tile decode may throw — safe to ignore */ }
   map.addSource('qld-globe', {
     type: 'raster',
     tiles: [layerUrl(activeLayer)],
@@ -207,9 +213,9 @@ function loadSightings() {
         },
       });
 
-      const count = geojson.features?.length ?? 0;
-      const el = document.getElementById('sightings-count');
-      if (el) el.textContent = count.toLocaleString();
+      sightingsTotalCount = geojson.features?.length ?? 0;
+      const countEl = document.getElementById('sightings-count');
+      if (countEl) countEl.textContent = sightingsTotalCount.toLocaleString();
 
       map.on('click', 'sightings-layer', (e) => {
         const feat = e.features[0];
@@ -218,6 +224,9 @@ function loadSightings() {
       });
       map.on('mouseenter', 'sightings-layer', () => { map.getCanvas().style.cursor = 'pointer'; });
       map.on('mouseleave', 'sightings-layer', () => { map.getCanvas().style.cursor = ''; });
+
+      // expose features for year-slider count updates
+      sightingsFeatures = geojson.features ?? [];
     })
     .catch(err => console.error('Failed to load sightings:', err));
 }
@@ -560,6 +569,8 @@ const CMAP_GRADIENTS = {
 
 let currentRankingOpacity = 0.6;
 let currentCmap = 'rdylgn';
+let sightingsTotalCount = 0;
+let sightingsFeatures = [];
 
 document.getElementById('colormap-swatch').style.background = CMAP_GRADIENTS[currentCmap];
 
@@ -612,6 +623,31 @@ document.getElementById('sightings-toggle').addEventListener('change', (e) => {
     map.setLayoutProperty('sightings-layer', 'visibility', e.target.checked ? 'visible' : 'none');
   }
 });
+
+{
+  const slider = document.getElementById('sightings-year-slider');
+  const label = document.getElementById('sightings-year-label');
+  const MIN_YEAR = parseInt(slider.min, 10);
+
+  function applySightingsYearFilter() {
+    if (!map.getLayer('sightings-layer')) return;
+    const since = parseInt(slider.value, 10);
+    if (since <= MIN_YEAR) {
+      map.setFilter('sightings-layer', null);
+      label.textContent = 'all years';
+      const countEl = document.getElementById('sightings-count');
+      if (countEl) countEl.textContent = sightingsTotalCount.toLocaleString();
+    } else {
+      map.setFilter('sightings-layer', ['>=', ['to-number', ['get', 'year']], since]);
+      label.textContent = `≥ ${since}`;
+      const n = sightingsFeatures.filter(f => (f.properties.year ?? 0) >= since).length;
+      const countEl = document.getElementById('sightings-count');
+      if (countEl) countEl.textContent = n.toLocaleString();
+    }
+  }
+
+  slider.addEventListener('input', applySightingsYearFilter);
+}
 
 // ---------------------------------------------------------------------------
 // Imagery info sidebar section

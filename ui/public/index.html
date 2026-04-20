@@ -468,6 +468,13 @@
         <span class="ival"><label style="cursor:pointer;"><input type="checkbox" id="sightings-toggle"> ALA occurrences</label></span>
       </div>
       <div class="irow">
+        <span class="ikey">since</span>
+        <span class="ival" style="flex:1;">
+          <input type="range" id="sightings-year-slider" min="1900" max="2026" value="1900" step="1" style="width:100%;accent-color:#f97316;">
+          <span id="sightings-year-label" style="font-size:11px;color:#888;">all years</span>
+        </span>
+      </div>
+      <div class="irow">
         <span class="ikey">count</span>
         <span class="ival" id="sightings-count"><span class="dim">—</span></span>
       </div>
@@ -483,6 +490,7 @@
           <option value="LatestStateProgram_AllUsers">Latest aerial (public)</option>
           <option value="LatestSatelliteWOS_AllUsers">Latest satellite (Planet)</option>
           <option value="EarliestAerialOrtho_AllUsers">Earliest aerial</option>
+          <option value="EsriWorldImagery">Recent satellite (Esri)</option>
         </select>
       </div>
       <div class="irow">

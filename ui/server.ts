@@ -165,6 +165,11 @@ const QGLOBE_LAYERS = new Set([
   "LatestStateProgram_QGovSISPUsers",
 ]);
 
+// Extra direct-tile layers (no proxy — served straight from the client)
+// Listed here so the server knows they're valid for /api/imagery-date (returns null)
+const DIRECT_TILE_LAYERS = new Set([
+  "EsriWorldImagery",
+]);
 
 const SPATIAL_IMG_BASE = "https://spatial-img.information.qld.gov.au";
 const QGLOBE_URL = "https://qldglobe.information.qld.gov.au";
@@ -296,6 +301,7 @@ async function handleWmsTile(req: Request, layer: string): Promise<Response> {
   const params = new URL(req.url).searchParams;
   const key = await cacheKey(layer, params);
   const cachePath = join(WMS_CACHE_DIR, key + ".jpg");
+
   const upstreamUrl = new URL(wmsBase(layer));
   upstreamUrl.search = params.toString();
   return fetchAndCache(upstreamUrl.toString(), cachePath);
@@ -330,6 +336,13 @@ async function handleImageryDate(req: Request): Promise<Response> {
   if (!x || !y) {
     return new Response(JSON.stringify({ error: "x and y required" }), {
       status: 400,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  // Direct-tile layers don't support ArcGIS ImageServer identify
+  if (DIRECT_TILE_LAYERS.has(layer)) {
+    return new Response(JSON.stringify({ date: null }), {
       headers: { "content-type": "application/json" },
     });
   }

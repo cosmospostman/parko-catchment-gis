@@ -19,9 +19,9 @@ EXPERIMENT = Experiment(
         "norman_road_presence_3", "norman_road_presence_4",
         "norman_road_absence_1", "norman_road_absence_2",
         # "rockhampton_presence_1", "rockhampton_presence_2",  # removed — uncertain labels (swamp context)
-        "stonehenge_presence1", "stonehenge_presence_2", "stonehenge_presence_3",
-        "stonehenge_presence_4", "stonehenge_presence_5", "stonehenge_presence_6",
-        "stonehenge_absence1", "stonehenge_absence_2", "stonehenge_absence_3",
+        # "stonehenge_presence1", "stonehenge_presence_2", "stonehenge_presence_3",  # removed — patches too small
+        # "stonehenge_presence_4", "stonehenge_presence_5", "stonehenge_presence_6",
+        # "stonehenge_absence1", "stonehenge_absence_2", "stonehenge_absence_3",
     ],
     feature_cols=ALL_FEATURE_COLS,
     model_kwargs={},
