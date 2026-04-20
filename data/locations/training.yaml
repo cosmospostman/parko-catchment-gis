@@ -133,15 +133,12 @@ regions:
     year: 2021
     tags: [arid, riparian]
 
-  - id: lake_mueller_presence_mixed
-    name: "Lake Mueller — presence (mixed riparian)"
-    label: presence
-    bbox: [145.444249, -22.749611, 145.448192, -22.747165]
-    year: 2021
-    tags: [arid, riparian, mixed]
-    notes: >
-      Parkinsonia mixed with native riparian. Noisy positive — forces model to detect
-      Parkinsonia signal when not dominant in canopy.
+  # - id: lake_mueller_presence_mixed  # removed — noisy labels (Parkinsonia mixed with native canopy)
+  #   name: "Lake Mueller — presence (mixed riparian)"
+  #   label: presence
+  #   bbox: [145.444249, -22.749611, 145.448192, -22.747165]
+  #   year: 2021
+  #   tags: [arid, riparian, mixed]
 
   - id: lake_mueller_absence
     name: "Lake Mueller — absence"

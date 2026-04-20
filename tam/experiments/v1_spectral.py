@@ -6,7 +6,8 @@ from tam.core.experiment import Experiment
 EXPERIMENT = Experiment(
     name="v1_spectral",
     region_ids=[
-        "lake_mueller_presence", "lake_mueller_presence_2", "lake_mueller_presence_3", "lake_mueller_presence_mixed",
+        "lake_mueller_presence", "lake_mueller_presence_2", "lake_mueller_presence_3",
+        # "lake_mueller_presence_mixed",  # removed — noisy labels (Parkinsonia mixed with native canopy)
         "lake_mueller_absence",
         "barcoorah_presence", "barcoorah_absence_lake", "barcoorah_absence_woodland",
         "frenchs_presence_1", "frenchs_presence_2",
