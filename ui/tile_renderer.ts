@@ -17,7 +17,7 @@ const OUTPUTS_DIR = join(__dirname, "..", "outputs");
 // ---------------------------------------------------------------------------
 
 interface Grid {
-  arr: Float32Array; // row-major, prob_lr values; 0 = no pixel
+  arr: Float32Array; // row-major, prob_* values; 0 = no pixel
   lonMin: number;
   latMax: number; // top-left corner (lat decreases with row index)
   width: number;
@@ -78,7 +78,7 @@ export async function loadGrid(location: string, stem: string): Promise<Grid | n
   const text = await Deno.readTextFile(csvPath);
   const lines = text.split("\n");
 
-  // Header: point_id,lon,lat,is_presence,prob_lr,rank,...
+  // Header: point_id,lon,lat,is_presence,prob_tam,rank,...
   // Find column indices from header
   const header = lines[0].split(",");
   const iLon  = header.indexOf("lon");

@@ -1,6 +1,6 @@
 """utils/heatmap.py — Parkinsonia probability heatmap plots.
 
-Produces two separate figures from a scored DataFrame (output of ParkoClassifier.score()):
+Produces two separate figures from a scored DataFrame:
   1. <stem>_prob_vs_imagery.png  — Queensland Globe satellite underlay + per-pixel overlay
   2. <stem>_prob_black.png       — Black-background probability grid
 
@@ -57,7 +57,7 @@ def _prob_grid(
     lat_min: float, lat_max: float,
     cmap,
     alpha: float = 0.85,
-    prob_col: str = "prob_lr",
+    prob_col: str = "prob_tam",
 ) -> np.ndarray:
     """Rasterise probability values onto a regular lon/lat grid.
 
@@ -125,7 +125,7 @@ def plot_prob_heatmaps(
     out_dir: Path,
     stem: str,
     annotations: list[dict] | None = None,
-    prob_col: str = "prob_lr",
+    prob_col: str = "prob_tam",
 ) -> list[Path]:
     """Render two separate probability heatmap figures.
 
@@ -145,7 +145,7 @@ def plot_prob_heatmaps(
     annotations: optional list of Rectangle annotation dicts. Each dict must
                  contain ``xy``, ``width``, ``height`` and any valid
                  ``mpatches.Rectangle`` kwargs (e.g. edgecolor, linestyle, label).
-    prob_col   : name of the probability column (default: "prob_lr")
+    prob_col   : name of the probability column (default: "prob_tam")
 
     Returns
     -------

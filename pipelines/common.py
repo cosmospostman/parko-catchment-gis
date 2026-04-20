@@ -53,23 +53,9 @@ def summarise(
     loc,
     *,
     show_scene_percentiles: bool = True,
-    prob_col: str = "prob_lr",
+    prob_col: str = "prob_tam",
 ) -> None:
-    """Print per-class probability statistics.
-
-    Parameters
-    ----------
-    scored_df:
-        Output of ``ParkoClassifier.score()`` — must contain ``is_presence``
-        and ``prob_lr`` columns.
-    loc:
-        Location whose name is used in the header.
-    show_scene_percentiles:
-        When True (default), also print full-scene probability distribution
-        (mean / median / std / p75 / p90 / p95).  Set to False for the
-        training-only (Longreach) pipeline where the scene *is* the training
-        set and scene-level percentiles are not meaningful.
-    """
+    """Print per-class probability statistics."""
     print(f"\n{'='*60}")
     print(f"Site: {loc.name}  ({len(scored_df):,} pixels)")
     print(f"{'='*60}")
@@ -96,7 +82,8 @@ def save_pixel_ranking(
     features: list[str],
 ) -> None:
     """Write the scored pixel table sorted by rank to a CSV file."""
-    cols = ["point_id", "lon", "lat", "is_presence", "prob_lr", "rank"] + features
+    prob_cols = [c for c in scored_df.columns if c.startswith("prob_")]
+    cols = ["point_id", "lon", "lat", "is_presence"] + prob_cols + ["rank"] + features
     scored_df[[c for c in cols if c in scored_df.columns]].sort_values("rank").to_csv(
         out_path, index=False, float_format="%.4f"
     )

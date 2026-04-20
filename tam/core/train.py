@@ -241,6 +241,11 @@ def train_tam(
     with open(out_dir / "tam_config.json", "w") as fh:
         json.dump(model.config(), fh, indent=2)
 
+    # If val AUC never improved (e.g. tiny smoke datasets), save current weights so
+    # the checkpoint always exists for the load below.
+    if not checkpoint_path.exists():
+        torch.save(model.state_dict(), checkpoint_path)
+
     # Load best weights before returning
     model.load_state_dict(torch.load(checkpoint_path, map_location=device, weights_only=True))
     model.eval()
