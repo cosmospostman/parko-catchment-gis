@@ -72,6 +72,7 @@ map.on('load', () => {
 
   loadLocations();
   loadSightings();
+  loadCatchments();
 });
 
 document.getElementById('layer-select').addEventListener('change', (e) => {
@@ -87,10 +88,8 @@ document.getElementById('layer-select').addEventListener('change', (e) => {
     attribution: '© Queensland Globe',
   });
   map.addLayer({ id: 'qld-globe-layer', type: 'raster', source: 'qld-globe' }, 'loc-fill-location');
-  // Clear stale imagery info
-  idateCache.clear();
-  iiDate.innerHTML = '<span class="dim">hover map</span>';
-  iiName.innerHTML = '<span class="dim">—</span>';
+  // Refresh imagery info for new layer
+  fetchImageryInfo();
 });
 
 // ---------------------------------------------------------------------------
@@ -278,6 +277,77 @@ function buildSightingPopupHtml(p) {
     ${qaWarning}
   `;
 }
+
+// ---------------------------------------------------------------------------
+// Catchments layer
+// ---------------------------------------------------------------------------
+
+const CATCHMENT_LAYERS = ['catchments-fill', 'catchments-line'];
+
+function loadCatchments() {
+  fetch('/api/catchments')
+    .then(r => r.json())
+    .then(geojson => {
+      map.addSource('catchments', { type: 'geojson', data: geojson });
+
+      const vis = document.getElementById('catchments-toggle').checked ? 'visible' : 'none';
+
+      map.addLayer({
+        id: 'catchments-fill',
+        type: 'fill',
+        source: 'catchments',
+        layout: { visibility: vis },
+        paint: { 'fill-color': '#38bdf8', 'fill-opacity': 0.08 },
+      });
+
+      map.addLayer({
+        id: 'catchments-line',
+        type: 'line',
+        source: 'catchments',
+        layout: { visibility: vis },
+        paint: { 'line-color': '#38bdf8', 'line-width': 2, 'line-dasharray': [4, 3] },
+      });
+
+      buildCatchmentsSidebar(geojson);
+    })
+    .catch(err => console.error('Failed to load catchments:', err));
+}
+
+function buildCatchmentsSidebar(geojson) {
+  const body = document.getElementById('catchments-accordion-body');
+  const header = document.getElementById('catchments-accordion-header');
+
+  for (const feat of geojson.features) {
+    const name = feat.properties?.name ?? feat.properties?.id ?? 'Catchment';
+    const coords = feat.geometry?.coordinates?.[0];
+    if (!coords) continue;
+
+    const lngs = coords.map(c => c[0]);
+    const lats = coords.map(c => c[1]);
+    const bbox = [Math.min(...lngs), Math.min(...lats), Math.max(...lngs), Math.max(...lats)];
+
+    const item = document.createElement('div');
+    item.className = 'catchment-item';
+    item.innerHTML = `<span class="catchment-dot"></span><span>${name}</span>`;
+    item.addEventListener('click', () => {
+      map.fitBounds([[bbox[0], bbox[1]], [bbox[2], bbox[3]]], { padding: 60, maxZoom: 9 });
+    });
+    body.appendChild(item);
+  }
+
+  header.addEventListener('click', (e) => {
+    if (e.target.id === 'catchments-toggle') return;
+    header.classList.toggle('open');
+    body.classList.toggle('open');
+  });
+}
+
+document.getElementById('catchments-toggle').addEventListener('change', (e) => {
+  const vis = e.target.checked ? 'visible' : 'none';
+  for (const id of CATCHMENT_LAYERS) {
+    if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', vis);
+  }
+});
 
 // ---------------------------------------------------------------------------
 // Sidebar — Locations panel
@@ -674,9 +744,6 @@ sightingsYearSlider.addEventListener('input', applySightingsYearFilter);
 const iiDate = document.getElementById('ii-date');
 const iiName = document.getElementById('ii-name');
 
-let idateThrottle = null;
-const idateCache = new Map(); // key → response JSON
-
 function merc(lng, lat) {
   const x = lng * 20037508.34 / 180;
   const y = Math.log(Math.tan((90 + lat) * Math.PI / 360)) / (Math.PI / 180) * 20037508.34 / 180;
@@ -696,29 +763,17 @@ function setImageryInfo(data) {
   }
 }
 
-map.on('mousemove', (e) => {
-  if (isDrawing) return;
-
-  clearTimeout(idateThrottle);
-  idateThrottle = setTimeout(async () => {
-    const { x, y } = merc(e.lngLat.lng, e.lngLat.lat);
-    // Snap to ~500 m grid to improve cache hit rate
-    const gx = Math.round(x / 500) * 500;
-    const gy = Math.round(y / 500) * 500;
-    const key = `${gx},${gy}`;
-
-    let data = idateCache.get(key);
-    if (!data) {
-      try {
-        const resp = await fetch(`/api/imagery-date?x=${gx}&y=${gy}&layer=${activeLayer}`);
-        data = await resp.json();
-        idateCache.set(key, data);
-        if (idateCache.size > 500) idateCache.delete(idateCache.keys().next().value);
-      } catch {
-        return;
-      }
-    }
-
+async function fetchImageryInfo() {
+  const center = map.getCenter();
+  const { x, y } = merc(center.lng, center.lat);
+  try {
+    const zoom = Math.round(map.getZoom());
+    const resp = await fetch(`/api/imagery-date?x=${x}&y=${y}&layer=${activeLayer}&zoom=${zoom}`);
+    const data = await resp.json();
     setImageryInfo(data);
-  }, 300);
-});
+  } catch {
+    // leave existing display intact
+  }
+}
+
+map.on('moveend', fetchImageryInfo);

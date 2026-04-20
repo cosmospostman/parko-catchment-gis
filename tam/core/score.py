@@ -128,11 +128,13 @@ def _preprocess(
 def _gpu_score(
     prepared: _PreparedBatch,
     model: TAMClassifier,
-    pixel_year_probs: dict[str, dict[int, list[float]]],
+    all_pids: list,
+    all_years: list,
+    all_probs: list,
     batch_size: int,
     device: str,
 ) -> None:
-    """GPU-side: transfer tensors and run inference."""
+    """GPU-side: transfer tensors, run inference, append (pid, year, prob) to lists."""
     bands_th, doy_th, mask_th, pids, years = prepared
     W = len(pids)
     with torch.inference_mode():
@@ -143,32 +145,38 @@ def _gpu_score(
                 doy_th[start:end].to(device, non_blocking=True),
                 mask_th[start:end].to(device, non_blocking=True),
             )
-            for pid, yr, p in zip(pids[start:end], years[start:end], prob.cpu().numpy()):
-                pixel_year_probs.setdefault(str(pid), {}).setdefault(int(yr), []).append(float(p))
+            prob_np = prob.cpu().numpy()
+            all_pids.append(pids[start:end])
+            all_years.append(years[start:end])
+            all_probs.append(prob_np)
 
 
 def aggregate_year_probs(
-    pixel_year_probs: dict[str, dict[int, list[float]]],
+    all_pids: list,
+    all_years: list,
+    all_probs: list,
     end_year: int,
     decay: float = 0.7,
 ) -> pd.DataFrame:
     """Aggregate per-(pixel, year) probabilities into a single score per pixel.
 
-    Each year's mean probability is weighted by exp(-decay * (end_year - year)),
-    so years closer to end_year receive higher weight.
+    Vectorised: concatenates all arrays, applies decay weights, then uses
+    pandas groupby to compute weighted mean per pixel.
     """
-    records = []
-    for pid, year_probs in pixel_year_probs.items():
-        total_w = 0.0
-        total_wp = 0.0
-        for yr, probs in year_probs.items():
-            w = float(np.exp(-decay * (end_year - yr)))
-            total_w += w
-            total_wp += w * float(np.mean(probs))
-        records.append({"point_id": pid, "prob_tam": total_wp / total_w if total_w > 0 else 0.0})
-    if not records:
+    if not all_pids:
         return pd.DataFrame(columns=["point_id", "prob_tam"])
-    return pd.DataFrame(records)
+
+    pids_np  = np.concatenate(all_pids)
+    years_np = np.concatenate(all_years).astype(np.int32)
+    probs_np = np.concatenate(all_probs).astype(np.float32)
+
+    weights = np.exp(-decay * (end_year - years_np)).astype(np.float32)
+    weighted_probs = weights * probs_np
+
+    df = pd.DataFrame({"point_id": pids_np, "wp": weighted_probs, "w": weights})
+    agg = df.groupby("point_id", sort=False)[["wp", "w"]].sum()
+    agg["prob_tam"] = agg["wp"] / agg["w"]
+    return agg[["prob_tam"]].reset_index()
 
 
 def score_pixels_chunked(
@@ -252,6 +260,10 @@ def score_pixels_chunked(
                 continue
             ts_us = chunk["date"].values.astype("int64")
             chunk["year"], chunk["doy"] = _extract_year_doy(ts_us)
+            if end_year:
+                chunk = chunk[chunk["year"] <= end_year]
+            if chunk.empty:
+                continue
             buffer.append(chunk)
             if len(buffer) >= buffer_row_groups:
                 leftover = _emit(buffer, leftover, is_last=(rg == n_rg - 1))
@@ -280,7 +292,10 @@ def score_pixels_chunked(
     prep_pool = ThreadPoolExecutor(max_workers=n_prep_workers)
     prep_futures = [prep_pool.submit(_preprocessor) for _ in range(n_prep_workers)]
 
-    pixel_year_probs: dict[str, dict[int, list[float]]] = {}
+    all_pids:  list[np.ndarray] = []
+    all_years: list[np.ndarray] = []
+    all_probs: list[np.ndarray] = []
+    n_scored = 0
     sentinels_seen = 0
 
     while sentinels_seen < n_prep_workers:
@@ -288,19 +303,19 @@ def score_pixels_chunked(
         if item is _SENTINEL:
             sentinels_seen += 1
             continue
-        _gpu_score(item, model, pixel_year_probs, batch_size, device)
-        n_unique = len(pixel_year_probs)
+        _gpu_score(item, model, all_pids, all_years, all_probs, batch_size, device)
+        n_scored += len(np.unique(item.pids))
         if n_total_pixels:
-            logger.info("Scored %.1f%% (%d / %d pixels)", 100 * n_unique / n_total_pixels, n_unique, n_total_pixels)
+            logger.info("Scored %.1f%% (%d / %d pixels)", 100 * n_scored / n_total_pixels, n_scored, n_total_pixels)
         else:
-            logger.info("Scored %d pixels so far", n_unique)
+            logger.info("Scored %d windows so far", n_scored)
 
     reader_thread.join()
     for f in prep_futures:
         f.result()
     prep_pool.shutdown(wait=False)
 
-    inferred_end_year = end_year or max(
-        yr for yp in pixel_year_probs.values() for yr in yp
-    )
-    return aggregate_year_probs(pixel_year_probs, end_year=inferred_end_year, decay=decay)
+    logger.info("Aggregating scores ...")
+    if not end_year:
+        end_year = int(np.concatenate(all_years).max())
+    return aggregate_year_probs(all_pids, all_years, all_probs, end_year=end_year, decay=decay)

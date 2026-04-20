@@ -151,9 +151,10 @@ class Location:
         """Canonical pixel observation parquet: data/pixels/<id>/<id>.parquet"""
         return _PROJECT_ROOT / "data" / "pixels" / self.id / f"{self.id}.parquet"
 
-    def coords_cache_path(self) -> Path:
+    def coords_cache_path(self, tile_id: str | None = None) -> Path:
         """Sidecar parquet caching unique (point_id, lon, lat) for this location."""
-        return _PROJECT_ROOT / "data" / "pixels" / self.id / f"{self.id}.coords.parquet"
+        suffix = f".{tile_id}" if tile_id else ""
+        return _PROJECT_ROOT / "data" / "pixels" / self.id / f"{self.id}.coords{suffix}.parquet"
 
     def chips_path(self) -> Path:
         """Canonical fetch chip cache: data/pixels/<id>/<id>.chips/"""

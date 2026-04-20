@@ -340,41 +340,109 @@ async function handleImageryDate(req: Request): Promise<Response> {
     });
   }
 
-  // Direct-tile layers don't support ArcGIS ImageServer identify
+  // Esri World Imagery — query the public Citations layer for capture metadata
+  if (layer === "EsriWorldImagery") {
+    const zoom = Number(url.searchParams.get("zoom") ?? "14");
+    const nx = Number(x), ny = Number(y);
+    const esriIdentifyUrl = "https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/identify";
+    const params = new URLSearchParams({
+      geometry: JSON.stringify({ x: nx, y: ny, spatialReference: { wkid: 102100 } }),
+      geometryType: "esriGeometryPoint",
+      layers: "all:4",
+      tolerance: "0",
+      mapExtent: `${nx - 2000},${ny - 2000},${nx + 2000},${ny + 2000}`,
+      imageDisplay: "256,256,96",
+      returnGeometry: "false",
+      f: "json",
+    });
+    try {
+      const data = await fetch(`${esriIdentifyUrl}?${params}`).then(r => r.json());
+      type EsriResult = { attributes: Record<string, string> };
+      const results: EsriResult[] = data.results ?? [];
+      // Pick the citation matching current zoom level
+      const match = results.find(r => {
+        const from = parseInt(r.attributes["FROM_CACHE_LEVEL"]);
+        const to   = parseInt(r.attributes["TO_CACHE_LEVEL"]);
+        return !isNaN(from) && !isNaN(to) && from <= zoom && zoom <= to;
+      }) ?? results[0];
+      if (!match) {
+        return new Response(JSON.stringify({ date: null }), {
+          headers: { "content-type": "application/json" },
+        });
+      }
+      const a = match.attributes;
+      const raw = a["DATE (YYYYMMDD)"];
+      const dateStr = raw && raw !== "Null" && raw.length === 8
+        ? `${raw.slice(0, 4)}-${raw.slice(4, 6)}-${raw.slice(6, 8)}`
+        : null;
+      return new Response(JSON.stringify({
+        capturestart: dateStr,
+        captureend:   dateStr,
+        name:  a["SOURCE_INFO"] ?? null,
+        title: `${a["SOURCE_INFO"] ?? ""} ${a["RESOLUTION (M)"] ? `(${a["RESOLUTION (M)"]}m)` : ""}`.trim() || null,
+      }), {
+        headers: { "content-type": "application/json", "cache-control": "public, max-age=3600" },
+      });
+    } catch (err) {
+      console.error("Esri Citations identify failed:", err);
+      return new Response(JSON.stringify({ date: null }), {
+        headers: { "content-type": "application/json" },
+      });
+    }
+  }
+
+  // Other direct-tile layers don't support identify
   if (DIRECT_TILE_LAYERS.has(layer)) {
     return new Response(JSON.stringify({ date: null }), {
       headers: { "content-type": "application/json" },
     });
   }
 
-  const geom = JSON.stringify({ x: Number(x), y: Number(y), spatialReference: { wkid: 102100 } });
-  const params = new URLSearchParams({
-    geometry: geom,
+  // QGovSISP layer doesn't support identify — fall back to the public equivalent
+  const identifyLayer = layer === "LatestStateProgram_QGovSISPUsers"
+    ? "LatestStateProgram_AllUsers"
+    : layer;
+
+  const nx = Number(x);
+  const ny = Number(y);
+  // Sample a small cluster of points — mosaic catalog footprints can be tighter than
+  // the rendered extent, so probing nearby points surfaces high-res items at seam edges.
+  const offsets = [0, 2000, -2000];
+  const probePoints = offsets.flatMap(dx => offsets.map(dy => ({ x: nx + dx, y: ny + dy })));
+
+  const makeParams = (px: number, py: number) => new URLSearchParams({
+    geometry: JSON.stringify({ x: px, y: py, spatialReference: { wkid: 102100 } }),
     geometryType: "esriGeometryPoint",
     returnGeometry: "false",
     returnCatalogItems: "true",
-    catalogItemsFieldName: "capturestart,captureend,name,title",
+    catalogItemsFieldName: "capturestart,captureend,name,title,lowps",
     f: "json",
   });
 
   try {
-    if (QGLOBE_LAYERS.has(layer)) {
-      params.set("token", await getQGlobeToken());
-    }
-    const resp = await fetch(`${imageServerBase(layer)}?${params}`);
-    const data = await resp.json() as {
-      catalogItems?: { features?: Array<{ attributes: Record<string, unknown> }> };
-    };
+    const responses = await Promise.all(
+      probePoints.map(p => fetch(`${imageServerBase(identifyLayer)}?${makeParams(p.x, p.y)}`).then(r => r.json()))
+    );
 
-    const features = data.catalogItems?.features ?? [];
-    if (features.length === 0) {
+    type Feature = { attributes: Record<string, unknown> };
+    const allFeatures: Feature[] = [];
+    const seen = new Set<unknown>();
+    for (const data of responses) {
+      for (const f of (data.catalogItems?.features ?? []) as Feature[]) {
+        const id = f.attributes.objectid ?? f.attributes.name;
+        if (!seen.has(id)) { seen.add(id); allFeatures.push(f); }
+      }
+    }
+
+    if (allFeatures.length === 0) {
       return new Response(JSON.stringify({ date: null }), {
         headers: { "content-type": "application/json" },
       });
     }
 
-    // Use the first (highest-priority) catalog item
-    const attrs = features[0].attributes;
+    // Pick the item with the finest native resolution (smallest lowps)
+    allFeatures.sort((a, b) => ((a.attributes.lowps as number) ?? 9999) - ((b.attributes.lowps as number) ?? 9999));
+    const attrs = allFeatures[0].attributes;
     const start = attrs.capturestart ? new Date(attrs.capturestart as number) : null;
     const end   = attrs.captureend   ? new Date(attrs.captureend   as number) : null;
 
@@ -466,6 +534,29 @@ async function handler(req: Request): Promise<Response> {
     } catch (err) {
       console.error("Failed to load locations:", err);
       return new Response(JSON.stringify({ error: "Failed to load locations" }), {
+        status: 500,
+        headers: { "content-type": "application/json" },
+      });
+    }
+  }
+
+  if (url.pathname === "/api/catchments") {
+    try {
+      const catchmentsDir = join(__dirname, "..", "data", "catchments");
+      const features: GeoJSON.Feature[] = [];
+      for (const entry of Deno.readDirSync(catchmentsDir)) {
+        if (!entry.name.endsWith(".geojson")) continue;
+        const raw = Deno.readTextFileSync(join(catchmentsDir, entry.name));
+        const feat = JSON.parse(raw) as GeoJSON.Feature;
+        features.push(feat);
+      }
+      const fc: GeoJSON.FeatureCollection = { type: "FeatureCollection", features };
+      return new Response(JSON.stringify(fc), {
+        headers: { "content-type": "application/json" },
+      });
+    } catch (err) {
+      console.error("Failed to load catchments:", err);
+      return new Response(JSON.stringify({ error: "Failed to load catchments" }), {
         status: 500,
         headers: { "content-type": "application/json" },
       });

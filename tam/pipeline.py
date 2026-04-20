@@ -169,7 +169,7 @@ def _cmd_score(args: argparse.Namespace) -> None:
 
     # Load pixel coords for labeling (cached sidecar to avoid scanning 2000+ row groups)
     tile_prefix = f"_{tile_id}_" if tile_id else None
-    coords_cache = loc.coords_cache_path() if not tile_id else None
+    coords_cache = loc.coords_cache_path(tile_id=tile_id)
 
     if coords_cache and coords_cache.exists():
         logger.info("Loading pixel coords from cache ...")

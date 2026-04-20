@@ -102,7 +102,14 @@ class TAMClassifier(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return (prob, logit), each shape (B,)."""
         x = self.band_proj(bands) + _doy_encoding(doy, self.d_model)  # (B, T, d_model)
-        x = self.encoder(x, src_key_padding_mask=key_padding_mask)
+
+        # Rows where every position is masked cause softmax over all-inf attention
+        # logits → NaN. Unmask such rows before the encoder; the mean pool below
+        # still produces zero for them because valid is all-False.
+        all_masked = key_padding_mask.all(dim=1, keepdim=True)  # (B, 1)
+        safe_mask = key_padding_mask & ~all_masked               # (B, T)
+
+        x = self.encoder(x, src_key_padding_mask=safe_mask)
 
         # Mean pool over non-padded positions
         valid = (~key_padding_mask).float().unsqueeze(-1)  # (B, T, 1)
