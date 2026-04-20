@@ -33,7 +33,6 @@ from tam.core.config import TAMConfig
 from tam.core.dataset import BAND_COLS
 from tam.core.score import score_pixels_chunked
 from tam.core.train import load_tam, train_tam
-from utils.heatmap import plot_prob_heatmaps
 from utils.location import get as get_location
 
 logger = logging.getLogger(__name__)
@@ -162,43 +161,54 @@ def _cmd_score(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     tile_id = getattr(args, "tile", None)
-    out_dir = checkpoint_dir
+    out_csv = Path(args.out) if getattr(args, "out", None) else None
+    out_dir = out_csv.parent if out_csv else checkpoint_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info("Location: %s  parquet: %s  checkpoint: %s", loc.name, parquet, checkpoint_dir)
 
-    # Load pixel coords for labeling
-    logger.info("Resolving labels ...")
-    pf_coords = pq.ParquetFile(parquet)
-    read_coord_cols = ["point_id", "lon", "lat"] + (["item_id"] if tile_id else [])
+    # Load pixel coords for labeling (cached sidecar to avoid scanning 2000+ row groups)
     tile_prefix = f"_{tile_id}_" if tile_id else None
-    n_rg_coords = pf_coords.metadata.num_row_groups
+    coords_cache = loc.coords_cache_path() if not tile_id else None
 
-    def _read_coord_rg(rg: int) -> pd.DataFrame:
-        pf = pq.ParquetFile(parquet)
-        chunk = pf.read_row_group(rg, columns=read_coord_cols).to_pandas()
-        if tile_prefix:
-            chunk = chunk[chunk["item_id"].str.contains(tile_prefix, regex=False)]
-        return chunk[["point_id", "lon", "lat"]].drop_duplicates("point_id")
+    if coords_cache and coords_cache.exists():
+        logger.info("Loading pixel coords from cache ...")
+        pixel_coords = pd.read_parquet(coords_cache)
+    else:
+        logger.info("Resolving labels ...")
+        pf_coords = pq.ParquetFile(parquet)
+        read_coord_cols = ["point_id", "lon", "lat"] + (["item_id"] if tile_id else [])
+        n_rg_coords = pf_coords.metadata.num_row_groups
 
-    coord_chunks = []
-    n_done = 0
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        futures = {ex.submit(_read_coord_rg, rg): rg for rg in range(n_rg_coords)}
-        for fut in as_completed(futures):
-            chunk = fut.result()
-            if not chunk.empty:
-                coord_chunks.append(chunk)
-            n_done += 1
-            if n_done % 100 == 0:
-                logger.info("  coords %d/%d row groups", n_done, n_rg_coords)
+        def _read_coord_rg(rg: int) -> pd.DataFrame:
+            pf = pq.ParquetFile(parquet)
+            chunk = pf.read_row_group(rg, columns=read_coord_cols).to_pandas()
+            if tile_prefix:
+                chunk = chunk[chunk["item_id"].str.contains(tile_prefix, regex=False)]
+            return chunk[["point_id", "lon", "lat"]].drop_duplicates("point_id")
 
-    pixel_coords = (
-        pd.concat(coord_chunks, ignore_index=True)
-        .groupby("point_id")[["lon", "lat"]]
-        .first()
-        .reset_index()
-    )
+        coord_chunks = []
+        n_done = 0
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            futures = {ex.submit(_read_coord_rg, rg): rg for rg in range(n_rg_coords)}
+            for fut in as_completed(futures):
+                chunk = fut.result()
+                if not chunk.empty:
+                    coord_chunks.append(chunk)
+                n_done += 1
+                if n_done % 100 == 0:
+                    logger.info("  coords %d/%d row groups", n_done, n_rg_coords)
+
+        pixel_coords = (
+            pd.concat(coord_chunks, ignore_index=True)
+            .groupby("point_id")[["lon", "lat"]]
+            .first()
+            .reset_index()
+        )
+        if coords_cache:
+            pixel_coords.to_parquet(coords_cache, index=False)
+            logger.info("Cached pixel coords to %s", coords_cache)
+
     logger.info("Unique pixels after tile filter: %d", len(pixel_coords))
 
     labelled = label_pixels(pixel_coords, loc)
@@ -215,16 +225,17 @@ def _cmd_score(args: argparse.Namespace) -> None:
         tile_id=tile_id,
         end_year=args.end_year,
         decay=args.decay,
+        batch_size=args.batch_size,
+        n_total_pixels=len(pixel_coords),
     )
 
     scored = pixel_coords.merge(scores, on="point_id", how="left")
     scored = scored.merge(labelled[["point_id", "is_presence"]], on="point_id", how="left")
     scored["rank"] = scored["prob_tam"].rank(ascending=False, method="first").astype("Int64")
 
-    stem = f"tam_{loc.id}" + (f"_{tile_id}" if tile_id else "")
-    summarise(scored, loc)
-    save_pixel_ranking(scored, out_dir / "tam_pixel_ranking.csv", features=["prob_tam"])
-    plot_prob_heatmaps(scored.dropna(subset=["prob_tam"]), loc, out_dir, stem=stem, prob_col="prob_tam")
+    summarise(scored, loc, prob_col="prob_tam")
+    csv_path = out_csv if out_csv else out_dir / "tam_pixel_ranking.csv"
+    save_pixel_ranking(scored, csv_path, features=["prob_tam"])
     logger.info("Done — outputs in %s", out_dir)
 
 
@@ -337,17 +348,15 @@ def _cmd_legacy(args: argparse.Namespace) -> None:
     scores = score_pixels_chunked(
         parquet_sorted, model, band_mean, band_std,
         scl_purity_min=args.scl_purity, device=args.device, tile_id=tile_id,
-        end_year=args.end_year, decay=args.decay,
+        end_year=args.end_year, decay=args.decay, batch_size=args.batch_size,
     )
 
     scored = pixel_coords.merge(scores, on="point_id", how="left")
     scored = scored.merge(labelled[["point_id", "is_presence"]], on="point_id", how="left")
     scored["rank"] = scored["prob_tam"].rank(ascending=False, method="first").astype("Int64")
 
-    stem = f"tam_{loc.id}" + (f"_{tile_id}" if tile_id else "")
-    summarise(scored, loc)
+    summarise(scored, loc, prob_col="prob_tam")
     save_pixel_ranking(scored, out_dir / "tam_pixel_ranking.csv", features=["prob_tam"])
-    plot_prob_heatmaps(scored.dropna(subset=["prob_tam"]), loc, out_dir, stem=stem, prob_col="prob_tam")
     logger.info("Done — outputs in %s", out_dir)
 
 
@@ -356,10 +365,11 @@ def _cmd_legacy(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def _add_common_score_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--scl-purity", type=float, default=0.5)
-    p.add_argument("--device",     default=None, help="cpu / cuda (auto-detect if omitted)")
-    p.add_argument("--end-year",   type=int, default=None)
-    p.add_argument("--decay",      type=float, default=0.7)
+    p.add_argument("--scl-purity",  type=float, default=0.5)
+    p.add_argument("--device",      default=None, help="cpu / cuda (auto-detect if omitted)")
+    p.add_argument("--end-year",    type=int, default=None)
+    p.add_argument("--decay",       type=float, default=0.7)
+    p.add_argument("--batch-size",  type=int, default=4096)
 
 
 if __name__ == "__main__":
@@ -384,6 +394,7 @@ if __name__ == "__main__":
     p_score.add_argument("--checkpoint", required=True, help="Checkpoint directory")
     p_score.add_argument("--location",   required=True, help="Location ID")
     p_score.add_argument("--tile",       default=None, help="Restrict to one S2 tile_id")
+    p_score.add_argument("--out",        default=None, help="Output CSV path (overrides default in checkpoint dir)")
     _add_common_score_args(p_score)
 
     # --- legacy ---

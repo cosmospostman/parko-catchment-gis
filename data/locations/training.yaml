@@ -71,6 +71,55 @@ regions:
       Parkinsonia mixed with savanna, central scene. Cape York Peninsula.
       ~457 pixels at 10 m resolution (bbox area; fewer after SCL filtering).
 
+  - id: frenchs_presence_3
+    name: "Frenchs — presence 3"
+    label: presence
+    bbox: [141.557221, -15.806047, 141.558701, -15.804949]
+    year: 2023
+    tags: [monsoonal, savanna, riparian]
+
+  - id: frenchs_presence_4
+    name: "Frenchs — presence 4"
+    label: presence
+    bbox: [141.547167, -15.813608, 141.550058, -15.811496]
+    year: 2023
+    tags: [monsoonal, savanna, riparian]
+
+  - id: frenchs_presence_5
+    name: "Frenchs — presence 5"
+    label: presence
+    bbox: [141.537488, -15.784261, 141.540400, -15.780201]
+    year: 2023
+    tags: [monsoonal, savanna, riparian]
+
+  - id: frenchs_absence_bare_soil_1
+    name: "Frenchs — absence (bare soil 1)"
+    label: absence
+    bbox: [141.551405, -15.795050, 141.560868, -15.787841]
+    year: 2023
+    tags: [monsoonal, bare_soil]
+
+  - id: frenchs_absence_bare_soil_2
+    name: "Frenchs — absence (bare soil 2)"
+    label: absence
+    bbox: [141.471099, -15.774006, 141.476241, -15.768994]
+    year: 2023
+    tags: [monsoonal, bare_soil]
+
+  - id: frenchs_absence_bare_soil_3
+    name: "Frenchs — absence (bare soil 3)"
+    label: absence
+    bbox: [141.538499, -15.795649, 141.541354, -15.791923]
+    year: 2023
+    tags: [monsoonal, bare_soil]
+
+  - id: frenchs_presence_6
+    name: "Frenchs — presence 6"
+    label: presence
+    bbox: [141.527051, -15.805300, 141.529198, -15.804409]
+    year: 2023
+    tags: [monsoonal, savanna, riparian]
+
   - id: frenchs_absence_mangrove
     name: "Frenchs — absence (mangrove)"
     label: absence
@@ -105,6 +154,27 @@ regions:
     bbox: [141.551999, -15.802930, 141.557016, -15.798478]
     year: 2023
     tags: [monsoonal, savanna]
+
+  - id: frenchs_absence_water_1
+    name: "Frenchs — absence (water 1)"
+    label: absence
+    bbox: [141.462497, -15.838618, 141.463648, -15.836257]
+    year: 2023
+    tags: [monsoonal, water]
+
+  - id: frenchs_absence_water_2
+    name: "Frenchs — absence (water 2)"
+    label: absence
+    bbox: [141.689911, -15.668254, 141.693834, -15.664845]
+    year: 2023
+    tags: [monsoonal, water]
+
+  - id: frenchs_absence_water_3
+    name: "Frenchs — absence (water 3)"
+    label: absence
+    bbox: [141.643142, -15.872742, 141.650156, -15.872481]
+    year: 2023
+    tags: [monsoonal, water]
 
   # ---------------------------------------------------------------------------
   # Lake Mueller — Thomson River riparian corridor (GPS-logged field survey)

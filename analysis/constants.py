@@ -73,9 +73,9 @@ def add_spectral_indices(df: "pd.DataFrame") -> "pd.DataFrame":
     b08 = df["B08"].values.astype("float32")
     df = df.copy()
     denom = b08 + b04
-    df["NDVI"] = np.where(denom == 0, 0.0, (b08 - b04) / denom)
+    df["NDVI"] = np.divide(b08 - b04, denom, out=np.zeros_like(denom), where=denom != 0)
     denom = b03 + b08
-    df["NDWI"] = np.where(denom == 0, 0.0, (b03 - b08) / denom)
+    df["NDWI"] = np.divide(b03 - b08, denom, out=np.zeros_like(denom), where=denom != 0)
     evi_denom = b08 + 6 * b04 - 7.5 * b02 + 1
-    df["EVI"]  = np.where(evi_denom == 0, 0.0, 2.5 * (b08 - b04) / evi_denom)
+    df["EVI"]  = np.divide(2.5 * (b08 - b04), evi_denom, out=np.zeros_like(evi_denom), where=evi_denom != 0)
     return df

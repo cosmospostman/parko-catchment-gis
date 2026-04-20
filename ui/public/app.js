@@ -136,7 +136,7 @@ function loadLocations() {
         type: 'fill',
         source: 'locations',
         filter: ['==', ['get', 'role'], 'location'],
-        paint: { 'fill-color': '#3b82f6', 'fill-opacity': 0.12 },
+        paint: { 'fill-color': '#2e1065', 'fill-opacity': 0.15 },
       });
 
       map.addLayer({
@@ -163,7 +163,7 @@ function loadLocations() {
         paint: {
           'line-color': [
             'match', ['get', 'role'],
-            'location', '#93c5fd',
+            'location', '#c4b5fd',
             COLOR_EXPR,
           ],
           'line-width': ['match', ['get', 'role'], 'location', 3, 2],
@@ -242,7 +242,7 @@ function loadSightings() {
         popup.setLngLat(e.lngLat).setHTML(buildSightingPopupHtml(feat.properties)).addTo(map);
       });
       map.on('mouseenter', 'sightings-layer', () => { map.getCanvas().style.cursor = 'pointer'; });
-      map.on('mouseleave', 'sightings-layer', () => { map.getCanvas().style.cursor = ''; });
+      map.on('mouseleave', 'sightings-layer', () => { if (currentMode === 'locations') map.getCanvas().style.cursor = ''; });
 
       sightingsFeatures = geojson.features ?? [];
       applySightingsYearFilter();
@@ -411,18 +411,33 @@ function attachPopups() {
       popup.setLngLat(e.lngLat).setHTML(buildPopupHtml(feat.properties)).addTo(map);
     });
     map.on('mouseenter', layer, () => { if (currentMode === 'locations') map.getCanvas().style.cursor = 'pointer'; });
-    map.on('mouseleave', layer, () => { map.getCanvas().style.cursor = ''; });
+    map.on('mouseleave', layer, () => { if (currentMode === 'locations') map.getCanvas().style.cursor = ''; });
   }
 }
 
 // ---------------------------------------------------------------------------
-// Mode switching
+// BBox accordion toggle
 // ---------------------------------------------------------------------------
 
 let currentMode = 'locations';
 
-document.getElementById('mode-select').addEventListener('change', (e) => {
-  setMode(e.target.value);
+const bboxAccordionHeader = document.getElementById('bbox-accordion-header');
+const bboxAccordionBody   = document.getElementById('bbox-accordion-body');
+
+bboxAccordionHeader.addEventListener('click', () => {
+  const opening = !bboxAccordionHeader.classList.contains('open');
+  bboxAccordionHeader.classList.toggle('open');
+  bboxAccordionBody.classList.toggle('open');
+
+  if (opening) {
+    currentMode = 'bbox';
+    popup.remove();
+    map.getCanvas().style.cursor = 'crosshair';
+  } else {
+    currentMode = 'locations';
+    clearBboxDraw();
+    map.getCanvas().style.cursor = '';
+  }
 });
 
 document.getElementById('training-toggle').addEventListener('change', (e) => {
@@ -431,21 +446,6 @@ document.getElementById('training-toggle').addEventListener('change', (e) => {
     if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', vis);
   }
 });
-
-function setMode(mode) {
-  currentMode = mode;
-  document.getElementById('panel-locations').style.display = mode === 'locations' ? 'flex' : 'none';
-  document.getElementById('panel-bbox').style.display      = mode === 'bbox'      ? 'flex' : 'none';
-
-  if (mode === 'locations') {
-    popup.remove();
-    clearBboxDraw();
-    map.getCanvas().style.cursor = '';
-  } else {
-    popup.remove();
-    map.getCanvas().style.cursor = 'crosshair';
-  }
-}
 
 // ---------------------------------------------------------------------------
 // BBox draw mode
@@ -498,10 +498,8 @@ function commitBbox(a, b) {
   const lat_max = Math.max(a.lat, b.lat);
 
   const coords = [lon_min, lat_min, lon_max, lat_max];
-  const raw = coords.map(v => v.toFixed(6)).join(', ');
   const yaml = `bbox: [${coords.map(v => v.toFixed(6)).join(', ')}]`;
 
-  document.getElementById('bbox-raw').textContent = raw;
   document.getElementById('bbox-yaml').textContent = yaml;
 
   const box = document.getElementById('bbox-coords');
@@ -512,7 +510,7 @@ function commitBbox(a, b) {
     const done = () => {
       btn.textContent = 'Copied!';
       btn.classList.add('copied');
-      setTimeout(() => { btn.textContent = 'Copy bbox'; btn.classList.remove('copied'); }, 1500);
+      setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 1500);
     };
     if (navigator.clipboard) {
       navigator.clipboard.writeText(yaml).then(done);
@@ -556,7 +554,13 @@ map.on('mouseup', (e) => {
   drawStart = null;
 });
 
-document.getElementById('btn-clear').addEventListener('click', clearBboxDraw);
+document.getElementById('btn-clear').addEventListener('click', () => {
+  clearBboxDraw();
+  bboxAccordionHeader.classList.remove('open');
+  bboxAccordionBody.classList.remove('open');
+  currentMode = 'locations';
+  map.getCanvas().style.cursor = '';
+});
 
 // ---------------------------------------------------------------------------
 // Ranking overlay
@@ -570,6 +574,7 @@ const CMAP_GRADIENTS = {
 
 let currentRankingOpacity = 0.6;
 let currentCmap = 'rdylgn';
+let currentCutoff = 0;
 let sightingsTotalCount = 0;
 let sightingsFeatures = [];
 
@@ -598,7 +603,7 @@ function setRankingLayer(location, stem) {
   if (!stem) return;
 
   const bust = Date.now();
-  const tileUrl = `/ranking-tile/${location}/${stem}/{z}/{x}/{y}?cmap=${currentCmap}&v=${bust}`;
+  const tileUrl = `/ranking-tile/${location}/${stem}/{z}/{x}/{y}?cmap=${currentCmap}&cutoff=${currentCutoff}&v=${bust}`;
   map.addSource('ranking', {
     type: 'raster',
     tiles: [tileUrl],
@@ -619,10 +624,24 @@ document.getElementById('ranking-opacity').addEventListener('input', (e) => {
   }
 });
 
+document.getElementById('ranking-cutoff').addEventListener('input', (e) => {
+  currentCutoff = Number(e.target.value) / 100;
+  document.getElementById('ranking-cutoff-label').textContent = `${e.target.value}%`;
+  if (activeRankingLocation && activeRankingStem) setRankingLayer(activeRankingLocation, activeRankingStem);
+});
+
 document.getElementById('sightings-toggle').addEventListener('change', (e) => {
   if (map.getLayer('sightings-layer')) {
     map.setLayoutProperty('sightings-layer', 'visibility', e.target.checked ? 'visible' : 'none');
   }
+});
+
+const sightingsAccordionHeader = document.getElementById('sightings-accordion-header');
+const sightingsAccordionBody   = document.getElementById('sightings-accordion-body');
+sightingsAccordionHeader.addEventListener('click', (e) => {
+  if (e.target.closest('input[type="checkbox"]')) return;
+  sightingsAccordionHeader.classList.toggle('open');
+  sightingsAccordionBody.classList.toggle('open');
 });
 
 const sightingsYearSlider = document.getElementById('sightings-year-slider');

@@ -83,7 +83,7 @@ export async function loadGrid(location: string, stem: string): Promise<Grid | n
   const header = lines[0].split(",");
   const iLon  = header.indexOf("lon");
   const iLat  = header.indexOf("lat");
-  const iProb = header.indexOf("prob_lr");
+  const iProb = header.findIndex((c) => c.startsWith("prob_"));
   if (iLon < 0 || iLat < 0 || iProb < 0) {
     console.error(`Missing columns in ${csvPath}`);
     return null;
@@ -303,6 +303,7 @@ export async function renderTile(
   x: number,
   y: number,
   cmap = "rdylgn",
+  cutoff = 0,
 ): Promise<Uint8Array> {
   const stops = COLORMAPS[cmap] ?? COLORMAPS.rdylgn;
   const { lonMin: tLonMin, lonMax: tLonMax, latMin: tLatMin, latMax: tLatMax } =
@@ -325,7 +326,7 @@ export async function renderTile(
       if (xi < 0 || xi >= grid.width) continue;
 
       const prob = grid.arr[yi * grid.width + xi];
-      if (prob === 0) continue;
+      if (prob === 0 || prob < cutoff) continue;
 
       const t = Math.max(0, Math.min(1, prob)) * (stops.length - 1);
       const lo = Math.floor(t);

@@ -4,53 +4,147 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from queue import Queue
+from threading import Thread
+from typing import NamedTuple
 
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader
 
-from tam.core.dataset import TAMDataset, collate_fn, BAND_COLS, INDEX_COLS
+from tam.core.dataset import ALL_FEATURE_COLS, BAND_COLS, MAX_SEQ_LEN
 from tam.core.model import TAMClassifier
 
 logger = logging.getLogger(__name__)
 
+_N_FEATURES = len(ALL_FEATURE_COLS)
+_SENTINEL = object()
 
-def _score_chunk(
+# Precomputed offset for fast numpy year/doy extraction (no pd.to_datetime)
+_EPOCH_D = np.datetime64("1970-01-01", "D")
+
+# Band column positions in the feature matrix (matches ALL_FEATURE_COLS order)
+_BAND_INDICES = {c: i for i, c in enumerate(ALL_FEATURE_COLS)}
+
+
+def _extract_year_doy(ts_us: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Extract year and day-of-year from timestamp[us]-as-int64."""
+    ts_day = ts_us // (86_400 * 1_000_000)
+    days = _EPOCH_D + ts_day.astype("timedelta64[D]")
+    year = days.astype("datetime64[Y]").astype("int32") + 1970
+    year_start = (year - 1970).astype("datetime64[Y]").astype("datetime64[D]").astype("int64")
+    doy = (ts_day - year_start + 1).astype("int32")
+    return year, doy
+
+
+class _PreparedBatch(NamedTuple):
+    bands: torch.Tensor   # (W, MAX_SEQ_LEN, N_FEATURES) float32
+    doy:   torch.Tensor   # (W, MAX_SEQ_LEN) int64
+    mask:  torch.Tensor   # (W, MAX_SEQ_LEN) bool
+    pids:  np.ndarray     # (W,) object
+    years: np.ndarray     # (W,) int32
+
+
+def _preprocess(
     chunk: pd.DataFrame,
-    model: TAMClassifier,
     band_mean: np.ndarray,
     band_std: np.ndarray,
-    pixel_year_probs: dict[str, dict[int, list[float]]],
     scl_purity_min: float,
     min_obs_per_year: int,
+    pin: bool = False,
+) -> _PreparedBatch | None:
+    """CPU-side preprocessing using numba kernels for maximum throughput.
+
+    Pipeline:
+      1. SCL filter (already applied by reader, but guard here too)
+      2. Extract features into C-contiguous float32 via numba parallel kernel
+      3. Find pixel-year window boundaries with numpy
+      4. Fill padded (W, SEQ, F) arrays + normalise via numba parallel kernel
+    """
+    from tam.core._preprocess_numba import extract_features, fill_windows
+
+    if "scl_purity" in chunk.columns:
+        chunk = chunk[chunk["scl_purity"] >= scl_purity_min]
+    if chunk.empty:
+        return None
+
+    N = len(chunk)
+
+    # Step 1: extract feature matrix — bands are already float32, zero-copy .values
+    feat = np.empty((N, _N_FEATURES), dtype=np.float32)
+    extract_features(
+        chunk["B02"].values, chunk["B03"].values, chunk["B04"].values,
+        chunk["B05"].values, chunk["B06"].values, chunk["B07"].values,
+        chunk["B08"].values, chunk["B8A"].values, chunk["B11"].values,
+        chunk["B12"].values,
+        feat,
+    )
+
+    # Step 2: find group boundaries (pixel-year windows)
+    pid_arr  = chunk["point_id"].values
+    year_arr = chunk["year"].values.astype(np.int32)
+    doy_arr  = chunk["doy"].values.astype(np.int32)
+
+    pid_change  = np.empty(N, dtype=bool)
+    year_change = np.empty(N, dtype=bool)
+    pid_change[0] = year_change[0] = True
+    pid_change[1:]  = pid_arr[1:]  != pid_arr[:-1]
+    year_change[1:] = year_arr[1:] != year_arr[:-1]
+
+    boundaries = np.where(pid_change | year_change)[0]
+    ends    = np.append(boundaries[1:], N)
+    lengths = ends - boundaries
+    valid   = lengths >= min_obs_per_year
+
+    if not valid.any():
+        return None
+
+    valid_starts = boundaries[valid].astype(np.int64)
+    capped = np.minimum(lengths[valid], MAX_SEQ_LEN).astype(np.int32)
+    W = int(valid.sum())
+
+    # Step 3: fill padded tensors with normalisation via numba parallel kernel
+    bands_np = np.zeros((W, MAX_SEQ_LEN, _N_FEATURES), dtype=np.float32)
+    doy_np   = np.zeros((W, MAX_SEQ_LEN), dtype=np.int64)
+    mask_np  = np.ones( (W, MAX_SEQ_LEN), dtype=np.bool_)
+
+    fill_windows(feat, doy_arr, valid_starts, capped, band_mean, band_std,
+                 bands_np, doy_np, mask_np)
+
+    pids  = pid_arr[valid_starts]
+    years = year_arr[valid_starts]
+
+    bands_th = torch.from_numpy(bands_np)
+    doy_th   = torch.from_numpy(doy_np)
+    mask_th  = torch.from_numpy(mask_np)
+    if pin:
+        bands_th = bands_th.pin_memory()
+        doy_th   = doy_th.pin_memory()
+        mask_th  = mask_th.pin_memory()
+
+    return _PreparedBatch(bands_th, doy_th, mask_th, pids, years)
+
+
+def _gpu_score(
+    prepared: _PreparedBatch,
+    model: TAMClassifier,
+    pixel_year_probs: dict[str, dict[int, list[float]]],
     batch_size: int,
     device: str,
 ) -> None:
-    """Score one in-memory chunk and accumulate results into pixel_year_probs (in-place).
-
-    pixel_year_probs maps point_id -> {year -> [prob, ...]} so that the caller
-    can apply year-weighted aggregation after all chunks are processed.
-    """
-    ds = TAMDataset(
-        chunk, labels=None,
-        band_mean=band_mean, band_std=band_std,
-        scl_purity_min=scl_purity_min,
-        min_obs_per_year=min_obs_per_year,
-    )
-    if len(ds) == 0:
-        return
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn, num_workers=4)
-    with torch.no_grad():
-        for batch in loader:
+    """GPU-side: transfer tensors and run inference."""
+    bands_th, doy_th, mask_th, pids, years = prepared
+    W = len(pids)
+    with torch.inference_mode():
+        for start in range(0, W, batch_size):
+            end = min(start + batch_size, W)
             prob, _ = model(
-                batch["bands"].to(device),
-                batch["doy"].to(device),
-                batch["mask"].to(device),
+                bands_th[start:end].to(device, non_blocking=True),
+                doy_th[start:end].to(device, non_blocking=True),
+                mask_th[start:end].to(device, non_blocking=True),
             )
-            for pid, year, p in zip(batch["point_id"], batch["year"], prob.cpu().numpy()):
-                year_int = int(year)
-                pixel_year_probs.setdefault(pid, {}).setdefault(year_int, []).append(float(p))
+            for pid, yr, p in zip(pids[start:end], years[start:end], prob.cpu().numpy()):
+                pixel_year_probs.setdefault(str(pid), {}).setdefault(int(yr), []).append(float(p))
 
 
 def aggregate_year_probs(
@@ -61,18 +155,7 @@ def aggregate_year_probs(
     """Aggregate per-(pixel, year) probabilities into a single score per pixel.
 
     Each year's mean probability is weighted by exp(-decay * (end_year - year)),
-    so years closer to end_year receive higher weight. This makes the score
-    reflect current presence while still benefiting from multi-year signal.
-
-    Parameters
-    ----------
-    pixel_year_probs:
-        Maps point_id -> {year -> [prob, ...]}
-    end_year:
-        The reference year (typically the last year of the inference window).
-    decay:
-        Exponential decay rate (per year back from end_year). Default 0.7
-        gives ~12% relative weight to a year 3 years old vs the current year.
+    so years closer to end_year receive higher weight.
     """
     records = []
     for pid, year_probs in pixel_year_probs.items():
@@ -95,66 +178,127 @@ def score_pixels_chunked(
     band_std: np.ndarray,
     scl_purity_min: float = 0.5,
     min_obs_per_year: int = 8,
-    batch_size: int = 256,
+    batch_size: int = 4096,
+    buffer_row_groups: int = 16,
+    n_prep_workers: int = 4,
     device: str | None = None,
     tile_id: str | None = None,
     end_year: int | None = None,
     decay: float = 0.7,
+    n_total_pixels: int | None = None,
 ) -> pd.DataFrame:
-    """Score all pixels in parquet one row-group at a time to bound peak RAM.
+    """Score all pixels in parquet with a three-stage concurrent pipeline.
 
-    Returns a DataFrame with columns: point_id, prob_tam
-    (exponentially decay-weighted mean probability across years, anchored at end_year).
+    Stage 1 (reader thread):          reads row groups → raw DataFrame queue
+    Stage 2 (n_prep_workers threads): numba preprocessing → pinned tensor queue
+    Stage 3 (main thread / GPU):      inference
+
+    Returns a DataFrame with columns: point_id, prob_tam.
     """
     import pyarrow.parquet as pq
+    from concurrent.futures import ThreadPoolExecutor
+    from tam.core._preprocess_numba import warmup as _numba_warmup
 
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    pin = device.startswith("cuda") and torch.cuda.is_available()
     model.to(device)
     model.eval()
 
+    logger.info("Warming up numba kernels ...")
+    _numba_warmup()
+
     pf = pq.ParquetFile(parquet)
     n_rg = pf.metadata.num_row_groups
-    pixel_year_probs: dict[str, dict[int, list[float]]] = {}
     tile_prefix = f"_{tile_id}_" if tile_id else None
-    parquet_cols = set(pf.schema_arrow.names)
-    available_index_cols = [c for c in INDEX_COLS if c in parquet_cols]
-    read_cols = ["point_id", "date", "scl_purity"] + (["item_id"] if tile_id else []) + BAND_COLS + available_index_cols
-    leftover: pd.DataFrame = pd.DataFrame()
 
-    for rg in range(n_rg):
-        chunk = pf.read_row_group(rg, columns=read_cols).to_pandas()
-        if tile_prefix:
-            chunk = chunk[chunk["item_id"].str.contains(tile_prefix, regex=False)]
-        chunk = chunk[chunk["scl_purity"] >= scl_purity_min]
-        dates = pd.to_datetime(chunk["date"])
-        chunk["year"] = dates.dt.year
-        chunk["doy"]  = dates.dt.day_of_year
+    read_cols = (
+        ["point_id", "date", "scl_purity"]
+        + (["item_id"] if tile_id else [])
+        + BAND_COLS
+    )
 
-        # Prepend any pixels that straddled the previous row-group boundary
+    # Stage 1→2: raw DataFrames
+    raw_q: Queue = Queue(maxsize=n_prep_workers * 2)
+    # Stage 2→3: prepared batches
+    prep_q: Queue = Queue(maxsize=n_prep_workers * 2)
+
+    # --- Stage 1: reader ---
+    def _reader() -> None:
+        leftover: pd.DataFrame = pd.DataFrame()
+        buffer: list[pd.DataFrame] = []
+
+        def _emit(buf: list[pd.DataFrame], lo: pd.DataFrame, is_last: bool) -> pd.DataFrame:
+            if not buf:
+                return lo
+            chunk = pd.concat(buf, ignore_index=True)
+            if not lo.empty:
+                chunk = pd.concat([lo, chunk], ignore_index=True)
+            if not is_last:
+                boundary_pid = chunk["point_id"].iloc[-1]
+                new_lo = chunk[chunk["point_id"] == boundary_pid].copy()
+                chunk = chunk[chunk["point_id"] != boundary_pid]
+            else:
+                new_lo = pd.DataFrame()
+            if not chunk.empty:
+                raw_q.put(chunk)
+            return new_lo
+
+        for rg in range(n_rg):
+            chunk = pf.read_row_group(rg, columns=read_cols).to_pandas()
+            if tile_prefix:
+                chunk = chunk[chunk["item_id"].str.contains(tile_prefix, regex=False)]
+            chunk = chunk[chunk["scl_purity"] >= scl_purity_min]
+            if chunk.empty:
+                continue
+            ts_us = chunk["date"].values.astype("int64")
+            chunk["year"], chunk["doy"] = _extract_year_doy(ts_us)
+            buffer.append(chunk)
+            if len(buffer) >= buffer_row_groups:
+                leftover = _emit(buffer, leftover, is_last=(rg == n_rg - 1))
+                buffer = []
+
+        leftover = _emit(buffer, leftover, is_last=True)
         if not leftover.empty:
-            chunk = pd.concat([leftover, chunk], ignore_index=True)
+            raw_q.put(leftover)
+        for _ in range(n_prep_workers):
+            raw_q.put(_SENTINEL)
 
-        is_last = (rg == n_rg - 1)
-        if chunk.empty:
-            leftover = pd.DataFrame()
+    # --- Stage 2: preprocessor workers ---
+    def _preprocessor() -> None:
+        while True:
+            item = raw_q.get()
+            if item is _SENTINEL:
+                break
+            prepared = _preprocess(item, band_mean, band_std, scl_purity_min, min_obs_per_year, pin=pin)
+            if prepared is not None:
+                prep_q.put(prepared)
+        prep_q.put(_SENTINEL)
+
+    reader_thread = Thread(target=_reader, daemon=True)
+    reader_thread.start()
+
+    prep_pool = ThreadPoolExecutor(max_workers=n_prep_workers)
+    prep_futures = [prep_pool.submit(_preprocessor) for _ in range(n_prep_workers)]
+
+    pixel_year_probs: dict[str, dict[int, list[float]]] = {}
+    sentinels_seen = 0
+
+    while sentinels_seen < n_prep_workers:
+        item = prep_q.get()
+        if item is _SENTINEL:
+            sentinels_seen += 1
             continue
-        if not is_last:
-            boundary_pid = chunk["point_id"].iloc[-1]
-            leftover = chunk[chunk["point_id"] == boundary_pid].copy()
-            chunk = chunk[chunk["point_id"] != boundary_pid]
+        _gpu_score(item, model, pixel_year_probs, batch_size, device)
+        n_unique = len(pixel_year_probs)
+        if n_total_pixels:
+            logger.info("Scored %.1f%% (%d / %d pixels)", 100 * n_unique / n_total_pixels, n_unique, n_total_pixels)
         else:
-            leftover = pd.DataFrame()
+            logger.info("Scored %d pixels so far", n_unique)
 
-        if chunk.empty:
-            continue
-        _score_chunk(chunk, model, band_mean, band_std, pixel_year_probs,
-                     scl_purity_min, min_obs_per_year, batch_size, device)
-        logger.info("Scored row group %d/%d  (%d pixels so far)", rg + 1, n_rg, len(pixel_year_probs))
-
-    # Flush any remaining leftover (last pixel in file)
-    if not leftover.empty:
-        _score_chunk(leftover, model, band_mean, band_std, pixel_year_probs,
-                     scl_purity_min, min_obs_per_year, batch_size, device)
+    reader_thread.join()
+    for f in prep_futures:
+        f.result()
+    prep_pool.shutdown(wait=False)
 
     inferred_end_year = end_year or max(
         yr for yp in pixel_year_probs.values() for yr in yp

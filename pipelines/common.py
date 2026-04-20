@@ -53,6 +53,7 @@ def summarise(
     loc,
     *,
     show_scene_percentiles: bool = True,
+    prob_col: str = "prob_lr",
 ) -> None:
     """Print per-class probability statistics.
 
@@ -77,12 +78,12 @@ def summarise(
     if not labelled.empty:
         print("\nProbability by class (mean / median / std):")
         for val, label in [(True, "Presence"), (False, "Absence")]:
-            sub = labelled[labelled["is_presence"] == val]["prob_lr"]
+            sub = labelled[labelled["is_presence"] == val][prob_col]
             if not sub.empty:
                 print(f"  {label:10s}  mean={sub.mean():.3f}  median={sub.median():.3f}  std={sub.std():.3f}")
 
     if show_scene_percentiles:
-        all_scored = scored_df["prob_lr"].dropna()
+        all_scored = scored_df[prob_col].dropna()
         print(f"\nFull scene  ({len(all_scored):,} scored pixels):")
         print(f"  mean={all_scored.mean():.3f}  median={all_scored.median():.3f}  std={all_scored.std():.3f}")
         for pct in (75, 90, 95):

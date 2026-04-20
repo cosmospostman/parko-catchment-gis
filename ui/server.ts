@@ -443,7 +443,8 @@ async function handler(req: Request): Promise<Response> {
       const grid = await loadGrid(location, stem);
       if (!grid) return new Response("Unknown stem", { status: 404 });
       const cmap = url.searchParams.get("cmap") ?? "rdylgn";
-      const png = await renderTile(grid, z, x, y, cmap);
+      const cutoff = parseFloat(url.searchParams.get("cutoff") ?? "0");
+      const png = await renderTile(grid, z, x, y, cmap, cutoff);
       return new Response(png as unknown as BodyInit, {
         headers: {
           "content-type": "image/png",

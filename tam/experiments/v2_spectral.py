@@ -1,17 +1,22 @@
-"""tam/experiments/v1_spectral.py — Spectral bands + NDVI/NDWI/EVI indices."""
+"""tam/experiments/v2_spectral.py — Spectral bands + NDVI/NDWI/EVI indices (V2).
+
+Extends V1 with additional Frenchs presence sites (3–5) and water absence sites (1–3)
+to improve discrimination of open water, which V1 misclassified as Parkinsonia.
+"""
 
 from tam.core.dataset import ALL_FEATURE_COLS
 from tam.core.experiment import Experiment
 
 EXPERIMENT = Experiment(
-    name="v1_spectral",
+    name="v2_spectral",
     region_ids=[
         "lake_mueller_presence", "lake_mueller_presence_2", "lake_mueller_presence_3",
         # "lake_mueller_presence_mixed",  # removed — noisy labels (Parkinsonia mixed with native canopy)
         "lake_mueller_absence",
         "barcoorah_presence", "barcoorah_absence_lake", "barcoorah_absence_woodland",
         "frenchs_presence_1", "frenchs_presence_2", "frenchs_presence_3",
-        "frenchs_presence_4", "frenchs_presence_5",
+        "frenchs_presence_4", "frenchs_presence_5", "frenchs_presence_6",
+        "frenchs_absence_bare_soil_1", "frenchs_absence_bare_soil_2", "frenchs_absence_bare_soil_3",
         "frenchs_absence_mangrove", "frenchs_absence_ocean",
         "frenchs_absence_riparian_woodland", "frenchs_absence_riparian", "frenchs_absence_savanna",
         "frenchs_absence_water_1", "frenchs_absence_water_2", "frenchs_absence_water_3",
