@@ -126,6 +126,23 @@ regions:
     year: 2021
     tags: [arid, riparian, gps_surveyed]
 
+  - id: lake_mueller_presence_3
+    name: "Lake Mueller — presence 3"
+    label: presence
+    bbox: [145.430767, -22.749062, 145.433150, -22.747257]
+    year: 2021
+    tags: [arid, riparian]
+
+  - id: lake_mueller_presence_mixed
+    name: "Lake Mueller — presence (mixed riparian)"
+    label: presence
+    bbox: [145.444249, -22.749611, 145.448192, -22.747165]
+    year: 2021
+    tags: [arid, riparian, mixed]
+    notes: >
+      Parkinsonia mixed with native riparian. Noisy positive — forces model to detect
+      Parkinsonia signal when not dominant in canopy.
+
   - id: lake_mueller_absence
     name: "Lake Mueller — absence"
     label: absence
@@ -255,6 +272,27 @@ regions:
     name: "Stonehenge — presence 3"
     label: presence
     bbox: [143.286742, -24.313390, 143.287147, -24.312574]
+    year: 2025
+    tags: [arid]
+
+  - id: stonehenge_presence_4
+    name: "Stonehenge — presence 4"
+    label: presence
+    bbox: [143.277658, -24.311052, 143.278163, -24.310214]
+    year: 2025
+    tags: [arid]
+
+  - id: stonehenge_presence_5
+    name: "Stonehenge — presence 5"
+    label: presence
+    bbox: [143.282036, -24.310648, 143.282975, -24.309879]
+    year: 2025
+    tags: [arid]
+
+  - id: stonehenge_presence_6
+    name: "Stonehenge — presence 6"
+    label: presence
+    bbox: [143.276377, -24.317941, 143.276927, -24.317244]
     year: 2025
     tags: [arid]
 
