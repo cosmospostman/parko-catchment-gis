@@ -1,0 +1,7 @@
+# Basalt — 3 km × 3 km scene centred on -19.739874, 146.116868.
+name: "Basalt 3x3km"
+centroid: [-19.739874, 146.116868]  # [lat, lon]
+bbox: [146.102552, -19.753349, 146.131184, -19.726399]  # [lon_min, lat_min, lon_max, lat_max] — approx 3 km × 3 km
+dry_months: [6, 7, 8, 9, 10]
+notes: >
+  3 km × 3 km scene centred on -19.739874, 146.116868 (Basalt area).

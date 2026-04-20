@@ -14,8 +14,7 @@ EXPERIMENT = Experiment(
         "mitchell_river_absence",
         "nardoo_presence",
         "norman_road_presence_1", "norman_road_presence_2",
-        # "norman_road_presence_3",  # removed — possible label noise
-        "norman_road_presence_4",
+        "norman_road_presence_3", "norman_road_presence_4",
         "norman_road_absence_1", "norman_road_absence_2",
         # "rockhampton_presence_1", "rockhampton_presence_2",  # removed — uncertain labels (swamp context)
         "stonehenge_presence1", "stonehenge_presence_2", "stonehenge_presence_3",

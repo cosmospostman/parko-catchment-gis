@@ -1,0 +1,9 @@
+# Basalt — 8 km × 8 km scene centred on -19.739874, 146.116868.
+name: "Basalt 8x8km"
+centroid: [-19.739874, 146.116868]  # [lat, lon]
+bbox: [146.077552, -19.775874, 146.156184, -19.703874]  # [lon_min, lat_min, lon_max, lat_max] — approx 8 km × 8 km
+dry_months: [6, 7, 8, 9, 10]
+notes: >
+  8 km × 8 km scene centred on -19.739874, 146.116868 (Basalt area).
+  Expanded from basalt-3x3km.yaml to cover a broader region.
+  Parent location: data/locations/basalt-3x3km.yaml

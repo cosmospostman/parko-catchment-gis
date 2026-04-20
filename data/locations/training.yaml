@@ -172,7 +172,7 @@ regions:
     year: 2025
     tags: [monsoonal]
 
-  - id: norman_road_presence_3  # removed — possible label noise
+  - id: norman_road_presence_3
     name: "Norman Road — presence 3"
     label: presence
     bbox: [141.471105, -20.316546, 141.473597, -20.312332]

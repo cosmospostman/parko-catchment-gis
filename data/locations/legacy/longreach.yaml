@@ -1,0 +1,23 @@
+# Longreach — Thomson River riparian infestation, GPS-logged field survey.
+# Primary training site. Compact cluster of ~748 GPS pixels split into
+# presence (north) and absence (south) sub-bboxes along the river corridor.
+name: "Longreach"
+centroid: [-22.7641, 145.4244]  # [lat, lon]
+bbox: [145.4239, -22.7672, 145.4250, -22.7610]  # [lon_min, lat_min, lon_max, lat_max]
+dry_months: [6, 7, 8, 9, 10]
+sub_bboxes:
+  presence:
+    label: "Presence — Thomson River infestation core"
+    role: presence
+    bbox: [145.4239, -22.7640, 145.4250, -22.7610]  # [lon_min, lat_min, lon_max, lat_max]
+  absence:
+    label: "Absence — riparian corridor south of infestation"
+    role: absence
+    bbox: [145.4239, -22.7672, 145.4250, -22.7640]  # [lon_min, lat_min, lon_max, lat_max]
+notes: >
+  Primary Longreach training site. GPS-logged field survey records along the
+  Thomson River riparian corridor. ~748 pixels across two contiguous sub-bboxes:
+  presence (north, ~363 px) and absence (south, ~385 px), separated at
+  lat ≈ -22.764. Used as training labels for all Longreach-derived pipelines
+  (longreach-8x8km, longreach-expanded, longreach-expanded-tuned).
+  Parent of data/locations/longreach-8x8km.yaml.
