@@ -11,30 +11,28 @@ transform and CRS only need to be plausible — the exact values are irrelevant.
 Tests
 -----
  1. make_pixel_grid returns at least one point for a small bbox.
- 2. stride=2 reduces the point count by roughly stride².
- 3. All point_ids match the "px_XXXX_YYYY" format.
- 4. Returned (lon, lat) lie inside the input bbox (with small snap slop).
- 5. Inverted bbox (lon_min > lon_max) returns empty list silently (Bug PC2 — documents).
- 6. stride=0 raises from numpy (Bug PC3 — documents opaque error).
- 7. _utm_crs_for_bbox: northern hemisphere → EPSG:326XX.
- 8. _utm_crs_for_bbox: southern hemisphere → EPSG:327XX.
- 9. _utm_crs_for_bbox: lon_centre=180.0 produces invalid zone 61 (Bug PC1 — FAILS).
-10. extract_item_to_df: clear pixels produce a DataFrame with correct columns and SR values.
-11. extract_item_to_df: all-clouded item (SCL=9) returns None.
-12. extract_item_to_df: missing SCL band returns None.
-13. extract_item_to_df: all rows all-NaN bands returns None (regression).
-14. extract_item_to_df: partial NaN rows are NOT dropped (Bug PC4 — documents).
-15. extract_item_to_df: spectral index columns (NDVI, NDWI, EVI) are present.
-16. extract_item_to_df: missing AOT band defaults aot column to 1.0.
-17. extract_item_to_df: apply_nbar=False does not raise.
-18. extract_item_to_df: two items from different tiles produce two rows — no cross-tile dedup.
-19. Granule dedup regex strips the processing-granule index suffix correctly.
-20. Cross-tile items with matching (date, satellite) both survive per-tile dedup (Bug PC6 — documents).
-21. collect() dedup step removes cross-tile duplicate rows, keeping higher scl_purity.
-22. collect() dedup: no-duplicate parquet is left unchanged, total_rows correct.
-23. collect() dedup: non-duplicate rows adjacent to a boundary pixel are preserved.
-24. collect() dedup: duplicate pair straddling a row-group boundary is resolved.
-25. collect() dedup: equal scl_purity tie-break keeps the first tile in input order.
+ 2. All point_ids match the "px_XXXX_YYYY" format.
+ 3. Returned (lon, lat) lie inside the input bbox (with small snap slop).
+ 4. Inverted bbox (lon_min > lon_max) returns empty list silently (Bug PC2 — documents).
+ 5. _utm_crs_for_bbox: northern hemisphere → EPSG:326XX.
+ 6. _utm_crs_for_bbox: southern hemisphere → EPSG:327XX.
+ 7. _utm_crs_for_bbox: lon_centre=180.0 produces invalid zone 61 (Bug PC1 — FAILS).
+ 8. extract_item_to_df: clear pixels produce a DataFrame with correct columns and SR values.
+ 9. extract_item_to_df: all-clouded item (SCL=9) returns None.
+10. extract_item_to_df: missing SCL band returns None.
+11. extract_item_to_df: all rows all-NaN bands returns None (regression).
+12. extract_item_to_df: partial NaN rows are NOT dropped (Bug PC4 — documents).
+13. extract_item_to_df: spectral index columns (NDVI, NDWI, EVI) are present.
+14. extract_item_to_df: missing AOT band defaults aot column to 1.0.
+15. extract_item_to_df: apply_nbar=False does not raise.
+16. extract_item_to_df: two items from different tiles produce two rows — no cross-tile dedup.
+17. Granule dedup regex strips the processing-granule index suffix correctly.
+18. Cross-tile items with matching (date, satellite) both survive per-tile dedup (Bug PC6 — documents).
+19. collect() dedup step removes cross-tile duplicate rows, keeping higher scl_purity.
+20. collect() dedup: no-duplicate parquet is left unchanged, total_rows correct.
+21. collect() dedup: non-duplicate rows adjacent to a boundary pixel are preserved.
+22. collect() dedup: duplicate pair straddling a row-group boundary is resolved.
+23. collect() dedup: equal scl_purity tie-break keeps the first tile in input order.
 """
 
 from __future__ import annotations
@@ -135,15 +133,8 @@ def test_make_pixel_grid_returns_points():
     assert isinstance(lat, float)
 
 
-def test_make_pixel_grid_stride_reduces_count():
-    pts1 = make_pixel_grid(_BBOX_AU, stride=1)
-    pts2 = make_pixel_grid(_BBOX_AU, stride=2)
-    # stride=2 → ~1/4 of the points
-    assert len(pts2) == pytest.approx(len(pts1) / 4, rel=0.15)
-
-
 def test_make_pixel_grid_point_id_format():
-    pts = make_pixel_grid(_BBOX_AU, stride=3)
+    pts = make_pixel_grid(_BBOX_AU)
     pattern = re.compile(r"^px_\d{4}_\d{4}$")
     for pid, _, _ in pts:
         assert pattern.match(pid), f"bad pid: {pid!r}"
@@ -152,14 +143,14 @@ def test_make_pixel_grid_point_id_format():
 def test_make_pixel_grid_lons_lats_inside_bbox():
     lon_min, lat_min, lon_max, lat_max = _BBOX_AU
     slop = 0.001  # allow small snap offset
-    pts = make_pixel_grid(_BBOX_AU, stride=2)
+    pts = make_pixel_grid(_BBOX_AU)
     for _, lon, lat in pts:
         assert lon_min - slop <= lon <= lon_max + slop
         assert lat_min - slop <= lat <= lat_max + slop
 
 
 # ---------------------------------------------------------------------------
-# Test 5 — inverted bbox returns empty list silently (Bug PC2 — documents)
+# Test 4 — inverted bbox returns empty list silently (Bug PC2 — documents)
 # ---------------------------------------------------------------------------
 
 def test_make_pixel_grid_inverted_bbox_returns_empty():
@@ -170,18 +161,7 @@ def test_make_pixel_grid_inverted_bbox_returns_empty():
 
 
 # ---------------------------------------------------------------------------
-# Test 6 — stride=0 raises (Bug PC3 — documents opaque numpy error)
-# ---------------------------------------------------------------------------
-
-def test_make_pixel_grid_stride_zero_raises():
-    # numpy raises ValueError: slice step cannot be zero.
-    # Bug PC3: should raise a clear application-level ValueError instead.
-    with pytest.raises((ValueError, IndexError)):
-        make_pixel_grid(_BBOX_AU, stride=0)
-
-
-# ---------------------------------------------------------------------------
-# Tests 7–9: _utm_crs_for_bbox
+# Tests 5–7: _utm_crs_for_bbox
 # ---------------------------------------------------------------------------
 
 def test_utm_crs_northern_hemisphere():

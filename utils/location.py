@@ -194,7 +194,6 @@ class Location:
         end: Optional[str] = None,
         cloud_max: int = 30,
         cache_dir: Optional[Path] = None,
-        stride: int = 1,
         apply_nbar: bool = True,
     ) -> Path:
         """Fetch Sentinel-2 pixel observations for this location.
@@ -219,7 +218,6 @@ class Location:
             out_path=_out,
             cloud_max=cloud_max,
             cache_dir=_cache,
-            stride=stride,
             apply_nbar=apply_nbar,
         )
         return _out

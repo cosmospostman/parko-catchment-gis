@@ -101,17 +101,12 @@ def make_pixel_grid(
     bbox_wgs84: list[float],
     utm_crs: str | None = None,
     resolution_m: float = 10.0,
-    stride: int = 1,
     point_id_prefix: str = "px",
 ) -> list[tuple[str, float, float]]:
     """Generate one point per S2 pixel inside bbox_wgs84, aligned to a 10 m UTM grid.
 
     The grid origin is snapped to the nearest 10 m multiple so that points
     fall at S2 pixel centres rather than between pixels.
-
-    stride > 1 keeps every Nth pixel in both x and y, reducing point count by
-    stride² while preserving uniform spatial coverage. Effective resolution
-    becomes stride × 10 m (e.g. stride=3 → 30 m spacing).
 
     Returns list of (point_id, lon, lat).
     """
@@ -130,8 +125,8 @@ def make_pixel_grid(
     x0_snap = np.floor(x0 / r) * r
     y0_snap = np.floor(y0 / r) * r
 
-    xs = np.arange(x0_snap, x1, r)[::stride]
-    ys = np.arange(y0_snap, y1, r)[::stride]
+    xs = np.arange(x0_snap, x1, r)
+    ys = np.arange(y0_snap, y1, r)
 
     xx, yy = np.meshgrid(xs, ys, indexing="ij")
     lons, lats = to_wgs.transform(xx.ravel(), yy.ravel())
@@ -140,8 +135,8 @@ def make_pixel_grid(
     points = list(zip(pids, lons.tolist(), lats.tolist()))
 
     logger.info(
-        "Pixel grid: %d × %d = %d points at %.0f m spacing (stride=%d)",
-        len(xs), len(ys), len(points), r * stride, stride,
+        "Pixel grid: %d × %d = %d points at %.0f m spacing",
+        len(xs), len(ys), len(points), r,
     )
     return points
 
@@ -258,7 +253,6 @@ def collect(
     out_path: Path,
     cloud_max: int,
     cache_dir: Path | None = None,
-    stride: int = 1,
     apply_nbar: bool = True,
     max_concurrent: int = 32,
     items=None,
@@ -272,7 +266,7 @@ def collect(
     """
     # --- 1. Generate pixel grid -------------------------------------------
     utm_crs = _utm_crs_for_bbox(bbox_wgs84)
-    points = make_pixel_grid(bbox_wgs84, utm_crs=utm_crs, stride=stride, point_id_prefix=point_id_prefix)
+    points = make_pixel_grid(bbox_wgs84, utm_crs=utm_crs, point_id_prefix=point_id_prefix)
     point_coords = {pid: (lon, lat) for pid, lon, lat in points}
 
     import hashlib, pickle
@@ -672,7 +666,6 @@ if __name__ == "__main__":
     parser.add_argument("--start",    required=True, help="Start date YYYY-MM-DD")
     parser.add_argument("--end",      required=True, help="End date YYYY-MM-DD")
     parser.add_argument("--cloud-max", type=int, default=80, help="Max cloud cover %% (default 80)")
-    parser.add_argument("--stride",    type=int, default=1,  help="Pixel stride (default 1)")
     parser.add_argument("--no-nbar",   action="store_true",  help="Disable BRDF NBAR c-factor correction")
     parser.add_argument("--out",       default=None,         help="Output parquet path (default data/pixels/<location>.parquet)")
     args = parser.parse_args()
@@ -690,6 +683,5 @@ if __name__ == "__main__":
         start=args.start,
         end=args.end,
         cloud_max=args.cloud_max,
-        stride=args.stride,
         apply_nbar=not args.no_nbar,
     )

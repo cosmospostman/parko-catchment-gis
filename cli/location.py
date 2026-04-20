@@ -6,10 +6,10 @@ Usage
   python cli/location.py info <id>
   python cli/location.py bbox <id>
   python cli/location.py fetch <id> [--start YYYY-MM-DD] [--end YYYY-MM-DD]
-                                     [--cloud-max N] [--stride N] [--no-nbar]
+                                     [--cloud-max N] [--no-nbar]
   python cli/location.py training list
   python cli/location.py training fetch [--regions ID ...] [--all]
-                                         [--cloud-max N] [--stride N] [--no-nbar]
+                                         [--cloud-max N] [--no-nbar]
 
 Examples
 --------
@@ -96,7 +96,6 @@ def cmd_fetch(args: argparse.Namespace) -> None:
         start=args.start,
         end=args.end,
         cloud_max=args.cloud_max,
-        stride=args.stride,
         apply_nbar=not args.no_nbar,
     )
     print(f"Written: {out}")
@@ -132,7 +131,6 @@ def cmd_training_fetch(args: argparse.Namespace) -> None:
     ensure_training_pixels(
         regions=regions,
         cloud_max=args.cloud_max,
-        stride=args.stride,
         apply_nbar=not args.no_nbar,
         max_concurrent=args.max_concurrent,
     )
@@ -166,8 +164,6 @@ def main() -> None:
     pf.add_argument("--end", default=None, help="End date (default: today)")
     pf.add_argument("--cloud-max", type=int, default=30, metavar="N",
                     help="Max cloud cover %% (default: 30)")
-    pf.add_argument("--stride", type=int, default=1,
-                    help="Pixel grid stride, 1=every pixel (default: 1)")
     pf.add_argument("--no-nbar", action="store_true",
                     help="Disable BRDF NBAR c-factor correction")
 
@@ -183,7 +179,6 @@ def main() -> None:
     grp.add_argument("--all", action="store_true",
                      help="Fetch all regions in training.yaml")
     tf.add_argument("--cloud-max", type=int, default=80, metavar="N")
-    tf.add_argument("--stride", type=int, default=1)
     tf.add_argument("--no-nbar", action="store_true")
     tf.add_argument("--max-concurrent", type=int, default=32, metavar="N",
                     help="Max concurrent HTTP patch fetches per tile (default: 32)")

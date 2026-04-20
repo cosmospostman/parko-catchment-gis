@@ -184,7 +184,6 @@ def _tile_date_window(tile_regions: list[TrainingRegion]) -> tuple[str, str]:
 def ensure_training_pixels(
     regions: list[TrainingRegion],
     cloud_max: int = 80,
-    stride: int = 1,
     apply_nbar: bool = True,
     max_concurrent: int = 32,
 ) -> None:
@@ -248,7 +247,6 @@ def ensure_training_pixels(
                 out_path=out_path,
                 cloud_max=cloud_max,
                 cache_dir=cache_dir,
-                stride=stride,
                 apply_nbar=apply_nbar,
                 max_concurrent=max_concurrent,
                 items=tile_items,
