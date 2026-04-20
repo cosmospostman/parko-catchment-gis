@@ -117,7 +117,7 @@ class Location:
     @property
     def pixel_count(self) -> int:
         """Approximate S2 pixel count at 10 m resolution."""
-        return int(self._lon_m / 10) * int(self._lat_m / 10)
+        return round(self._lon_m / 10) * round(self._lat_m / 10)
 
     def estimated_parquet_mb(
         self,
@@ -251,12 +251,20 @@ def _load_registry(locations_dir: Path = _LOCATIONS_DIR) -> dict[str, Location]:
             )
 
         centroid = data.get("centroid")
+        if centroid is not None:
+            if not isinstance(centroid, (list, tuple)) or len(centroid) != 2:
+                raise ValueError(
+                    f"{yaml_path}: 'centroid' must be a [lat, lon] list, got {centroid!r}"
+                )
+            centroid = tuple(centroid)
+        else:
+            centroid = None
         result[loc_id] = Location(
             id=loc_id,
             name=data["name"],
             bbox=data["bbox"],
             dry_months=data.get("dry_months", [6, 7, 8, 9, 10]),
-            centroid=tuple(centroid) if centroid else None,
+            centroid=centroid,
             notes=data.get("notes"),
             sub_bboxes=sub_bboxes,
             signal_params=data.get("signals") or {},
@@ -291,7 +299,7 @@ def _bbox_pixel_count(bbox: list[float], resolution_m: float = 10.0) -> int:
     lat_centre = (lat_min + lat_max) / 2
     lon_m = (lon_max - lon_min) * 111_320 * math.cos(math.radians(lat_centre))
     lat_m = (lat_max - lat_min) * 111_320
-    return int(lon_m / resolution_m) * int(lat_m / resolution_m)
+    return round(lon_m / resolution_m) * round(lat_m / resolution_m)
 
 
 def training_pixel_summary(resolution_m: float = 10.0) -> None:

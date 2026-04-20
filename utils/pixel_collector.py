@@ -70,7 +70,7 @@ def _utm_crs_for_bbox(bbox_wgs84: list[float]) -> str:
     """Return the UTM CRS EPSG code for the centre longitude of a WGS84 bbox."""
     lon_centre = (bbox_wgs84[0] + bbox_wgs84[2]) / 2
     lat_centre = (bbox_wgs84[1] + bbox_wgs84[3]) / 2
-    zone = int((lon_centre + 180) / 6) + 1
+    zone = min(int((lon_centre + 180) / 6) + 1, 60)
     epsg = 32600 + zone if lat_centre >= 0 else 32700 + zone
     return f"EPSG:{epsg}"
 

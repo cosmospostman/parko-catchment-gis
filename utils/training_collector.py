@@ -61,6 +61,11 @@ def _update_index(region_id: str, tile_ids: list[str]) -> None:
     """Add or refresh the index entries for one region."""
     df = _load_index()
     df = df[df["region_id"] != region_id]  # remove stale entries
+    if not tile_ids:
+        raise ValueError(
+            f"_update_index: region {region_id!r} maps to zero tiles — "
+            "check that bbox_to_tile_ids() returns at least one tile."
+        )
     new_rows = pd.DataFrame({"region_id": region_id, "tile_id": tile_ids})
     df = pd.concat([df, new_rows], ignore_index=True)
     _save_index(df)
