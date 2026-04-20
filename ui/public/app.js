@@ -51,8 +51,24 @@ map.on('load', () => {
     tileSize: 256,
     attribution: '© Queensland Globe',
   });
-
   map.addLayer({ id: 'qld-globe-layer', type: 'raster', source: 'qld-globe' });
+
+  map.addSource('drawn-bbox', {
+    type: 'geojson',
+    data: { type: 'FeatureCollection', features: [] },
+  });
+  map.addLayer({
+    id: 'drawn-bbox-fill',
+    type: 'fill',
+    source: 'drawn-bbox',
+    paint: { 'fill-color': '#f59e0b', 'fill-opacity': 0.2 },
+  });
+  map.addLayer({
+    id: 'drawn-bbox-line',
+    type: 'line',
+    source: 'drawn-bbox',
+    paint: { 'line-color': '#f59e0b', 'line-width': 2 },
+  });
 
   loadLocations();
   loadSightings();
@@ -166,11 +182,13 @@ function loadLocations() {
         },
       });
 
-      // Training region layers (toggleable)
+      // Training region layers (toggleable) — initial visibility follows the checkbox
+      const trainingVisibility = document.getElementById('training-toggle').checked ? 'visible' : 'none';
       map.addLayer({
         id: 'training-fill',
         type: 'fill',
         source: 'training-regions',
+        layout: { visibility: trainingVisibility },
         paint: { 'fill-color': COLOR_EXPR, 'fill-opacity': 0.30 },
       });
 
@@ -178,6 +196,7 @@ function loadLocations() {
         id: 'training-line',
         type: 'line',
         source: 'training-regions',
+        layout: { visibility: trainingVisibility },
         paint: { 'line-color': COLOR_EXPR, 'line-width': 2 },
       });
 
@@ -203,7 +222,7 @@ function loadSightings() {
         id: 'sightings-layer',
         type: 'circle',
         source: 'sightings',
-        layout: { visibility: 'none' },
+        layout: { visibility: document.getElementById('sightings-toggle').checked ? 'visible' : 'none' },
         paint: {
           'circle-radius': 4,
           'circle-color': '#f97316',
@@ -225,8 +244,8 @@ function loadSightings() {
       map.on('mouseenter', 'sightings-layer', () => { map.getCanvas().style.cursor = 'pointer'; });
       map.on('mouseleave', 'sightings-layer', () => { map.getCanvas().style.cursor = ''; });
 
-      // expose features for year-slider count updates
       sightingsFeatures = geojson.features ?? [];
+      applySightingsYearFilter();
     })
     .catch(err => console.error('Failed to load sightings:', err));
 }
@@ -432,25 +451,7 @@ function setMode(mode) {
 // BBox draw mode
 // ---------------------------------------------------------------------------
 
-// Source + layer for the drawn rectangle
-map.on('load', () => {
-  map.addSource('drawn-bbox', {
-    type: 'geojson',
-    data: { type: 'FeatureCollection', features: [] },
-  });
-  map.addLayer({
-    id: 'drawn-bbox-fill',
-    type: 'fill',
-    source: 'drawn-bbox',
-    paint: { 'fill-color': '#f59e0b', 'fill-opacity': 0.2 },
-  });
-  map.addLayer({
-    id: 'drawn-bbox-line',
-    type: 'line',
-    source: 'drawn-bbox',
-    paint: { 'line-color': '#f59e0b', 'line-width': 2 },
-  });
-});
+// drawn-bbox source + layers are added in the main map.on('load') handler above.
 
 let drawStart = null;   // {lng, lat} of mousedown
 let isDrawing = false;
@@ -624,30 +625,28 @@ document.getElementById('sightings-toggle').addEventListener('change', (e) => {
   }
 });
 
-{
-  const slider = document.getElementById('sightings-year-slider');
-  const label = document.getElementById('sightings-year-label');
-  const MIN_YEAR = parseInt(slider.min, 10);
+const sightingsYearSlider = document.getElementById('sightings-year-slider');
+const sightingsYearLabel = document.getElementById('sightings-year-label');
+const SIGHTINGS_MIN_YEAR = parseInt(sightingsYearSlider.min, 10);
 
-  function applySightingsYearFilter() {
-    if (!map.getLayer('sightings-layer')) return;
-    const since = parseInt(slider.value, 10);
-    if (since <= MIN_YEAR) {
-      map.setFilter('sightings-layer', null);
-      label.textContent = 'all years';
-      const countEl = document.getElementById('sightings-count');
-      if (countEl) countEl.textContent = sightingsTotalCount.toLocaleString();
-    } else {
-      map.setFilter('sightings-layer', ['>=', ['to-number', ['get', 'year']], since]);
-      label.textContent = `≥ ${since}`;
-      const n = sightingsFeatures.filter(f => (f.properties.year ?? 0) >= since).length;
-      const countEl = document.getElementById('sightings-count');
-      if (countEl) countEl.textContent = n.toLocaleString();
-    }
+function applySightingsYearFilter() {
+  if (!map.getLayer('sightings-layer')) return;
+  const since = parseInt(sightingsYearSlider.value, 10);
+  if (since <= SIGHTINGS_MIN_YEAR) {
+    map.setFilter('sightings-layer', null);
+    sightingsYearLabel.textContent = 'all years';
+    const countEl = document.getElementById('sightings-count');
+    if (countEl) countEl.textContent = sightingsTotalCount.toLocaleString();
+  } else {
+    map.setFilter('sightings-layer', ['>=', ['to-number', ['get', 'year']], since]);
+    sightingsYearLabel.textContent = `≥ ${since}`;
+    const n = sightingsFeatures.filter(f => (f.properties.year ?? 0) >= since).length;
+    const countEl = document.getElementById('sightings-count');
+    if (countEl) countEl.textContent = n.toLocaleString();
   }
-
-  slider.addEventListener('input', applySightingsYearFilter);
 }
+
+sightingsYearSlider.addEventListener('input', applySightingsYearFilter);
 
 // ---------------------------------------------------------------------------
 // Imagery info sidebar section
