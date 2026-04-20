@@ -103,7 +103,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
 
 
 def cmd_training_list(args: argparse.Namespace) -> None:
-    from training.regions import load_regions
+    from utils.regions import load_regions
     from utils.location import _bbox_pixel_count
 
     regions = load_regions()
@@ -125,7 +125,7 @@ def cmd_training_list(args: argparse.Namespace) -> None:
 def cmd_training_fetch(args: argparse.Namespace) -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     logging.getLogger("rasterio").setLevel(logging.WARNING)
-    from training.regions import load_regions, select_regions
+    from utils.regions import load_regions, select_regions
     from utils.training_collector import ensure_training_pixels
 
     regions = load_regions() if args.all else select_regions(args.regions)

@@ -29,7 +29,7 @@ import hashlib
 import pickle
 import re as _re
 
-from training.regions import TrainingRegion, load_regions, select_regions
+from utils.regions import TrainingRegion, load_regions, select_regions
 from utils.location import tile_chips_path
 from utils.s2_tiles import bbox_to_tile_ids
 from utils.stac import search_sentinel2

@@ -133,12 +133,11 @@ def make_pixel_grid(
     xs = np.arange(x0_snap, x1, r)[::stride]
     ys = np.arange(y0_snap, y1, r)[::stride]
 
-    points: list[tuple[str, float, float]] = []
-    for i, xi in enumerate(xs):
-        for j, yj in enumerate(ys):
-            lon, lat = to_wgs.transform(float(xi), float(yj))
-            pid = f"{point_id_prefix}_{i:04d}_{j:04d}"
-            points.append((pid, float(lon), float(lat)))
+    xx, yy = np.meshgrid(xs, ys, indexing="ij")
+    lons, lats = to_wgs.transform(xx.ravel(), yy.ravel())
+    ii, jj = np.meshgrid(np.arange(len(xs)), np.arange(len(ys)), indexing="ij")
+    pids = [f"{point_id_prefix}_{i:04d}_{j:04d}" for i, j in zip(ii.ravel(), jj.ravel())]
+    points = list(zip(pids, lons.tolist(), lats.tolist()))
 
     logger.info(
         "Pixel grid: %d × %d = %d points at %.0f m spacing (stride=%d)",
@@ -176,9 +175,7 @@ def extract_item_to_df(
     if scl_vals is None:
         return None
     scl_int = scl_vals.astype(np.int32)
-    clear_mask = np.zeros(n, dtype=bool)
-    for v in SCL_CLEAR_VALUES:
-        clear_mask |= (scl_int == v)
+    clear_mask = np.isin(scl_int, list(SCL_CLEAR_VALUES))
     if not clear_mask.any():
         return None
     scl_purity = clear_mask.astype(np.float32)  # 1×1 chip → purity = 0 or 1
@@ -395,12 +392,19 @@ def collect(
         )
         # Check how many items are already fully cached on disk
         from utils.fetch import _cache_path
+        import os as _os
+        cached_keys: set[tuple[str, str]] = set()
+        try:
+            for _entry in _os.scandir(cache_dir):
+                if _entry.is_dir():
+                    for _f in _os.scandir(_entry.path):
+                        if _f.name.endswith(".npz"):
+                            cached_keys.add((_entry.name, _f.name[:-4]))
+        except FileNotFoundError:
+            pass
         uncached_items = [
             item for item in items
-            if not all(
-                _cache_path(cache_dir, item.id, band).exists()
-                for band in FETCH_BANDS
-            )
+            if any((item.id, band) not in cached_keys for band in FETCH_BANDS)
         ]
         if uncached_items:
             logger.info(
@@ -439,7 +443,8 @@ def collect(
         shard_lons = np.array([lon for _, lon, _ in shard_points], dtype=np.float64)
         shard_lats = np.array([lat for _, _, lat in shard_points], dtype=np.float64)
 
-        shard_point_coords = {pid: (lon, lat) for pid, lon, lat in shard_points}
+        shard_pids = {pid for pid, _, _ in shard_points}
+        shard_point_coords = {pid: point_coords[pid] for pid in shard_pids}
 
         # Per-shard checkpoint: item ids already written for this shard
         done_ids: set[str] = set()
@@ -450,7 +455,6 @@ def collect(
 
         writer: pq.ParquetWriter | None = None
         shard_rows = 0
-        done_fh = done_path.open("a")
 
         # --- Concurrent item processing --------------------------------------
         # N_WORKERS threads each process one item at a time: load .npz from
@@ -477,7 +481,7 @@ def collect(
             store.release_item(_item.id)
             return (_item.id, df)
 
-        with ThreadPoolExecutor(max_workers=N_WORKERS) as pool:
+        with done_path.open("a") as done_fh, ThreadPoolExecutor(max_workers=N_WORKERS) as pool:
             # Submit all items; keep futures in order for checkpoint tracking
             futures = {pool.submit(_process_item, item): item for item in pending_items}
 
@@ -503,11 +507,11 @@ def collect(
                         shard_idx + 1, n_shards, i, len(pending_items), shard_rows,
                     )
 
-        done_fh.close()
         if writer is not None:
             writer.close()
         # Mark shard complete with a sentinel line
-        done_path.open("a").write("__done__\n")
+        with done_path.open("a") as done_fh:
+            done_fh.write("__done__\n")
         if shard_path.exists():
             shard_paths.append(shard_path)
         logger.info("  shard %d/%d complete: %d rows", shard_idx + 1, n_shards, shard_rows)

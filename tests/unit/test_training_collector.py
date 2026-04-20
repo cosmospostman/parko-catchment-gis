@@ -33,7 +33,7 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
-from training.regions import TrainingRegion
+from utils.regions import TrainingRegion
 import utils.training_collector as tc
 from utils.training_collector import (
     _load_index,

@@ -1,8 +1,8 @@
-"""training/regions.py — Load and select training regions from YAML.
+"""utils/regions.py — Load and select training regions from YAML.
 
 Usage
 -----
-    from training.regions import load_regions, select_regions
+    from utils.regions import load_regions, select_regions
 
     # Load all regions
     regions = load_regions()

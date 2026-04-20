@@ -50,7 +50,7 @@ def _cmd_train(args: argparse.Namespace) -> None:
     exp_module = importlib.import_module(f"tam.experiments.{args.experiment}")
     exp = exp_module.EXPERIMENT
 
-    from training.regions import select_regions
+    from utils.regions import select_regions
     from utils.training_collector import tile_ids_for_regions, tile_parquet_path
 
     regions = select_regions(exp.region_ids)

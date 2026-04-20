@@ -304,7 +304,7 @@ def _bbox_pixel_count(bbox: list[float], resolution_m: float = 10.0) -> int:
 
 def training_pixel_summary(resolution_m: float = 10.0) -> None:
     """Print estimated pixel counts for all training regions, grouped by label."""
-    from training.regions import load_regions  # noqa: PLC0415
+    from utils.regions import load_regions  # noqa: PLC0415
 
     regions = load_regions()
     totals: dict[str, int] = {}
