@@ -9,6 +9,7 @@ are defined here and imported by every other module. Edit once, applies everywhe
 # ---------------------------------------------------------------------------
 
 BANDS: list[str] = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12"]
+SPECTRAL_INDEX_COLS: list[str] = ["NDVI", "NDWI", "EVI"]
 
 SCL_BAND = "SCL"
 AOT_BAND = "AOT"
@@ -57,3 +58,24 @@ SPATIAL_VALIDATION_THRESHOLD: float = 0.85
 
 FLOWERING_WINDOW: tuple[int, int] = (200, 340)
 FLOWERING_THRESHOLD: float = 0.15
+
+
+# ---------------------------------------------------------------------------
+# Spectral index computation
+# ---------------------------------------------------------------------------
+
+def add_spectral_indices(df: "pd.DataFrame") -> "pd.DataFrame":
+    """Return df with NDVI, NDWI, EVI columns appended, derived from raw bands."""
+    import numpy as np
+    b02 = df["B02"].values.astype("float32")
+    b03 = df["B03"].values.astype("float32")
+    b04 = df["B04"].values.astype("float32")
+    b08 = df["B08"].values.astype("float32")
+    df = df.copy()
+    denom = b08 + b04
+    df["NDVI"] = np.where(denom == 0, 0.0, (b08 - b04) / denom)
+    denom = b03 + b08
+    df["NDWI"] = np.where(denom == 0, 0.0, (b03 - b08) / denom)
+    evi_denom = b08 + 6 * b04 - 7.5 * b02 + 1
+    df["EVI"]  = np.where(evi_denom == 0, 0.0, 2.5 * (b08 - b04) / evi_denom)
+    return df

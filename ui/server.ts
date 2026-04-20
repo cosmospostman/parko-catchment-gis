@@ -30,6 +30,19 @@ interface LocationYaml {
   sub_bboxes?: Record<string, SubBbox>;
 }
 
+interface TrainingRegion {
+  id: string;
+  name: string;
+  label: string;   // "presence" | "absence"
+  bbox: [number, number, number, number];
+  year?: number;
+  notes?: string;
+}
+
+interface TrainingYaml {
+  regions: TrainingRegion[];
+}
+
 // ---------------------------------------------------------------------------
 // YAML → GeoJSON
 // ---------------------------------------------------------------------------
@@ -48,11 +61,42 @@ function bboxToPolygon(bbox: [number, number, number, number]): GeoJSON.Polygon 
   };
 }
 
+function loadTrainingRegions(features: GeoJSON.Feature[]): void {
+  const path = join(LOCATIONS_DIR, "training.yaml");
+  try {
+    const raw = Deno.readTextFileSync(path);
+    const data = parseYaml(raw) as TrainingYaml;
+    for (const region of data.regions ?? []) {
+      if (!region.bbox) continue;
+      features.push({
+        type: "Feature",
+        geometry: bboxToPolygon(region.bbox),
+        properties: {
+          id: region.id,
+          name: region.name,
+          label: region.name,
+          role: "sub_bbox",
+          sub_role: region.label,   // "presence" | "absence"
+          parent_id: "training",
+          year: region.year ?? null,
+          notes: region.notes ?? null,
+          bbox: region.bbox,
+        },
+      });
+    }
+  } catch (_) {
+    // training.yaml absent or unreadable — skip silently
+  }
+}
+
 function loadLocations(): GeoJSON.FeatureCollection {
   const features: GeoJSON.Feature[] = [];
 
+  loadTrainingRegions(features);
+
   for (const entry of Deno.readDirSync(LOCATIONS_DIR)) {
     if (!entry.name.endsWith(".yaml")) continue;
+    if (entry.name === "training.yaml") continue;  // handled above
     const slug = entry.name.replace(/\.yaml$/, "");
     const raw = Deno.readTextFileSync(join(LOCATIONS_DIR, entry.name));
     const loc = parseYaml(raw) as LocationYaml;
@@ -378,12 +422,12 @@ async function handler(req: Request): Promise<Response> {
     });
   }
 
-  const rankingTileMatch = url.pathname.match(/^\/ranking-tile\/([^/]+)\/(\d+)\/(\d+)\/(\d+)$/);
+  const rankingTileMatch = url.pathname.match(/^\/ranking-tile\/([^/]+)\/([^/]+)\/(\d+)\/(\d+)\/(\d+)$/);
   if (rankingTileMatch) {
-    const [, stem, zs, xs, ys] = rankingTileMatch;
+    const [, location, stem, zs, xs, ys] = rankingTileMatch;
     const z = parseInt(zs), x = parseInt(xs), y = parseInt(ys);
     try {
-      const grid = await loadGrid(stem);
+      const grid = await loadGrid(location, stem);
       if (!grid) return new Response("Unknown stem", { status: 404 });
       const cmap = url.searchParams.get("cmap") ?? "rdylgn";
       const png = await renderTile(grid, z, x, y, cmap);

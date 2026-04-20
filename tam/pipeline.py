@@ -3,8 +3,7 @@
 Usage
 -----
     # Train a named experiment
-    python -m tam.pipeline train --experiment v1_spectral \\
-        --start 2020-01-01 --end 2025-12-31
+    python -m tam.pipeline train --experiment v1_spectral
 
     # Score any location with an existing checkpoint
     python -m tam.pipeline score --checkpoint outputs/tam-v1_spectral \\
@@ -79,14 +78,32 @@ def _cmd_train(args: argparse.Namespace) -> None:
 
     # Apply date filter
     dates = pd.to_datetime(pixel_df["date"])
-    if args.start:
-        pixel_df = pixel_df[dates >= args.start]
-    if args.end:
-        pixel_df = pixel_df[dates <= args.end]
-
     dates = pd.to_datetime(pixel_df["date"])
     pixel_df["year"] = dates.dt.year
     pixel_df["doy"]  = dates.dt.day_of_year
+
+    # Per-region year pinning: drop observations outside [year-5, year] for
+    # regions that carry a `year` field (guards against post-clearance imagery).
+    pinned_regions = [r for r in regions if r.year is not None]
+    if pinned_regions:
+        # For each pixel_id, find which pinned region it falls in and derive
+        # the allowed year window; pixels in no pinned region are kept as-is.
+        keep_mask = pd.Series(True, index=pixel_df.index)
+        for region in pinned_regions:
+            lon_min, lat_min, lon_max, lat_max = region.bbox
+            in_region = (
+                pixel_df["lon"].between(lon_min, lon_max) &
+                pixel_df["lat"].between(lat_min, lat_max)
+            )
+            out_of_window = in_region & (
+                (pixel_df["year"] < region.year - 5) |
+                (pixel_df["year"] > region.year)
+            )
+            keep_mask &= ~out_of_window
+        n_dropped = (~keep_mask).sum()
+        if n_dropped:
+            logger.info("Year-pinning: dropped %d observations outside region windows", n_dropped)
+        pixel_df = pixel_df[keep_mask].reset_index(drop=True)
 
     # Build labels from regions
     pixel_coords = (
@@ -357,8 +374,6 @@ if __name__ == "__main__":
     # --- train ---
     p_train = sub.add_parser("train", help="Train a named experiment")
     p_train.add_argument("--experiment", required=True, help="Experiment module name (e.g. v1_spectral)")
-    p_train.add_argument("--start", default=None, help="Start date filter YYYY-MM-DD")
-    p_train.add_argument("--end",   default=None, help="End date filter YYYY-MM-DD")
     p_train.add_argument("--epochs",   type=int, default=None)
     p_train.add_argument("--patience", type=int, default=None)
     p_train.add_argument("--scl-purity", type=float, default=0.5)

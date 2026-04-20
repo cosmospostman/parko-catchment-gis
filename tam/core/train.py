@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 
 import numpy as np
@@ -128,7 +129,10 @@ def train_tam(
     )
     logger.info("Train windows: %d  |  Val windows: %d", len(train_ds), len(val_ds))
 
-    n_workers = 4
+    n_cpu = os.cpu_count() or 4
+    # Reserve cores for DataLoader workers; give the rest to PyTorch matmuls.
+    n_workers = max(2, n_cpu // 4)
+    torch.set_num_threads(max(1, n_cpu - n_workers))
     train_loader = DataLoader(
         train_ds, batch_size=cfg.batch_size, shuffle=True,
         collate_fn=collate_fn, num_workers=n_workers, persistent_workers=True, pin_memory=True,

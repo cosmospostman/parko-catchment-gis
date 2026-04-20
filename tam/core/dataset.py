@@ -18,10 +18,12 @@ from torch.utils.data import Dataset
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from analysis.constants import BANDS
+from analysis.constants import BANDS, SPECTRAL_INDEX_COLS, add_spectral_indices
 
 BAND_COLS: list[str] = list(BANDS)   # B02 B03 B04 B05 B06 B07 B08 B8A B11 B12
-N_BANDS: int = len(BAND_COLS)        # 10
+INDEX_COLS: list[str] = SPECTRAL_INDEX_COLS
+ALL_FEATURE_COLS: list[str] = BAND_COLS + INDEX_COLS
+N_BANDS: int = len(ALL_FEATURE_COLS)  # 13 (10 bands + NDVI + NDWI + EVI)
 MAX_SEQ_LEN: int = 128       # canonical value lives in TAMConfig; kept here for model.py import
 MIN_OBS_PER_YEAR: int = 8
 
@@ -85,7 +87,11 @@ class TAMDataset(Dataset):
         # relative timing between observations is preserved.  Set 0 to disable.
         # band_noise_std: std of Gaussian noise added to normalised band values per
         # observation independently (training only).  Set 0.0 to disable.
-        df = pixel_df
+        if any(c not in pixel_df.columns for c in INDEX_COLS):
+            df = add_spectral_indices(pixel_df)
+        else:
+            df = pixel_df
+        feature_cols = ALL_FEATURE_COLS
 
         # SCL filter
         if "scl_purity" in df.columns:
@@ -101,7 +107,7 @@ class TAMDataset(Dataset):
 
         # Compute band stats from training data if not supplied
         if band_mean is None or band_std is None:
-            vals = df[BAND_COLS].values.astype(np.float32)
+            vals = df[feature_cols].values.astype(np.float32)
             band_mean = np.nanmean(vals, axis=0)
             band_std  = np.nanstd(vals, axis=0)
             band_std  = np.where(band_std < 1e-6, 1.0, band_std)
@@ -117,7 +123,7 @@ class TAMDataset(Dataset):
             if len(grp) < min_obs_per_year:
                 continue
             n = min(len(grp), MAX_SEQ_LEN)
-            raw = grp[BAND_COLS].values[:n].astype(np.float32)
+            raw = grp[feature_cols].values[:n].astype(np.float32)
             bands_np = (raw - self.band_mean) / self.band_std
             if "doy" in grp.columns:
                 doy_np = grp["doy"].values[:n].astype(np.int32)

@@ -10,7 +10,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
-from tam.core.dataset import TAMDataset, collate_fn, BAND_COLS
+from tam.core.dataset import TAMDataset, collate_fn, BAND_COLS, INDEX_COLS
 from tam.core.model import TAMClassifier
 
 logger = logging.getLogger(__name__)
@@ -116,7 +116,9 @@ def score_pixels_chunked(
     n_rg = pf.metadata.num_row_groups
     pixel_year_probs: dict[str, dict[int, list[float]]] = {}
     tile_prefix = f"_{tile_id}_" if tile_id else None
-    read_cols = ["point_id", "date", "scl_purity"] + (["item_id"] if tile_id else []) + BAND_COLS
+    parquet_cols = set(pf.schema_arrow.names)
+    available_index_cols = [c for c in INDEX_COLS if c in parquet_cols]
+    read_cols = ["point_id", "date", "scl_purity"] + (["item_id"] if tile_id else []) + BAND_COLS + available_index_cols
     leftover: pd.DataFrame = pd.DataFrame()
 
     for rg in range(n_rg):

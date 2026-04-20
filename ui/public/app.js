@@ -91,13 +91,23 @@ const SCORE_BBOX_COLOR = '#a855f7';
 
 let geojsonData = null;
 
+const TRAINING_LAYERS = ['training-fill', 'training-line'];
+
 function loadLocations() {
-  fetch('/api/locations')
-    .then(r => r.json())
-    .then(geojson => {
+  Promise.all([
+    fetch('/api/locations').then(r => r.json()),
+    fetch('/api/rankings').then(r => r.json()).catch(() => ({})),
+  ]).then(([geojson, rankings]) => {
       geojsonData = geojson;
 
-      map.addSource('locations', { type: 'geojson', data: geojson });
+      // Split training regions into their own source so they can be toggled.
+      const trainingFeatures = geojson.features.filter(f => f.properties.parent_id === 'training');
+      const locationFeatures = geojson.features.filter(f => f.properties.parent_id !== 'training');
+      const locationGeojson = { type: 'FeatureCollection', features: locationFeatures };
+      const trainingGeojson = { type: 'FeatureCollection', features: trainingFeatures };
+
+      map.addSource('locations', { type: 'geojson', data: locationGeojson });
+      map.addSource('training-regions', { type: 'geojson', data: trainingGeojson });
 
       map.addLayer({
         id: 'loc-fill-location',
@@ -150,7 +160,22 @@ function loadLocations() {
         },
       });
 
-      buildSidebar(geojson);
+      // Training region layers (toggleable)
+      map.addLayer({
+        id: 'training-fill',
+        type: 'fill',
+        source: 'training-regions',
+        paint: { 'fill-color': COLOR_EXPR, 'fill-opacity': 0.30 },
+      });
+
+      map.addLayer({
+        id: 'training-line',
+        type: 'line',
+        source: 'training-regions',
+        paint: { 'line-color': COLOR_EXPR, 'line-width': 2 },
+      });
+
+      buildSidebar(geojson, rankings);
       attachPopups();
     })
     .catch(err => console.error('Failed to load locations:', err));
@@ -230,24 +255,76 @@ function buildSightingPopupHtml(p) {
 // Sidebar — Locations panel
 // ---------------------------------------------------------------------------
 
-function buildSidebar(geojson) {
+function buildSidebar(geojson, rankings) {
+  // Training regions accordion
+  const trainingFeatures = geojson.features.filter(f => f.properties.parent_id === 'training');
+  document.querySelector('#training-accordion-header .accordion-label').textContent =
+    `Training regions (${trainingFeatures.length})`;
+  const body = document.getElementById('training-accordion-body');
+  for (const feat of trainingFeatures) {
+    const { name, sub_role } = feat.properties;
+    let bbox = feat.properties.bbox;
+    if (typeof bbox === 'string') bbox = JSON.parse(bbox);
+
+    const item = document.createElement('div');
+    item.className = 'training-region-item';
+    item.innerHTML = `
+      <span class="training-role-dot ${sub_role}"></span>
+      <span>${name}</span>
+    `;
+    item.addEventListener('click', () => {
+      map.fitBounds([[bbox[0], bbox[1]], [bbox[2], bbox[3]]], { padding: 80, maxZoom: 16 });
+    });
+    body.appendChild(item);
+  }
+
+  const header = document.getElementById('training-accordion-header');
+  header.addEventListener('click', (e) => {
+    // Checkbox click handled separately — don't also toggle accordion
+    if (e.target.id === 'training-toggle') return;
+    header.classList.toggle('open');
+    body.classList.toggle('open');
+  });
+
+  // Location list
   const list = document.getElementById('location-list');
   const locations = geojson.features.filter(f => f.properties.role === 'location');
   locations.sort((a, b) => a.properties.name.localeCompare(b.properties.name));
 
   for (const feat of locations) {
     const { id, name } = feat.properties;
-    const bbox = feat.properties.bbox;
+    let bbox = feat.properties.bbox;
+    if (typeof bbox === 'string') bbox = JSON.parse(bbox);
 
     const li = document.createElement('li');
     li.dataset.id = id;
     li.innerHTML = `<div class="loc-name">${name}</div><div class="loc-id">${id}</div>`;
 
-    li.addEventListener('click', () => {
+    li.addEventListener('click', (e) => {
+      if (e.target.classList.contains('loc-ranking-select')) return;
       document.querySelectorAll('#location-list li').forEach(el => el.classList.remove('active'));
       li.classList.add('active');
       map.fitBounds([[bbox[0], bbox[1]], [bbox[2], bbox[3]]], { padding: 60, maxZoom: 14 });
     });
+
+    const runs = rankings[id];
+    if (runs && runs.length > 0) {
+      const sel = document.createElement('select');
+      sel.className = 'loc-ranking-select';
+      sel.dataset.location = id;
+      sel.innerHTML = '<option value="">— ranking —</option>';
+      for (const { stem, label } of runs) {
+        const opt = document.createElement('option');
+        opt.value = stem;
+        opt.textContent = label;
+        sel.appendChild(opt);
+      }
+      sel.addEventListener('change', (e) => {
+        e.stopPropagation();
+        setRankingLayer(id, e.target.value);
+      });
+      li.appendChild(sel);
+    }
 
     list.appendChild(li);
   }
@@ -283,17 +360,21 @@ function buildPopupHtml(props) {
   const parentLabel = props.parent_id
     ? `<div class="popup-row"><span class="popup-label">parent</span><span>${props.parent_id}</span></div>`
     : '';
+  const yearLabel = props.year
+    ? `<div class="popup-row"><span class="popup-label">year</span><span>${props.year} (±5 yr window)</span></div>`
+    : '';
   return `
     <div class="popup-title">${title}</div>
     <div class="popup-row"><span class="popup-label">role</span>${roleBadge(props)}</div>
     ${parentLabel}
+    ${yearLabel}
     <div class="popup-row"><span class="popup-label">bbox</span><span>${formatBbox(bbox)}</span></div>
     ${notes ? `<div class="popup-notes">${notes}</div>` : ''}
   `;
 }
 
 function attachPopups() {
-  const clickableLayers = ['loc-fill-location', 'loc-fill-sub', 'loc-fill-score'];
+  const clickableLayers = ['loc-fill-location', 'loc-fill-sub', 'loc-fill-score', 'training-fill'];
   for (const layer of clickableLayers) {
     map.on('click', layer, (e) => {
       if (currentMode !== 'locations') return;
@@ -314,6 +395,13 @@ let currentMode = 'locations';
 
 document.getElementById('mode-select').addEventListener('change', (e) => {
   setMode(e.target.value);
+});
+
+document.getElementById('training-toggle').addEventListener('change', (e) => {
+  const vis = e.target.checked ? 'visible' : 'none';
+  for (const id of TRAINING_LAYERS) {
+    if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', vis);
+  }
 });
 
 function setMode(mode) {
@@ -477,22 +565,28 @@ document.getElementById('colormap-swatch').style.background = CMAP_GRADIENTS[cur
 
 document.getElementById('colormap-select').addEventListener('change', (e) => {
   currentCmap = e.target.value;
-  console.log('[cmap] changed to', currentCmap);
   document.getElementById('colormap-swatch').style.background = CMAP_GRADIENTS[currentCmap];
-  const stem = document.getElementById('ranking-select').value;
-  console.log('[cmap] current stem:', stem);
-  if (stem) setRankingLayer(stem);
+  if (activeRankingLocation && activeRankingStem) setRankingLayer(activeRankingLocation, activeRankingStem);
 });
 
-function setRankingLayer(stem) {
+let activeRankingLocation = null;
+let activeRankingStem = null;
+
+function setRankingLayer(location, stem) {
   if (map.getLayer('ranking-layer')) map.removeLayer('ranking-layer');
   if (map.getSource('ranking'))      map.removeSource('ranking');
+
+  // Reset all per-location selects to none (except the one being set)
+  document.querySelectorAll('.loc-ranking-select').forEach(sel => {
+    if (sel.dataset.location !== location || !stem) sel.value = '';
+  });
+
+  activeRankingLocation = stem ? location : null;
+  activeRankingStem = stem || null;
   if (!stem) return;
 
-  // bust MapLibre's internal tile cache when cmap changes
   const bust = Date.now();
-  const tileUrl = `/ranking-tile/${stem}/{z}/{x}/{y}?cmap=${currentCmap}&v=${bust}`;
-  console.log('[cmap] adding source with tile URL:', tileUrl);
+  const tileUrl = `/ranking-tile/${location}/${stem}/{z}/{x}/{y}?cmap=${currentCmap}&v=${bust}`;
   map.addSource('ranking', {
     type: 'raster',
     tiles: [tileUrl],
@@ -505,23 +599,6 @@ function setRankingLayer(stem) {
     paint: { 'raster-opacity': currentRankingOpacity },
   }, 'loc-fill-location');
 }
-
-fetch('/api/rankings')
-  .then(r => r.json())
-  .then(rankings => {
-    const sel = document.getElementById('ranking-select');
-    for (const { stem, label } of rankings) {
-      const opt = document.createElement('option');
-      opt.value = stem;
-      opt.textContent = label;
-      sel.appendChild(opt);
-    }
-  })
-  .catch(err => console.error('Failed to load rankings:', err));
-
-document.getElementById('ranking-select').addEventListener('change', (e) => {
-  setRankingLayer(e.target.value);
-});
 
 document.getElementById('ranking-opacity').addEventListener('input', (e) => {
   currentRankingOpacity = Number(e.target.value) / 100;

@@ -7,6 +7,9 @@ Usage
   python cli/location.py bbox <id>
   python cli/location.py fetch <id> [--start YYYY-MM-DD] [--end YYYY-MM-DD]
                                      [--cloud-max N] [--stride N] [--no-nbar]
+  python cli/location.py training list
+  python cli/location.py training fetch [--regions ID ...] [--all]
+                                         [--cloud-max N] [--stride N] [--no-nbar]
 
 Examples
 --------
@@ -14,6 +17,9 @@ Examples
   python cli/location.py info longreach
   python cli/location.py bbox muttaburra
   python cli/location.py fetch barcaldine --start 2022-01-01 --end 2024-12-31
+  python cli/location.py training list
+  python cli/location.py training fetch --all
+  python cli/location.py training fetch --regions lake_mueller_presence barcoorah_presence
 """
 
 from __future__ import annotations
@@ -96,6 +102,49 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     print(f"Written: {out}")
 
 
+def cmd_training_list(args: argparse.Namespace) -> None:
+    from training.regions import load_regions
+    from utils.location import _bbox_pixel_count
+
+    regions = load_regions()
+    totals: dict[str, int] = {}
+
+    print(f"  {'ID':<40} {'LABEL':<10} {'YEAR':<6} {'PIXELS':>8}")
+    print("  " + "-" * 68)
+    for r in regions:
+        n = _bbox_pixel_count(r.bbox)
+        totals[r.label] = totals.get(r.label, 0) + n
+        year_str = str(r.year) if r.year else "—"
+        print(f"  {r.id:<40} {r.label:<10} {year_str:<6} {n:>8,}")
+
+    print("  " + "-" * 68)
+    for label, total in sorted(totals.items()):
+        print(f"  {'Total ' + label:<40} {'':10} {'':6} {total:>8,}")
+
+
+def cmd_training_fetch(args: argparse.Namespace) -> None:
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    logging.getLogger("rasterio").setLevel(logging.WARNING)
+    from training.regions import load_regions, select_regions
+    from utils.training_collector import ensure_training_pixels
+
+    regions = load_regions() if args.all else select_regions(args.regions)
+    ensure_training_pixels(
+        regions=regions,
+        cloud_max=args.cloud_max,
+        stride=args.stride,
+        apply_nbar=not args.no_nbar,
+        max_concurrent=args.max_concurrent,
+    )
+
+
+def cmd_training(args: argparse.Namespace) -> None:
+    {
+        "list":  cmd_training_list,
+        "fetch": cmd_training_fetch,
+    }[args.training_cmd](args)
+
+
 def main() -> None:
     p = argparse.ArgumentParser(
         prog="python cli/location.py",
@@ -122,8 +171,31 @@ def main() -> None:
     pf.add_argument("--no-nbar", action="store_true",
                     help="Disable BRDF NBAR c-factor correction")
 
+    pt = sub.add_parser("training", help="Manage training regions and pixel collection")
+    tsub = pt.add_subparsers(dest="training_cmd", required=True)
+
+    tsub.add_parser("list", help="List all training regions with estimated pixel counts")
+
+    tf = tsub.add_parser("fetch", help="Fetch pixels for training regions")
+    grp = tf.add_mutually_exclusive_group(required=True)
+    grp.add_argument("--regions", nargs="+", metavar="ID",
+                     help="Region IDs to fetch")
+    grp.add_argument("--all", action="store_true",
+                     help="Fetch all regions in training.yaml")
+    tf.add_argument("--cloud-max", type=int, default=80, metavar="N")
+    tf.add_argument("--stride", type=int, default=1)
+    tf.add_argument("--no-nbar", action="store_true")
+    tf.add_argument("--max-concurrent", type=int, default=32, metavar="N",
+                    help="Max concurrent HTTP patch fetches per tile (default: 32)")
+
     args = p.parse_args()
-    {"list": cmd_list, "info": cmd_info, "bbox": cmd_bbox, "fetch": cmd_fetch}[args.cmd](args)
+    {
+        "list":     cmd_list,
+        "info":     cmd_info,
+        "bbox":     cmd_bbox,
+        "fetch":    cmd_fetch,
+        "training": cmd_training,
+    }[args.cmd](args)
 
 
 if __name__ == "__main__":

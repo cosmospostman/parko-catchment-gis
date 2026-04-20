@@ -27,45 +27,49 @@ interface Grid {
 
 const gridCache = new Map<string, Grid>();
 
-/** Scan outputs/ for *_pixel_ranking.csv files and return stem list. */
-export function listRankings(): Array<{ stem: string; label: string }> {
-  const results: Array<{ stem: string; label: string }> = [];
+/** Scan outputs/<location>/<stem>.csv files and return grouped list. */
+export function listRankings(): Record<string, Array<{ stem: string; label: string }>> {
+  const results: Record<string, Array<{ stem: string; label: string }>> = {};
   try {
     for (const entry of Deno.readDirSync(OUTPUTS_DIR)) {
       if (!entry.isDirectory) continue;
       const dir = join(OUTPUTS_DIR, entry.name);
-      for (const f of Deno.readDirSync(dir)) {
-        if (f.name.endsWith("_pixel_ranking.csv")) {
-          results.push({ stem: entry.name, label: entry.name });
-          break;
+      const runs: Array<{ stem: string; label: string }> = [];
+      try {
+        for (const f of Deno.readDirSync(dir)) {
+          if (f.isFile && f.name.endsWith(".csv")) {
+            const stem = f.name.replace(/\.csv$/, "");
+            runs.push({ stem, label: stem });
+          }
         }
+      } catch { /* unreadable subdir */ }
+      if (runs.length > 0) {
+        runs.sort((a, b) => a.stem.localeCompare(b.stem));
+        results[entry.name] = runs;
       }
     }
   } catch {
     // outputs dir may not exist yet
   }
-  results.sort((a, b) => a.stem.localeCompare(b.stem));
   return results;
 }
 
-/** Find the ranking CSV path for a given stem. */
-function findCsv(stem: string): string | null {
-  const dir = join(OUTPUTS_DIR, stem);
+/** Find the ranking CSV path for a given location + stem. */
+function findCsv(location: string, stem: string): string | null {
+  const path = join(OUTPUTS_DIR, location, `${stem}.csv`);
   try {
-    for (const f of Deno.readDirSync(dir)) {
-      if (f.name.endsWith("_pixel_ranking.csv")) {
-        return join(dir, f.name);
-      }
-    }
-  } catch { /* ignore */ }
+    Deno.statSync(path);
+    return path;
+  } catch { /* not found */ }
   return null;
 }
 
-/** Load (or return cached) grid for the given stem. */
-export async function loadGrid(stem: string): Promise<Grid | null> {
-  if (gridCache.has(stem)) return gridCache.get(stem)!;
+/** Load (or return cached) grid for the given location + stem. */
+export async function loadGrid(location: string, stem: string): Promise<Grid | null> {
+  const cacheKey = `${location}/${stem}`;
+  if (gridCache.has(cacheKey)) return gridCache.get(cacheKey)!;
 
-  const csvPath = findCsv(stem);
+  const csvPath = findCsv(location, stem);
   if (!csvPath) return null;
 
   console.log(`Loading ranking grid: ${csvPath}`);
@@ -119,7 +123,7 @@ export async function loadGrid(stem: string): Promise<Grid | null> {
   }
 
   const grid: Grid = { arr, lonMin, latMax, width, height, res };
-  gridCache.set(stem, grid);
+  gridCache.set(cacheKey, grid);
   console.log(`Grid loaded in ${(performance.now() - t0).toFixed(0)} ms  (${width}×${height})`);
   return grid;
 }

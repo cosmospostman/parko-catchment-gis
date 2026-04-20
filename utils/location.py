@@ -220,6 +220,9 @@ def _load_registry(locations_dir: Path = _LOCATIONS_DIR) -> dict[str, Location]:
         with yaml_path.open() as fh:
             data = yaml.safe_load(fh)
 
+        if not isinstance(data, dict) or "name" not in data:
+            continue
+
         sub_bboxes: dict[str, SubBbox] = {}
         for sub_key, sub_data in (data.get("sub_bboxes") or {}).items():
             sub_bboxes[sub_key] = SubBbox(
@@ -257,3 +260,39 @@ def all_locations() -> list[Location]:
     if _registry is None:
         _registry = _load_registry()
     return list(_registry.values())
+
+
+# ---------------------------------------------------------------------------
+# Training-region pixel estimates
+# ---------------------------------------------------------------------------
+
+def _bbox_pixel_count(bbox: list[float], resolution_m: float = 10.0) -> int:
+    """Estimate S2 pixel count for a [lon_min, lat_min, lon_max, lat_max] bbox."""
+    lon_min, lat_min, lon_max, lat_max = bbox
+    lat_centre = (lat_min + lat_max) / 2
+    lon_m = (lon_max - lon_min) * 111_320 * math.cos(math.radians(lat_centre))
+    lat_m = (lat_max - lat_min) * 111_320
+    return int(lon_m / resolution_m) * int(lat_m / resolution_m)
+
+
+def training_pixel_summary(resolution_m: float = 10.0) -> None:
+    """Print estimated pixel counts for all training regions, grouped by label."""
+    from training.regions import load_regions  # noqa: PLC0415
+
+    regions = load_regions()
+    totals: dict[str, int] = {}
+
+    print(f"{'ID':<40} {'LABEL':<10} {'PIXELS':>8}")
+    print("-" * 62)
+    for r in regions:
+        n = _bbox_pixel_count(r.bbox, resolution_m)
+        totals[r.label] = totals.get(r.label, 0) + n
+        print(f"{r.id:<40} {r.label:<10} {n:>8,}")
+
+    print("-" * 62)
+    for label, total in sorted(totals.items()):
+        print(f"{'Total ' + label:<40} {'':10} {total:>8,}")
+
+
+if __name__ == "__main__":
+    training_pixel_summary()

@@ -57,6 +57,82 @@
 
     /* ---- Locations panel ---- */
 
+    /* ---- Training regions accordion ---- */
+
+    #training-accordion {
+      border-bottom: 1px solid #333;
+      flex-shrink: 0;
+    }
+
+    #training-accordion-header {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      padding: 8px 14px;
+      cursor: pointer;
+      user-select: none;
+      font-size: 12px;
+      color: #aaa;
+    }
+
+    #training-accordion-header:hover { background: #2e2e2e; }
+
+    #training-accordion-header input[type="checkbox"] {
+      accent-color: #22c55e;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+
+    #training-accordion-header .accordion-label {
+      flex: 1;
+      font-weight: 500;
+      color: #c0c0c0;
+    }
+
+    #training-accordion-header .accordion-chevron {
+      font-size: 10px;
+      color: #555;
+      transition: transform 0.15s;
+    }
+
+    #training-accordion-header.open .accordion-chevron {
+      transform: rotate(90deg);
+    }
+
+    #training-accordion-body {
+      display: none;
+      flex-direction: column;
+      background: #1e1e1e;
+      max-height: 220px;
+      overflow-y: auto;
+    }
+
+    #training-accordion-body.open { display: flex; }
+
+    .training-region-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 14px 6px 28px;
+      cursor: pointer;
+      border-top: 1px solid #2a2a2a;
+      font-size: 12px;
+      color: #b0b0b0;
+      transition: background 0.1s;
+    }
+
+    .training-region-item:hover { background: #262626; }
+
+    .training-role-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+
+    .training-role-dot.presence { background: #22c55e; }
+    .training-role-dot.absence  { background: #ef4444; }
+
     #panel-locations {
       display: flex;
       flex-direction: column;
@@ -90,6 +166,18 @@
       font-size: 11px;
       color: #666;
       margin-top: 1px;
+    }
+
+    .loc-ranking-select {
+      width: 100%;
+      margin-top: 5px;
+      background: #1a1a1a;
+      color: #d0d0d0;
+      border: 1px solid #3a3a3a;
+      border-radius: 3px;
+      padding: 2px 4px;
+      font-size: 11px;
+      cursor: pointer;
     }
 
     /* ---- BBox panel ---- */
@@ -330,6 +418,14 @@
 
     <!-- Locations panel -->
     <div id="panel-locations">
+      <div id="training-accordion">
+        <div id="training-accordion-header">
+          <input type="checkbox" id="training-toggle" checked>
+          <span class="accordion-label">Training regions</span>
+          <span class="accordion-chevron">&#9658;</span>
+        </div>
+        <div id="training-accordion-body"></div>
+      </div>
       <ul id="location-list"></ul>
     </div>
 
@@ -347,13 +443,7 @@
 
     <!-- Rankings overlay -->
     <div id="ranking-section">
-      <div class="section-label">rankings</div>
-      <div class="irow">
-        <span class="ikey">run</span>
-        <select id="ranking-select">
-          <option value="">— none —</option>
-        </select>
-      </div>
+      <div class="section-label">Active ranking</div>
       <div class="irow">
         <span class="ikey">opacity</span>
         <input type="range" id="ranking-opacity" min="0" max="100" value="60"

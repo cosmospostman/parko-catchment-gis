@@ -2,7 +2,7 @@
 import math
 import numpy as np
 import pytest
-from tam.pipeline import aggregate_year_probs
+from tam.core.score import aggregate_year_probs
 
 
 def test_single_year_returns_mean_prob():

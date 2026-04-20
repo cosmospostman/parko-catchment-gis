@@ -12,10 +12,10 @@ class TAMConfig:
     n_heads:  int   = 4
     n_layers: int   = 2
     d_ff:     int   = 128
-    dropout:  float = 0.1
+    dropout:  float = 0.3
 
     # Data (mirrors dataset.py constants — change both together)
-    n_bands:          int   = 10
+    n_bands:          int   = 13
     max_seq_len:      int   = 128
     min_obs_per_year: int   = 8
     scl_purity_min:   float = 0.5
@@ -24,8 +24,8 @@ class TAMConfig:
     # Training
     n_epochs:     int   = 100
     batch_size:   int   = 1024
-    lr:           float = 1e-3
-    weight_decay: float = 1e-4
+    lr:           float = 1e-4
+    weight_decay: float = 1e-3
     val_frac:     float = 0.2
     patience:     int   = 15
     min_delta:    float = 1e-4

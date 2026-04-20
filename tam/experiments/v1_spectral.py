@@ -1,12 +1,28 @@
-"""tam/experiments/v1_spectral.py — First experiment: spectral bands only."""
+"""tam/experiments/v1_spectral.py — Spectral bands + NDVI/NDWI/EVI indices."""
 
-from tam.core.dataset import BAND_COLS
+from tam.core.dataset import ALL_FEATURE_COLS
 from tam.core.experiment import Experiment
 
 EXPERIMENT = Experiment(
     name="v1_spectral",
-    region_ids=["longreach_presence", "longreach_absence"],
-    feature_cols=BAND_COLS,
+    region_ids=[
+        "lake_mueller_presence", "lake_mueller_presence_2", "lake_mueller_absence",
+        "barcoorah_presence", "barcoorah_absence_lake", "barcoorah_absence_woodland",
+        "frenchs_presence_1", "frenchs_presence_2",
+        "frenchs_absence_mangrove", "frenchs_absence_ocean",
+        "frenchs_absence_riparian_woodland", "frenchs_absence_riparian", "frenchs_absence_savanna",
+        "mitchell_river_absence",
+        "nardoo_presence",
+        "norman_road_presence_1", "norman_road_presence_2",
+        # "norman_road_presence_3",  # removed — possible label noise
+        "norman_road_presence_4",
+        # "norman_road_absence_1",   # removed — possible label noise
+        # "norman_road_absence_2",   # removed — possible label noise
+        # "rockhampton_presence_1", "rockhampton_presence_2",  # removed — uncertain labels (swamp context)
+        "stonehenge_presence1", "stonehenge_presence_2", "stonehenge_presence_3",
+        "stonehenge_absence1", "stonehenge_absence_2", "stonehenge_absence_3",
+    ],
+    feature_cols=ALL_FEATURE_COLS,
     model_kwargs={},
     train_kwargs={},
 )

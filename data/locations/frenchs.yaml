@@ -3,47 +3,6 @@ name: "Frenchs"
 centroid: null
 bbox: [141.533301, -15.808510, 141.558659, -15.765509]  # [lon_min, lat_min, lon_max, lat_max] — scene extent
 dry_months: [5, 6, 7, 8, 9, 10]  # monsoonal
-sub_bboxes:
-  woody_1:
-    label: "Woody — possibly mixed Parkinsonia (north)"
-    role: woody
-    bbox: [141.551545, -15.769770, 141.554368, -15.768536]  # [lon_min, lat_min, lon_max, lat_max]
-  woody_2:
-    label: "Woody — possibly mixed Parkinsonia (south)"
-    role: woody
-    bbox: [141.542005, -15.805644, 141.543592, -15.804744]  # [lon_min, lat_min, lon_max, lat_max]
-  parkinsonia_1:
-    label: "Parkinsonia — mixed with savanna (south)"
-    role: presence
-    bbox: [141.539634, -15.808447, 141.541670, -15.806446]  # [lon_min, lat_min, lon_max, lat_max]
-  parkinsonia_2:
-    label: "Parkinsonia — mixed with savanna (central)"
-    role: presence
-    bbox: [141.540181, -15.799743, 141.541919, -15.797536]  # [lon_min, lat_min, lon_max, lat_max]
-  woody_3:
-    label: "Woody — north-central"
-    role: woody
-    bbox: [141.542311, -15.778743, 141.545828, -15.777413]  # [lon_min, lat_min, lon_max, lat_max]
-  woody_4:
-    label: "Woody — north-west"
-    role: woody
-    bbox: [141.535144, -15.780502, 141.537821, -15.778114]  # [lon_min, lat_min, lon_max, lat_max]
-  woody_5:
-    label: "Woody — north (native riparian, used as absence)"
-    role: absence
-    bbox: [141.541134, -15.775787, 141.542919, -15.774480]  # [lon_min, lat_min, lon_max, lat_max]
-  savanna_1:
-    label: "Absence — bare ground / savanna (east)"
-    role: absence
-    bbox: [141.551059, -15.791419, 141.558458, -15.783258]  # [lon_min, lat_min, lon_max, lat_max]
-  savanna_2:
-    label: "Absence — bare ground / savanna (west)"
-    role: absence
-    bbox: [141.533516, -15.794543, 141.541296, -15.791567]  # [lon_min, lat_min, lon_max, lat_max]
-  water:
-    label: "Absence — permanent dam (water)"
-    role: absence
-    bbox: [141.541197, -15.803266, 141.544347, -15.802591]  # [lon_min, lat_min, lon_max, lat_max]
 notes: >
   Cape York Peninsula. Monsoonal climate (dry May–October).
   New exploration site — presence and absence bboxes defined for signal

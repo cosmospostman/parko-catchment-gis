@@ -8,7 +8,7 @@ Usage
     regions = load_regions()
 
     # Select specific regions by ID for an experiment
-    selected = select_regions(["longreach_presence", "longreach_absence"])
+    selected = select_regions(["lake_mueller_presence", "lake_mueller_absence"])
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from pathlib import Path
 import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_REGIONS_YAML = PROJECT_ROOT / "training" / "locations" / "training_regions.yaml"
+_REGIONS_YAML = PROJECT_ROOT / "data" / "locations" / "training.yaml"
 
 
 @dataclass(frozen=True)
@@ -29,6 +29,7 @@ class TrainingRegion:
     name: str
     label: str          # "presence" | "absence"
     bbox: list[float]   # [lon_min, lat_min, lon_max, lat_max]
+    year: int | None    # if set, pin observations to [year-5, year]
     tags: list[str]
     notes: str | None
 
@@ -53,6 +54,7 @@ def load_regions(yaml_path: Path = _REGIONS_YAML) -> list[TrainingRegion]:
             name=entry["name"],
             label=entry["label"],
             bbox=entry["bbox"],
+            year=entry.get("year"),
             tags=entry.get("tags", []),
             notes=entry.get("notes"),
         ))

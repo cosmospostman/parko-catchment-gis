@@ -51,7 +51,7 @@ from pyproj import Transformer
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from analysis.constants import BANDS, SCL_BAND, AOT_BAND, SCL_CLEAR_VALUES
+from analysis.constants import BANDS, SCL_BAND, AOT_BAND, SCL_CLEAR_VALUES, add_spectral_indices, SPECTRAL_INDEX_COLS
 from utils.chip_store import CachedNpzChipStore, MemoryChipStore
 from utils.fetch import fetch_patches
 from utils.stac import search_sentinel2
@@ -102,6 +102,7 @@ def make_pixel_grid(
     utm_crs: str | None = None,
     resolution_m: float = 10.0,
     stride: int = 1,
+    point_id_prefix: str = "px",
 ) -> list[tuple[str, float, float]]:
     """Generate one point per S2 pixel inside bbox_wgs84, aligned to a 10 m UTM grid.
 
@@ -136,7 +137,7 @@ def make_pixel_grid(
     for i, xi in enumerate(xs):
         for j, yj in enumerate(ys):
             lon, lat = to_wgs.transform(xi, yj)
-            pid = f"px_{i:04d}_{j:04d}"
+            pid = f"{point_id_prefix}_{i:04d}_{j:04d}"
             points.append((pid, float(lon), float(lat)))
 
     logger.info(
@@ -246,7 +247,7 @@ def extract_item_to_df(
     if df[list(BANDS)].isna().all(axis=1).all():
         return None
 
-    return df
+    return add_spectral_indices(df)
 
 
 # ---------------------------------------------------------------------------
@@ -262,73 +263,87 @@ def collect(
     cache_dir: Path | None = None,
     stride: int = 1,
     apply_nbar: bool = True,
+    max_concurrent: int = 32,
+    items=None,
+    point_id_prefix: str = "px",
 ) -> None:
+    """Collect S2 observations for bbox_wgs84.
+
+    If *items* is provided (a pre-fetched, deduplicated STAC item list), the
+    STAC search step is skipped entirely.  This lets the caller share one STAC
+    search result across multiple collect() calls for the same tile.
+    """
     # --- 1. Generate pixel grid -------------------------------------------
     utm_crs = _utm_crs_for_bbox(bbox_wgs84)
-    points = make_pixel_grid(bbox_wgs84, utm_crs=utm_crs, stride=stride)
+    points = make_pixel_grid(bbox_wgs84, utm_crs=utm_crs, stride=stride, point_id_prefix=point_id_prefix)
     point_coords = {pid: (lon, lat) for pid, lon, lat in points}
 
-    # --- 2. STAC search (cached) ---------------------------------------------
     import hashlib, pickle
     if cache_dir is None:
         cache_dir = PROJECT_ROOT / "data" / "chips" / (out_path.stem + ".chips")
     cache_dir.mkdir(parents=True, exist_ok=True)
-    stac_key = hashlib.md5(
-        f"{bbox_wgs84}|{start}|{end}|{cloud_max}".encode()
-    ).hexdigest()
-    stac_cache = cache_dir / f"stac_{stac_key}.pkl"
 
-    if stac_cache.exists():
-        logger.info("STAC search: loading cached result (%s)", stac_cache.name)
-        with stac_cache.open("rb") as fh:
-            items = pickle.load(fh)
-        logger.info("%d items loaded from cache", len(items))
+    # --- 2. STAC search (cached, or use caller-supplied items) ---------------
+    if items is not None:
+        logger.info("Using %d pre-supplied STAC items (skipping search)", len(items))
     else:
-        logger.info("STAC search: %s → %s  cloud < %d%%", start, end, cloud_max)
-        items = search_sentinel2(
-            bbox=bbox_wgs84,
-            start=start,
-            end=end,
-            cloud_cover_max=cloud_max,
-            endpoint=STAC_ENDPOINT,
-            collection=S2_COLLECTION,
-        )
+        stac_key = hashlib.md5(
+            f"{bbox_wgs84}|{start}|{end}|{cloud_max}".encode()
+        ).hexdigest()
+        stac_cache = cache_dir / f"stac_{stac_key}.pkl"
+
+        if stac_cache.exists():
+            logger.info("STAC search: loading cached result (%s)", stac_cache.name)
+            with stac_cache.open("rb") as fh:
+                items = pickle.load(fh)
+            logger.info("%d items loaded from cache", len(items))
+        else:
+            logger.info("STAC search: %s → %s  cloud < %d%%", start, end, cloud_max)
+            items = search_sentinel2(
+                bbox=bbox_wgs84,
+                start=start,
+                end=end,
+                cloud_cover_max=cloud_max,
+                endpoint=STAC_ENDPOINT,
+                collection=S2_COLLECTION,
+            )
+            if not items:
+                logger.error("No STAC items found — check bbox and date range")
+                sys.exit(1)
+            with stac_cache.open("wb") as fh:
+                pickle.dump(items, fh)
+            logger.info("%d items found, cached to %s", len(items), stac_cache.name)
         if not items:
             logger.error("No STAC items found — check bbox and date range")
             sys.exit(1)
-        with stac_cache.open("wb") as fh:
-            pickle.dump(items, fh)
-        logger.info("%d items found, cached to %s", len(items), stac_cache.name)
-    if not items:
-        logger.error("No STAC items found — check bbox and date range")
-        sys.exit(1)
 
-    # Deduplicate items: keep only one granule per (date, satellite, tile).
-    # A bbox that straddles two adjacent S2 processing granules (e.g. _0_L2A
-    # and _1_L2A from the same overpass) will otherwise produce duplicate
-    # (point_id, date) rows with slightly different resampled band values.
-    # Item IDs follow the pattern S2X_TTTTTT_YYYYMMDD_N_L2A where N is the
-    # granule index — we strip it to get a canonical per-overpass key.
-    import re as _re
-    _granule_re = _re.compile(r"_\d+_L2A$")
-    seen: set[tuple] = set()
-    deduped_items = []
-    for item in items:
-        key = _granule_re.sub("", item.id)
-        if key not in seen:
-            seen.add(key)
-            deduped_items.append(item)
-    if len(deduped_items) < len(items):
-        logger.info(
-            "Deduplicated STAC items: %d → %d (removed %d duplicate granules)",
-            len(items), len(deduped_items), len(items) - len(deduped_items),
-        )
-    items = deduped_items
+        # Deduplicate items: keep only one granule per (date, satellite, tile).
+        # A bbox that straddles two adjacent S2 processing granules (e.g. _0_L2A
+        # and _1_L2A from the same overpass) will otherwise produce duplicate
+        # (point_id, date) rows with slightly different resampled band values.
+        # Item IDs follow the pattern S2X_TTTTTT_YYYYMMDD_N_L2A where N is the
+        # granule index — we strip it to get a canonical per-overpass key.
+        import re as _re
+        _granule_re = _re.compile(r"_\d+_L2A$")
+        seen: set[tuple] = set()
+        deduped_items = []
+        for item in items:
+            key = _granule_re.sub("", item.id)
+            if key not in seen:
+                seen.add(key)
+                deduped_items.append(item)
+        if len(deduped_items) < len(items):
+            logger.info(
+                "Deduplicated STAC items: %d → %d (removed %d duplicate granules)",
+                len(items), len(deduped_items), len(items) - len(deduped_items),
+            )
+        items = deduped_items
 
     col_order = (
         ["point_id", "lon", "lat", "date", "item_id", "tile_id"]
         + list(BANDS)
         + ["scl_purity", "scl", "aot", "view_zenith", "sun_zenith"]
+        + SPECTRAL_INDEX_COLS
     )
 
     # --- 3+4. Plan shards, then fetch only if needed -------------------------
@@ -399,7 +414,7 @@ def collect(
                 bbox_wgs84=bbox_wgs84,
                 scl_filter=True,
                 band_alias=BAND_ALIAS,
-                max_concurrent=32,
+                max_concurrent=max_concurrent,
                 cache_dir=cache_dir,
             ))
         else:

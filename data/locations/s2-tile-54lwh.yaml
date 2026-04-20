@@ -1,8 +1,0 @@
-# name: "S2 Tile 54LWH"
-# bbox: [140.99982, -16.36924, 142.02790, -15.37426]  # [lon_min, lat_min, lon_max, lat_max]
-# dry_months: [5, 6, 7, 8, 9, 10]
-
-# notes: >
-#   Full footprint of Sentinel-2 MGRS tile 54LWH. Covers the southern portion of
-#   the Kowanyama scene (full scene extent). Used for diagnosing inter-tile
-#   calibration offsets in B05/B07 (red-edge ratio) south of lat -15.46.

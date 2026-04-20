@@ -1,8 +1,0 @@
-# Muttaburra — high-precision GPS-logged records, compact 2 km × 2 km cluster.
-name: "Muttaburra"
-centroid: [-22.538000, 144.558000]  # [lat, lon]
-bbox: [144.548274, -22.546983, 144.567726, -22.529017]  # [lon_min, lat_min, lon_max, lat_max]
-dry_months: [6, 7, 8, 9, 10]
-notes: >
-  High-precision GPS records (1 m coordinate uncertainty). Compact 2 km × 2 km
-  cluster, ~40,000 S2 pixels. Located ~30 km SW of the Jericho cluster.
