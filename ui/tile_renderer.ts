@@ -34,6 +34,7 @@ interface Grid {
 
 const GRID_CACHE_MAX = 3;
 const gridCache = new Map<string, Grid>();
+const gridLoading = new Map<string, Promise<Grid | null>>(); // in-flight loads
 
 function cacheSet(key: string, grid: Grid): void {
   gridCache.delete(key);
@@ -182,30 +183,37 @@ export function listRankings(): Record<string, Array<{ stem: string; label: stri
   return results;
 }
 
-export async function loadGrid(location: string, stem: string): Promise<Grid | null> {
+export function loadGrid(location: string, stem: string): Promise<Grid | null> {
   const cacheKey = `${location}/${stem}`;
   if (gridCache.has(cacheKey)) {
     const hit = gridCache.get(cacheKey)!;
     gridCache.delete(cacheKey);
     gridCache.set(cacheKey, hit);
-    return hit;
+    return Promise.resolve(hit);
   }
 
-  const bin = binPath(location, stem);
-  const csv = join(OUTPUTS_DIR, location, `${stem}.csv`);
+  // Return existing in-flight promise if already loading
+  if (gridLoading.has(cacheKey)) return gridLoading.get(cacheKey)!;
 
-  // Build .bin from CSV if absent
-  let binExists = false;
-  try { Deno.statSync(bin); binExists = true; } catch { /* absent */ }
-  if (!binExists) {
-    try { Deno.statSync(csv); } catch { return null; }
-    await buildBin(csv, bin);
-  }
+  const promise = (async () => {
+    const bin = binPath(location, stem);
+    const csv = join(OUTPUTS_DIR, location, `${stem}.csv`);
 
-  const grid = await loadBin(bin);
-  cacheSet(cacheKey, grid);
-  console.log(`Grid loaded: ${location}/${stem} (${grid.keys.length} pixels)`);
-  return grid;
+    let binExists = false;
+    try { Deno.statSync(bin); binExists = true; } catch { /* absent */ }
+    if (!binExists) {
+      try { Deno.statSync(csv); } catch { return null; }
+      await buildBin(csv, bin);
+    }
+
+    const grid = await loadBin(bin);
+    cacheSet(cacheKey, grid);
+    console.log(`Grid loaded: ${location}/${stem} (${grid.keys.length} pixels)`);
+    return grid;
+  })().finally(() => gridLoading.delete(cacheKey));
+
+  gridLoading.set(cacheKey, promise);
+  return promise;
 }
 
 // ---------------------------------------------------------------------------
