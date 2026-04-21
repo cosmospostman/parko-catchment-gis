@@ -25,7 +25,17 @@ interface Grid {
   res: number; // degrees per cell
 }
 
-const gridCache = new Map<string, Grid>();
+const GRID_CACHE_MAX = 3;
+const gridCache = new Map<string, Grid>(); // insertion order = LRU (Map preserves it)
+
+function cacheSet(key: string, grid: Grid): void {
+  gridCache.delete(key); // re-insert to mark as most-recent
+  gridCache.set(key, grid);
+  if (gridCache.size > GRID_CACHE_MAX) {
+    // Evict oldest (first entry)
+    gridCache.delete(gridCache.keys().next().value!);
+  }
+}
 
 /** Scan outputs/<location>/<stem>.csv files and return grouped list. */
 export function listRankings(): Record<string, Array<{ stem: string; label: string }>> {
@@ -67,7 +77,12 @@ function findCsv(location: string, stem: string): string | null {
 /** Load (or return cached) grid for the given location + stem. */
 export async function loadGrid(location: string, stem: string): Promise<Grid | null> {
   const cacheKey = `${location}/${stem}`;
-  if (gridCache.has(cacheKey)) return gridCache.get(cacheKey)!;
+  if (gridCache.has(cacheKey)) {
+    const hit = gridCache.get(cacheKey)!;
+    gridCache.delete(cacheKey);
+    gridCache.set(cacheKey, hit); // bump to most-recent
+    return hit;
+  }
 
   const csvPath = findCsv(location, stem);
   if (!csvPath) return null;
@@ -75,55 +90,72 @@ export async function loadGrid(location: string, stem: string): Promise<Grid | n
   console.log(`Loading ranking grid: ${csvPath}`);
   const t0 = performance.now();
 
-  const text = await Deno.readTextFile(csvPath);
-  const lines = text.split("\n");
+  const res = 0.0001;
 
-  // Header: point_id,lon,lat,is_presence,prob_tam,rank,...
-  // Find column indices from header
-  const header = lines[0].split(",");
-  const iLon  = header.indexOf("lon");
-  const iLat  = header.indexOf("lat");
-  const iProb = header.findIndex((c) => c.startsWith("prob_"));
+  // Stream the CSV twice to avoid holding the full text in memory.
+  async function streamLines(cb: (cols: string[], lineNo: number) => void): Promise<void> {
+    const file = await Deno.open(csvPath!, { read: true });
+    const decoder = new TextDecoder();
+    let buf = "";
+    let lineNo = 0;
+    for await (const chunk of file.readable) {
+      buf += decoder.decode(chunk, { stream: true });
+      let nl: number;
+      while ((nl = buf.indexOf("\n")) !== -1) {
+        const line = buf.slice(0, nl).trimEnd();
+        buf = buf.slice(nl + 1);
+        cb(line.split(","), lineNo++);
+      }
+    }
+    if (buf.trimEnd()) cb(buf.trimEnd().split(","), lineNo);
+  }
+
+  // Pass 0: parse header
+  let iLon = -1, iLat = -1, iProb = -1;
+  let headerParsed = false;
+  await streamLines((cols, lineNo) => {
+    if (lineNo !== 0 || headerParsed) return;
+    headerParsed = true;
+    iLon  = cols.indexOf("lon");
+    iLat  = cols.indexOf("lat");
+    iProb = cols.findIndex((c) => c.startsWith("prob_"));
+  });
   if (iLon < 0 || iLat < 0 || iProb < 0) {
     console.error(`Missing columns in ${csvPath}`);
     return null;
   }
 
-  const res = 0.0001;
-
-  // First pass: find bounds
+  // Pass 1: find bounds
   let lonMin = Infinity, lonMax = -Infinity;
   let latMin = Infinity, latMax = -Infinity;
-  for (let i = 1; i < lines.length; i++) {
-    if (!lines[i]) continue;
-    const cols = lines[i].split(",");
+  await streamLines((cols, lineNo) => {
+    if (lineNo === 0) return;
     const lon = parseFloat(cols[iLon]);
     const lat = parseFloat(cols[iLat]);
     if (lon < lonMin) lonMin = lon;
     if (lon > lonMax) lonMax = lon;
     if (lat < latMin) latMin = lat;
     if (lat > latMax) latMax = lat;
-  }
+  });
 
   const width  = Math.round((lonMax - lonMin) / res) + 1;
   const height = Math.round((latMax - latMin) / res) + 1;
   const arr = new Float32Array(width * height); // zeroed by default
 
-  // Second pass: fill grid
-  for (let i = 1; i < lines.length; i++) {
-    if (!lines[i]) continue;
-    const cols = lines[i].split(",");
+  // Pass 2: fill grid
+  await streamLines((cols, lineNo) => {
+    if (lineNo === 0) return;
     const lon  = parseFloat(cols[iLon]);
     const lat  = parseFloat(cols[iLat]);
     const prob = parseFloat(cols[iProb]);
-    if (isNaN(prob)) continue;
+    if (isNaN(prob)) return;
     const xi = Math.round((lon - lonMin) / res);
     const yi = Math.round((latMax - lat) / res);
     arr[yi * width + xi] = prob;
-  }
+  });
 
   const grid: Grid = { arr, lonMin, latMax, width, height, res };
-  gridCache.set(cacheKey, grid);
+  cacheSet(cacheKey, grid);
   console.log(`Grid loaded in ${(performance.now() - t0).toFixed(0)} ms  (${width}×${height})`);
   return grid;
 }

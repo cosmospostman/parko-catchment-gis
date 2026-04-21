@@ -9,8 +9,30 @@ if ! command -v deno &>/dev/null; then
   export PATH="$DENO_INSTALL/bin:$PATH"
 fi
 
-# Grant port 80 to deno without running as root
-sudo setcap cap_net_bind_service=+ep "$(which deno)"
+# Install Caddy if absent
+if ! command -v caddy &>/dev/null; then
+  sudo apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl
+  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+    | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+    | sudo tee /etc/apt/sources.list.d/caddy-stable.list
+  sudo apt-get update && sudo apt-get install -y caddy
+fi
+
+# Write Caddyfile (prompts for domain if not set)
+DOMAIN="${PARKO_DOMAIN:-}"
+if [[ -z "$DOMAIN" ]]; then
+  read -r -p "Enter domain name (e.g. parkinsonia.hello-mlj.net): " DOMAIN
+fi
+
+sudo tee /etc/caddy/Caddyfile > /dev/null <<EOF
+$DOMAIN {
+    reverse_proxy localhost:3000
+}
+EOF
+
+sudo systemctl enable caddy
+sudo systemctl restart caddy
 
 # Pre-cache Deno dependencies (fast startup)
 cd "$REPO_ROOT/ui"
