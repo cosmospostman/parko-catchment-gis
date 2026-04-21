@@ -399,7 +399,7 @@ function buildSidebar(geojson, rankings) {
 
     const li = document.createElement('li');
     li.dataset.id = id;
-    li.innerHTML = `<div class="loc-name">${name}</div><div class="loc-id">${id}</div>`;
+    li.innerHTML = `<div class="loc-name">${name}</div>`;
 
     li.addEventListener('click', (e) => {
       if (e.target.classList.contains('loc-ranking-select')) return;
@@ -675,8 +675,7 @@ function setRankingLayer(location, stem) {
   activeRankingStem = stem || null;
   if (!stem) return;
 
-  const bust = Date.now();
-  const tileUrl = `/ranking-tile/${location}/${stem}/{z}/{x}/{y}?cmap=${currentCmap}&cutoff=${currentCutoff}&v=${bust}`;
+  const tileUrl = `/ranking-tile/${location}/${stem}/{z}/{x}/{y}?cmap=${currentCmap}&cutoff=${currentCutoff}`;
   map.addSource('ranking', {
     type: 'raster',
     tiles: [tileUrl],
@@ -779,4 +778,8 @@ async function fetchImageryInfo() {
   }
 }
 
-map.on('moveend', fetchImageryInfo);
+let imageryInfoTimer = null;
+map.on('moveend', () => {
+  clearTimeout(imageryInfoTimer);
+  imageryInfoTimer = setTimeout(fetchImageryInfo, 500);
+});

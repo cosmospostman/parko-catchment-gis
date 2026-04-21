@@ -39,7 +39,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -475,31 +475,45 @@ def collect(
             store.release_item(_item.id)
             return (_item.id, df)
 
+        # Submit items in a sliding window of at most N_WORKERS in-flight at once.
+        # Submitting all items upfront would leave completed DataFrames queued in
+        # memory until the writer drains them — fatal for large shards.
+        from concurrent.futures import wait, FIRST_COMPLETED
         with done_path.open("a") as done_fh, ThreadPoolExecutor(max_workers=N_WORKERS) as pool:
-            # Submit all items; keep futures in order for checkpoint tracking
-            futures = {pool.submit(_process_item, item): item for item in pending_items}
-
+            pending_queue = list(pending_items)
+            in_flight: dict = {}  # future → item
             i = 0
-            for fut in as_completed(futures):
-                item_id, batch_df = fut.result()
 
-                if batch_df is not None and not batch_df.empty:
-                    table = pa.Table.from_pandas(batch_df[col_order], preserve_index=False)
-                    if writer is None:
-                        writer = pq.ParquetWriter(shard_path, table.schema)
-                    writer.write_table(table)
-                    shard_rows += len(batch_df)
+            while pending_queue or in_flight:
+                # Fill the window up to N_WORKERS
+                while pending_queue and len(in_flight) < N_WORKERS:
+                    item = pending_queue.pop(0)
+                    in_flight[pool.submit(_process_item, item)] = item
 
-                done_ids.add(item_id)
-                done_fh.write(item_id + "\n")
-                done_fh.flush()
+                # Wait for at least one to finish
+                done_futs, _ = wait(in_flight, return_when=FIRST_COMPLETED)
 
-                i += 1
-                if i % 50 == 0 or i == len(pending_items):
-                    logger.info(
-                        "  shard %d/%d  item %d/%d  %d rows",
-                        shard_idx + 1, n_shards, i, len(pending_items), shard_rows,
-                    )
+                for fut in done_futs:
+                    in_flight.pop(fut)
+                    item_id, batch_df = fut.result()
+
+                    if batch_df is not None and not batch_df.empty:
+                        table = pa.Table.from_pandas(batch_df[col_order], preserve_index=False)
+                        if writer is None:
+                            writer = pq.ParquetWriter(shard_path, table.schema)
+                        writer.write_table(table)
+                        shard_rows += len(batch_df)
+
+                    done_ids.add(item_id)
+                    done_fh.write(item_id + "\n")
+                    done_fh.flush()
+
+                    i += 1
+                    if i % 50 == 0 or i == len(pending_items):
+                        logger.info(
+                            "  shard %d/%d  item %d/%d  %d rows",
+                            shard_idx + 1, n_shards, i, len(pending_items), shard_rows,
+                        )
 
         if writer is not None:
             writer.close()

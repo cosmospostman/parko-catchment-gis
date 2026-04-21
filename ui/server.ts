@@ -276,7 +276,7 @@ async function fetchAndCache(upstreamUrl: string, cachePath: string, extraHeader
     // Cache miss — fall through
   }
 
-  const upstream = await fetch(upstreamUrl, { headers: extraHeaders });
+  const upstream = await fetch(upstreamUrl, { headers: extraHeaders, signal: AbortSignal.timeout(8000) });
   if (!upstream.ok || !upstream.body) {
     if (upstream.status === 404) return new Response(null, { status: 204 });
     console.error(`Upstream tile error ${upstream.status} for ${upstreamUrl.split("?")[0]}`);
@@ -356,7 +356,7 @@ async function handleImageryDate(req: Request): Promise<Response> {
       f: "json",
     });
     try {
-      const data = await fetch(`${esriIdentifyUrl}?${params}`).then(r => r.json());
+      const data = await fetch(`${esriIdentifyUrl}?${params}`, { signal: AbortSignal.timeout(8000) }).then(r => r.json());
       type EsriResult = { attributes: Record<string, string> };
       const results: EsriResult[] = data.results ?? [];
       // Pick the citation matching current zoom level
@@ -421,7 +421,7 @@ async function handleImageryDate(req: Request): Promise<Response> {
 
   try {
     const responses = await Promise.all(
-      probePoints.map(p => fetch(`${imageServerBase(identifyLayer)}?${makeParams(p.x, p.y)}`).then(r => r.json()))
+      probePoints.map(p => fetch(`${imageServerBase(identifyLayer)}?${makeParams(p.x, p.y)}`, { signal: AbortSignal.timeout(8000) }).then(r => r.json()))
     );
 
     type Feature = { attributes: Record<string, unknown> };
@@ -499,7 +499,7 @@ async function handler(req: Request): Promise<Response> {
 
   if (url.pathname === "/api/rankings") {
     return new Response(JSON.stringify(listRankings()), {
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", "cache-control": "public, max-age=300" },
     });
   }
 
@@ -529,7 +529,7 @@ async function handler(req: Request): Promise<Response> {
     try {
       const geojson = loadLocations();
       return new Response(JSON.stringify(geojson), {
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", "cache-control": "public, max-age=300" },
       });
     } catch (err) {
       console.error("Failed to load locations:", err);
@@ -556,7 +556,7 @@ async function handler(req: Request): Promise<Response> {
       }
       const fc: GeoJSON.FeatureCollection = { type: "FeatureCollection", features };
       return new Response(JSON.stringify(fc), {
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", "cache-control": "public, max-age=300" },
       });
     } catch (err) {
       console.error("Failed to load catchments:", err);
@@ -572,7 +572,7 @@ async function handler(req: Request): Promise<Response> {
     try {
       const data = await Deno.readFile(sightingsPath);
       return new Response(data, {
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", "cache-control": "public, max-age=3600" },
       });
     } catch (err) {
       console.error("Failed to load sightings:", err);
@@ -583,7 +583,12 @@ async function handler(req: Request): Promise<Response> {
     }
   }
 
-  return serveDir(req, { fsRoot: join(__dirname, "public"), urlRoot: "" });
+  const staticRes = await serveDir(req, { fsRoot: join(__dirname, "public"), urlRoot: "" });
+  const path = new URL(req.url).pathname;
+  if (path === "/" || path === "/index.html" || path === "/app.js") {
+    staticRes.headers.set("cache-control", "no-cache");
+  }
+  return staticRes;
 }
 
 // ---------------------------------------------------------------------------
