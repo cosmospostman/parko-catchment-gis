@@ -101,8 +101,17 @@ async function buildBin(csvPath: string, outPath: string): Promise<void> {
   const width  = Math.round((lonMax - lonMin) / res) + 1;
   const height = Math.round((latMax - latMin) / res) + 1;
 
-  // Pass 2: collect records
-  const records: Array<[number, number]> = [];
+  // Count valid rows for pre-allocation
+  let count = 0;
+  await streamLines((cols, lineNo) => {
+    if (lineNo === 0) return;
+    if (!isNaN(parseFloat(cols[iProb]))) count++;
+  });
+
+  // Pass 2: fill pre-allocated typed arrays (no JS object overhead)
+  const keys = new Uint32Array(count);
+  const vals = new Float32Array(count);
+  let idx = 0;
   await streamLines((cols, lineNo) => {
     if (lineNo === 0) return;
     const lon  = parseFloat(cols[iLon]);
@@ -111,14 +120,25 @@ async function buildBin(csvPath: string, outPath: string): Promise<void> {
     if (isNaN(prob)) return;
     const xi = Math.round((lon - lonMin) / res);
     const yi = Math.round((latMax - lat) / res);
-    records.push([yi * width + xi, prob]);
+    keys[idx] = yi * width + xi;
+    vals[idx] = prob;
+    idx++;
   });
 
-  records.sort((a, b) => a[0] - b[0]);
+  // Sort by key using an index array, then reorder in-place
+  const order = new Uint32Array(count);
+  for (let i = 0; i < count; i++) order[i] = i;
+  order.sort((a, b) => keys[a] - keys[b]);
+
+  const sortedKeys = new Uint32Array(count);
+  const sortedVals = new Float32Array(count);
+  for (let i = 0; i < count; i++) {
+    sortedKeys[i] = keys[order[i]];
+    sortedVals[i] = vals[order[i]];
+  }
 
   // Write binary file
-  const n = records.length;
-  const buf = new ArrayBuffer(HEADER_BYTES + n * 8);
+  const buf = new ArrayBuffer(HEADER_BYTES + count * 8);
   const dv  = new DataView(buf);
   dv.setFloat64(0,  lonMin, true);
   dv.setFloat64(8,  latMax, true);
@@ -126,9 +146,9 @@ async function buildBin(csvPath: string, outPath: string): Promise<void> {
   dv.setUint32(24,  width,  true);
   dv.setUint32(28,  height, true);
   let off = HEADER_BYTES;
-  for (const [key, prob] of records) {
-    dv.setUint32(off,     key,  true);
-    dv.setFloat32(off + 4, prob, true);
+  for (let i = 0; i < count; i++) {
+    dv.setUint32(off,      sortedKeys[i], true);
+    dv.setFloat32(off + 4, sortedVals[i], true);
     off += 8;
   }
   await Deno.writeFile(outPath, new Uint8Array(buf));
