@@ -28,6 +28,7 @@ outputs/
 
 # Keep location configs
 !data/locations/
+!data/catchments/
 
 # Logs
 *.log
