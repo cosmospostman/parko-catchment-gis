@@ -76,3 +76,25 @@ pytest
 ```
 
 Tests live in [tests/](tests/) and run with the settings in [pytest.ini](pytest.ini).
+
+## Deployment (DigitalOcean droplet)
+
+After cloning the repo on the droplet:
+
+```bash
+# 1. Bootstrap — installs Deno, sets up Python venv, fetches ALA sightings
+bash ui/production/setup.sh
+
+# 2. Copy ranking CSVs from your dev machine (run locally)
+rsync -avz --include="*/" --include="*.csv" --exclude="*" \
+  outputs/ <droplet>:/path/to/repo/outputs/
+
+# 3. Start the server inside screen (auto-respawns on crash, port 80)
+screen -S parko bash ui/production/run.sh
+```
+
+To refresh sightings data later without re-running full setup:
+
+```bash
+bash ui/production/fetch-sightings.sh
+```
