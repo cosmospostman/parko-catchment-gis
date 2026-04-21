@@ -152,7 +152,7 @@ async function buildBin(csvPath: string, outPath: string): Promise<void> {
     off += 8;
   }
   await Deno.writeFile(outPath, new Uint8Array(buf));
-  console.log(`Binary cache built in ${(performance.now() - t0).toFixed(0)} ms  (${n} pixels, ${width}×${height})`);
+  console.log(`Binary cache built in ${(performance.now() - t0).toFixed(0)} ms  (${count} pixels, ${width}×${height})`);
 }
 
 async function loadBin(path: string): Promise<Grid> {
