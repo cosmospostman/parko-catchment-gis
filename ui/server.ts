@@ -421,13 +421,14 @@ async function handleImageryDate(req: Request): Promise<Response> {
 
   try {
     const responses = await Promise.all(
-      probePoints.map(p => fetch(`${imageServerBase(identifyLayer)}?${makeParams(p.x, p.y)}`, { signal: AbortSignal.timeout(8000) }).then(r => r.json()))
+      probePoints.map(p => fetch(`${imageServerBase(identifyLayer)}?${makeParams(p.x, p.y)}`, { signal: AbortSignal.timeout(8000) }).then(r => r.ok ? r.json() : null).catch(() => null))
     );
 
     type Feature = { attributes: Record<string, unknown> };
     const allFeatures: Feature[] = [];
     const seen = new Set<unknown>();
     for (const data of responses) {
+      if (!data) continue;
       for (const f of (data.catalogItems?.features ?? []) as Feature[]) {
         const id = f.attributes.objectid ?? f.attributes.name;
         if (!seen.has(id)) { seen.add(id); allFeatures.push(f); }
