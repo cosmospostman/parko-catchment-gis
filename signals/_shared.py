@@ -450,11 +450,37 @@ def ensure_pixel_sorted(path: Path, row_group_size: int = 5_000_000) -> Path:
     return sorted_path
 
 
+_WRITE_OPTS = dict(
+    compression="zstd",
+    compression_level=3,
+    use_dictionary=["point_id", "item_id", "tile_id"],
+    write_statistics=True,
+)
+
+
+def _optimise_schema(tbl: "pa.Table") -> "pa.Table":
+    """Cast lon/lat → float32 and date → date32 to reduce parquet file size."""
+    import pyarrow as pa
+    for col in ("lon", "lat"):
+        if col in tbl.schema.names:
+            tbl = tbl.set_column(
+                tbl.schema.get_field_index(col), col,
+                tbl.column(col).cast(pa.float32()),
+            )
+    if "date" in tbl.schema.names:
+        tbl = tbl.set_column(
+            tbl.schema.get_field_index("date"), "date",
+            tbl.column("date").cast(pa.date32()),
+        )
+    return tbl
+
+
 def sort_parquet_by_pixel(
     src: Path,
     dst: Path,
     row_group_size: int = 5_000_000,
     ram_budget_gb: float = 8.0,
+    read_workers: int = 6,
 ) -> None:
     """Write a copy of ``src`` sorted by ``point_id`` using an in-memory multi-pass sort.
 
@@ -525,42 +551,58 @@ def sort_parquet_by_pixel(
     )
 
     # ── Step 3: multi-pass scan → sort → write ────────────────────────────
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
+
     out_writer: "pq.ParquetWriter | None" = None
     try:
-        out_writer = pq.ParquetWriter(str(dst), schema, compression="snappy")
 
         for pass_idx, pass_coords in enumerate(passes):
             coord_set = set(pass_coords)
+            coord_set_arr = pa.array(list(coord_set))
             buckets: dict[str, list[pa.Table]] = {c: [] for c in pass_coords}
+            buckets_lock = threading.Lock()
+            rg_counter = [0]
 
             print(
                 f"  [sort] pass {pass_idx+1}/{len(passes)}: "
-                f"scanning {n_rg} row groups for {len(pass_coords)} coords ...",
+                f"scanning {n_rg} row groups for {len(pass_coords)} coords "
+                f"({read_workers} workers) ...",
                 flush=True,
             )
-            for i in range(n_rg):
-                batch = pf.read_row_group(i)
+
+            def _read_and_bucket(rg_idx: int) -> None:
+                batch = pf.read_row_group(rg_idx)
                 ids = batch.column("point_id")
                 row_coords = pc.list_flatten(pc.list_slice(pc.split_pattern(ids, "_"), 1, 2))
-
-                # Filter to only rows whose coord is in this pass
-                in_pass = pc.is_in(row_coords, value_set=pa.array(list(coord_set)))
+                in_pass = pc.is_in(row_coords, value_set=coord_set_arr)
                 if not pc.any(in_pass).as_py():
-                    continue
+                    with buckets_lock:
+                        rg_counter[0] += 1
+                        if rg_counter[0] % 400 == 0:
+                            print(f"  [sort] pass {pass_idx+1}: {rg_counter[0]}/{n_rg} row groups", flush=True)
+                    return
                 batch = batch.filter(in_pass)
                 row_coords = row_coords.filter(in_pass)
-
-                # Split into per-coord buckets
                 unique_in_batch = pc.unique(row_coords).to_pylist()
                 if len(unique_in_batch) == 1:
-                    buckets[unique_in_batch[0]].append(batch)
+                    slices = [(unique_in_batch[0], batch)]
                 else:
-                    for coord in unique_in_batch:
-                        mask = pc.equal(row_coords, coord)
-                        buckets[coord].append(batch.filter(mask))
+                    slices = [
+                        (coord, batch.filter(pc.equal(row_coords, coord)))
+                        for coord in unique_in_batch
+                    ]
+                with buckets_lock:
+                    for coord, tbl in slices:
+                        buckets[coord].append(tbl)
+                    rg_counter[0] += 1
+                    if rg_counter[0] % 400 == 0:
+                        print(f"  [sort] pass {pass_idx+1}: {rg_counter[0]}/{n_rg} row groups", flush=True)
 
-                if i % 400 == 0:
-                    print(f"  [sort] pass {pass_idx+1}: {i}/{n_rg} row groups", flush=True)
+            with ThreadPoolExecutor(max_workers=read_workers) as pool:
+                futures = [pool.submit(_read_and_bucket, i) for i in range(n_rg)]
+                for fut in as_completed(futures):
+                    fut.result()  # propagate exceptions
 
             # Sort each coord bucket and write to output.
             # We accumulate whole row-coord tables and write one row group per
@@ -570,12 +612,14 @@ def sort_parquet_by_pixel(
             pending_rows = 0
 
             def _flush() -> None:
-                nonlocal pending_rows
+                nonlocal out_writer, pending_rows
                 if not pending:
                     return
                 # Write each coord table as its own row group so we never split
                 # a pixel across a row-group boundary.
                 for tbl in pending:
+                    if out_writer is None:
+                        out_writer = pq.ParquetWriter(str(dst), tbl.schema, **_WRITE_OPTS)
                     out_writer.write_table(tbl)
                 pending.clear()
                 pending_rows = 0
@@ -585,8 +629,8 @@ def sort_parquet_by_pixel(
                 if not chunks:
                     continue
                 bucket_tbl = pa.concat_tables(chunks)
-                order = pc.sort_indices(bucket_tbl, sort_keys=[("point_id", "ascending")])
-                bucket_tbl = bucket_tbl.take(order)
+                order = pc.sort_indices(bucket_tbl, sort_keys=[("point_id", "ascending"), ("date", "ascending"), ("scl_purity", "descending")])
+                bucket_tbl = _optimise_schema(bucket_tbl.take(order))
                 pending.append(bucket_tbl)
                 pending_rows += len(bucket_tbl)
                 if pending_rows >= row_group_size:

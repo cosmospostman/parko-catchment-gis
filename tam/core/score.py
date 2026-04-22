@@ -258,7 +258,7 @@ def score_pixels_chunked(
             chunk = chunk[chunk["scl_purity"] >= scl_purity_min]
             if chunk.empty:
                 continue
-            ts_us = chunk["date"].values.astype("int64")
+            ts_us = pd.to_datetime(chunk["date"]).values.astype("datetime64[us]").astype("int64")
             chunk["year"], chunk["doy"] = _extract_year_doy(ts_us)
             if end_year:
                 chunk = chunk[chunk["year"] <= end_year]

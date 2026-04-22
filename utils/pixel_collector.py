@@ -370,10 +370,14 @@ def collect(
     def _shard_path(idx: int) -> Path:
         return out_path.with_name(f"{out_path.stem}.shard{idx:03d}.parquet")
 
-    all_shards_done = all(
-        _shard_path(i).exists() and _shard_path(i).with_suffix(".done").exists()
-        for i in range(n_shards)
-    )
+    def _shard_complete(idx: int) -> bool:
+        sp = _shard_path(idx)
+        dp = sp.with_suffix(".done")
+        if not sp.exists() or not dp.exists():
+            return False
+        return "__done__" in dp.read_text()
+
+    all_shards_done = all(_shard_complete(i) for i in range(n_shards))
 
     if all_shards_done:
         logger.info("All %d shards already complete — skipping fetch", n_shards)
@@ -418,15 +422,28 @@ def collect(
         else:
             logger.info("All %d items already in cache — no network fetch needed", len(items))
 
-    shard_paths: list[Path] = []
+    from signals._shared import sort_parquet_by_pixel, _optimise_schema, _WRITE_OPTS
+
+    sorted_shard_paths: list[Path] = []
 
     for shard_idx, shard_points in enumerate(shards):
         shard_path = _shard_path(shard_idx)
         done_path = shard_path.with_suffix(".done")
 
-        if shard_path.exists() and done_path.exists():
+        sorted_sp = shard_path.with_name(shard_path.stem + "_sorted.parquet")
+        if _shard_complete(shard_idx):
             logger.info("Shard %d/%d already complete, skipping", shard_idx + 1, n_shards)
-            shard_paths.append(shard_path)
+            if sorted_sp.exists():
+                sorted_shard_paths.append(sorted_sp)
+            elif shard_path.exists():
+                sorting_tmp = sorted_sp.with_suffix(".sorting.parquet")
+                sorting_tmp.unlink(missing_ok=True)
+                logger.info("  sorting shard %d/%d → %s ...", shard_idx + 1, n_shards, sorted_sp.name)
+                sort_parquet_by_pixel(shard_path, sorting_tmp, row_group_size=5_000_000, ram_budget_gb=24.0)
+                sorting_tmp.replace(sorted_sp)
+                shard_path.unlink()
+                logger.info("  shard %d/%d sorted (raw shard deleted)", shard_idx + 1, n_shards)
+                sorted_shard_paths.append(sorted_sp)
             continue
 
         logger.info(
@@ -437,8 +454,7 @@ def collect(
         shard_lons = np.array([lon for _, lon, _ in shard_points], dtype=np.float64)
         shard_lats = np.array([lat for _, _, lat in shard_points], dtype=np.float64)
 
-        shard_pids = {pid for pid, _, _ in shard_points}
-        shard_point_coords = {pid: point_coords[pid] for pid in shard_pids}
+        shard_point_coords = {pid: (lon, lat) for pid, lon, lat in shard_points}
 
         # Per-shard checkpoint: item ids already written for this shard
         done_ids: set[str] = set()
@@ -449,6 +465,20 @@ def collect(
 
         writer: pq.ParquetWriter | None = None
         shard_rows = 0
+        shard_buf: list[pa.Table] = []
+        shard_buf_rows = 0
+        SHARD_BUF_SIZE = 500_000
+
+        def _flush_shard_buf() -> None:
+            nonlocal writer, shard_buf_rows
+            if not shard_buf:
+                return
+            out = pa.concat_tables(shard_buf)
+            shard_buf.clear()
+            shard_buf_rows = 0
+            if writer is None:
+                writer = pq.ParquetWriter(shard_path, out.schema, compression="none")
+            writer.write_table(out)
 
         # --- Concurrent item processing --------------------------------------
         # N_WORKERS threads each process one item at a time: load .npz from
@@ -499,10 +529,11 @@ def collect(
 
                     if batch_df is not None and not batch_df.empty:
                         table = pa.Table.from_pandas(batch_df[col_order], preserve_index=False)
-                        if writer is None:
-                            writer = pq.ParquetWriter(shard_path, table.schema)
-                        writer.write_table(table)
-                        shard_rows += len(batch_df)
+                        shard_buf.append(table)
+                        shard_buf_rows += len(table)
+                        shard_rows += len(table)
+                        if shard_buf_rows >= SHARD_BUF_SIZE:
+                            _flush_shard_buf()
 
                     done_ids.add(item_id)
                     done_fh.write(item_id + "\n")
@@ -515,146 +546,160 @@ def collect(
                             shard_idx + 1, n_shards, i, len(pending_items), shard_rows,
                         )
 
+        _flush_shard_buf()
         if writer is not None:
             writer.close()
         # Mark shard complete with a sentinel line
         with done_path.open("a") as done_fh:
             done_fh.write("__done__\n")
-        if shard_path.exists():
-            shard_paths.append(shard_path)
         logger.info("  shard %d/%d complete: %d rows", shard_idx + 1, n_shards, shard_rows)
 
-    # --- 5. Sort each shard by point_id, then concatenate → pixel-sorted output -
-    # Each shard covers a disjoint set of row-coords, so the shards are already
-    # pixel-disjoint from each other.  Within each shard rows are item-ordered
-    # (not pixel-ordered), so we must sort by point_id before concatenating.
-    #
-    # We use sort_parquet_by_pixel() on each shard in turn (single-pass, bounded
-    # RAM) writing to a <stem>_sorted.parquet sibling, then concatenate those
-    # sorted intermediates row-group-by-row-group into the final output.
-    # Original shard files are preserved.
-    from signals._shared import sort_parquet_by_pixel
-
-    sorted_shard_paths: list[Path] = []
-    for shard_idx in range(n_shards):
-        sp = _shard_path(shard_idx)
-        sorted_sp = sp.with_name(sp.stem + "_sorted.parquet")
+        # Sort immediately — overlaps fetch IO of the next shard with sort CPU.
+        # Write to a .sorting temp file and rename atomically so an interrupted
+        # sort never leaves a partial file that looks complete on restart.
         if sorted_sp.exists():
             logger.info(
                 "  shard %d/%d sorted file already exists, reusing: %s",
                 shard_idx + 1, n_shards, sorted_sp.name,
             )
-        elif sp.exists():
-            logger.info(
-                "  sorting shard %d/%d → %s ...", shard_idx + 1, n_shards, sorted_sp.name
-            )
-            sort_parquet_by_pixel(sp, sorted_sp, row_group_size=5_000_000)
-            logger.info("  shard %d/%d sorted", shard_idx + 1, n_shards)
-        else:
-            logger.warning("  shard %d/%d: neither unsorted nor sorted parquet found, skipping", shard_idx + 1, n_shards)
-            continue
+        elif shard_path.exists():
+            sorting_tmp = sorted_sp.with_suffix(".sorting.parquet")
+            sorting_tmp.unlink(missing_ok=True)
+            logger.info("  sorting shard %d/%d → %s ...", shard_idx + 1, n_shards, sorted_sp.name)
+            sort_parquet_by_pixel(shard_path, sorting_tmp, row_group_size=5_000_000, ram_budget_gb=24.0)
+            sorting_tmp.replace(sorted_sp)
+            shard_path.unlink()
+            logger.info("  shard %d/%d sorted (raw shard deleted)", shard_idx + 1, n_shards)
         sorted_shard_paths.append(sorted_sp)
 
+    # --- 5. Concat + dedup in a single streaming pass -------------------------
+    # Tile-boundary duplicates: a pixel near an MGRS boundary appears in two
+    # tiles on the same date with different band values. sort_parquet_by_pixel
+    # now sorts by (point_id, date, scl_purity desc), so within each pixel the
+    # best row for each date comes first. A simple adjacent-row shift-compare
+    # drops duplicates in O(n) with no re-sort.
+    #
+    # Sorted shards are deleted only after the output row count is verified.
     logger.info("Concatenating %d sorted shards → %s ...", n_shards, out_path.name)
+
     final_writer: pq.ParquetWriter | None = None
     total_rows = 0
-    for sorted_sp in sorted_shard_paths:
-        pf = pq.ParquetFile(sorted_sp)
-        schema = pf.schema_arrow
-        n_rg = pf.metadata.num_row_groups
-        for rg_idx in range(n_rg):
-            tbl = pf.read_row_group(rg_idx)
-            if final_writer is None:
-                final_writer = pq.ParquetWriter(out_path, schema)
-            final_writer.write_table(tbl)
-            total_rows += len(tbl)
-        del pf
+    n_dedup_dropped = 0
 
-    if final_writer is not None:
-        final_writer.close()
+    concat_rg_size = 5_000_000
+    write_buf: list[pa.Table] = []
+    write_buf_rows = 0
+    total_rgs = sum(
+        pq.ParquetFile(sp).metadata.num_row_groups for sp in sorted_shard_paths
+    )
+    rgs_done = 0
 
-    # --- 6. Dedup (point_id, date) — removes cross-tile boundary duplicates -----
-    # A pixel at the boundary of two S2 MGRS tiles may have been observed by both
-    # tiles on the same date, producing two rows with the same (point_id, date) but
-    # different band values (independent L2A atmospheric correction per tile).
-    # Keep the row with higher scl_purity; break ties by keeping the first tile
-    # (lexicographic order, which is arbitrary but deterministic).
-    #
-    # Two-pass streaming approach to avoid loading the full parquet into memory:
-    # Pass 1: read only the key columns to identify which (point_id, date, tile_id)
-    #         rows should be dropped (the lower-purity duplicate per pair).
-    # Pass 2: stream the full parquet row-group-by-row-group, filtering out the
-    #         drop set, writing directly to a temp file then renaming over out_path.
-    if final_writer is not None:
-        pf = pq.ParquetFile(out_path)
-        n_before = pf.metadata.num_rows
+    def _flush_write_buf() -> int:
+        nonlocal final_writer, write_buf_rows
+        if not write_buf:
+            return 0
+        out = _optimise_schema(pa.concat_tables(write_buf))
+        write_buf.clear()
+        write_buf_rows = 0
+        if final_writer is None:
+            final_writer = pq.ParquetWriter(str(out_path), out.schema, **_WRITE_OPTS)
+        final_writer.write_table(out)
+        return len(out)
 
-        # Pass 1 — find losers
-        key_cols = ["point_id", "date", "scl_purity", "tile_id"]
-        keys_df = pf.read(columns=key_cols).to_pandas()
-        # Primary sort: descending scl_purity so the winner is first.
-        # Tie-break: ascending tile_id so the result is deterministic regardless
-        # of the order rows were written (lower tile_id wins on equal purity).
-        keys_df = keys_df.sort_values(
-            ["point_id", "date", "scl_purity", "tile_id"],
-            ascending=[True, True, False, True],
-        ).reset_index(drop=True)
-        dup_mask = keys_df.duplicated(subset=["point_id", "date"], keep="first")
-        n_dedup = int(dup_mask.sum())
+    def _dedup_rg(tbl: pa.Table) -> pa.Table:
+        """Drop tile-boundary duplicate (point_id, date) rows.
 
-        if n_dedup:
-            logger.info(
-                "Cross-tile dedup: %d rows → %d (removing %d boundary duplicates)",
-                n_before, n_before - n_dedup, n_dedup,
-            )
-            # losers: one row per (point_id, date, tile_id) to drop.
-            # duplicated(keep="first") already handled ties — the winner was sorted
-            # first by descending scl_purity, so the loser is correctly marked.
-            losers = (
-                keys_df[dup_mask][["point_id", "date", "tile_id"]]
-                .assign(_drop=True)
-                .reset_index(drop=True)
-            )
+        sort_parquet_by_pixel now sorts by (point_id, date, scl_purity desc), so
+        within each pixel duplicates on the same date are adjacent and the best
+        (highest scl_purity) row comes first. A simple shift-compare drops them
+        in O(n) with no re-sort.
+        """
+        nonlocal n_dedup_dropped
+        import pyarrow.compute as pc
+        n_in = len(tbl)
+        pid_col  = tbl.column("point_id").combine_chunks()
+        date_col = tbl.column("date").combine_chunks()
+        pid_prev  = pa.concat_arrays([pid_col[:1],  pid_col[:-1]])
+        date_prev = pa.concat_arrays([date_col[:1], date_col[:-1]])
+        keep = pc.or_(pc.not_equal(pid_col, pid_prev), pc.not_equal(date_col, date_prev))
+        n_keep = pc.sum(keep).as_py()
+        if n_keep < n_in:
+            n_dedup_dropped += n_in - n_keep
+            return tbl.filter(keep)
+        return tbl
 
-            # Pass 2 — vectorised stream rewrite via anti-join
-            tmp_path = out_path.with_suffix(".dedup_tmp.parquet")
-            schema = pf.schema_arrow
-            tmp_writer = pq.ParquetWriter(tmp_path, schema)
-            n_written = 0
-
-            for rg_idx in range(pf.metadata.num_row_groups):
-                rg_df = pf.read_row_group(rg_idx).to_pandas()
-                # Anti-join: keep rows that do NOT appear in losers.
-                # merge with indicator then filter — no Python row loop.
-                merged = rg_df.merge(
-                    losers, on=["point_id", "date", "tile_id"], how="left"
-                )
-                # For the rare 3-tile case a loser row matches multiple times;
-                # we want to drop at most len(losers) rows total, but since the
-                # parquet is sorted and boundary strips are narrow, a simple mask
-                # is correct: every row that joined a loser entry is a duplicate.
-                filtered = rg_df[merged["_drop"].isna()]
-                if len(filtered):
-                    tmp_writer.write_table(pa.Table.from_pandas(filtered, schema=schema, preserve_index=False))
-                    n_written += len(filtered)
-
-            tmp_writer.close()
+    try:
+        for sorted_sp in sorted_shard_paths:
+            pf = pq.ParquetFile(sorted_sp)
+            n_rg = pf.metadata.num_row_groups
+            for rg_idx in range(n_rg):
+                rg = pf.read_row_group(rg_idx)
+                rg = _dedup_rg(rg)
+                write_buf.append(rg)
+                write_buf_rows += len(rg)
+                if write_buf_rows >= concat_rg_size:
+                    total_rows += _flush_write_buf()
+                rgs_done += 1
+                if rgs_done % 50 == 0 or rgs_done == total_rgs:
+                    logger.info(
+                        "  concat %d/%d row groups (%.0f%%)  %d rows written",
+                        rgs_done, total_rgs, 100 * rgs_done / total_rgs, total_rows,
+                    )
             del pf
-            tmp_path.replace(out_path)
-            total_rows = n_written
-        else:
-            del pf
-            total_rows = n_before
 
-    # Clean up sorted intermediates (original shards are kept)
-    for sorted_sp in sorted_shard_paths:
-        sorted_sp.unlink(missing_ok=True)
+        total_rows += _flush_write_buf()
 
+        if final_writer is not None:
+            final_writer.close()
+
+    except Exception:
+        if final_writer is not None:
+            try:
+                final_writer.close()
+            except Exception:
+                pass
+        if out_path.exists():
+            out_path.unlink()
+        raise
+
+    if n_dedup_dropped:
+        logger.info(
+            "Cross-tile dedup: removed %d boundary duplicate rows", n_dedup_dropped,
+        )
+
+    # Verify row count before deleting sorted intermediates.
     if total_rows == 0:
         logger.error("No usable observations — all pixels clouded or missing?")
         sys.exit(1)
 
+    written_rows = pq.ParquetFile(out_path).metadata.num_rows
+    if written_rows != total_rows:
+        logger.error(
+            "Row count mismatch: counted %d but parquet reports %d — output may be corrupt",
+            total_rows, written_rows,
+        )
+        sys.exit(1)
+
+    logger.info("Output verified: %d rows in %d row groups", written_rows,
+                pq.ParquetFile(out_path).metadata.num_row_groups)
+
+    # Only delete sorted intermediates after successful verification.
+    for sorted_sp in sorted_shard_paths:
+        sorted_sp.unlink(missing_ok=True)
+
     logger.info("Written: %s  (%d rows)", out_path, total_rows)
+
+    from signals._shared import is_pixel_sorted
+    if is_pixel_sorted(out_path, n_check=10):
+        logger.info("Output is pixel-sorted.")
+    else:
+        logger.warning("Output is NOT pixel-sorted — sorting now ...")
+        sorting_tmp = out_path.with_name(out_path.stem + ".sorting.parquet")
+        sorting_tmp.unlink(missing_ok=True)
+        sort_parquet_by_pixel(out_path, sorting_tmp, row_group_size=5_000_000, ram_budget_gb=24.0)
+        sorting_tmp.replace(out_path)
+        logger.info("Pixel sort complete.")
+
     print(f"\nDone.")
     print(f"  Rows   : {total_rows}")
     print(f"  Output : {out_path}")

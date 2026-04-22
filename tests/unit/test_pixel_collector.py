@@ -26,6 +26,7 @@ Tests
 14. extract_item_to_df: missing AOT band defaults aot column to 1.0.
 15. extract_item_to_df: apply_nbar=False does not raise.
 16. extract_item_to_df: two items from different tiles produce two rows — no cross-tile dedup.
+16b. extract_item_to_df: band values are aligned to point_ids (regression for set-ordering bug).
 17. Granule dedup regex strips the processing-granule index suffix correctly.
 18. Cross-tile items with matching (date, satellite) both survive per-tile dedup (Bug PC6 — documents).
 19. collect() dedup step removes cross-tile duplicate rows, keeping higher scl_purity.
@@ -338,6 +339,62 @@ def test_extract_item_to_df_apply_nbar_false_does_not_raise():
     store, lons, lats, _ = _make_store(1, scl_value=4.0, band_value=800.0)
     df = extract_item_to_df(item, store, _point_ids(1), lons, lats, apply_nbar=False)
     assert df is not None
+
+
+# ---------------------------------------------------------------------------
+# Test 17b — band values aligned to point_ids (regression for set-ordering bug)
+# ---------------------------------------------------------------------------
+
+def test_extract_item_to_df_band_values_aligned_to_point_ids():
+    """Regression: store point_coords order must match point_ids/lons/lats order.
+
+    Uses an N-column patch where column i holds a unique value for point i.
+    If point_coords insertion order differs from point_ids order (as happened
+    when shard_point_coords was built via a set comprehension), each point_id
+    gets the wrong band value.
+    """
+    from rasterio.transform import from_bounds as _from_bounds
+
+    N = 8
+    point_ids = [f"px_{i:04d}_0000" for i in range(N)]
+
+    crs = CRS.from_epsg(32755)
+    # 1-row × N-col patch at 100 m/px: column i holds the value for point i.
+    # lon/lat are pixel centres in this UTM extent, pre-computed so that
+    # reprojection maps point i → column i exactly.
+    x0, x1 = 550_000, 550_000 + N * 100
+    y0, y1 = 7_749_950, 7_750_050
+    transform = _from_bounds(x0, y0, x1, y1, N, 1)
+    lons = np.array([147.47952211, 147.48048017, 147.48143823, 147.48239629,
+                     147.48335435, 147.48431241, 147.48527047, 147.48622853])
+    lats = np.full(N, -20.34741, dtype=np.float64)
+    # point_coords in SAME order as point_ids — correct
+    point_coords = {pid: (float(lons[i]), float(lats[i])) for i, pid in enumerate(point_ids)}
+    scl_arr = np.full((1, N), 4, dtype=np.float32)  # all clear
+    # Point i → raw DN = (i+1)*1000 → SR = (i+1)/10
+    spectral_arr = np.array([[float((i + 1) * 1000) for i in range(N)]], dtype=np.float32)
+
+    item_id = "S2A_ALIGN_20220815_0_L2A"
+    patches: dict = {}
+    patches[(item_id, SCL_BAND)] = (scl_arr, transform, crs)
+    patches[(item_id, AOT_BAND)] = (np.full((1, N), 100.0, dtype=np.float32), transform, crs)
+    for band in BANDS:
+        patches[(item_id, band)] = (spectral_arr.copy(), transform, crs)
+
+    from utils.chip_store import MemoryChipStore as _MCS
+    store = _MCS(patches=patches, point_coords=point_coords)
+    item = _make_item(item_id=item_id)
+    df = extract_item_to_df(item, store, point_ids, lons, lats, apply_nbar=False)
+
+    assert df is not None
+    df = df.set_index("point_id")
+    for i, pid in enumerate(point_ids):
+        expected_sr = (i + 1) / 10.0
+        actual = float(df.loc[pid, BANDS[0]])
+        assert abs(actual - expected_sr) < 1e-3, (
+            f"{pid}: expected SR {expected_sr:.3f}, got {actual:.3f} — "
+            "point_id/band-value ordering mismatch"
+        )
 
 
 # ---------------------------------------------------------------------------

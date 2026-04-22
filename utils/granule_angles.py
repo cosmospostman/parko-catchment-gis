@@ -70,9 +70,7 @@ def _fetch_and_parse_xml(item_id: str, xml_url: str) -> dict | None:
                     )
             root = ET.fromstring(content)
             break
-        except (requests.RequestException, IOError) as exc:
-            last_exc = exc
-        except ET.ParseError as exc:
+        except (requests.RequestException, IOError, ET.ParseError) as exc:
             last_exc = exc
         time.sleep(2 ** attempt)
 

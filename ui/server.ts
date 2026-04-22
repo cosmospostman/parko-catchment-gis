@@ -500,7 +500,7 @@ async function handler(req: Request): Promise<Response> {
 
   if (url.pathname === "/api/rankings") {
     return new Response(JSON.stringify(listRankings()), {
-      headers: { "content-type": "application/json", "cache-control": "public, max-age=300" },
+      headers: { "content-type": "application/json", "cache-control": "no-store" },
     });
   }
 

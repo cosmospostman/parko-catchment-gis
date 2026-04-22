@@ -35,10 +35,39 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from utils.location import all_locations, get  # noqa: E402
 
 
+def _fmt_size(n_bytes: int) -> str:
+    if n_bytes >= 1e12:
+        return f"{n_bytes/1e12:.1f} TB"
+    if n_bytes >= 1e9:
+        return f"{n_bytes/1e9:.1f} GB"
+    if n_bytes >= 1e6:
+        return f"{n_bytes/1e6:.0f} MB"
+    return f"{n_bytes/1e3:.0f} KB"
+
+
+def _dir_size(p: "Path") -> int:
+    import os
+    total = 0
+    for entry in os.scandir(p):
+        if entry.is_file(follow_symlinks=False):
+            total += entry.stat().st_size
+        elif entry.is_dir(follow_symlinks=False):
+            total += _dir_size(Path(entry.path))
+    return total
+
+
 def cmd_list(args: argparse.Namespace) -> None:
     locs = sorted(all_locations(), key=lambda l: l.id)
+    print(f"  {'ID':<26} {'STATUS':<9} {'CHIPS':>8}  {'PARQUET':>8}")
+    print("  " + "-" * 56)
     for loc in locs:
-        print(f"  {loc.id:<22} {loc.name}")
+        parquet = loc.parquet_path()
+        chips   = parquet.parent / (loc.id + ".chips")
+        fetched      = parquet.exists()
+        status       = "fetched" if fetched else ""
+        parquet_str  = _fmt_size(parquet.stat().st_size) if fetched else "—"
+        chips_str    = _fmt_size(_dir_size(chips)) if chips.exists() else "—"
+        print(f"  {loc.id:<26} {status:<9} {chips_str:>8}  {parquet_str:>8}")
 
 
 def cmd_info(args: argparse.Namespace) -> None:

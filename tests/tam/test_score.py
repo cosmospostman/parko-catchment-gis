@@ -73,8 +73,9 @@ def _make_parquet(
 
 
 def _stub_model() -> tuple[TAMClassifier, np.ndarray, np.ndarray]:
-    """Tiny untrained model + zero-mean unit-std stats — enough for shape checks."""
+    """Tiny seeded model + zero-mean unit-std stats — enough for shape checks."""
     cfg = TAMConfig(d_model=16, n_heads=2, n_layers=1, d_ff=32)
+    torch.manual_seed(42)
     model = TAMClassifier.from_config(cfg)
     model.eval()
     n_features = 13  # ALL_FEATURE_COLS length
