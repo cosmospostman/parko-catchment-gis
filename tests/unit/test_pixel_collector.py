@@ -27,6 +27,10 @@ Tests
 15. extract_item_to_df: apply_nbar=False does not raise.
 16. extract_item_to_df: two items from different tiles produce two rows — no cross-tile dedup.
 16b. extract_item_to_df: band values are aligned to point_ids (regression for set-ordering bug).
+ A. extract_item_to_df: tile_id extracted from item.id when s2:mgrs_tile absent.
+ B. extract_item_to_df: canonical_tiles mask suppresses non-canonical tile rows.
+ C. extract_item_to_df: canonical_tiles=None keeps all clear pixels (no regression).
+ D. extract_item_to_df: all non-canonical points → returns None.
 17. Granule dedup regex strips the processing-granule index suffix correctly.
 18. Cross-tile items with matching (date, satellite) both survive per-tile dedup (Bug PC6 — documents).
 19. collect() dedup step removes cross-tile duplicate rows, keeping higher scl_purity.
@@ -62,7 +66,7 @@ _GRANULE_RE = re.compile(r"_\d+_L2A$")
 
 
 def _make_item(
-    item_id: str = "S2A_TTTTTT_20220815_0_L2A",
+    item_id: str = "S2A_55HBU_20220815_0_L2A",
     dt: datetime | None = None,
     tile_id: str = "55HBU",
 ) -> SimpleNamespace:
@@ -78,7 +82,7 @@ def _make_store(
     scl_value: float,
     band_value: float,
     *,
-    item_id: str = "S2A_TTTTTT_20220815_0_L2A",
+    item_id: str = "S2A_55HBU_20220815_0_L2A",
     missing_bands: tuple[str, ...] = (),
     aot_value: float = 100.0,   # raw DN → 1 - 100*0.001 = 0.9 quality
     all_band_array: np.ndarray | None = None,
@@ -117,7 +121,7 @@ def _make_store(
     return store, lons, lats, point_coords
 
 
-def _point_ids(n: int, item_id: str = "S2A_TTTTTT_20220815_0_L2A") -> list[str]:
+def _point_ids(n: int, item_id: str = "S2A_55HBU_20220815_0_L2A") -> list[str]:
     return [f"px_{i:04d}_0000" for i in range(n)]
 
 
@@ -398,6 +402,74 @@ def test_extract_item_to_df_band_values_aligned_to_point_ids():
 
 
 # ---------------------------------------------------------------------------
+# Tests A–D — tile_id extraction and canonical tile filtering
+# ---------------------------------------------------------------------------
+
+def test_extract_item_to_df_tile_id_from_item_id():
+    """tile_id is extracted from item.id when s2:mgrs_tile is absent (Element84)."""
+    item = SimpleNamespace(
+        id="S2A_54LWH_20220815_0_L2A",
+        datetime=_ITEM_DT,
+        properties={},  # no s2:mgrs_tile
+    )
+    store, lons, lats, _ = _make_store(2, scl_value=4.0, band_value=500.0,
+                                       item_id="S2A_54LWH_20220815_0_L2A")
+    df = extract_item_to_df(item, store, _point_ids(2, "S2A_54LWH_20220815_0_L2A"),
+                            lons, lats, apply_nbar=False)
+    assert df is not None
+    assert (df["tile_id"] == "54LWH").all()
+
+
+def test_extract_item_to_df_canonical_tile_mask_filters_rows():
+    """Points whose canonical tile differs from item's tile are suppressed."""
+    item = SimpleNamespace(
+        id="S2A_54LWH_20220815_0_L2A",
+        datetime=_ITEM_DT,
+        properties={},
+    )
+    N = 4
+    store, lons, lats, _ = _make_store(N, scl_value=4.0, band_value=500.0,
+                                       item_id="S2A_54LWH_20220815_0_L2A")
+    pids = _point_ids(N, "S2A_54LWH_20220815_0_L2A")
+    # px_0000, px_0001 → canonical 54LWH (this item's tile) → kept
+    # px_0002, px_0003 → canonical 54LWJ (other tile) → suppressed
+    canonical = np.array(["54LWH", "54LWH", "54LWJ", "54LWJ"])
+    df = extract_item_to_df(item, store, pids, lons, lats,
+                            apply_nbar=False, canonical_tiles=canonical)
+    assert df is not None
+    assert set(df["point_id"]) == {pids[0], pids[1]}
+    assert pids[2] not in df["point_id"].values
+    assert pids[3] not in df["point_id"].values
+
+
+def test_extract_item_to_df_canonical_tiles_none_keeps_all():
+    """canonical_tiles=None (default) keeps all clear pixels — no regression."""
+    item = _make_item()
+    store, lons, lats, _ = _make_store(3, scl_value=4.0, band_value=500.0)
+    df = extract_item_to_df(item, store, _point_ids(3), lons, lats,
+                            apply_nbar=False, canonical_tiles=None)
+    assert df is not None
+    assert len(df) == 3
+
+
+def test_extract_item_to_df_all_non_canonical_returns_none():
+    """If every point's canonical tile differs from item's tile, returns None."""
+    item = SimpleNamespace(
+        id="S2A_54LWH_20220815_0_L2A",
+        datetime=_ITEM_DT,
+        properties={},
+    )
+    N = 3
+    store, lons, lats, _ = _make_store(N, scl_value=4.0, band_value=500.0,
+                                       item_id="S2A_54LWH_20220815_0_L2A")
+    pids = _point_ids(N, "S2A_54LWH_20220815_0_L2A")
+    canonical = np.array(["54LWJ", "54LWJ", "54LWJ"])  # none match 54LWH
+    df = extract_item_to_df(item, store, pids, lons, lats,
+                            apply_nbar=False, canonical_tiles=canonical)
+    assert df is None
+
+
+# ---------------------------------------------------------------------------
 # Test 18 — two items from different tiles produce separate rows (regression)
 # ---------------------------------------------------------------------------
 
@@ -408,14 +480,14 @@ def test_extract_item_to_df_two_tiles_produce_separate_rows():
     rows in the combined DataFrame — one per tile.  This is the mechanism by
     which tile-boundary pixels are double-counted in the output parquet.
     """
-    item_hbu = _make_item("S2A_20220815_hbu", tile_id="55HBU")
-    item_hbv = _make_item("S2A_20220815_hbv", tile_id="55HBV")
+    item_hbu = _make_item("S2A_55HBU_20220815_0_L2A", tile_id="55HBU")
+    item_hbv = _make_item("S2A_55HBV_20220815_0_L2A", tile_id="55HBV")
 
     store_hbu, lons, lats, _ = _make_store(
-        1, scl_value=4.0, band_value=1000.0, item_id="S2A_20220815_hbu"
+        1, scl_value=4.0, band_value=1000.0, item_id="S2A_55HBU_20220815_0_L2A"
     )
     store_hbv, _, _, _ = _make_store(
-        1, scl_value=4.0, band_value=1100.0, item_id="S2A_20220815_hbv"
+        1, scl_value=4.0, band_value=1100.0, item_id="S2A_55HBV_20220815_0_L2A"
     )
 
     df_hbu = extract_item_to_df(item_hbu, store_hbu, _point_ids(1), lons, lats, apply_nbar=False)

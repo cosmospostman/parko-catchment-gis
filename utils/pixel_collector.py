@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -64,6 +65,8 @@ logger = logging.getLogger(__name__)
 
 STAC_ENDPOINT = "https://earth-search.aws.element84.com/v1"
 S2_COLLECTION  = "sentinel-2-l2a"
+
+_TILE_ID_RE = re.compile(r"^S2[AB]_(\d{2}[A-Z]{3})_")
 
 
 def _utm_crs_for_bbox(bbox_wgs84: list[float]) -> str:
@@ -153,15 +156,22 @@ def extract_item_to_df(
     lats: np.ndarray,
     apply_nbar: bool = True,
     utm_crs: str = "EPSG:32755",
+    canonical_tiles: np.ndarray | None = None,
 ) -> pd.DataFrame | None:
     """Extract all usable pixels for one STAC item into a DataFrame.
 
     Uses store.get_all_points() to fetch entire bands as numpy arrays,
     avoiding per-point Python loops. Returns None if the item has no
     clear pixels at all (cloud-filtered).
+
+    canonical_tiles : 1-D string array parallel to point_ids.
+        When provided, only points whose canonical tile matches this item's
+        tile_id are included.  Points assigned to the other tile in an overlap
+        zone are suppressed, preventing sub-pixel misalignment artefacts.
     """
     item_id = item.id
-    tile_id = item.properties.get("s2:mgrs_tile", "")
+    m = _TILE_ID_RE.match(item_id)
+    tile_id = m.group(1) if m else item.properties.get("s2:mgrs_tile", "")
     item_date = pd.Timestamp(item.datetime.replace(tzinfo=None))
     n = len(point_ids)
 
@@ -171,6 +181,8 @@ def extract_item_to_df(
         return None
     scl_int = scl_vals.astype(np.int32)
     clear_mask = np.isin(scl_int, list(SCL_CLEAR_VALUES))
+    if canonical_tiles is not None and tile_id:
+        clear_mask &= (canonical_tiles == tile_id)
     if not clear_mask.any():
         return None
     scl_purity = clear_mask.astype(np.float32)  # 1×1 chip → purity = 0 or 1
@@ -257,6 +269,7 @@ def collect(
     max_concurrent: int = 32,
     items=None,
     point_id_prefix: str = "px",
+    calibration_out: Path | None = None,
 ) -> None:
     """Collect S2 observations for bbox_wgs84.
 
@@ -314,8 +327,7 @@ def collect(
         # (point_id, date) rows with slightly different resampled band values.
         # Item IDs follow the pattern S2X_TTTTTT_YYYYMMDD_N_L2A where N is the
         # granule index — we strip it to get a canonical per-overpass key.
-        import re as _re
-        _granule_re = _re.compile(r"_\d+_L2A$")
+        _granule_re = re.compile(r"_\d+_L2A$")
         seen: set[tuple] = set()
         deduped_items = []
         for item in items:
@@ -329,6 +341,41 @@ def collect(
                 len(items), len(deduped_items), len(items) - len(deduped_items),
             )
         items = deduped_items
+
+    # --- Canonical tile assignment -------------------------------------------
+    # Adjacent MGRS tiles have non-aligned 10 m pixel grids. A point sampled
+    # from tile A vs tile B gets a different sub-pixel position, producing
+    # spurious spectral variation. Assign each point one canonical tile (the
+    # one whose grid it is natively aligned to) and suppress observations from
+    # other tiles in extract_item_to_df.
+    all_tile_ids = sorted({
+        m.group(1) for item in items if (m := _TILE_ID_RE.match(item.id))
+    })
+    canonical_tile: dict[str, str] = {}
+    if len(all_tile_ids) > 1:
+        # Project all points into the shared UTM CRS and compute sub-pixel
+        # offset from the nearest pixel centre (centres at coord % 10 == 5).
+        # The tile whose origin produces the offset closest to 0 on the
+        # boundary axis owns this pixel.  For adjacent MGRS tiles sharing a
+        # UTM zone the boundary is vertical (easting axis), so we compare dx.
+        # all_tile_ids is sorted alphabetically; tile [0] corresponds to lower
+        # eastings (left/west tile).
+        _to_utm = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
+        for pid, lon, lat in points:
+            ux, _uy = _to_utm.transform(lon, lat)
+            dx = (ux % 10.0) - 5.0  # signed distance from pixel centre
+            canonical_tile[pid] = all_tile_ids[0] if dx <= 0.0 else all_tile_ids[1]
+        n_left = sum(1 for t in canonical_tile.values() if t == all_tile_ids[0])
+        logger.info(
+            "Canonical tile assignment: %d tiles (%s), %d/%d points → %s, %d/%d → %s",
+            len(all_tile_ids), ", ".join(all_tile_ids),
+            n_left, len(points), all_tile_ids[0],
+            len(points) - n_left, len(points), all_tile_ids[1],
+        )
+    else:
+        default_tile = all_tile_ids[0] if all_tile_ids else ""
+        for pid, _, _ in points:
+            canonical_tile[pid] = default_tile
 
     col_order = (
         ["point_id", "lon", "lat", "date", "item_id", "tile_id"]
@@ -455,6 +502,9 @@ def collect(
         shard_lats = np.array([lat for _, _, lat in shard_points], dtype=np.float64)
 
         shard_point_coords = {pid: (lon, lat) for pid, lon, lat in shard_points}
+        shard_canonical_tiles = np.array(
+            [canonical_tile.get(pid, "") for pid in shard_point_ids]
+        )
 
         # Per-shard checkpoint: item ids already written for this shard
         done_ids: set[str] = set()
@@ -501,6 +551,7 @@ def collect(
             df = extract_item_to_df(
                 _item, store, shard_point_ids, shard_lons, shard_lats,
                 apply_nbar=apply_nbar, utm_crs=utm_crs,
+                canonical_tiles=shard_canonical_tiles,
             )
             store.release_item(_item.id)
             return (_item.id, df)
@@ -580,6 +631,14 @@ def collect(
     # drops duplicates in O(n) with no re-sort.
     #
     # Sorted shards are deleted only after the output row count is verified.
+
+    from utils.tile_harmonisation import calibrate, load_corrections
+
+    _corrections: dict | None = None
+    if calibration_out is not None:
+        calibrate(sorted_shard_paths, calibration_out)
+        _corrections = load_corrections(calibration_out)
+
     logger.info("Concatenating %d sorted shards → %s ...", n_shards, out_path.name)
 
     final_writer: pq.ParquetWriter | None = None
@@ -598,13 +657,54 @@ def collect(
         nonlocal final_writer, write_buf_rows
         if not write_buf:
             return 0
-        out = _optimise_schema(pa.concat_tables(write_buf))
+        out = pa.concat_tables(write_buf)
         write_buf.clear()
         write_buf_rows = 0
+        if _corrections:
+            out = _apply_corrections(out)
+        out = _optimise_schema(out)
         if final_writer is None:
             final_writer = pq.ParquetWriter(str(out_path), out.schema, **_WRITE_OPTS)
         final_writer.write_table(out)
         return len(out)
+
+    _CORRECT_BANDS = ["B04", "B05", "B07", "B08", "B11"]
+
+    import polars as _pl
+    _corr_df = (
+        _pl.DataFrame(
+            [(t, b, y, s) for (t, b, y), s in _corrections.items()],
+            schema={"tile_id": _pl.String, "band": _pl.String, "year": _pl.Int32, "scale": _pl.Float32},
+            orient="row",
+        ) if _corrections else None
+    )
+
+    def _apply_corrections(tbl: pa.Table) -> pa.Table:
+        chunk = _pl.from_arrow(tbl).with_columns(
+            _pl.col("date").dt.year().cast(_pl.Int32).alias("year")
+        )
+        for band in _CORRECT_BANDS:
+            if band not in chunk.columns:
+                continue
+            band_corr = _corr_df.filter(_pl.col("band") == band).select(["tile_id", "year", "scale"])
+            chunk = (
+                chunk
+                .join(band_corr, on=["tile_id", "year"], how="left")
+                .with_columns(
+                    _pl.when(_pl.col("scale").is_not_null())
+                      .then(_pl.col(band) * _pl.col("scale"))
+                      .otherwise(_pl.col(band))
+                      .alias(band)
+                )
+                .drop("scale")
+            )
+        chunk = chunk.drop("year").with_columns([
+            ((_pl.col("B08") - _pl.col("B04")) / (_pl.col("B08") + _pl.col("B04"))).alias("NDVI"),
+            ((_pl.col("B03") - _pl.col("B08")) / (_pl.col("B03") + _pl.col("B08"))).alias("NDWI"),
+            (2.5 * (_pl.col("B08") - _pl.col("B04")) /
+             (_pl.col("B08") + 6.0 * _pl.col("B04") - 7.5 * _pl.col("B02") + 1.0)).alias("EVI"),
+        ])
+        return chunk.to_arrow()
 
     def _dedup_rg(tbl: pa.Table) -> pa.Table:
         """Drop tile-boundary duplicate (point_id, date) rows.

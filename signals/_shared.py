@@ -78,7 +78,6 @@ def compute_features_chunked(
     curve_out_path: Path | None = None,
     smooth_days: int = 30,
     compute_ndvi_integral: bool = False,
-    calibration_path: Path | None = None,
     tile_id: str | None = None,
 ) -> "pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]":
     """Compute all four Parkinsonia signal features in a single row-group pass.
@@ -154,16 +153,7 @@ def compute_features_chunked(
     if tile_id is not None and "item_id" in _schema_names and "item_id" not in LOAD_COLS:
         LOAD_COLS = LOAD_COLS + ["item_id"]
 
-    # Load correction table once — None if no calibration_path or file absent
-    from utils.tile_harmonisation import load_corrections
-    corrections = load_corrections(calibration_path) if calibration_path else None
-    if corrections:
-        _corr_df = pl.DataFrame([
-            {"tile_id": t, "band": b, "year": y, "scale": s}
-            for (t, b, y), s in corrections.items()
-        ])
-    else:
-        _corr_df = None
+    _corr_df = None
 
     parts: list[pd.DataFrame] = []
     integral_parts: list[pd.DataFrame] = []

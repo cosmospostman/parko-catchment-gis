@@ -302,6 +302,68 @@ regions:
     tags: [monsoonal]
 
   # ---------------------------------------------------------------------------
+  # Quaids — Gulf savanna (monsoonal, open savanna woodland + floodplain)
+  # Added after V2 produced high false-positive rates across Quaids site.
+  # All regions selected from >95% confidence false positive areas.
+  # ---------------------------------------------------------------------------
+
+  - id: quaids_absence_sparse_shrub_1
+    name: "Quaids — absence (sparse shrub 1)"
+    label: absence
+    bbox: [145.255377, -16.807961, 145.258166, -16.806230]
+    year: 2025
+    tags: [monsoonal, savanna, sparse_shrub]
+
+  - id: quaids_absence_sparse_shrub_2
+    name: "Quaids — absence (sparse shrub 2)"
+    label: absence
+    bbox: [145.252731, -16.801740, 145.258462, -16.799858]
+    year: 2025
+    tags: [monsoonal, savanna, sparse_shrub]
+
+  - id: quaids_absence_sparse_eucalypt_1
+    name: "Quaids — absence (sparse eucalypt)"
+    label: absence
+    bbox: [145.200864, -16.730436, 145.205123, -16.726404]
+    year: 2025
+    tags: [monsoonal, savanna, sparse_eucalypt]
+
+  - id: quaids_absence_shrub_1
+    name: "Quaids — absence (shrub 1)"
+    label: absence
+    bbox: [145.217649, -16.734727, 145.220944, -16.732041]
+    year: 2025
+    tags: [monsoonal, savanna, shrub]
+
+  - id: quaids_absence_shrub_2
+    name: "Quaids — absence (shrub 2)"
+    label: absence
+    bbox: [145.259846, -16.783927, 145.263234, -16.782218]
+    year: 2025
+    tags: [monsoonal, savanna, shrub]
+
+  - id: quaids_absence_shrub_3
+    name: "Quaids — absence (shrub 3)"
+    label: absence
+    bbox: [145.263449, -16.782414, 145.266436, -16.779541]
+    year: 2025
+    tags: [monsoonal, savanna, shrub]
+
+  - id: quaids_absence_very_sparse_1
+    name: "Quaids — absence (very sparse)"
+    label: absence
+    bbox: [145.227387, -16.798335, 145.233480, -16.795356]
+    year: 2025
+    tags: [monsoonal, savanna, very_sparse]
+
+  - id: quaids_absence_dense_eucalypt_1
+    name: "Quaids — absence (dense eucalypt)"
+    label: absence
+    bbox: [145.206365, -16.794920, 145.209648, -16.791476]
+    year: 2025
+    tags: [monsoonal, savanna, dense_eucalypt]
+
+  # ---------------------------------------------------------------------------
   # Rockhampton
   # ---------------------------------------------------------------------------
   # - id: rockhampton_presence_1  # removed — uncertain labels (swamp context)

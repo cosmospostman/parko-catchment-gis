@@ -83,7 +83,6 @@ def extract_parko_features(
     year_from: int | None = None,
     year_to: int | None = None,
     bbox: tuple[float, float, float, float] | None = None,
-    calibration_path: Path | None = None,
     tile_id: str | None = None,
 ) -> pd.DataFrame:
     """Compute all tabular signal features and join into one per-pixel table.
@@ -112,13 +111,6 @@ def extract_parko_features(
         (e.g. extracting training pixels from a small sub-bbox inside a large
         scene parquet).  The in-memory DataFrame path is used, so the parquet
         does not need to be pixel-sorted.
-    calibration_path:
-        Optional path to a tile-harmonisation correction table (produced by
-        ``utils.tile_harmonisation.calibrate``).  When provided, per-(tile,
-        band, year) scale factors are applied before computing derived
-        features.  Ignored on the in-memory DataFrame path (sub-bbox use).
-        Pass ``loc.calibration_path()`` for automatic discovery.
-
     Returns
     -------
     DataFrame with columns
@@ -182,7 +174,6 @@ def extract_parko_features(
             year_to=year_to,
             smooth_days=ndvi_integral_params.smooth_days,
             compute_ndvi_integral=True,
-            calibration_path=calibration_path,
             tile_id=tile_id,
         )
         integral_stats = NdviIntegralSignal(ndvi_integral_params).compute(

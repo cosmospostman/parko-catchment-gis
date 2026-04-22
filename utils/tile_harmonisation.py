@@ -39,7 +39,7 @@ _DEFAULT_BANDS = ["B04", "B05", "B07", "B08", "B11"]
 # ---------------------------------------------------------------------------
 
 def calibrate(
-    parquet_path: Path,
+    parquet_paths: Path | list[Path],
     out_path: Path,
     bands: list[str] = _DEFAULT_BANDS,
 ) -> pd.DataFrame:
@@ -59,9 +59,10 @@ def calibrate(
 
     Parameters
     ----------
-    parquet_path:
-        Path to a pixel-sorted parquet containing ``point_id``, ``date``,
-        ``tile_id``, and the requested band columns.
+    parquet_paths:
+        Path or list of paths to pixel-sorted parquets containing ``point_id``,
+        ``date``, ``tile_id``, and the requested band columns.  When a list is
+        given all files are scanned as if they were one file.
     out_path:
         Destination for the correction table parquet.  Parent directory is
         created if needed.
@@ -75,20 +76,36 @@ def calibrate(
     import concurrent.futures
     import pyarrow.parquet as pq
 
-    LOAD_COLS = ["point_id", "date", "tile_id"] + bands
+    paths: list[Path] = [parquet_paths] if isinstance(parquet_paths, Path) else list(parquet_paths)
 
     # Benchmarked on this dataset: 4 workers gives ~4x speedup on both IO and
     # CPU phases; beyond 6 there is no further gain.  Use separate ParquetFile
     # handles per worker to avoid lock contention inside pyarrow.
     N_WORKERS = 6
 
-    pf = pq.ParquetFile(parquet_path)
-    n_rg = pf.metadata.num_row_groups
-    print(f"  [calibrate] {parquet_path.name}: {n_rg} row groups, "
-          f"{pf.metadata.num_rows:,} rows")
+    # Build (path, rg_idx) index across all files
+    _pf_map: dict[Path, pq.ParquetFile] = {p: pq.ParquetFile(p) for p in paths}
+    rg_index: list[tuple[Path, int]] = []
+    total_rows = 0
+    for p in paths:
+        pf = _pf_map[p]
+        n_rg = pf.metadata.num_row_groups
+        total_rows += pf.metadata.num_rows
+        rg_index.extend((p, i) for i in range(n_rg))
+    n_rg = len(rg_index)
 
-    # Shared ParquetFile handles — one per worker, indexed by rg_idx % N_WORKERS.
-    _pfs = [pq.ParquetFile(parquet_path) for _ in range(N_WORKERS)]
+    # Prefer item_id (always populated) over tile_id (often null)
+    _schema_names = set(_pf_map[paths[0]].schema_arrow.names)
+    _use_item_id = "item_id" in _schema_names
+    _tile_src = "item_id" if _use_item_id else "tile_id"
+    LOAD_COLS = ["lon", "lat", "date", _tile_src] + bands
+    names = ", ".join(p.name for p in paths)
+    print(f"  [calibrate] {names}: {n_rg} row groups, {total_rows:,} rows")
+
+    # Shared ParquetFile handles — one set per worker per path.
+    _pfs: dict[Path, list[pq.ParquetFile]] = {
+        p: [pq.ParquetFile(p) for _ in range(N_WORKERS)] for p in paths
+    }
 
     # ------------------------------------------------------------------ #
     # Phase 1: tile-count scan (tile_id column only, ~10 MB total).       #
@@ -96,10 +113,16 @@ def calibrate(
     print("  [calibrate] counting observations per tile ...")
     tile_counts: dict[str, int] = {}
 
-    def _read_tile_col(rg_idx: int) -> pl.DataFrame:
-        return pl.from_arrow(
-            _pfs[rg_idx % N_WORKERS].read_row_groups([rg_idx], columns=["tile_id"])
+    def _read_tile_col(idx: int) -> pl.DataFrame:
+        p, rg = rg_index[idx]
+        chunk = pl.from_arrow(
+            _pfs[p][idx % N_WORKERS].read_row_groups([rg], columns=[_tile_src])
         )
+        if _use_item_id:
+            chunk = chunk.with_columns(
+                pl.col("item_id").str.split("_").list.get(1).alias("tile_id")
+            )
+        return chunk.select("tile_id")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=N_WORKERS) as ex:
         for chunk in ex.map(_read_tile_col, range(n_rg)):
@@ -129,11 +152,16 @@ def calibrate(
     # RgResult: list of (tile_id, band, year, median_ratio, n_pairs)
     RgResult = list  # type alias for clarity
 
-    def _process_rg(rg_idx: int) -> RgResult:
+    def _process_rg(idx: int) -> RgResult:
+        p, rg = rg_index[idx]
         chunk = pl.from_arrow(
-            _pfs[rg_idx % N_WORKERS].read_row_groups([rg_idx], columns=LOAD_COLS)
+            _pfs[p][idx % N_WORKERS].read_row_groups([rg], columns=LOAD_COLS)
         )
 
+        if _use_item_id:
+            chunk = chunk.with_columns(
+                pl.col("item_id").str.split("_").list.get(1).alias("tile_id")
+            )
         chunk = chunk.filter(pl.col("tile_id").is_in(relevant_tiles))
         if chunk.is_empty():
             return []
@@ -141,27 +169,30 @@ def calibrate(
         chunk = chunk.with_columns([
             pl.col("date").dt.year().alias("year"),
             pl.col("date").dt.date().alias("date_only"),
+            # Round to nearest ~10 m to match pixels across tile grids
+            (pl.col("lon") * 10000).round(0).alias("lon_r"),
+            (pl.col("lat") * 10000).round(0).alias("lat_r"),
         ])
 
-        # Find (point_id, date_only) pairs seen under more than one tile
+        # Find (lon_r, lat_r, date_only) pairs seen under more than one tile
         pair_counts = (
             chunk
-            .group_by(["point_id", "date_only"])
+            .group_by(["lon_r", "lat_r", "date_only"])
             .agg(pl.col("tile_id").n_unique().alias("n_tiles"))
             .filter(pl.col("n_tiles") > 1)
         )
         if pair_counts.is_empty():
             return []
 
-        overlap = chunk.join(pair_counts.select(["point_id", "date_only"]),
-                             on=["point_id", "date_only"], how="inner")
+        overlap = chunk.join(pair_counts.select(["lon_r", "lat_r", "date_only"]),
+                             on=["lon_r", "lat_r", "date_only"], how="inner")
 
         results: RgResult = []
         for band in bands:
             pivot = (
                 overlap
-                .select(["point_id", "date_only", "year", "tile_id", band])
-                .pivot(on="tile_id", index=["point_id", "date_only", "year"],
+                .select(["lon_r", "lat_r", "date_only", "year", "tile_id", band])
+                .pivot(on="tile_id", index=["lon_r", "lat_r", "date_only", "year"],
                        values=band, aggregate_function="mean")
             )
             if ref_tile not in pivot.columns:
@@ -195,15 +226,16 @@ def calibrate(
     # Collect per-row-group results — workers return plain lists, no locking needed
     all_results: list[tuple] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=N_WORKERS) as ex:
-        futs = {ex.submit(_process_rg, i): i for i in range(n_rg)}
+        futs = {ex.submit(_process_rg, i): i for i in range(len(rg_index))}
+        n_total = len(rg_index)
         done = 0
-        report_every = max(1, n_rg // 10)
+        report_every = max(1, n_total // 10)
         for fut in concurrent.futures.as_completed(futs):
             all_results.extend(fut.result())  # re-raises worker exceptions
             done += 1
-            if done % report_every == 0 or done == n_rg:
-                pct = 100 * done // n_rg
-                print(f"  [calibrate] {done}/{n_rg} row groups ({pct}%)", flush=True)
+            if done % report_every == 0 or done == n_total:
+                pct = 100 * done // n_total
+                print(f"  [calibrate] {done}/{n_total} row groups ({pct}%)", flush=True)
 
     if not all_results:
         print("  [calibrate] no overlap observations found — empty correction table.")

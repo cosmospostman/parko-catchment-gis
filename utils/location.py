@@ -204,12 +204,18 @@ class Location:
         Returns the output parquet path.
         """
         from utils.pixel_collector import collect  # noqa: PLC0415
+        from utils.s2_tiles import bbox_to_tile_ids  # noqa: PLC0415
 
         _out = out_path or self.parquet_path()
         _end = end or date.today().isoformat()
         _cache = cache_dir or self.cache_dir()
 
         _out.parent.mkdir(parents=True, exist_ok=True)
+
+        _cal_out: Path | None = None
+        if len(bbox_to_tile_ids(tuple(self.bbox))) > 1:
+            _cal_out = _PROJECT_ROOT / "data" / "calibration" / f"{self.id}.parquet"
+            _cal_out.parent.mkdir(parents=True, exist_ok=True)
 
         collect(
             bbox_wgs84=self.bbox,
@@ -219,6 +225,7 @@ class Location:
             cloud_max=cloud_max,
             cache_dir=_cache,
             apply_nbar=apply_nbar,
+            calibration_out=_cal_out,
         )
         return _out
 

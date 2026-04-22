@@ -573,7 +573,22 @@ function commitBbox(a, b) {
   const coords = [lon_min, lat_min, lon_max, lat_max];
   const yaml = `bbox: [${coords.map(v => v.toFixed(6)).join(', ')}]`;
 
+  // Estimate S2 10m pixel count via haversine area
+  const R = 6371000;
+  const dLat = (lat_max - lat_min) * Math.PI / 180;
+  const dLon = (lon_max - lon_min) * Math.PI / 180;
+  const midLat = (lat_min + lat_max) / 2 * Math.PI / 180;
+  const heightM = R * dLat;
+  const widthM = R * Math.cos(midLat) * dLon;
+  const pixelCount = Math.round(heightM * widthM / 100);
+  const pixelLabel = pixelCount >= 1e6
+    ? (pixelCount / 1e6).toFixed(1) + 'M'
+    : pixelCount >= 1e3
+      ? (pixelCount / 1e3).toFixed(0) + 'k'
+      : pixelCount.toString();
+
   document.getElementById('bbox-yaml').textContent = yaml;
+  document.getElementById('bbox-pixel-estimate').textContent = `~${pixelLabel} S2 pixels (10 m)`;
 
   const box = document.getElementById('bbox-coords');
   box.style.display = 'flex';

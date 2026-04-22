@@ -10,6 +10,9 @@ Contract tests
   C3. calibrate(): extreme ratio (2.0×) is clamped to 1.15 upper bound
   C4. load_corrections(): missing file → returns None (graceful fallback)
   C5. corrections applied: band values are multiplied by scale factor via join
+  C6. calibrate(): pixels at ~10 m separation are matched; pixels >100 m apart
+      are NOT matched — guards against coarse-rounding regression (the ×1000
+      bug that caused 111 m cells and washed out real offsets)
 """
 
 from __future__ import annotations
@@ -217,4 +220,122 @@ def test_corrections_applied_via_join():
     )
     assert math.isclose(vals["54LWH"], 0.20, rel_tol=1e-6), (
         "54LWH B07 has no correction entry — should be unchanged"
+    )
+
+
+# ---------------------------------------------------------------------------
+# C6 — pixel matching resolution: co-located pixels match; distant ones don't
+# ---------------------------------------------------------------------------
+
+def _make_nonoverlap_parquet(tmp_path: Path, ratio: float = 1.08) -> Path:
+    """Two tiles whose pixel grids do NOT share any physical location.
+
+    54LWH pixels are at lons [142.0000, 142.0010, 142.0020, ...] (0.001° apart).
+    54LWJ pixels are at lons [142.0005, 142.0015, 142.0025, ...] (midpoints).
+
+    At 0.0001° (11 m) cell resolution the two grids never share a cell.
+    At 0.001° (111 m) cell resolution every J pixel falls in the same cell as
+    its H neighbour → false matches → the calibrated scale reflects the ratio
+    of mixed non-co-located observations rather than the real offset.
+
+    With the ×1000 bug, calibrate() returns a non-empty table whose
+    scale_factor is NOT close to 1/ratio — it is some arbitrary value driven
+    by the mixed-pixel average.  With the correct ×10000, the result is empty.
+    """
+    import pyarrow.parquet as pq
+
+    base_lon = 142.0
+    base_lat = -15.5
+    date_ = datetime(2022, 6, 1)
+
+    rows_h = [
+        dict(point_id=f"p_{i:04d}_0001", lon=base_lon + i * 0.001, lat=base_lat,
+             date=date_, tile_id="54LWH", scl_purity=1.0,
+             B07=0.10, B04=0.10, B05=0.10, B08=0.10, B11=0.10)
+        for i in range(10)
+    ]
+    rows_j = [
+        dict(point_id=f"q_{i:04d}_0001", lon=base_lon + i * 0.001 + 0.0005, lat=base_lat,
+             date=date_, tile_id="54LWJ", scl_purity=1.0,
+             B07=0.10 * ratio, B04=0.10, B05=0.10, B08=0.10, B11=0.10)
+        for i in range(10)
+    ]
+
+    df = pl.DataFrame(rows_h + rows_j).with_columns(pl.col("date").cast(pl.Datetime))
+    out = tmp_path / "nonoverlap.parquet"
+    pq.write_table(df.to_arrow(), str(out))
+    return out
+
+
+def _make_collocated_parquet(tmp_path: Path, ratio: float = 1.08) -> Path:
+    """Two tiles whose pixels are truly co-located (same lon/lat, same date).
+
+    calibrate() should recover scale ≈ 1/ratio regardless of rounding multiplier.
+    """
+    import pyarrow.parquet as pq
+
+    base_lon = 142.0
+    base_lat = -15.5
+    date_ = datetime(2022, 6, 1)
+
+    rows_h = [
+        dict(point_id=f"p_{i:04d}_0001", lon=base_lon + i * 0.0001, lat=base_lat,
+             date=date_, tile_id="54LWH", scl_purity=1.0,
+             B07=0.10, B04=0.10, B05=0.10, B08=0.10, B11=0.10)
+        for i in range(10)
+    ]
+    rows_j = [
+        dict(point_id=f"q_{i:04d}_0001", lon=base_lon + i * 0.0001, lat=base_lat,
+             date=date_, tile_id="54LWJ", scl_purity=1.0,
+             B07=0.10 * ratio, B04=0.10, B05=0.10, B08=0.10, B11=0.10)
+        for i in range(10)
+    ]
+
+    df = pl.DataFrame(rows_h + rows_j).with_columns(pl.col("date").cast(pl.Datetime))
+    out = tmp_path / "collocated.parquet"
+    pq.write_table(df.to_arrow(), str(out))
+    return out
+
+
+def test_calibrate_matches_collocated_pixels(tmp_path):
+    """Truly co-located same-date pixels are matched and the offset is recovered."""
+    from utils.tile_harmonisation import calibrate
+
+    parquet = _make_collocated_parquet(tmp_path, ratio=1.08)
+    out = tmp_path / "corr.parquet"
+    result = calibrate(parquet, out, bands=["B07"])
+
+    j_row = result[(result["tile_id"] == "54LWJ") & (result["band"] == "B07")]
+    assert len(j_row) == 1, "Co-located pixels should produce a correction row"
+    scale = j_row["scale_factor"].iloc[0]
+    expected = 1.0 / 1.08
+    assert math.isclose(scale, expected, rel_tol=0.01), (
+        f"Expected scale ≈ {expected:.4f} (1/1.08), got {scale:.4f}"
+    )
+
+
+def test_calibrate_ignores_non_overlapping_pixels(tmp_path):
+    """Pixels on interleaved grids (midpoints of each other, ~55 m apart) must
+    NOT be matched.
+
+    Grid H: lons at 0.000°, 0.001°, 0.002°, … (every 0.001°)
+    Grid J: lons at 0.0005°, 0.0015°, 0.0025°, … (midpoints, ~55 m offset)
+
+    With ×10000 (11 m cells): H and J pixels land in different cells → no
+    overlap pairs → empty correction table.
+
+    With the ×1000 bug (111 m cells): H[i] and J[i] both round to the same
+    cell (e.g. 142000 for lon 142.0000 and 142.0005) → falsely paired →
+    calibrate() returns a non-empty table, catching the regression.
+    """
+    from utils.tile_harmonisation import calibrate
+
+    parquet = _make_nonoverlap_parquet(tmp_path, ratio=1.08)
+    out = tmp_path / "corr_nonoverlap.parquet"
+    result = calibrate(parquet, out, bands=["B07"])
+
+    assert len(result) == 0, (
+        "Non-overlapping pixel grids should produce an empty correction table. "
+        "A non-empty result means the rounding cell is too coarse (×1000 bug): "
+        "physically distinct pixels from different tiles are being falsely paired."
     )
