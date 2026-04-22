@@ -8,20 +8,15 @@ Usage
     # Score any location with an existing checkpoint
     python -m tam.pipeline score --checkpoint outputs/tam-v1_spectral \\
         --location longreach-8x8km --end-year 2024
-
-    # Legacy: train and score with a location (backwards compat)
-    python -m tam.pipeline legacy --location longreach --train
 """
 
 from __future__ import annotations
 
 import argparse
-import importlib
 import logging
 import sys
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -30,7 +25,6 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from tam.utils import label_pixels, save_pixel_ranking, summarise
 from signals._shared import ensure_pixel_sorted
 from tam.core.config import TAMConfig
-from tam.core.dataset import BAND_COLS
 from tam.core.score import score_pixels_chunked
 from tam.core.train import load_tam, train_tam
 from utils.location import get as get_location
@@ -76,7 +70,6 @@ def _cmd_train(args: argparse.Namespace) -> None:
     pixel_df = pd.concat(chunks, ignore_index=True)
 
     # Apply date filter
-    dates = pd.to_datetime(pixel_df["date"])
     dates = pd.to_datetime(pixel_df["date"])
     pixel_df["year"] = dates.dt.year
     pixel_df["doy"]  = dates.dt.day_of_year
@@ -240,127 +233,6 @@ def _cmd_score(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
-# legacy subcommand (backwards compat: --location + optional --train)
-# ---------------------------------------------------------------------------
-
-def _cmd_legacy(args: argparse.Namespace) -> None:
-    """Original single-location train+score flow."""
-    import pyarrow.parquet as pq
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    loc = get_location(args.location)
-    parquet = loc.parquet_path()
-    if not parquet.exists():
-        logger.error("Parquet not found: %s — run pixel_collector first", parquet)
-        sys.exit(1)
-
-    tile_id = getattr(args, "tile", None)
-    out_dir = PROJECT_ROOT / "outputs" / f"tam-{loc.id}"
-    if tile_id:
-        out_dir = out_dir / tile_id
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    logger.info("Location: %s  parquet: %s  tile: %s", loc.name, parquet, tile_id or "all")
-
-    logger.info("Resolving labels ...")
-    pf_coords = pq.ParquetFile(parquet)
-    read_coord_cols = ["point_id", "lon", "lat"] + (["item_id"] if tile_id else [])
-    tile_prefix = f"_{tile_id}_" if tile_id else None
-    n_rg_coords = pf_coords.metadata.num_row_groups
-
-    def _read_coord_rg(rg: int) -> pd.DataFrame:
-        pf = pq.ParquetFile(parquet)
-        chunk = pf.read_row_group(rg, columns=read_coord_cols).to_pandas()
-        if tile_prefix:
-            chunk = chunk[chunk["item_id"].str.contains(tile_prefix, regex=False)]
-        return chunk[["point_id", "lon", "lat"]].drop_duplicates("point_id")
-
-    coord_chunks = []
-    n_done = 0
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        futures = {ex.submit(_read_coord_rg, rg): rg for rg in range(n_rg_coords)}
-        for fut in as_completed(futures):
-            chunk = fut.result()
-            if not chunk.empty:
-                coord_chunks.append(chunk)
-            n_done += 1
-            if n_done % 100 == 0:
-                logger.info("  coords %d/%d row groups", n_done, n_rg_coords)
-
-    pixel_coords = (
-        pd.concat(coord_chunks, ignore_index=True)
-        .groupby("point_id")[["lon", "lat"]]
-        .first()
-        .reset_index()
-    )
-    logger.info("Unique pixels after tile filter: %d", len(pixel_coords))
-
-    labelled = label_pixels(pixel_coords, loc)
-    labelled_known = labelled.dropna(subset=["is_presence"])
-    labels = labelled_known.set_index("point_id")["is_presence"].map(
-        {True: 1.0, False: 0.0}
-    )
-    logger.info(
-        "Labeled pixels — presence: %d  absence: %d",
-        (labels == 1).sum(), (labels == 0).sum(),
-    )
-
-    parquet_sorted = ensure_pixel_sorted(parquet)
-
-    if args.train:
-        logger.info("Loading parquet (labeled pixels only for training) ...")
-        labeled_ids = set(labels.index)
-        pf = pq.ParquetFile(parquet_sorted)
-        chunks = []
-        for rg in range(pf.metadata.num_row_groups):
-            tbl = pf.read_row_group(rg, columns=["point_id", "lon", "lat", "date", "scl_purity"] + BAND_COLS)
-            pdf = tbl.to_pandas()
-            pdf = pdf[pdf["point_id"].isin(labeled_ids)]
-            if not pdf.empty:
-                chunks.append(pdf)
-        pixel_df = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
-        pixel_df = pixel_df[pixel_df["scl_purity"] >= args.scl_purity]
-        _dates = pd.to_datetime(pixel_df["date"])
-        pixel_df["year"] = _dates.dt.year
-        pixel_df["doy"]  = _dates.dt.day_of_year
-        logger.info("Loaded %d observations for %d labeled pixels", len(pixel_df), pixel_df["point_id"].nunique())
-
-        logger.info("Training TAM ...")
-        cfg = TAMConfig(
-            n_epochs=args.epochs,
-            patience=args.patience,
-            scl_purity_min=args.scl_purity,
-        )
-        train_tam(
-            pixel_df=pixel_df,
-            labels=labels,
-            pixel_coords=pixel_coords,
-            out_dir=out_dir,
-            cfg=cfg,
-            device=args.device,
-        )
-
-    checkpoint_dir = Path(args.checkpoint) if args.checkpoint else out_dir
-    logger.info("Loading checkpoint from %s ...", checkpoint_dir)
-    model, band_mean, band_std = load_tam(checkpoint_dir, device=args.device)
-
-    logger.info("Scoring all pixels (chunked) ...")
-    scores = score_pixels_chunked(
-        parquet_sorted, model, band_mean, band_std,
-        scl_purity_min=args.scl_purity, device=args.device, tile_id=tile_id,
-        end_year=args.end_year, decay=args.decay, batch_size=args.batch_size,
-    )
-
-    scored = pixel_coords.merge(scores, on="point_id", how="left")
-    scored = scored.merge(labelled[["point_id", "is_presence"]], on="point_id", how="left")
-    scored["rank"] = scored["prob_tam"].rank(ascending=False, method="first").astype("Int64")
-
-    summarise(scored, loc, prob_col="prob_tam")
-    save_pixel_ranking(scored, out_dir / "tam_pixel_ranking.csv", features=["prob_tam"])
-    logger.info("Done — outputs in %s", out_dir)
-
-
-# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -397,21 +269,9 @@ if __name__ == "__main__":
     p_score.add_argument("--out",        default=None, help="Output CSV path (overrides default in checkpoint dir)")
     _add_common_score_args(p_score)
 
-    # --- legacy ---
-    p_legacy = sub.add_parser("legacy", help="Original single-location train+score flow")
-    p_legacy.add_argument("--location",   required=True)
-    p_legacy.add_argument("--train",      action="store_true")
-    p_legacy.add_argument("--epochs",     type=int, default=100)
-    p_legacy.add_argument("--patience",   type=int, default=15)
-    p_legacy.add_argument("--tile",       default=None)
-    p_legacy.add_argument("--checkpoint", default=None)
-    _add_common_score_args(p_legacy)
-
     args = parser.parse_args()
 
     if args.command == "train":
         _cmd_train(args)
     elif args.command == "score":
         _cmd_score(args)
-    elif args.command == "legacy":
-        _cmd_legacy(args)

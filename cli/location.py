@@ -58,8 +58,8 @@ def _dir_size(p: "Path") -> int:
 
 def cmd_list(args: argparse.Namespace) -> None:
     locs = sorted(all_locations(), key=lambda l: l.id)
-    print(f"  {'ID':<26} {'STATUS':<9} {'CHIPS':>8}  {'PARQUET':>8}")
-    print("  " + "-" * 56)
+    print(f"  {'ID':<26} {'STATUS':<9} {'AREA km²':>8}  {'PIXELS':>10}  {'CHIPS':>8}  {'PARQUET':>8}")
+    print("  " + "-" * 80)
     for loc in locs:
         parquet = loc.parquet_path()
         chips   = parquet.parent / (loc.id + ".chips")
@@ -67,7 +67,9 @@ def cmd_list(args: argparse.Namespace) -> None:
         status       = "fetched" if fetched else ""
         parquet_str  = _fmt_size(parquet.stat().st_size) if fetched else "—"
         chips_str    = _fmt_size(_dir_size(chips)) if chips.exists() else "—"
-        print(f"  {loc.id:<26} {status:<9} {chips_str:>8}  {parquet_str:>8}")
+        area_str     = f"{loc.area_km2:.1f}"
+        pixels_str   = f"{loc.pixel_count:,}"
+        print(f"  {loc.id:<26} {status:<9} {area_str:>8}  {pixels_str:>10}  {chips_str:>8}  {parquet_str:>8}")
 
 
 def cmd_info(args: argparse.Namespace) -> None:
