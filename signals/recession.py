@@ -277,7 +277,6 @@ class RecessionSensitivitySignal:
         ]
         return stats[col_order]
 
-    def diagnose(
         self,
         pixel_df: pd.DataFrame,
         loc: object,

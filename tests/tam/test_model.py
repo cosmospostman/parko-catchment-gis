@@ -9,9 +9,9 @@ import pytest
 import torch
 import torch.nn as nn
 
-from tam.config import TAMConfig
-from tam.dataset import MAX_SEQ_LEN, N_BANDS
-from tam.model import TAMClassifier, _doy_encoding
+from tam.core.config import TAMConfig
+from tam.core.dataset import MAX_SEQ_LEN, N_BANDS
+from tam.core.model import TAMClassifier, _doy_encoding
 
 
 # ---------------------------------------------------------------------------

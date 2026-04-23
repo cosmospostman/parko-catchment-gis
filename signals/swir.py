@@ -66,7 +66,6 @@ class SwirSignal:
 
         return stats[["point_id", "lon", "lat", "swir_p10", "n_years"]]
 
-    def diagnose(
         self,
         pixel_df: pd.DataFrame,
         loc: object,

@@ -1,7 +1,6 @@
 """Shared pytest fixtures for the Parkinsonia GIS pipeline test suite."""
 import json
 import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -15,86 +14,6 @@ import rioxarray  # noqa: F401 — registers .rio accessor
 # Ensure project root is on sys.path
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
-
-# ---------------------------------------------------------------------------
-# Pipeline source files whose modification should trigger a test data refresh.
-# If any of these files changed after the sentinel was written, test data is
-# considered stale and the pipeline may not reflect current code.
-# ---------------------------------------------------------------------------
-
-_FIXTURE_DIR = PROJECT_ROOT / "tests" / "fixtures"
-_SENTINEL_FILE = _FIXTURE_DIR / ".fixture_commit"
-
-_PIPELINE_SOURCES = [
-    "pipelines/fetch.py",
-    "pipelines/chip_store.py",
-    "analysis/constants.py",
-    "analysis/timeseries/observation.py",
-]
-
-
-def _git_diff_names(since_commit: str) -> list[str]:
-    """Return list of files changed since the given commit (relative paths)."""
-    try:
-        out = subprocess.check_output(
-            ["git", "diff", "--name-only", since_commit, "HEAD"],
-            cwd=PROJECT_ROOT,
-            stderr=subprocess.DEVNULL,
-        )
-        return [line.strip() for line in out.decode().splitlines() if line.strip()]
-    except Exception:
-        return []
-
-
-_SCIENCE_DIR = PROJECT_ROOT / "tests" / "science"
-
-
-def _science_tests_requested(config: pytest.Config) -> bool:
-    """Return True if the science test directory is in the collection paths."""
-    args = config.args or []
-    if not args:
-        # Default collection: testpaths from pytest.ini — science/ is not included
-        return False
-    return any(
-        _SCIENCE_DIR == Path(a).resolve() or str(_SCIENCE_DIR) in a
-        for a in args
-    )
-
-
-def pytest_configure(config: pytest.Config) -> None:
-    """Warn if fixture test data is missing or stale.
-
-    Only emitted when science tests are explicitly requested, since unit and
-    integration tests use synthetic data and never need staged chips.
-
-    To refresh: python pipelines/train.py load-testdata
-    """
-    if not _science_tests_requested(config):
-        return
-
-    if not _SENTINEL_FILE.exists():
-        print(
-            "\n[conftest] WARNING: fixture test data not staged.\n"
-            "  Some tests require real chip data. Run:\n"
-            "    python pipelines/train.py load-testdata\n",
-            file=sys.stderr,
-        )
-        return
-
-    recorded_commit = _SENTINEL_FILE.read_text().strip()
-    if not recorded_commit or recorded_commit == "unknown":
-        return
-
-    changed = _git_diff_names(recorded_commit)
-    stale = [f for f in changed if f in _PIPELINE_SOURCES]
-    if stale:
-        print(
-            f"\n[conftest] WARNING: test data may be stale — pipeline sources "
-            f"changed since load-testdata ran:\n"
-            + "".join(f"  {f}\n" for f in stale)
-            + "  Run: python pipelines/train.py load-testdata\n",
-            file=sys.stderr,
-        )
 
 
 # ---------------------------------------------------------------------------

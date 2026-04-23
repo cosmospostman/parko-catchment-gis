@@ -71,7 +71,6 @@ class NirCvSignal:
         col_order = ["point_id", "lon", "lat", "nir_mean", "nir_std", "nir_cv", "n_years"]
         return stats[col_order]
 
-    def diagnose(
         self,
         pixel_df: pd.DataFrame,
         loc: object,

@@ -20,7 +20,7 @@ import torch
 from tam.core.dataset import BAND_COLS
 from tam.core.model import TAMClassifier
 from tam.core.score import score_pixels_chunked
-from tam.config import TAMConfig
+from tam.core.config import TAMConfig
 
 
 # ---------------------------------------------------------------------------

@@ -306,7 +306,6 @@ class NdviIntegralSignal:
         finally:
             curve_path.unlink(missing_ok=True)
 
-    def diagnose(
         self,
         pixel_df: pd.DataFrame | None,
         loc: object,

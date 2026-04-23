@@ -59,11 +59,7 @@ tests/fixtures/
   .fixture_commit           # sentinel: HEAD commit when load-testdata ran
 ```
 
-To stage:
-
-```bash
-python pipelines/train.py load-testdata
-```
+To stage, run the `load-testdata` subcommand via the training pipeline CLI.
 
 ### Points CSV
 

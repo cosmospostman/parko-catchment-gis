@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 import torch
 
-from tam.dataset import (
+from tam.core.dataset import (
     BAND_COLS,
     MAX_SEQ_LEN,
     MIN_OBS_PER_YEAR,

@@ -6,9 +6,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from tam.config import TAMConfig
-from tam.dataset import BAND_COLS
-from tam.model import TAMClassifier
+from tam.core.config import TAMConfig
+from tam.core.dataset import BAND_COLS
+from tam.core.model import TAMClassifier
 
 
 @pytest.fixture

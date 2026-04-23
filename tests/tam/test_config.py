@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from tam.config import TAMConfig
+from tam.core.config import TAMConfig
 
 
 class TestTC1DefaultValuesConsistent:

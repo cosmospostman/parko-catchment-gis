@@ -64,7 +64,6 @@ class RedEdgeSignal:
 
         return stats[["point_id", "lon", "lat", "re_p10", "n_years"]]
 
-    def diagnose(
         self,
         pixel_df: pd.DataFrame,
         loc: object,

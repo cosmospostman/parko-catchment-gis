@@ -57,16 +57,25 @@ curl -s "https://spatial-gis.information.qld.gov.au/arcgis/rest/services/InlandW
 
 ## Running the pipeline
 
-**Training** — fetch chips and train a classifier:
+**Collect training pixels** — fetch per-tile Sentinel-2 parquets for labeled regions:
 
 ```bash
-python pipelines/train.py --year 2024
+python -m utils.training_collector ensure --all \
+    --start 2020-01-01 --end 2025-12-31
 ```
 
-**Inference** — apply the trained model to produce output rasters:
+**Train** — fit a TAM classifier for a named experiment:
 
 ```bash
-python pipelines/infer.py --year 2025
+python -m tam.pipeline train --experiment v1_spectral
+```
+
+**Score** — apply the trained model to a location:
+
+```bash
+python -m tam.pipeline score \
+    --checkpoint outputs/tam-v1_spectral \
+    --location frenchs --end-year 2025
 ```
 
 ## Running tests

@@ -10,10 +10,10 @@ import pandas as pd
 import pytest
 import torch
 
-from tam.config import TAMConfig
-from tam.dataset import BAND_COLS, TAMDataset, collate_fn
-from tam.model import TAMClassifier
-from tam.train import load_tam, spatial_split, train_tam
+from tam.core.config import TAMConfig
+from tam.core.dataset import BAND_COLS, TAMDataset, collate_fn
+from tam.core.model import TAMClassifier
+from tam.core.train import load_tam, spatial_split, train_tam
 
 
 # ---------------------------------------------------------------------------

@@ -32,6 +32,8 @@ from tam.core.model import TAMClassifier
 from tam.core.train import load_tam
 from utils.location import get as get_location
 
+logger = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # Legacy checkpoint support (learned DOY embedding, pre-sinusoidal refactor)
@@ -110,8 +112,6 @@ def _load_tam_compat(
 
     stats = np.load(checkpoint_dir / "tam_band_stats.npz")
     return model, stats["mean"].astype(np.float32), stats["std"].astype(np.float32)
-
-logger = logging.getLogger(__name__)
 
 # Defaults
 DEFAULT_CHECKPOINT = PROJECT_ROOT / "outputs" / "tam-frenchs"

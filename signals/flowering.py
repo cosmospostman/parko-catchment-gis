@@ -275,7 +275,6 @@ class FloweringSignal:
         available = [c for c in col_order if c in p90.columns]
         return p90[available]
 
-    def diagnose(
         self,
         pixel_df: pd.DataFrame,
         loc: object,

@@ -247,7 +247,8 @@ class GreenupTimingSignal:
         ]
         return stats_pl.select(col_order).to_pandas()
 
-    def diagnose(
+
+
         self,
         pixel_df: pd.DataFrame,
         loc: object,

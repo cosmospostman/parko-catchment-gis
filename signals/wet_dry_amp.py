@@ -82,7 +82,6 @@ class RecPSignal:
 
         return stats[["point_id", "lon", "lat", "rec_p", "rec_p_std", "n_years"]]
 
-    def diagnose(
         self,
         pixel_df: pd.DataFrame,
         loc: object,
