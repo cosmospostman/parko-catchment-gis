@@ -1,0 +1,5 @@
+# Vanrook — Gulf Plains, Queensland.
+name: "Vanrook"
+centroid: null
+bbox: [142.040977, -17.019778, 142.076352, -16.998107]  # [lon_min, lat_min, lon_max, lat_max]
+dry_months: [5, 6, 7, 8, 9, 10]  # monsoonal

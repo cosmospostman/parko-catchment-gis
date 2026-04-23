@@ -32,6 +32,7 @@ class TAMSample(NamedTuple):
     bands:    torch.Tensor   # (MAX_SEQ_LEN, N_BANDS)  float32, normalised, zero-padded
     doy:      torch.Tensor   # (MAX_SEQ_LEN,)           int64, 1–365, 0=padding
     mask:     torch.Tensor   # (MAX_SEQ_LEN,)           bool, True=padding
+    n_obs:    torch.Tensor   # ()                       float32, n / MAX_SEQ_LEN
     label:    torch.Tensor   # ()                       float32 {0, 1}
     weight:   torch.Tensor   # ()                       float32 confidence weight
     point_id: str
@@ -43,6 +44,7 @@ def collate_fn(samples: list[TAMSample]) -> dict:
         "bands":    torch.stack([s.bands  for s in samples]),
         "doy":      torch.stack([s.doy    for s in samples]),
         "mask":     torch.stack([s.mask   for s in samples]),
+        "n_obs":    torch.stack([s.n_obs  for s in samples]),
         "label":    torch.stack([s.label  for s in samples]),
         "weight":   torch.stack([s.weight for s in samples]),
         "point_id": [s.point_id for s in samples],
@@ -81,12 +83,15 @@ class TAMDataset(Dataset):
         min_obs_per_year: int = MIN_OBS_PER_YEAR,
         doy_jitter: int = 0,
         band_noise_std: float = 0.0,
+        obs_dropout_min: int = 0,
     ) -> None:
         # doy_jitter: max ±days to shift all observations in a window (training only).
         # A single offset is drawn per __getitem__ call and applied uniformly so
         # relative timing between observations is preserved.  Set 0 to disable.
         # band_noise_std: std of Gaussian noise added to normalised band values per
         # observation independently (training only).  Set 0.0 to disable.
+        # obs_dropout_min: if >0, subsample each window to Uniform(obs_dropout_min, n)
+        # per __getitem__ call, teaching the model to be invariant to obs density.
         if any(c not in pixel_df.columns for c in INDEX_COLS):
             df = add_spectral_indices(pixel_df)
         else:
@@ -133,6 +138,7 @@ class TAMDataset(Dataset):
 
         self._labels = labels
         self._doy_jitter = doy_jitter
+        self._obs_dropout_min = obs_dropout_min
 
     # ------------------------------------------------------------------
     def __len__(self) -> int:
@@ -141,6 +147,13 @@ class TAMDataset(Dataset):
     def __getitem__(self, idx: int) -> TAMSample:
         pid, yr, bands_np, doy_np = self._windows[idx]
         n = len(bands_np)
+
+        if self._obs_dropout_min > 0 and n > self._obs_dropout_min:
+            keep = np.random.randint(self._obs_dropout_min, n + 1)
+            idx_keep = np.sort(np.random.choice(n, keep, replace=False))
+            bands_np = bands_np[idx_keep]
+            doy_np   = doy_np[idx_keep]
+            n        = keep
 
         bands = np.zeros((MAX_SEQ_LEN, N_BANDS), dtype=np.float32)
         bands[:n] = bands_np
@@ -166,6 +179,7 @@ class TAMDataset(Dataset):
             bands    = torch.from_numpy(bands),
             doy      = torch.from_numpy(doy),
             mask     = torch.from_numpy(mask),
+            n_obs    = torch.tensor(n / MAX_SEQ_LEN, dtype=torch.float32),
             label    = torch.tensor(label,  dtype=torch.float32),
             weight   = torch.tensor(weight, dtype=torch.float32),
             point_id = pid,

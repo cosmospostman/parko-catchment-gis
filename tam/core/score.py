@@ -41,6 +41,7 @@ class _PreparedBatch(NamedTuple):
     bands: torch.Tensor   # (W, MAX_SEQ_LEN, N_FEATURES) float32
     doy:   torch.Tensor   # (W, MAX_SEQ_LEN) int64
     mask:  torch.Tensor   # (W, MAX_SEQ_LEN) bool
+    n_obs: torch.Tensor   # (W,) float32, n / MAX_SEQ_LEN
     pids:  np.ndarray     # (W,) object
     years: np.ndarray     # (W,) int32
 
@@ -114,15 +115,19 @@ def _preprocess(
     pids  = pid_arr[valid_starts]
     years = year_arr[valid_starts]
 
+    n_obs_np = (capped / MAX_SEQ_LEN).astype(np.float32)
+
     bands_th = torch.from_numpy(bands_np)
     doy_th   = torch.from_numpy(doy_np)
     mask_th  = torch.from_numpy(mask_np)
+    n_obs_th = torch.from_numpy(n_obs_np)
     if pin:
         bands_th = bands_th.pin_memory()
         doy_th   = doy_th.pin_memory()
         mask_th  = mask_th.pin_memory()
+        n_obs_th = n_obs_th.pin_memory()
 
-    return _PreparedBatch(bands_th, doy_th, mask_th, pids, years)
+    return _PreparedBatch(bands_th, doy_th, mask_th, n_obs_th, pids, years)
 
 
 def _gpu_score(
@@ -135,7 +140,7 @@ def _gpu_score(
     device: str,
 ) -> None:
     """GPU-side: transfer tensors, run inference, append (pid, year, prob) to lists."""
-    bands_th, doy_th, mask_th, pids, years = prepared
+    bands_th, doy_th, mask_th, n_obs_th, pids, years = prepared
     W = len(pids)
     with torch.inference_mode():
         for start in range(0, W, batch_size):
@@ -144,6 +149,7 @@ def _gpu_score(
                 bands_th[start:end].to(device, non_blocking=True),
                 doy_th[start:end].to(device, non_blocking=True),
                 mask_th[start:end].to(device, non_blocking=True),
+                n_obs_th[start:end].to(device, non_blocking=True),
             )
             prob_np = prob.cpu().numpy()
             all_pids.append(pids[start:end])

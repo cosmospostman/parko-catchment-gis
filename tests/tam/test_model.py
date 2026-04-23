@@ -19,7 +19,7 @@ from tam.model import TAMClassifier, _doy_encoding
 # ---------------------------------------------------------------------------
 
 def _random_batch(B: int, T: int, n_valid: int, d_model: int = 16):
-    """Return (bands, doy, mask) for a batch with n_valid non-padded positions."""
+    """Return (bands, doy, mask, n_obs) for a batch with n_valid non-padded positions."""
     rng = torch.Generator()
     rng.manual_seed(0)
     bands = torch.rand(B, T, N_BANDS, generator=rng)
@@ -30,7 +30,8 @@ def _random_batch(B: int, T: int, n_valid: int, d_model: int = 16):
     mask = torch.ones(B, T, dtype=torch.bool)
     mask[:, :n_valid] = False
     bands[:, n_valid:] = 0.0
-    return bands, doy, mask
+    n_obs = torch.full((B,), n_valid / T, dtype=torch.float32)
+    return bands, doy, mask, n_obs
 
 
 def _small_model(n_layers=1) -> TAMClassifier:
@@ -125,8 +126,8 @@ class TestTM6ForwardPassOutputShapes:
     def test_prob_and_logit_shape(self):
         model = _small_model()
         B, T, n_valid = 4, MAX_SEQ_LEN, 20
-        bands, doy, mask = _random_batch(B, T, n_valid)
-        prob, logit = model(bands, doy, mask)
+        bands, doy, mask, n_obs = _random_batch(B, T, n_valid)
+        prob, logit = model(bands, doy, mask, n_obs)
         assert prob.shape == (4,)
         assert logit.shape == (4,)
 
@@ -138,8 +139,8 @@ class TestTM6ForwardPassOutputShapes:
 class TestTM7ProbabilitiesInOpenInterval:
     def test_probs_strictly_between_0_and_1(self):
         model = _small_model()
-        bands, doy, mask = _random_batch(4, MAX_SEQ_LEN, 20)
-        prob, _ = model(bands, doy, mask)
+        bands, doy, mask, n_obs = _random_batch(4, MAX_SEQ_LEN, 20)
+        prob, _ = model(bands, doy, mask, n_obs)
         assert (prob > 0).all()
         assert (prob < 1).all()
 
@@ -151,8 +152,8 @@ class TestTM7ProbabilitiesInOpenInterval:
 class TestTM8NoNaNOrInf:
     def test_outputs_finite(self):
         model = _small_model()
-        bands, doy, mask = _random_batch(4, MAX_SEQ_LEN, 20)
-        prob, logit = model(bands, doy, mask)
+        bands, doy, mask, n_obs = _random_batch(4, MAX_SEQ_LEN, 20)
+        prob, logit = model(bands, doy, mask, n_obs)
         assert torch.isfinite(prob).all()
         assert torch.isfinite(logit).all()
 
@@ -168,7 +169,8 @@ class TestTM9AllPaddingDoesNotCrash:
         bands = torch.zeros(B, T, N_BANDS)
         doy   = torch.zeros(B, T, dtype=torch.int64)
         mask  = torch.ones(B, T, dtype=torch.bool)  # all padding
-        prob, logit = model(bands, doy, mask)
+        n_obs = torch.zeros(B, dtype=torch.float32)
+        prob, logit = model(bands, doy, mask, n_obs)
         assert torch.isfinite(prob).all()
         assert torch.isfinite(logit).all()
 
@@ -180,13 +182,14 @@ class TestTM9AllPaddingDoesNotCrash:
 class TestTM10AllPaddingVsRealDifferent:
     def test_masked_and_real_differ(self):
         model = _small_model()
-        bands, doy, mask = _random_batch(2, MAX_SEQ_LEN, 20)
-        prob_real, _ = model(bands, doy, mask)
+        bands, doy, mask, n_obs = _random_batch(2, MAX_SEQ_LEN, 20)
+        prob_real, _ = model(bands, doy, mask, n_obs)
 
         mask_all = torch.ones_like(mask)
         bands_zero = torch.zeros_like(bands)
         doy_zero   = torch.zeros_like(doy)
-        prob_pad, _ = model(bands_zero, doy_zero, mask_all)
+        n_obs_zero = torch.zeros_like(n_obs)
+        prob_pad, _ = model(bands_zero, doy_zero, mask_all, n_obs_zero)
 
         assert not torch.allclose(prob_real, prob_pad)
 
@@ -201,7 +204,7 @@ class TestTM11GetAttentionWeightsStructure:
         model = TAMClassifier(d_model=16, n_heads=2, n_layers=n_layers, d_ff=32, dropout=0.0)
         model.eval()
         T, n_valid = MAX_SEQ_LEN, 10
-        bands, doy, mask = _random_batch(1, T, n_valid)
+        bands, doy, mask, n_obs = _random_batch(1, T, n_valid)
         weights = model.get_attention_weights(bands, doy, mask)
         assert len(weights) == n_layers
         for w in weights:
@@ -217,7 +220,7 @@ class TestTM12AttentionWeightsSumToOne:
         model = TAMClassifier(d_model=16, n_heads=2, n_layers=1, d_ff=32, dropout=0.0)
         model.eval()
         n_valid = 15
-        bands, doy, mask = _random_batch(1, MAX_SEQ_LEN, n_valid)
+        bands, doy, mask, n_obs = _random_batch(1, MAX_SEQ_LEN, n_valid)
         weights = model.get_attention_weights(bands, doy, mask)
         w = weights[0]  # (n_heads, T, T)
         # For each query, weights over non-masked keys should sum to ~1
@@ -230,7 +233,7 @@ class TestTM12AttentionWeightsSumToOne:
         model = TAMClassifier(d_model=16, n_heads=2, n_layers=1, d_ff=32, dropout=0.0)
         model.eval()
         n_valid = 10
-        bands, doy, mask = _random_batch(1, MAX_SEQ_LEN, n_valid)
+        bands, doy, mask, n_obs = _random_batch(1, MAX_SEQ_LEN, n_valid)
         weights = model.get_attention_weights(bands, doy, mask)
         w = weights[0]  # (n_heads, T, T)
         # Attention from valid queries to padding keys should be near zero
@@ -246,12 +249,12 @@ class TestTM13GetAttentionWeightsMatchesForward:
     def test_logit_matches_forward(self):
         model = TAMClassifier(d_model=16, n_heads=2, n_layers=2, d_ff=32, dropout=0.0)
         model.eval()
-        bands, doy, mask = _random_batch(1, MAX_SEQ_LEN, 15)
+        bands, doy, mask, n_obs = _random_batch(1, MAX_SEQ_LEN, 15)
 
         # get_attention_weights runs its own forward; compare final logit
         # We need to run the full forward separately and compare
         with torch.no_grad():
-            prob_fwd, logit_fwd = model(bands, doy, mask)
+            prob_fwd, logit_fwd = model(bands, doy, mask, n_obs)
 
         # get_attention_weights also returns after running the full encoder
         # We verify by checking that it doesn't crash and the model is in eval mode after
@@ -259,7 +262,7 @@ class TestTM13GetAttentionWeightsMatchesForward:
 
         # Re-run forward after get_attention_weights to confirm model state unchanged
         with torch.no_grad():
-            prob_after, logit_after = model(bands, doy, mask)
+            prob_after, logit_after = model(bands, doy, mask, n_obs)
 
         torch.testing.assert_close(logit_fwd, logit_after)
 

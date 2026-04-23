@@ -124,6 +124,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     out = loc.fetch(
+        out_path=Path(args.out) if args.out else None,
         start=args.start,
         end=args.end,
         cloud_max=args.cloud_max,
@@ -197,6 +198,8 @@ def main() -> None:
                     help="Max cloud cover %% (default: 30)")
     pf.add_argument("--no-nbar", action="store_true",
                     help="Disable BRDF NBAR c-factor correction")
+    pf.add_argument("--out", default=None, metavar="PATH",
+                    help="Output parquet path (default: location's canonical path)")
 
     pt = sub.add_parser("training", help="Manage training regions and pixel collection")
     tsub = pt.add_subparsers(dest="training_cmd", required=True)

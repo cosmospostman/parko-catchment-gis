@@ -420,7 +420,7 @@ def collect(
     def _shard_complete(idx: int) -> bool:
         sp = _shard_path(idx)
         dp = sp.with_suffix(".done")
-        if not sp.exists() or not dp.exists():
+        if not dp.exists():
             return False
         return "__done__" in dp.read_text()
 
@@ -486,7 +486,7 @@ def collect(
                 sorting_tmp = sorted_sp.with_suffix(".sorting.parquet")
                 sorting_tmp.unlink(missing_ok=True)
                 logger.info("  sorting shard %d/%d → %s ...", shard_idx + 1, n_shards, sorted_sp.name)
-                sort_parquet_by_pixel(shard_path, sorting_tmp, row_group_size=5_000_000, ram_budget_gb=24.0)
+                sort_parquet_by_pixel(shard_path, sorting_tmp, row_group_size=5_000_000, ram_budget_gb=20.0)
                 sorting_tmp.replace(sorted_sp)
                 shard_path.unlink()
                 logger.info("  shard %d/%d sorted (raw shard deleted)", shard_idx + 1, n_shards)
@@ -617,11 +617,14 @@ def collect(
             sorting_tmp = sorted_sp.with_suffix(".sorting.parquet")
             sorting_tmp.unlink(missing_ok=True)
             logger.info("  sorting shard %d/%d → %s ...", shard_idx + 1, n_shards, sorted_sp.name)
-            sort_parquet_by_pixel(shard_path, sorting_tmp, row_group_size=5_000_000, ram_budget_gb=24.0)
+            sort_parquet_by_pixel(shard_path, sorting_tmp, row_group_size=5_000_000, ram_budget_gb=20.0)
             sorting_tmp.replace(sorted_sp)
             shard_path.unlink()
             logger.info("  shard %d/%d sorted (raw shard deleted)", shard_idx + 1, n_shards)
-        sorted_shard_paths.append(sorted_sp)
+        else:
+            logger.info("  shard %d/%d produced no rows, skipping", shard_idx + 1, n_shards)
+        if sorted_sp.exists():
+            sorted_shard_paths.append(sorted_sp)
 
     # --- 5. Concat + dedup in a single streaming pass -------------------------
     # Tile-boundary duplicates: a pixel near an MGRS boundary appears in two
@@ -633,6 +636,9 @@ def collect(
     # Sorted shards are deleted only after the output row count is verified.
 
     from utils.tile_harmonisation import calibrate, load_corrections
+
+    if not sorted_shard_paths:
+        raise RuntimeError("No data collected: all shards are empty. Check STAC availability and date range.")
 
     _corrections: dict | None = None
     if calibration_out is not None:
@@ -796,51 +802,10 @@ def collect(
         logger.warning("Output is NOT pixel-sorted — sorting now ...")
         sorting_tmp = out_path.with_name(out_path.stem + ".sorting.parquet")
         sorting_tmp.unlink(missing_ok=True)
-        sort_parquet_by_pixel(out_path, sorting_tmp, row_group_size=5_000_000, ram_budget_gb=24.0)
+        sort_parquet_by_pixel(out_path, sorting_tmp, row_group_size=5_000_000, ram_budget_gb=20.0)
         sorting_tmp.replace(out_path)
         logger.info("Pixel sort complete.")
 
     print(f"\nDone.")
     print(f"  Rows   : {total_rows}")
     print(f"  Output : {out_path}")
-
-
-# ---------------------------------------------------------------------------
-# CLI entry point
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    import argparse
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
-    logging.getLogger("rasterio").setLevel(logging.WARNING)
-
-    parser = argparse.ArgumentParser(
-        description="Collect Sentinel-2 L2A pixel observations for a named location."
-    )
-    parser.add_argument("--location", required=True, help="Location name (matches data/locations/*.yaml)")
-    parser.add_argument("--start",    required=True, help="Start date YYYY-MM-DD")
-    parser.add_argument("--end",      required=True, help="End date YYYY-MM-DD")
-    parser.add_argument("--cloud-max", type=int, default=80, help="Max cloud cover %% (default 80)")
-    parser.add_argument("--no-nbar",   action="store_true",  help="Disable BRDF NBAR c-factor correction")
-    parser.add_argument("--out",       default=None,         help="Output parquet path (default data/pixels/<location>.parquet)")
-    args = parser.parse_args()
-
-    from utils.location import get as get_location
-
-    try:
-        loc = get_location(args.location)
-    except KeyError:
-        print(f"ERROR: unknown location '{args.location}'", file=sys.stderr)
-        sys.exit(1)
-
-    loc.fetch(
-        out_path=Path(args.out) if args.out else None,
-        start=args.start,
-        end=args.end,
-        cloud_max=args.cloud_max,
-        apply_nbar=not args.no_nbar,
-    )

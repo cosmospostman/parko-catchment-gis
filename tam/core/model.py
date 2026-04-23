@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 
 from tam.core.config import TAMConfig
-from tam.core.dataset import N_BANDS, MAX_SEQ_LEN
+from tam.core.dataset import N_BANDS, MAX_SEQ_LEN  # N_BANDS used as default only
 
 
 def _doy_encoding(doy: torch.Tensor, d_model: int) -> torch.Tensor:
@@ -68,20 +68,24 @@ class TAMClassifier(nn.Module):
 
     def __init__(
         self,
-        d_model:  int   = 64,
-        n_heads:  int   = 4,
-        n_layers: int   = 2,
-        d_ff:     int   = 128,
-        dropout:  float = 0.1,
+        d_model:    int   = 64,
+        n_heads:    int   = 4,
+        n_layers:   int   = 2,
+        d_ff:       int   = 128,
+        dropout:    float = 0.1,
+        n_bands:    int   = N_BANDS,
+        use_n_obs:  bool  = True,
     ) -> None:
         super().__init__()
-        self.d_model  = d_model
-        self.n_heads  = n_heads
-        self.n_layers = n_layers
-        self.d_ff     = d_ff
-        self.dropout  = dropout
+        self.d_model   = d_model
+        self.n_heads   = n_heads
+        self.n_layers  = n_layers
+        self.d_ff      = d_ff
+        self.dropout   = dropout
+        self.n_bands   = n_bands
+        self.use_n_obs = use_n_obs
 
-        self.band_proj = nn.Linear(N_BANDS, d_model)
+        self.band_proj = nn.Linear(n_bands, d_model)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -91,7 +95,8 @@ class TAMClassifier(nn.Module):
             batch_first=True,
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-        self.head = nn.Linear(d_model, 1)
+        head_in = d_model + (1 if use_n_obs else 0)
+        self.head = nn.Linear(head_in, 1)
 
     # ------------------------------------------------------------------
     def forward(
@@ -99,6 +104,7 @@ class TAMClassifier(nn.Module):
         bands: torch.Tensor,              # (B, T, N_BANDS)
         doy:   torch.Tensor,              # (B, T)  int, 0=padding
         key_padding_mask: torch.Tensor,   # (B, T)  bool, True=padding
+        n_obs: torch.Tensor,              # (B,)    float32, n / MAX_SEQ_LEN
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return (prob, logit), each shape (B,)."""
         x = self.band_proj(bands) + _doy_encoding(doy, self.d_model)  # (B, T, d_model)
@@ -114,6 +120,9 @@ class TAMClassifier(nn.Module):
         # Mean pool over non-padded positions
         valid = (~key_padding_mask).float().unsqueeze(-1)  # (B, T, 1)
         x_pool = (x * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1)  # (B, d_model)
+
+        if self.use_n_obs:
+            x_pool = torch.cat([x_pool, n_obs.unsqueeze(-1)], dim=-1)  # (B, d_model + 1)
 
         logit = self.head(x_pool).squeeze(-1)   # (B,)
         prob  = torch.sigmoid(logit)
@@ -165,7 +174,8 @@ class TAMClassifier(nn.Module):
             "n_layers":      self.n_layers,
             "d_ff":          self.d_ff,
             "dropout":       self.dropout,
-            "n_bands":       N_BANDS,
+            "n_bands":       self.n_bands,
+            "use_n_obs":     self.use_n_obs,
             "max_seq_len":   MAX_SEQ_LEN,
         }
 
@@ -177,4 +187,6 @@ class TAMClassifier(nn.Module):
             n_layers=cfg.n_layers,
             d_ff=cfg.d_ff,
             dropout=cfg.dropout,
+            n_bands=cfg.n_bands,
+            use_n_obs=cfg.use_n_obs,
         )

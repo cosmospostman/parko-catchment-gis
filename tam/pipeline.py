@@ -112,17 +112,24 @@ def _cmd_train(args: argparse.Namespace) -> None:
         (labels == 1).sum(), (labels == 0).sum(),
     )
 
-    out_dir = PROJECT_ROOT / "outputs" / f"tam-{exp.name}"
+    out_dir = Path(args.output_dir) if args.output_dir else PROJECT_ROOT / "outputs" / f"tam-{exp.name}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     train_kwargs = dict(exp.train_kwargs)
     model_kwargs = dict(exp.model_kwargs)
 
+    overrides = {k: v for k, v in {
+        "lr":              args.lr,
+        "dropout":         args.dropout,
+        "n_layers":        args.n_layers,
+        "obs_dropout_min": args.obs_dropout_min,
+    }.items() if v is not None}
     cfg = TAMConfig(
-        n_epochs=args.epochs or 100,
-        patience=args.patience or 15,
+        n_epochs=args.epochs or TAMConfig.__dataclass_fields__["n_epochs"].default,
+        patience=args.patience or TAMConfig.__dataclass_fields__["patience"].default,
         scl_purity_min=args.scl_purity,
         **{k: v for k, v in train_kwargs.items() if k in TAMConfig.__dataclass_fields__},
+        **overrides,
     )
 
     train_tam(
@@ -150,7 +157,7 @@ def _cmd_score(args: argparse.Namespace) -> None:
     parquet = loc.parquet_path()
 
     if not parquet.exists():
-        logger.error("Parquet not found: %s — run pixel_collector first", parquet)
+        logger.error("Parquet not found: %s — run `python cli/location.py fetch <location>` first", parquet)
         sys.exit(1)
 
     tile_id = getattr(args, "tile", None)
@@ -256,8 +263,14 @@ if __name__ == "__main__":
     # --- train ---
     p_train = sub.add_parser("train", help="Train a named experiment")
     p_train.add_argument("--experiment", required=True, help="Experiment module name (e.g. v1_spectral)")
-    p_train.add_argument("--epochs",   type=int, default=None)
-    p_train.add_argument("--patience", type=int, default=None)
+    p_train.add_argument("--output-dir", default=None, help="Override output directory (default: outputs/tam-<experiment>)")
+    p_train.add_argument("--epochs",           type=int,   default=None)
+    p_train.add_argument("--patience",         type=int,   default=None)
+    p_train.add_argument("--lr",               type=float, default=None)
+    p_train.add_argument("--dropout",          type=float, default=None)
+    p_train.add_argument("--obs-dropout-min",  type=int,   default=None,
+                         help="Subsample each training window to Uniform(N, n) obs (default: off)")
+    p_train.add_argument("--n-layers", type=int,   default=None)
     p_train.add_argument("--scl-purity", type=float, default=0.5)
     p_train.add_argument("--device", default=None)
 

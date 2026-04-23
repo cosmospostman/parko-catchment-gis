@@ -118,6 +118,7 @@ def train_tam(
         scl_purity_min=cfg.scl_purity_min,
         min_obs_per_year=cfg.min_obs_per_year,
         doy_jitter=cfg.doy_jitter,
+        obs_dropout_min=cfg.obs_dropout_min,
     )
     band_mean, band_std = train_ds.band_stats
     val_ds = TAMDataset(
@@ -178,10 +179,11 @@ def train_tam(
             bands  = batch["bands"].to(device)
             doy    = batch["doy"].to(device)
             mask   = batch["mask"].to(device)
+            n_obs  = batch["n_obs"].to(device)
             label  = batch["label"].to(device)
             weight = batch["weight"].to(device)
 
-            _, logit = model(bands, doy, mask)
+            _, logit = model(bands, doy, mask, n_obs)
             loss = (criterion(logit, label) * weight).mean()
 
             optimizer.zero_grad()
@@ -201,6 +203,7 @@ def train_tam(
                     batch["bands"].to(device),
                     batch["doy"].to(device),
                     batch["mask"].to(device),
+                    batch["n_obs"].to(device),
                 )
                 val_probs.extend(prob.cpu().numpy())
                 val_labels_list.extend(batch["label"].numpy())
@@ -268,8 +271,14 @@ def load_tam(out_dir: Path, device: str | None = None) -> tuple[TAMClassifier, n
     with open(out_dir / "tam_config.json") as fh:
         cfg = TAMConfig.from_dict(json.load(fh))
 
+    state = torch.load(out_dir / "tam_model.pt", map_location=device, weights_only=True)
+
+    # Infer use_n_obs from saved weights: head input dim == d_model → no n_obs appended
+    head_in = state["head.weight"].shape[1]
+    cfg.use_n_obs = (head_in == cfg.d_model + 1)
+
     model = TAMClassifier.from_config(cfg)
-    model.load_state_dict(torch.load(out_dir / "tam_model.pt", map_location=device, weights_only=True))
+    model.load_state_dict(state)
     model.to(device)
     model.eval()
 

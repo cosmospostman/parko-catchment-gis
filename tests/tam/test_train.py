@@ -179,7 +179,7 @@ class TestTT6TrainTamSmokeCheckpoints:
         batch = collate_fn(samples)
         model.eval()
         with torch.no_grad():
-            prob, _ = model(batch["bands"], batch["doy"], batch["mask"])
+            prob, _ = model(batch["bands"], batch["doy"], batch["mask"], batch["n_obs"])
         assert torch.isfinite(prob).all()
 
 
@@ -219,7 +219,7 @@ class TestTT8LoadTamIdenticalPredictions:
         trained.eval()
         loaded.eval()
         with torch.no_grad():
-            prob_trained, _ = trained(batch["bands"], batch["doy"], batch["mask"])
-            prob_loaded,  _ = loaded(batch["bands"],  batch["doy"], batch["mask"])
+            prob_trained, _ = trained(batch["bands"], batch["doy"], batch["mask"], batch["n_obs"])
+            prob_loaded,  _ = loaded(batch["bands"],  batch["doy"], batch["mask"], batch["n_obs"])
 
         torch.testing.assert_close(prob_trained, prob_loaded)
