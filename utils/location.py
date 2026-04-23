@@ -139,7 +139,7 @@ class Location:
     @property
     def pixel_count(self) -> int:
         """Approximate S2 pixel count at 10 m resolution."""
-        return round(self.area_km2 * 1e6 / 100)
+        return round(self._lon_m / 10) * round(self._lat_m / 10)
 
     def estimated_parquet_mb(
         self,
@@ -174,21 +174,38 @@ class Location:
     # Paths
     # ------------------------------------------------------------------
 
-    def parquet_path(self, year: int) -> Path:
-        """Canonical pixel observation parquet: data/pixels/<id>/<year>/<id>.parquet"""
-        return _PROJECT_ROOT / "data" / "pixels" / self.id / str(year) / f"{self.id}.parquet"
+    def parquet_year_dir(self, year: int) -> Path:
+        """Directory holding per-tile parquets for one year: data/pixels/<id>/<year>/"""
+        return _PROJECT_ROOT / "data" / "pixels" / self.id / str(year)
+
+    def parquet_path(self, year: int, tile_id: str) -> Path:
+        """Canonical pixel observation parquet: data/pixels/<id>/<year>/<tile_id>.parquet"""
+        return self.parquet_year_dir(year) / f"{tile_id}.parquet"
+
+    def parquet_tile_paths(self) -> dict[int, list[Path]]:
+        """Return {year: [tile_parquet_paths]} for all fetched data."""
+        base = _PROJECT_ROOT / "data" / "pixels" / self.id
+        result: dict[int, list[Path]] = {}
+        if not base.is_dir():
+            return result
+        for child in base.iterdir():
+            if not (child.is_dir() and child.name.isdigit()):
+                continue
+            year = int(child.name)
+            paths = sorted(
+                p for p in child.iterdir()
+                if p.suffix == ".parquet" and not p.stem.startswith("_collect_")
+                and not p.stem.endswith("-by-pixel")
+                and not p.stem.endswith(".coords")
+                and "coords" not in p.stem
+            )
+            if paths:
+                result[year] = paths
+        return result
 
     def parquet_years(self) -> list[int]:
-        """Return sorted list of years that have a parquet on disk."""
-        base = _PROJECT_ROOT / "data" / "pixels" / self.id
-        years = []
-        if base.is_dir():
-            for child in base.iterdir():
-                if child.is_dir() and child.name.isdigit():
-                    p = child / f"{self.id}.parquet"
-                    if p.exists():
-                        years.append(int(child.name))
-        return sorted(years)
+        """Return sorted list of years that have at least one tile parquet on disk."""
+        return sorted(self.parquet_tile_paths().keys())
 
     def coords_cache_path(self, year: int, tile_id: str | None = None) -> Path:
         """Sidecar parquet caching unique (point_id, lon, lat) for this location and year."""
@@ -228,9 +245,9 @@ class Location:
         cache_dir: Optional[Path] = None,
         apply_nbar: bool = True,
     ) -> list[Path]:
-        """Fetch Sentinel-2 pixel observations for this location, one parquet per year.
+        """Fetch Sentinel-2 pixel observations for this location, one parquet per S2 tile per year.
 
-        Output is written to data/pixels/<id>/<year>/<id>.parquet.
+        Output is written to data/pixels/<id>/<year>/<tile_id>.parquet.
         The chip cache is shared across years.
 
         Returns the list of written parquet paths.
@@ -247,20 +264,20 @@ class Location:
 
         written: list[Path] = []
         for year in sorted(years):
-            _out = self.parquet_path(year)
-            _out.parent.mkdir(parents=True, exist_ok=True)
-            collect(
+            _out_dir = self.parquet_year_dir(year)
+            _out_dir.mkdir(parents=True, exist_ok=True)
+            tile_paths = collect(
                 bbox_wgs84=self.bbox,
                 start=f"{year}-01-01",
                 end=f"{year}-12-31",
-                out_path=_out,
+                out_dir=_out_dir,
                 cloud_max=cloud_max,
                 cache_dir=_cache,
                 apply_nbar=apply_nbar,
                 calibration_out=_cal_out,
                 geometry=self.geometry,
             )
-            written.append(_out)
+            written.extend(tile_paths)
         return written
 
 

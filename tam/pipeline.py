@@ -155,56 +155,53 @@ def _cmd_score(args: argparse.Namespace) -> None:
     checkpoint_dir = Path(args.checkpoint)
     loc = get_location(args.location)
 
-    years = loc.parquet_years()
-    if not years:
-        logger.error("No annual parquets found for %s — run `python cli/location.py fetch %s --years ...` first", loc.id, loc.id)
+    tile_paths_by_year = loc.parquet_tile_paths()
+    if not tile_paths_by_year:
+        logger.error("No tile parquets found for %s — run `python cli/location.py fetch %s --years ...` first", loc.id, loc.id)
         sys.exit(1)
     if args.end_year:
-        years = [y for y in years if y <= args.end_year]
-    if not years:
+        tile_paths_by_year = {y: ps for y, ps in tile_paths_by_year.items() if y <= args.end_year}
+    if not tile_paths_by_year:
         logger.error("No parquets found for years up to %d", args.end_year)
         sys.exit(1)
 
-    tile_id = getattr(args, "tile", None)
+    years = sorted(tile_paths_by_year)
     out_csv = Path(args.out) if getattr(args, "out", None) else None
     out_dir = out_csv.parent if out_csv else checkpoint_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info("Location: %s  years: %s  checkpoint: %s", loc.name, years, checkpoint_dir)
 
-    # Load pixel coords from the first available year (coords are stable across years)
-    tile_prefix = f"_{tile_id}_" if tile_id else None
+    # Load pixel coords from all tile parquets of the first year.
     first_year = years[0]
-    coords_cache = loc.coords_cache_path(first_year, tile_id=tile_id)
-    first_parquet = loc.parquet_path(first_year)
+    coords_cache = loc.coords_cache_path(first_year)
+    first_year_parquets = tile_paths_by_year[first_year]
 
     if coords_cache.exists():
         logger.info("Loading pixel coords from cache ...")
         pixel_coords = pd.read_parquet(coords_cache)
     else:
-        logger.info("Resolving pixel coords from %d parquet ...", first_year)
-        pf_coords = pq.ParquetFile(first_parquet)
-        read_coord_cols = ["point_id", "lon", "lat"] + (["item_id"] if tile_id else [])
-        n_rg_coords = pf_coords.metadata.num_row_groups
-
-        def _read_coord_rg(rg: int) -> pd.DataFrame:
-            pf = pq.ParquetFile(first_parquet)
-            chunk = pf.read_row_group(rg, columns=read_coord_cols).to_pandas()
-            if tile_prefix:
-                chunk = chunk[chunk["item_id"].str.contains(tile_prefix, regex=False)]
-            return chunk[["point_id", "lon", "lat"]].drop_duplicates("point_id")
-
+        logger.info("Resolving pixel coords from %d tile parquet(s) for year %d ...", len(first_year_parquets), first_year)
         coord_chunks = []
-        n_done = 0
-        with ThreadPoolExecutor(max_workers=8) as ex:
-            futures = {ex.submit(_read_coord_rg, rg): rg for rg in range(n_rg_coords)}
-            for fut in as_completed(futures):
-                chunk = fut.result()
-                if not chunk.empty:
-                    coord_chunks.append(chunk)
-                n_done += 1
-                if n_done % 100 == 0:
-                    logger.info("  coords %d/%d row groups", n_done, n_rg_coords)
+        for tile_parquet in first_year_parquets:
+            pf_coords = pq.ParquetFile(tile_parquet)
+            n_rg_coords = pf_coords.metadata.num_row_groups
+
+            def _read_coord_rg(rg: int, _path: Path = tile_parquet) -> pd.DataFrame:
+                pf = pq.ParquetFile(_path)
+                chunk = pf.read_row_group(rg, columns=["point_id", "lon", "lat"]).to_pandas()
+                return chunk.drop_duplicates("point_id")
+
+            n_done = 0
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                futures = {ex.submit(_read_coord_rg, rg): rg for rg in range(n_rg_coords)}
+                for fut in as_completed(futures):
+                    chunk = fut.result()
+                    if not chunk.empty:
+                        coord_chunks.append(chunk)
+                    n_done += 1
+                    if n_done % 100 == 0:
+                        logger.info("  coords %d/%d row groups (%s)", n_done, n_rg_coords, tile_parquet.name)
 
         pixel_coords = (
             pd.concat(coord_chunks, ignore_index=True)
@@ -215,16 +212,21 @@ def _cmd_score(args: argparse.Namespace) -> None:
         pixel_coords.to_parquet(coords_cache, index=False)
         logger.info("Cached pixel coords to %s", coords_cache)
 
-    logger.info("Unique pixels after tile filter: %d", len(pixel_coords))
+    logger.info("Unique pixels: %d", len(pixel_coords))
 
     labelled = label_pixels(pixel_coords, loc)
 
-    year_parquets = [(y, ensure_pixel_sorted(loc.parquet_path(y))) for y in years]
+    # Flat list of (year, path) — one entry per tile per year.
+    year_parquets = [
+        (y, ensure_pixel_sorted(p))
+        for y, paths in sorted(tile_paths_by_year.items())
+        for p in paths
+    ]
 
     logger.info("Loading checkpoint from %s ...", checkpoint_dir)
     model, band_mean, band_std = load_tam(checkpoint_dir, device=args.device)
 
-    logger.info("Scoring %d annual parquets ...", len(year_parquets))
+    logger.info("Scoring %d tile-year parquets ...", len(year_parquets))
     scores = score_location_years(
         year_parquets=year_parquets,
         model=model,
@@ -232,7 +234,6 @@ def _cmd_score(args: argparse.Namespace) -> None:
         band_std=band_std,
         scl_purity_min=args.scl_purity,
         device=args.device,
-        tile_id=tile_id,
         end_year=args.end_year,
         decay=args.decay,
         batch_size=args.batch_size,
@@ -288,7 +289,6 @@ if __name__ == "__main__":
     p_score = sub.add_parser("score", help="Score a location with an existing checkpoint")
     p_score.add_argument("--checkpoint", required=True, help="Checkpoint directory")
     p_score.add_argument("--location",   required=True, help="Location ID")
-    p_score.add_argument("--tile",       default=None, help="Restrict to one S2 tile_id")
     p_score.add_argument("--out",        default=None, help="Output CSV path (overrides default in checkpoint dir)")
     _add_common_score_args(p_score)
 

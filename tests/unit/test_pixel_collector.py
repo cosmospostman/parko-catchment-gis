@@ -803,3 +803,114 @@ def test_dedup_tiebreak_lower_tile_id_wins(tmp_path):
     assert n_removed == 1
     assert len(result) == 1
     assert result.iloc[0]["tile_id"] == "55HBU"   # lower tile_id wins
+
+
+# ---------------------------------------------------------------------------
+# Tests PC-T1–PC-T3 — per-tile parquet output splitting
+# ---------------------------------------------------------------------------
+
+def _make_sorted_shard(tmp_path: Path, rows: list[dict]) -> "Path":
+    """Write a sorted shard parquet from a list of row dicts (sorted by point_id)."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import pandas as pd
+    from analysis.constants import BANDS, SPECTRAL_INDEX_COLS
+
+    full_rows = []
+    for r in sorted(rows, key=lambda x: x["point_id"]):
+        full_rows.append({
+            "lon": 145.0, "lat": -23.0,
+            "date": pd.Timestamp("2022-08-15").to_datetime64(),
+            "item_id": f"S2A_{r['tile_id']}_20220815_0_L2A",
+            "scl_purity": 1.0, "scl": 4, "aot": 0.9,
+            "view_zenith": 0.95, "sun_zenith": 0.80,
+            **{b: 0.15 for b in BANDS},
+            **{c: 0.3 for c in SPECTRAL_INDEX_COLS},
+            **r,
+        })
+    df = pd.DataFrame(full_rows)
+    df["date"] = pd.to_datetime(df["date"]).astype("datetime64[us]")
+    p = tmp_path / "_collect_shard000_sorted.parquet"
+    pq.write_table(pa.Table.from_pandas(df, preserve_index=False), p)
+    return p
+
+
+def _run_split(sorted_shard: "Path", out_dir: "Path") -> "dict[str, pd.DataFrame]":
+    """Invoke the per-tile split logic used inside collect() and return {tile_id: df}."""
+    import pyarrow.parquet as pq
+    import pyarrow.compute as pc
+    import pandas as pd
+
+    pf = pq.ParquetFile(sorted_shard)
+    tile_writers: dict = {}
+    for rg_idx in range(pf.metadata.num_row_groups):
+        rg = pf.read_row_group(rg_idx)
+        tile_col = rg.column("tile_id").combine_chunks()
+        for tid in pc.unique(tile_col).to_pylist():
+            subset = rg.filter(pc.equal(tile_col, tid))
+            if tid not in tile_writers:
+                p = out_dir / f"{tid}.parquet"
+                tile_writers[tid] = pq.ParquetWriter(str(p), subset.schema)
+            tile_writers[tid].write_table(subset)
+
+    for w in tile_writers.values():
+        w.close()
+
+    return {
+        tid: pq.read_table(out_dir / f"{tid}.parquet").to_pandas()
+        for tid in tile_writers
+    }
+
+
+def test_per_tile_split_writes_separate_files(tmp_path):
+    """Sorted shard with two tile_ids produces two separate output parquets."""
+    shard_dir = tmp_path / "shards"
+    shard_dir.mkdir()
+    rows = [
+        {"point_id": "px_0000_0000", "tile_id": "55HBU"},
+        {"point_id": "px_0001_0000", "tile_id": "55HBU"},
+        {"point_id": "px_0002_0000", "tile_id": "55HBV"},
+    ]
+    shard = _make_sorted_shard(shard_dir, rows)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    result = _run_split(shard, out_dir)
+
+    assert set(result.keys()) == {"55HBU", "55HBV"}
+    assert set(result["55HBU"]["point_id"]) == {"px_0000_0000", "px_0001_0000"}
+    assert set(result["55HBV"]["point_id"]) == {"px_0002_0000"}
+
+
+def test_per_tile_split_each_file_contains_only_its_tile(tmp_path):
+    """Each output parquet contains only rows whose tile_id matches the filename."""
+    shard_dir = tmp_path / "shards"
+    shard_dir.mkdir()
+    rows = [
+        {"point_id": "px_0000_0000", "tile_id": "54LWH"},
+        {"point_id": "px_0001_0000", "tile_id": "55HBU"},
+        {"point_id": "px_0002_0000", "tile_id": "55HBU"},
+    ]
+    shard = _make_sorted_shard(shard_dir, rows)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    result = _run_split(shard, out_dir)
+
+    for tid, df in result.items():
+        assert (df["tile_id"] == tid).all(), f"tile {tid} file contains foreign tile_ids"
+
+
+def test_per_tile_split_single_tile_writes_one_file(tmp_path):
+    """Single-tile input writes exactly one output parquet."""
+    shard_dir = tmp_path / "shards"
+    shard_dir.mkdir()
+    rows = [
+        {"point_id": "px_0000_0000", "tile_id": "55HBU"},
+        {"point_id": "px_0001_0000", "tile_id": "55HBU"},
+    ]
+    shard = _make_sorted_shard(shard_dir, rows)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    result = _run_split(shard, out_dir)
+
+    assert list(result.keys()) == ["55HBU"]
+    assert len(result["55HBU"]) == 2

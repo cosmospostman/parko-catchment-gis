@@ -29,7 +29,7 @@ from typing import Any
 import pytest
 import yaml
 
-from utils.location import Location, SubBbox, _bbox_pixel_count, _load_registry
+from utils.location import Location, SubBbox, _bbox_pixel_count, _load_registry, _PROJECT_ROOT
 
 
 # ---------------------------------------------------------------------------
@@ -288,3 +288,85 @@ def test_location_geometry_property(tmp_path):
     geom = loc.geometry
     assert isinstance(geom, ShapelyPolygon)
     assert geom.is_valid
+
+
+# ---------------------------------------------------------------------------
+# Tests 17–21 — tile-partitioned parquet path helpers
+# ---------------------------------------------------------------------------
+
+def _make_loc_with_root(tmp_path: Path) -> tuple[Location, Path]:
+    """Return a Location whose _PROJECT_ROOT is monkeypatched to tmp_path."""
+    loc = _make_location([145.0, -23.0, 146.0, -22.0], id="mysite")
+    return loc, tmp_path
+
+
+def test_parquet_year_dir_path():
+    """parquet_year_dir returns data/pixels/<id>/<year>/ under PROJECT_ROOT."""
+    loc = _make_location([145.0, -23.0, 146.0, -22.0], id="mysite")
+    d = loc.parquet_year_dir(2023)
+    assert d == _PROJECT_ROOT / "data" / "pixels" / "mysite" / "2023"
+
+
+def test_parquet_path_includes_tile_id():
+    """parquet_path(year, tile_id) returns the tile-specific parquet path."""
+    loc = _make_location([145.0, -23.0, 146.0, -22.0], id="mysite")
+    p = loc.parquet_path(2023, "55HBU")
+    assert p.name == "55HBU.parquet"
+    assert p.parent.name == "2023"
+    assert p.parent.parent.name == "mysite"
+
+
+def test_parquet_tile_paths_empty_when_no_data(tmp_path, monkeypatch):
+    """parquet_tile_paths() returns {} when no year dirs exist."""
+    import utils.location as loc_mod
+    monkeypatch.setattr(loc_mod, "_PROJECT_ROOT", tmp_path)
+    loc = _make_location([145.0, -23.0, 146.0, -22.0], id="mysite")
+    assert loc.parquet_tile_paths() == {}
+
+
+def test_parquet_tile_paths_finds_tile_parquets(tmp_path, monkeypatch):
+    """parquet_tile_paths() returns {year: [paths]} for existing tile parquets."""
+    import utils.location as loc_mod
+    monkeypatch.setattr(loc_mod, "_PROJECT_ROOT", tmp_path)
+    loc = _make_location([145.0, -23.0, 146.0, -22.0], id="mysite")
+
+    year_dir = tmp_path / "data" / "pixels" / "mysite" / "2022"
+    year_dir.mkdir(parents=True)
+    (year_dir / "55HBU.parquet").touch()
+    (year_dir / "55HBV.parquet").touch()
+
+    result = loc.parquet_tile_paths()
+    assert list(result.keys()) == [2022]
+    assert {p.name for p in result[2022]} == {"55HBU.parquet", "55HBV.parquet"}
+
+
+def test_parquet_years_returns_sorted_years(tmp_path, monkeypatch):
+    """parquet_years() returns sorted list of years with at least one tile parquet."""
+    import utils.location as loc_mod
+    monkeypatch.setattr(loc_mod, "_PROJECT_ROOT", tmp_path)
+    loc = _make_location([145.0, -23.0, 146.0, -22.0], id="mysite")
+
+    for yr in [2024, 2021, 2023]:
+        d = tmp_path / "data" / "pixels" / "mysite" / str(yr)
+        d.mkdir(parents=True)
+        (d / "55HBU.parquet").touch()
+
+    assert loc.parquet_years() == [2021, 2023, 2024]
+
+
+def test_parquet_tile_paths_ignores_sidecar_files(tmp_path, monkeypatch):
+    """parquet_tile_paths() excludes coords, shard, and by-pixel sidecar files."""
+    import utils.location as loc_mod
+    monkeypatch.setattr(loc_mod, "_PROJECT_ROOT", tmp_path)
+    loc = _make_location([145.0, -23.0, 146.0, -22.0], id="mysite")
+
+    year_dir = tmp_path / "data" / "pixels" / "mysite" / "2022"
+    year_dir.mkdir(parents=True)
+    (year_dir / "55HBU.parquet").touch()
+    (year_dir / "55HBU-by-pixel.parquet").touch()
+    (year_dir / "mysite.coords.parquet").touch()
+    (year_dir / "_collect_shard000.parquet").touch()
+
+    result = loc.parquet_tile_paths()
+    names = {p.name for p in result[2022]}
+    assert names == {"55HBU.parquet"}

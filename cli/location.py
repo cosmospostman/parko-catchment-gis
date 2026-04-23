@@ -66,7 +66,8 @@ def cmd_list(args: argparse.Namespace) -> None:
         years = loc.parquet_years()
         if years:
             years_str = f"{years[0]}–{years[-1]}" if len(years) > 1 else str(years[0])
-            total_bytes = sum(loc.parquet_path(y).stat().st_size for y in years)
+            tile_paths = loc.parquet_tile_paths()
+            total_bytes = sum(p.stat().st_size for ps in tile_paths.values() for p in ps)
             parquet_str = _fmt_size(total_bytes)
         else:
             years_str   = "—"
@@ -110,10 +111,13 @@ def cmd_info(args: argparse.Namespace) -> None:
     print()
     print(f"  Fetched years: {', '.join(str(y) for y in years)}")
 
+    tile_paths_by_year = loc.parquet_tile_paths()
     for year in years:
-        parquet = loc.parquet_path(year)
-        size_str = _fmt_size(parquet.stat().st_size)
-        df = pd.read_parquet(parquet, columns=["date"])
+        tile_paths = tile_paths_by_year.get(year, [])
+        total_size = sum(p.stat().st_size for p in tile_paths)
+        size_str = _fmt_size(total_size)
+        dfs = [pd.read_parquet(p, columns=["date"]) for p in tile_paths]
+        df = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame(columns=["date"])
         df["date"] = pd.to_datetime(df["date"])
         counts = (
             df.groupby(df["date"].dt.to_period("M"))["date"]

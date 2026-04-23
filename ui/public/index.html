@@ -204,7 +204,65 @@
       background: #38bdf8;
     }
 
-    #panel-locations {
+    /* ---- S2 tiles accordion ---- */
+
+    #s2tiles-accordion {
+      border-bottom: 1px solid #333;
+      flex-shrink: 0;
+    }
+
+    #s2tiles-accordion-header {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      padding: 10px 16px;
+      cursor: pointer;
+      user-select: none;
+      font-size: 12px;
+      color: #aaa;
+    }
+
+    #s2tiles-accordion-header:hover { background: #2e2e2e; }
+
+    #s2tiles-accordion-header input[type="checkbox"] {
+      accent-color: #a78bfa;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+
+    #s2tiles-accordion-header .accordion-label {
+      flex: 1;
+      font-weight: 500;
+      color: #c0c0c0;
+    }
+
+    #s2tiles-accordion-header .accordion-chevron {
+      font-size: 10px;
+      color: #555;
+      transition: transform 0.15s;
+    }
+
+    #s2tiles-accordion-header.open .accordion-chevron { transform: rotate(90deg); }
+
+    #s2tiles-accordion-body {
+      display: none;
+      flex-direction: column;
+      background: #1e1e1e;
+      padding: 10px 16px;
+      gap: 6px;
+    }
+
+    #s2tiles-accordion-body.open { display: flex; }
+
+    .s2tiles-level-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 11px;
+      color: #aaa;
+    }
+
+#panel-locations {
       display: flex;
       flex-direction: column;
       flex: 1;
@@ -599,6 +657,16 @@
           <span class="accordion-chevron">&#9658;</span>
         </div>
         <div id="catchments-accordion-body"></div>
+      </div>
+      <div id="s2tiles-accordion">
+        <div id="s2tiles-accordion-header">
+          <input type="checkbox" id="s2tiles-toggle">
+          <span class="accordion-label">S2 tiles</span>
+          <span class="accordion-chevron">&#9658;</span>
+        </div>
+        <div id="s2tiles-accordion-body">
+          <div class="s2tiles-level-row" style="color:#666;font-size:11px;padding:2px 0;">543 MGRS tiles · labels at zoom ≥ 6</div>
+        </div>
       </div>
       <div id="sightings-accordion">
         <div id="sightings-accordion-header">

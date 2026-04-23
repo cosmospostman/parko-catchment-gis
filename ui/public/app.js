@@ -4,7 +4,7 @@
 
 const map = new maplibregl.Map({
   container: 'map',
-  style: { version: 8, sources: {}, layers: [] },
+  style: { version: 8, sources: {}, layers: [], glyphs: 'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf' },
   center: [144, -22],
   zoom: 6,
 });
@@ -73,6 +73,7 @@ map.on('load', () => {
   loadLocations();
   loadSightings();
   loadCatchments();
+  loadS2Tiles();
 });
 
 document.getElementById('layer-select').addEventListener('change', (e) => {
@@ -351,6 +352,78 @@ document.getElementById('catchments-toggle').addEventListener('change', (e) => {
     if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', vis);
   }
 });
+
+// ---------------------------------------------------------------------------
+// Sentinel-2 tiles layer
+// ---------------------------------------------------------------------------
+
+const S2_TILE_LAYERS = ['s2tiles-fill', 's2tiles-line', 's2tiles-label'];
+
+function loadS2Tiles() {
+  const vis = () => document.getElementById('s2tiles-toggle').checked ? 'visible' : 'none';
+
+  Promise.all([
+    fetch('/sentinel2_tiles.geojson').then(r => r.json()),
+    fetch('/sentinel2_tile_labels.geojson').then(r => r.json()),
+  ]).then(([tiles, labels]) => {
+    map.addSource('s2tiles', { type: 'geojson', data: tiles });
+    map.addSource('s2tiles-centroids', { type: 'geojson', data: labels });
+
+    map.addLayer({
+      id: 's2tiles-fill',
+      type: 'fill',
+      source: 's2tiles',
+      layout: { visibility: vis() },
+      paint: { 'fill-color': '#a78bfa', 'fill-opacity': 0.04 },
+    });
+
+    map.addLayer({
+      id: 's2tiles-line',
+      type: 'line',
+      source: 's2tiles',
+      layout: { visibility: vis() },
+      paint: { 'line-color': '#a78bfa', 'line-width': 1, 'line-opacity': 0.6 },
+    });
+
+    map.addLayer({
+      id: 's2tiles-label',
+      type: 'symbol',
+      source: 's2tiles-centroids',
+      minzoom: 6,
+      layout: {
+        visibility: vis(),
+        'text-field': ['get', 'name'],
+        'text-size': 11,
+        'text-font': ['Noto Sans Regular'],
+        'text-anchor': 'center',
+        'text-allow-overlap': false,
+      },
+      paint: {
+        'text-color': '#a78bfa',
+        'text-opacity': 0.8,
+        'text-halo-color': '#111',
+        'text-halo-width': 1,
+      },
+    });
+  }).catch(err => console.error('Failed to load Sentinel-2 tiles:', err));
+}
+
+document.getElementById('s2tiles-toggle').addEventListener('change', (e) => {
+  const vis = e.target.checked ? 'visible' : 'none';
+  for (const id of S2_TILE_LAYERS) {
+    if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', vis);
+  }
+});
+
+(function() {
+  const header = document.getElementById('s2tiles-accordion-header');
+  const body = document.getElementById('s2tiles-accordion-body');
+  header.addEventListener('click', (e) => {
+    if (e.target.id === 's2tiles-toggle') return;
+    header.classList.toggle('open');
+    body.classList.toggle('open');
+  });
+})();
 
 // ---------------------------------------------------------------------------
 // Sidebar — Locations panel

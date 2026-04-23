@@ -531,11 +531,14 @@ def _resolve_parquet(args_parquet: str | None, year: int | None = None) -> Path:
     if args_parquet:
         return Path(args_parquet)
     loc = get_location("kowanyama")
-    years = loc.parquet_years()
-    if not years:
-        raise FileNotFoundError(f"No annual parquets found for {loc.id}")
-    y = year if year is not None else years[-1]
-    return loc.parquet_path(y)
+    tile_paths = loc.parquet_tile_paths()
+    if not tile_paths:
+        raise FileNotFoundError(f"No tile parquets found for {loc.id}")
+    y = year if year is not None else max(tile_paths)
+    paths = tile_paths[y]
+    if not paths:
+        raise FileNotFoundError(f"No tile parquets for {loc.id} year {y}")
+    return paths[0]
 
 
 if __name__ == "__main__":

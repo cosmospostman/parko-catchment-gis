@@ -262,7 +262,7 @@ def collect(
     bbox_wgs84: list[float],
     start: str,
     end: str,
-    out_path: Path,
+    out_dir: Path,
     cloud_max: int,
     cache_dir: Path | None = None,
     apply_nbar: bool = True,
@@ -271,8 +271,11 @@ def collect(
     point_id_prefix: str = "px",
     calibration_out: Path | None = None,
     geometry=None,
-) -> None:
-    """Collect S2 observations for bbox_wgs84.
+) -> list[Path]:
+    """Collect S2 observations for bbox_wgs84, writing one parquet per S2 tile.
+
+    Output files are written to ``out_dir/<tile_id>.parquet``, one per MGRS
+    tile that has observations.  Returns the list of written paths.
 
     If *items* is provided (a pre-fetched, deduplicated STAC item list), the
     STAC search step is skipped entirely.  This lets the caller share one STAC
@@ -430,10 +433,10 @@ def collect(
         shards.append(current_shard)
 
     n_shards = len(shards)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     def _shard_path(idx: int) -> Path:
-        return out_path.with_name(f"{out_path.stem}.shard{idx:03d}.parquet")
+        return out_dir / f"_collect_shard{idx:03d}.parquet"
 
     def _shard_complete(idx: int) -> bool:
         sp = _shard_path(idx)
@@ -644,14 +647,18 @@ def collect(
         if sorted_sp.exists():
             sorted_shard_paths.append(sorted_sp)
 
-    # --- 5. Concat + dedup in a single streaming pass -------------------------
-    # Tile-boundary duplicates: a pixel near an MGRS boundary appears in two
-    # tiles on the same date with different band values. sort_parquet_by_pixel
-    # now sorts by (point_id, date, scl_purity desc), so within each pixel the
-    # best row for each date comes first. A simple adjacent-row shift-compare
-    # drops duplicates in O(n) with no re-sort.
+    # --- 5. Concat + dedup in a single streaming pass, writing per-tile -------
+    # Rows are sorted by point_id. Canonical tile assignment ensures each
+    # point_id belongs to exactly one tile, so all rows for a given tile are
+    # contiguous in the sorted stream. We maintain per-tile writers and open a
+    # new writer whenever tile_id changes.
     #
-    # Sorted shards are deleted only after the output row count is verified.
+    # Tile-boundary duplicates: a pixel near an MGRS boundary may appear in two
+    # tiles on the same date. sort_parquet_by_pixel sorts by
+    # (point_id, date, scl_purity desc) so the best row comes first; a simple
+    # shift-compare drops duplicates in O(n).
+    #
+    # Sorted shards are deleted only after all output files are verified.
 
     from utils.tile_harmonisation import calibrate, load_corrections
 
@@ -663,34 +670,22 @@ def collect(
         calibrate(sorted_shard_paths, calibration_out)
         _corrections = load_corrections(calibration_out)
 
-    logger.info("Concatenating %d sorted shards → %s ...", n_shards, out_path.name)
+    logger.info("Concatenating %d sorted shards → per-tile parquets in %s ...", n_shards, out_dir)
 
-    final_writer: pq.ParquetWriter | None = None
+    # tile_id → ParquetWriter
+    tile_writers: dict[str, pq.ParquetWriter] = {}
+    tile_rows: dict[str, int] = {}
     total_rows = 0
     n_dedup_dropped = 0
 
     concat_rg_size = 5_000_000
-    write_buf: list[pa.Table] = []
-    write_buf_rows = 0
+    # Per-tile write buffers: tile_id → list[pa.Table]
+    write_bufs: dict[str, list[pa.Table]] = {}
+    write_buf_rows: dict[str, int] = {}
     total_rgs = sum(
         pq.ParquetFile(sp).metadata.num_row_groups for sp in sorted_shard_paths
     )
     rgs_done = 0
-
-    def _flush_write_buf() -> int:
-        nonlocal final_writer, write_buf_rows
-        if not write_buf:
-            return 0
-        out = pa.concat_tables(write_buf)
-        write_buf.clear()
-        write_buf_rows = 0
-        if _corrections:
-            out = _apply_corrections(out)
-        out = _optimise_schema(out)
-        if final_writer is None:
-            final_writer = pq.ParquetWriter(str(out_path), out.schema, **_WRITE_OPTS)
-        final_writer.write_table(out)
-        return len(out)
 
     _CORRECT_BANDS = ["B04", "B05", "B07", "B08", "B11"]
 
@@ -730,14 +725,27 @@ def collect(
         ])
         return chunk.to_arrow()
 
-    def _dedup_rg(tbl: pa.Table) -> pa.Table:
-        """Drop tile-boundary duplicate (point_id, date) rows.
+    def _flush_tile(tid: str) -> int:
+        buf = write_bufs.get(tid)
+        if not buf:
+            return 0
+        out = pa.concat_tables(buf)
+        write_bufs[tid] = []
+        write_buf_rows[tid] = 0
+        if _corrections:
+            out = _apply_corrections(out)
+        out = _optimise_schema(out)
+        if tid not in tile_writers:
+            tile_path = out_dir / f"{tid}.parquet"
+            tile_writers[tid] = pq.ParquetWriter(str(tile_path), out.schema, **_WRITE_OPTS)
+            tile_rows[tid] = 0
+        tile_writers[tid].write_table(out)
+        n = len(out)
+        tile_rows[tid] += n
+        return n
 
-        sort_parquet_by_pixel now sorts by (point_id, date, scl_purity desc), so
-        within each pixel duplicates on the same date are adjacent and the best
-        (highest scl_purity) row comes first. A simple shift-compare drops them
-        in O(n) with no re-sort.
-        """
+    def _dedup_rg(tbl: pa.Table) -> pa.Table:
+        """Drop tile-boundary duplicate (point_id, date) rows."""
         nonlocal n_dedup_dropped
         import pyarrow.compute as pc
         n_in = len(tbl)
@@ -752,6 +760,8 @@ def collect(
             return tbl.filter(keep)
         return tbl
 
+    import pyarrow.compute as pc
+
     try:
         for sorted_sp in sorted_shard_paths:
             pf = pq.ParquetFile(sorted_sp)
@@ -759,10 +769,19 @@ def collect(
             for rg_idx in range(n_rg):
                 rg = pf.read_row_group(rg_idx)
                 rg = _dedup_rg(rg)
-                write_buf.append(rg)
-                write_buf_rows += len(rg)
-                if write_buf_rows >= concat_rg_size:
-                    total_rows += _flush_write_buf()
+                if len(rg) == 0:
+                    rgs_done += 1
+                    continue
+                # Split row group by tile_id and route to per-tile buffers.
+                tile_col = rg.column("tile_id").combine_chunks()
+                unique_tiles = pc.unique(tile_col).to_pylist()
+                for tid in unique_tiles:
+                    mask = pc.equal(tile_col, tid)
+                    subset = rg.filter(mask)
+                    write_bufs.setdefault(tid, []).append(subset)
+                    write_buf_rows[tid] = write_buf_rows.get(tid, 0) + len(subset)
+                    if write_buf_rows[tid] >= concat_rg_size:
+                        total_rows += _flush_tile(tid)
                 rgs_done += 1
                 if rgs_done % 50 == 0 or rgs_done == total_rgs:
                     logger.info(
@@ -771,32 +790,35 @@ def collect(
                     )
             del pf
 
-        total_rows += _flush_write_buf()
+        for tid in list(write_bufs.keys()):
+            total_rows += _flush_tile(tid)
 
-        if final_writer is not None:
-            final_writer.close()
+        for writer in tile_writers.values():
+            writer.close()
 
     except Exception:
-        if final_writer is not None:
+        for writer in tile_writers.values():
             try:
-                final_writer.close()
+                writer.close()
             except Exception:
                 pass
-        if out_path.exists():
-            out_path.unlink()
+        for tid in tile_writers:
+            p = out_dir / f"{tid}.parquet"
+            p.unlink(missing_ok=True)
         raise
 
     if n_dedup_dropped:
-        logger.info(
-            "Cross-tile dedup: removed %d boundary duplicate rows", n_dedup_dropped,
-        )
+        logger.info("Cross-tile dedup: removed %d boundary duplicate rows", n_dedup_dropped)
 
     # Verify row count before deleting sorted intermediates.
     if total_rows == 0:
         logger.error("No usable observations — all pixels clouded or missing?")
         sys.exit(1)
 
-    written_rows = pq.ParquetFile(out_path).metadata.num_rows
+    written_rows = sum(
+        pq.ParquetFile(out_dir / f"{tid}.parquet").metadata.num_rows
+        for tid in tile_writers
+    )
     if written_rows != total_rows:
         logger.error(
             "Row count mismatch: counted %d but parquet reports %d — output may be corrupt",
@@ -804,26 +826,29 @@ def collect(
         )
         sys.exit(1)
 
-    logger.info("Output verified: %d rows in %d row groups", written_rows,
-                pq.ParquetFile(out_path).metadata.num_row_groups)
-
     # Only delete sorted intermediates after successful verification.
     for sorted_sp in sorted_shard_paths:
         sorted_sp.unlink(missing_ok=True)
 
-    logger.info("Written: %s  (%d rows)", out_path, total_rows)
+    written_paths = [out_dir / f"{tid}.parquet" for tid in sorted(tile_writers)]
+    for p in written_paths:
+        n = pq.ParquetFile(p).metadata.num_rows
+        logger.info("Written: %s  (%d rows)", p.name, n)
 
     from signals._shared import is_pixel_sorted
-    if is_pixel_sorted(out_path, n_check=10):
-        logger.info("Output is pixel-sorted.")
-    else:
-        logger.warning("Output is NOT pixel-sorted — sorting now ...")
-        sorting_tmp = out_path.with_name(out_path.stem + ".sorting.parquet")
-        sorting_tmp.unlink(missing_ok=True)
-        sort_parquet_by_pixel(out_path, sorting_tmp, row_group_size=5_000_000, ram_budget_gb=20.0)
-        sorting_tmp.replace(out_path)
-        logger.info("Pixel sort complete.")
+    for p in written_paths:
+        if not is_pixel_sorted(p, n_check=10):
+            logger.warning("%s is NOT pixel-sorted — sorting now ...", p.name)
+            sorting_tmp = p.with_name(p.stem + ".sorting.parquet")
+            sorting_tmp.unlink(missing_ok=True)
+            sort_parquet_by_pixel(p, sorting_tmp, row_group_size=5_000_000, ram_budget_gb=20.0)
+            sorting_tmp.replace(p)
+            logger.info("Pixel sort complete: %s", p.name)
 
     print(f"\nDone.")
     print(f"  Rows   : {total_rows}")
-    print(f"  Output : {out_path}")
+    print(f"  Tiles  : {len(written_paths)}")
+    for p in written_paths:
+        print(f"  Output : {p}")
+
+    return written_paths

@@ -19,7 +19,7 @@ import torch
 
 from tam.core.dataset import BAND_COLS
 from tam.core.model import TAMClassifier
-from tam.core.score import score_pixels_chunked
+from tam.core.score import score_pixels_chunked, score_location_years
 from tam.core.config import TAMConfig
 
 
@@ -386,3 +386,64 @@ class TestTS5OutputSchema:
         result = score_pixels_chunked(path, model, band_mean, band_std, device="cpu")
         assert len(result) == len(pixels)
         assert result["point_id"].nunique() == len(pixels)
+
+
+# ---------------------------------------------------------------------------
+# TS-MT  Multi-tile scoring via score_location_years
+# ---------------------------------------------------------------------------
+
+class TestMultiTileScoring:
+    """score_location_years with per-tile parquets produces identical results
+    to a single merged parquet (regression guard for tile-partitioned layout)."""
+
+    def test_multi_tile_produces_one_row_per_pixel(self, tmp_path):
+        """Passing two tile parquets for the same year yields one score per pixel."""
+        pixels_a = ["px_0000_0000", "px_0001_0000"]
+        pixels_b = ["px_0002_0000", "px_0003_0000"]
+        path_a = _make_parquet(tmp_path, pixels=pixels_a, years=[2022], filename="tileA.parquet")
+        path_b = _make_parquet(tmp_path, pixels=pixels_b, years=[2022], filename="tileB.parquet")
+        model, band_mean, band_std = _stub_model()
+
+        result = score_location_years(
+            year_parquets=[(2022, path_a), (2022, path_b)],
+            model=model,
+            band_mean=band_mean,
+            band_std=band_std,
+            device="cpu",
+            end_year=2022,
+        )
+        all_pixels = pixels_a + pixels_b
+        assert set(result["point_id"]) == set(all_pixels)
+        assert result["point_id"].nunique() == len(all_pixels)
+
+    def test_multi_tile_matches_merged_parquet(self, tmp_path):
+        """Scores from per-tile parquets match scores from a single merged parquet."""
+        pixels_a = ["px_0000_0000", "px_0001_0000"]
+        pixels_b = ["px_0002_0000", "px_0003_0000"]
+        years = [2022, 2023]
+
+        path_a = _make_parquet(tmp_path, pixels=pixels_a, years=years, filename="tileA.parquet")
+        path_b = _make_parquet(tmp_path, pixels=pixels_b, years=years, filename="tileB.parquet")
+
+        # Build merged parquet from both tiles
+        df_a = pd.read_parquet(path_a)
+        df_b = pd.read_parquet(path_b)
+        merged = pd.concat([df_a, df_b], ignore_index=True).sort_values(["point_id", "date"])
+        merged_path = tmp_path / "merged.parquet"
+        pq.write_table(pa.Table.from_pandas(merged, preserve_index=False), merged_path, row_group_size=N_OBS_PER_YEAR)
+
+        model, band_mean, band_std = _stub_model()
+
+        result_tiled = score_location_years(
+            year_parquets=[(y, p) for y in years for p in [path_a, path_b]],
+            model=model, band_mean=band_mean, band_std=band_std,
+            device="cpu", end_year=max(years),
+        ).sort_values("point_id").reset_index(drop=True)
+
+        result_merged = score_location_years(
+            year_parquets=[(y, merged_path) for y in years],
+            model=model, band_mean=band_mean, band_std=band_std,
+            device="cpu", end_year=max(years),
+        ).sort_values("point_id").reset_index(drop=True)
+
+        pd.testing.assert_frame_equal(result_tiled, result_merged, check_like=True)
