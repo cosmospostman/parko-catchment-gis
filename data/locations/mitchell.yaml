@@ -1,0 +1,6 @@
+name: "Mitchell River Catchment"
+polygon_file: data/catchments/mitchell_river.geojson
+dry_months: [6, 7, 8, 9, 10]
+notes: >
+  Mitchell River catchment, Far North Queensland. Bbox and pixel grid are
+  automatically derived from the catchment polygon boundary.

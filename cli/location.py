@@ -59,8 +59,8 @@ def _dir_size(p: "Path") -> int:
 
 def cmd_list(args: argparse.Namespace) -> None:
     locs = sorted(all_locations(), key=lambda l: l.id)
-    print(f"  {'ID':<26} {'YEARS':<14} {'AREA km²':>8}  {'PIXELS':>10}  {'CHIPS':>8}  {'PARQUET':>8}")
-    print("  " + "-" * 84)
+
+    rows = []
     for loc in locs:
         chips = loc.chips_path()
         years = loc.parquet_years()
@@ -74,7 +74,22 @@ def cmd_list(args: argparse.Namespace) -> None:
         chips_str  = _fmt_size(_dir_size(chips)) if chips.exists() else "—"
         area_str   = f"{loc.area_km2:.1f}"
         pixels_str = f"{loc.pixel_count:,}"
-        print(f"  {loc.id:<26} {years_str:<14} {area_str:>8}  {pixels_str:>10}  {chips_str:>8}  {parquet_str:>8}")
+        rows.append((loc.id, years_str, area_str, pixels_str, chips_str, parquet_str))
+
+    headers = ("ID", "YEARS", "AREA km²", "PIXELS", "CHIPS", "PARQUET")
+    # columns 0,1 are left-aligned; 2-5 are right-aligned
+    widths = [max(len(h), max(len(r[i]) for r in rows)) for i, h in enumerate(headers)]
+
+    def fmt_row(cols):
+        id_col, yr, area, px, chips, parq = cols
+        w = widths
+        return (f"  {id_col:<{w[0]}} {yr:<{w[1]}} {area:>{w[2]}}  {px:>{w[3]}}  "
+                f"{chips:>{w[4]}}  {parq:>{w[5]}}")
+
+    print(fmt_row(headers))
+    print("  " + "-" * (sum(widths) + 12))
+    for row in rows:
+        print(fmt_row(row))
 
 
 def cmd_info(args: argparse.Namespace) -> None:

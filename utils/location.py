@@ -66,6 +66,7 @@ class Location:
     sub_bboxes: dict[str, SubBbox] = field(default_factory=dict)
     signal_params: dict = field(default_factory=dict)  # raw signals: dict from YAML
     score_bbox: Optional[list[float]] = None            # if set, restrict scoring to this bbox
+    polygon_file: Optional[Path] = None                 # GeoJSON file; pixels outside polygon are dropped
 
     # ------------------------------------------------------------------
     # Bbox accessors
@@ -86,6 +87,21 @@ class Location:
     def bbox_cli(self) -> str:
         """'lon_min,lat_min,lon_max,lat_max' — for --bbox CLI argument"""
         return ",".join(str(v) for v in self.bbox)
+
+    @property
+    def geometry(self):
+        """Shapely geometry loaded from polygon_file, or None for bbox-only locations."""
+        if self.polygon_file is None:
+            return None
+        import json
+        from shapely.geometry import shape
+        with self.polygon_file.open() as fh:
+            gj = json.load(fh)
+        if gj["type"] == "FeatureCollection":
+            gj = gj["features"][0]["geometry"]
+        elif gj["type"] == "Feature":
+            gj = gj["geometry"]
+        return shape(gj)
 
     # ------------------------------------------------------------------
     # Geometry
@@ -112,12 +128,18 @@ class Location:
 
     @property
     def area_km2(self) -> float:
+        geom = self.geometry
+        if geom is not None:
+            from pyproj import Geod
+            geod = Geod(ellps="WGS84")
+            area_m2, _ = geod.geometry_area_perimeter(geom)
+            return abs(area_m2) / 1e6
         return self._lon_m * self._lat_m / 1e6
 
     @property
     def pixel_count(self) -> int:
         """Approximate S2 pixel count at 10 m resolution."""
-        return round(self._lon_m / 10) * round(self._lat_m / 10)
+        return round(self.area_km2 * 1e6 / 100)
 
     def estimated_parquet_mb(
         self,
@@ -236,6 +258,7 @@ class Location:
                 cache_dir=_cache,
                 apply_nbar=apply_nbar,
                 calibration_out=_cal_out,
+                geometry=self.geometry,
             )
             written.append(_out)
         return written
@@ -275,16 +298,39 @@ def _load_registry(locations_dir: Path = _LOCATIONS_DIR) -> dict[str, Location]:
             centroid = tuple(centroid)
         else:
             centroid = None
+
+        polygon_file: Path | None = None
+        raw_pf = data.get("polygon_file")
+        if raw_pf is not None:
+            polygon_file = _PROJECT_ROOT / raw_pf
+
+        bbox = data.get("bbox")
+        if bbox is None:
+            if polygon_file is None:
+                raise ValueError(f"{yaml_path}: must provide 'bbox' or 'polygon_file'")
+            import json
+            from shapely.geometry import shape
+            with polygon_file.open() as fh:
+                gj = json.load(fh)
+            if gj["type"] == "FeatureCollection":
+                gj = gj["features"][0]["geometry"]
+            elif gj["type"] == "Feature":
+                gj = gj["geometry"]
+            geom = shape(gj)
+            minx, miny, maxx, maxy = geom.bounds
+            bbox = [minx, miny, maxx, maxy]
+
         result[loc_id] = Location(
             id=loc_id,
             name=data["name"],
-            bbox=data["bbox"],
+            bbox=bbox,
             dry_months=data.get("dry_months", [6, 7, 8, 9, 10]),
             centroid=centroid,
             notes=data.get("notes"),
             sub_bboxes=sub_bboxes,
             signal_params=data.get("signals") or {},
             score_bbox=data.get("score_bbox"),
+            polygon_file=polygon_file,
         )
     return result
 

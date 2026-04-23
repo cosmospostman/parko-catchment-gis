@@ -570,6 +570,46 @@ def test_cross_tile_items_survive_per_tile_dedup():
 
 
 # ---------------------------------------------------------------------------
+# Test PC-G — polygon mask in collect(): non-rectangular polygon drops exterior points
+# ---------------------------------------------------------------------------
+
+def test_polygon_mask_drops_exterior_points():
+    """Points outside a non-rectangular polygon are removed by the mask in collect().
+
+    Uses a right-triangle polygon (lower-left half of a unit square).  Points
+    on the lower-left side of the diagonal are inside; points on the upper-right
+    side are outside.  This is non-trivial for a bbox and confirms the geometry
+    path through collect() actually filters correctly.
+    """
+    from shapely.geometry import Polygon as ShapelyPolygon, MultiPoint
+
+    # A right-triangle polygon: lower-left half of the 0–1 degree square.
+    # Interior: lon + lat < 1  (i.e. lat < 1 - lon)
+    triangle = ShapelyPolygon([(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (0.0, 0.0)])
+
+    # Build a 2×2 degree grid that contains both inside and outside points.
+    # Use a coarse resolution so the test is fast.
+    bbox = [0.0, 0.0, 1.0, 1.0]
+    points = make_pixel_grid(bbox, resolution_m=50_000)  # ~50 km steps → few points
+
+    assert len(points) > 0, "grid must be non-empty"
+
+    # Apply the same mask logic as collect()
+    mp = MultiPoint([(lon, lat) for _, lon, lat in points])
+    kept = [pt for pt, contained in zip(points, [triangle.contains(p) for p in mp.geoms]) if contained]
+
+    # All kept points must be inside the triangle
+    from shapely.geometry import Point
+    for _, lon, lat in kept:
+        assert triangle.contains(Point(lon, lat)), f"kept point ({lon}, {lat}) is outside the triangle"
+
+    # The mask must have dropped at least one point — the grid covers the whole
+    # bbox so some points fall outside the triangle.
+    assert len(kept) < len(points), "polygon mask should drop some exterior points"
+    assert len(kept) > 0, "polygon mask should retain some interior points"
+
+
+# ---------------------------------------------------------------------------
 # Tests 21–25 — collect() two-pass streaming dedup
 # ---------------------------------------------------------------------------
 

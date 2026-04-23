@@ -270,16 +270,34 @@ def collect(
     items=None,
     point_id_prefix: str = "px",
     calibration_out: Path | None = None,
+    geometry=None,
 ) -> None:
     """Collect S2 observations for bbox_wgs84.
 
     If *items* is provided (a pre-fetched, deduplicated STAC item list), the
     STAC search step is skipped entirely.  This lets the caller share one STAC
     search result across multiple collect() calls for the same tile.
+
+    If *geometry* is provided (a Shapely geometry), only pixels whose centres
+    fall inside the geometry are fetched and stored.  The bbox_wgs84 is still
+    used for STAC search and COG reads (unavoidable — rasterio reads rectangular
+    windows), but the chip cache and parquet output will only contain
+    polygon-interior pixels.
     """
     # --- 1. Generate pixel grid -------------------------------------------
     utm_crs = _utm_crs_for_bbox(bbox_wgs84)
     points = make_pixel_grid(bbox_wgs84, utm_crs=utm_crs, point_id_prefix=point_id_prefix)
+
+    if geometry is not None:
+        from shapely.geometry import MultiPoint
+        before = len(points)
+        mp = MultiPoint([(lon, lat) for _, lon, lat in points])
+        points = [pt for pt, contained in zip(points, [geometry.contains(p) for p in mp.geoms]) if contained]
+        logger.info(
+            "Polygon mask: %d / %d points retained (%.0f%%)",
+            len(points), before, 100 * len(points) / before if before else 0,
+        )
+
     point_coords = {pid: (lon, lat) for pid, lon, lat in points}
 
     import hashlib, pickle

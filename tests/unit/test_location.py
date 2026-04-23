@@ -238,3 +238,53 @@ def test_load_registry_sub_bboxes(tmp_path):
     assert sb.role == "presence"
     assert sb.label == "pres"
     assert sb.bbox == [145.41, -22.80, 145.43, -22.75]
+
+
+# ---------------------------------------------------------------------------
+# Test 15 — polygon_file: bbox auto-derived from GeoJSON bounds (regression)
+# ---------------------------------------------------------------------------
+
+def test_load_registry_polygon_file_derives_bbox(tmp_path):
+    import json
+    poly = {
+        "type": "Feature",
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[[145.0, -23.0], [146.0, -23.0], [146.0, -22.0], [145.0, -22.0], [145.0, -23.0]]],
+        },
+        "properties": {},
+    }
+    gj_path = tmp_path / "test_poly.geojson"
+    gj_path.write_text(json.dumps(poly))
+
+    data = {"name": "Poly Site", "polygon_file": str(gj_path), "dry_months": [6, 7, 8]}
+    _write_yaml(tmp_path, "poly_site", data)
+    loc = _load_registry(tmp_path)["poly_site"]
+
+    assert loc.bbox == pytest.approx([145.0, -23.0, 146.0, -22.0])
+    assert loc.polygon_file == gj_path
+    assert loc.geometry is not None
+
+
+# ---------------------------------------------------------------------------
+# Test 16 — polygon_file: geometry property returns correct Shapely type
+# ---------------------------------------------------------------------------
+
+def test_location_geometry_property(tmp_path):
+    import json
+    from shapely.geometry import Polygon as ShapelyPolygon
+
+    poly = {
+        "type": "Polygon",
+        "coordinates": [[[145.0, -23.0], [146.0, -23.0], [146.0, -22.0], [145.0, -22.0], [145.0, -23.0]]],
+    }
+    gj_path = tmp_path / "bare_poly.geojson"
+    gj_path.write_text(json.dumps(poly))
+
+    data = {"name": "Bare Poly", "polygon_file": str(gj_path), "dry_months": [6]}
+    _write_yaml(tmp_path, "bare", data)
+    loc = _load_registry(tmp_path)["bare"]
+
+    geom = loc.geometry
+    assert isinstance(geom, ShapelyPolygon)
+    assert geom.is_valid
