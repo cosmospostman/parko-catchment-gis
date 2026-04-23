@@ -151,7 +151,10 @@ def _main() -> None:
     if args.location:
         from utils.location import get
         loc = get(args.location)
-        parquet_path = loc.parquet_path()
+        years = loc.parquet_years()
+        if not years:
+            raise FileNotFoundError(f"No annual parquets found for {args.location}")
+        parquet_path = loc.parquet_path(years[-1])
         cal_out = args.cal_out or (_PROJECT_ROOT / "data" / "calibration" / f"{args.location}.parquet")
     else:
         parquet_path = args.parquet

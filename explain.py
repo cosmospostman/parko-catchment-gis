@@ -527,11 +527,15 @@ def explain(
     logger.info("Done — outputs in %s", out_dir)
 
 
-def _resolve_parquet(args_parquet: str | None) -> Path:
+def _resolve_parquet(args_parquet: str | None, year: int | None = None) -> Path:
     if args_parquet:
         return Path(args_parquet)
     loc = get_location("kowanyama")
-    return loc.parquet_path()
+    years = loc.parquet_years()
+    if not years:
+        raise FileNotFoundError(f"No annual parquets found for {loc.id}")
+    y = year if year is not None else years[-1]
+    return loc.parquet_path(y)
 
 
 if __name__ == "__main__":
@@ -560,7 +564,7 @@ if __name__ == "__main__":
     explain(
         checkpoint  = Path(args.checkpoint),
         ranking_csv = Path(args.ranking),
-        parquet     = _resolve_parquet(args.parquet),
+        parquet     = _resolve_parquet(args.parquet, year=args.end_year),
         out_dir     = Path(args.out),
         n           = args.n,
         end_year    = args.end_year,

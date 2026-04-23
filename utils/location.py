@@ -152,17 +152,29 @@ class Location:
     # Paths
     # ------------------------------------------------------------------
 
-    def parquet_path(self) -> Path:
-        """Canonical pixel observation parquet: data/pixels/<id>/<id>.parquet"""
-        return _PROJECT_ROOT / "data" / "pixels" / self.id / f"{self.id}.parquet"
+    def parquet_path(self, year: int) -> Path:
+        """Canonical pixel observation parquet: data/pixels/<id>/<year>/<id>.parquet"""
+        return _PROJECT_ROOT / "data" / "pixels" / self.id / str(year) / f"{self.id}.parquet"
 
-    def coords_cache_path(self, tile_id: str | None = None) -> Path:
-        """Sidecar parquet caching unique (point_id, lon, lat) for this location."""
+    def parquet_years(self) -> list[int]:
+        """Return sorted list of years that have a parquet on disk."""
+        base = _PROJECT_ROOT / "data" / "pixels" / self.id
+        years = []
+        if base.is_dir():
+            for child in base.iterdir():
+                if child.is_dir() and child.name.isdigit():
+                    p = child / f"{self.id}.parquet"
+                    if p.exists():
+                        years.append(int(child.name))
+        return sorted(years)
+
+    def coords_cache_path(self, year: int, tile_id: str | None = None) -> Path:
+        """Sidecar parquet caching unique (point_id, lon, lat) for this location and year."""
         suffix = f".{tile_id}" if tile_id else ""
-        return _PROJECT_ROOT / "data" / "pixels" / self.id / f"{self.id}.coords{suffix}.parquet"
+        return _PROJECT_ROOT / "data" / "pixels" / self.id / str(year) / f"{self.id}.coords{suffix}.parquet"
 
     def chips_path(self) -> Path:
-        """Canonical fetch chip cache: data/pixels/<id>/<id>.chips/"""
+        """Canonical fetch chip cache: data/pixels/<id>/<id>.chips/ (shared across years)"""
         return _PROJECT_ROOT / "data" / "pixels" / self.id / f"{self.id}.chips"
 
     def calibration_path(self) -> Path | None:
@@ -189,45 +201,44 @@ class Location:
 
     def fetch(
         self,
-        out_path: Optional[Path] = None,
-        start: str = "2020-01-01",
-        end: Optional[str] = None,
+        years: list[int],
         cloud_max: int = 30,
         cache_dir: Optional[Path] = None,
         apply_nbar: bool = True,
-    ) -> Path:
-        """Fetch Sentinel-2 pixel observations for this location.
+    ) -> list[Path]:
+        """Fetch Sentinel-2 pixel observations for this location, one parquet per year.
 
-        Delegates to scripts.collect_pixel_observations.collect().
-        Output is written to data/pixels/<id>/<id>.parquet by default.
+        Output is written to data/pixels/<id>/<year>/<id>.parquet.
+        The chip cache is shared across years.
 
-        Returns the output parquet path.
+        Returns the list of written parquet paths.
         """
         from utils.pixel_collector import collect  # noqa: PLC0415
         from utils.s2_tiles import bbox_to_tile_ids  # noqa: PLC0415
 
-        _out = out_path or self.parquet_path()
-        _end = end or date.today().isoformat()
         _cache = cache_dir or self.cache_dir()
-
-        _out.parent.mkdir(parents=True, exist_ok=True)
 
         _cal_out: Path | None = None
         if len(bbox_to_tile_ids(tuple(self.bbox))) > 1:
             _cal_out = _PROJECT_ROOT / "data" / "calibration" / f"{self.id}.parquet"
             _cal_out.parent.mkdir(parents=True, exist_ok=True)
 
-        collect(
-            bbox_wgs84=self.bbox,
-            start=start,
-            end=_end,
-            out_path=_out,
-            cloud_max=cloud_max,
-            cache_dir=_cache,
-            apply_nbar=apply_nbar,
-            calibration_out=_cal_out,
-        )
-        return _out
+        written: list[Path] = []
+        for year in sorted(years):
+            _out = self.parquet_path(year)
+            _out.parent.mkdir(parents=True, exist_ok=True)
+            collect(
+                bbox_wgs84=self.bbox,
+                start=f"{year}-01-01",
+                end=f"{year}-12-31",
+                out_path=_out,
+                cloud_max=cloud_max,
+                cache_dir=_cache,
+                apply_nbar=apply_nbar,
+                calibration_out=_cal_out,
+            )
+            written.append(_out)
+        return written
 
 
 # ---------------------------------------------------------------------------

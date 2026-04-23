@@ -200,12 +200,20 @@ def score_pixels_chunked(
     end_year: int | None = None,
     decay: float = 0.7,
     n_total_pixels: int | None = None,
+    # accumulators — pass across years to merge results before final aggregation
+    _all_pids:  list | None = None,
+    _all_years: list | None = None,
+    _all_probs: list | None = None,
 ) -> pd.DataFrame:
-    """Score all pixels in parquet with a three-stage concurrent pipeline.
+    """Score all pixels in a single-year parquet with a three-stage concurrent pipeline.
 
     Stage 1 (reader thread):          reads row groups → raw DataFrame queue
     Stage 2 (n_prep_workers threads): numba preprocessing → pinned tensor queue
     Stage 3 (main thread / GPU):      inference
+
+    When called across multiple years, pass the same _all_pids/_all_years/_all_probs
+    lists and only call aggregate_year_probs() after the final year.  The convenience
+    wrapper score_location_years() handles this automatically.
 
     Returns a DataFrame with columns: point_id, prob_tam.
     """
@@ -298,9 +306,9 @@ def score_pixels_chunked(
     prep_pool = ThreadPoolExecutor(max_workers=n_prep_workers)
     prep_futures = [prep_pool.submit(_preprocessor) for _ in range(n_prep_workers)]
 
-    all_pids:  list[np.ndarray] = []
-    all_years: list[np.ndarray] = []
-    all_probs: list[np.ndarray] = []
+    all_pids:  list[np.ndarray] = _all_pids  if _all_pids  is not None else []
+    all_years: list[np.ndarray] = _all_years if _all_years is not None else []
+    all_probs: list[np.ndarray] = _all_probs if _all_probs is not None else []
     n_scored = 0
     sentinels_seen = 0
 
@@ -325,3 +333,59 @@ def score_pixels_chunked(
     if not end_year:
         end_year = int(np.concatenate(all_years).max())
     return aggregate_year_probs(all_pids, all_years, all_probs, end_year=end_year, decay=decay)
+
+
+def score_location_years(
+    year_parquets: list[tuple[int, Path]],
+    model: TAMClassifier,
+    band_mean: np.ndarray,
+    band_std: np.ndarray,
+    scl_purity_min: float = 0.5,
+    min_obs_per_year: int = 8,
+    batch_size: int = 4096,
+    n_prep_workers: int = 4,
+    device: str | None = None,
+    tile_id: str | None = None,
+    end_year: int | None = None,
+    decay: float = 0.7,
+    n_total_pixels: int | None = None,
+) -> pd.DataFrame:
+    """Score a location across multiple annual parquets and aggregate.
+
+    year_parquets: [(year, path), ...] — must be pixel-sorted parquets.
+
+    Accumulates (pid, year, prob) triples across all years then calls
+    aggregate_year_probs() once, so decay weighting is globally consistent.
+    """
+    all_pids:  list[np.ndarray] = []
+    all_years: list[np.ndarray] = []
+    all_probs: list[np.ndarray] = []
+
+    _eff_end_year = end_year or max(y for y, _ in year_parquets)
+
+    for year, path in sorted(year_parquets):
+        if end_year and year > end_year:
+            logger.info("Skipping %d (past end_year=%d)", year, end_year)
+            continue
+        logger.info("Scoring year %d — %s", year, path.name)
+        score_pixels_chunked(
+            parquet=path,
+            model=model,
+            band_mean=band_mean,
+            band_std=band_std,
+            scl_purity_min=scl_purity_min,
+            min_obs_per_year=min_obs_per_year,
+            batch_size=batch_size,
+            n_prep_workers=n_prep_workers,
+            device=device,
+            tile_id=tile_id,
+            end_year=_eff_end_year,
+            decay=decay,
+            n_total_pixels=n_total_pixels,
+            _all_pids=all_pids,
+            _all_years=all_years,
+            _all_probs=all_probs,
+        )
+
+    logger.info("Aggregating scores across %d years ...", len(year_parquets))
+    return aggregate_year_probs(all_pids, all_years, all_probs, end_year=_eff_end_year, decay=decay)

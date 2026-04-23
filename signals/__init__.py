@@ -16,7 +16,7 @@ from utils.location import get
 from signals import NirCvSignal, QualityParams
 
 loc    = get("longreach")
-df     = pd.read_parquet(loc.parquet_path())
+df     = pd.read_parquet(loc.parquet_path(2022))
 result = NirCvSignal().diagnose(df, loc, out_dir=Path("outputs/longreach-nir-cv"))
 print(result["separability"])
 

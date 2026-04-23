@@ -25,7 +25,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from tam.utils import label_pixels, save_pixel_ranking, summarise
 from signals._shared import ensure_pixel_sorted
 from tam.core.config import TAMConfig
-from tam.core.score import score_pixels_chunked
+from tam.core.score import score_location_years
 from tam.core.train import load_tam, train_tam
 from utils.location import get as get_location
 
@@ -154,10 +154,15 @@ def _cmd_score(args: argparse.Namespace) -> None:
 
     checkpoint_dir = Path(args.checkpoint)
     loc = get_location(args.location)
-    parquet = loc.parquet_path()
 
-    if not parquet.exists():
-        logger.error("Parquet not found: %s — run `python cli/location.py fetch <location>` first", parquet)
+    years = loc.parquet_years()
+    if not years:
+        logger.error("No annual parquets found for %s — run `python cli/location.py fetch %s --years ...` first", loc.id, loc.id)
+        sys.exit(1)
+    if args.end_year:
+        years = [y for y in years if y <= args.end_year]
+    if not years:
+        logger.error("No parquets found for years up to %d", args.end_year)
         sys.exit(1)
 
     tile_id = getattr(args, "tile", None)
@@ -165,23 +170,25 @@ def _cmd_score(args: argparse.Namespace) -> None:
     out_dir = out_csv.parent if out_csv else checkpoint_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info("Location: %s  parquet: %s  checkpoint: %s", loc.name, parquet, checkpoint_dir)
+    logger.info("Location: %s  years: %s  checkpoint: %s", loc.name, years, checkpoint_dir)
 
-    # Load pixel coords for labeling (cached sidecar to avoid scanning 2000+ row groups)
+    # Load pixel coords from the first available year (coords are stable across years)
     tile_prefix = f"_{tile_id}_" if tile_id else None
-    coords_cache = loc.coords_cache_path(tile_id=tile_id)
+    first_year = years[0]
+    coords_cache = loc.coords_cache_path(first_year, tile_id=tile_id)
+    first_parquet = loc.parquet_path(first_year)
 
-    if coords_cache and coords_cache.exists():
+    if coords_cache.exists():
         logger.info("Loading pixel coords from cache ...")
         pixel_coords = pd.read_parquet(coords_cache)
     else:
-        logger.info("Resolving labels ...")
-        pf_coords = pq.ParquetFile(parquet)
+        logger.info("Resolving pixel coords from %d parquet ...", first_year)
+        pf_coords = pq.ParquetFile(first_parquet)
         read_coord_cols = ["point_id", "lon", "lat"] + (["item_id"] if tile_id else [])
         n_rg_coords = pf_coords.metadata.num_row_groups
 
         def _read_coord_rg(rg: int) -> pd.DataFrame:
-            pf = pq.ParquetFile(parquet)
+            pf = pq.ParquetFile(first_parquet)
             chunk = pf.read_row_group(rg, columns=read_coord_cols).to_pandas()
             if tile_prefix:
                 chunk = chunk[chunk["item_id"].str.contains(tile_prefix, regex=False)]
@@ -205,21 +212,24 @@ def _cmd_score(args: argparse.Namespace) -> None:
             .first()
             .reset_index()
         )
-        if coords_cache:
-            pixel_coords.to_parquet(coords_cache, index=False)
-            logger.info("Cached pixel coords to %s", coords_cache)
+        pixel_coords.to_parquet(coords_cache, index=False)
+        logger.info("Cached pixel coords to %s", coords_cache)
 
     logger.info("Unique pixels after tile filter: %d", len(pixel_coords))
 
     labelled = label_pixels(pixel_coords, loc)
 
-    parquet_sorted = ensure_pixel_sorted(parquet)
+    year_parquets = [(y, ensure_pixel_sorted(loc.parquet_path(y))) for y in years]
+
     logger.info("Loading checkpoint from %s ...", checkpoint_dir)
     model, band_mean, band_std = load_tam(checkpoint_dir, device=args.device)
 
-    logger.info("Scoring all pixels (chunked) ...")
-    scores = score_pixels_chunked(
-        parquet_sorted, model, band_mean, band_std,
+    logger.info("Scoring %d annual parquets ...", len(year_parquets))
+    scores = score_location_years(
+        year_parquets=year_parquets,
+        model=model,
+        band_mean=band_mean,
+        band_std=band_std,
         scl_purity_min=args.scl_purity,
         device=args.device,
         tile_id=tile_id,
