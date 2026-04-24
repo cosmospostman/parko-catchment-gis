@@ -510,7 +510,7 @@ def sort_parquet_by_pixel(
     for i in range(n_rg):
         tbl = pf.read_row_group(i, columns=["point_id"])
         ids = tbl.column("point_id")
-        row_coords = pc.list_flatten(pc.list_slice(pc.split_pattern(ids, "_"), 1, 2))
+        row_coords = pc.list_flatten(pc.list_slice(pc.split_pattern(ids, "_"), 2, 3))
         all_coords.update(pc.unique(row_coords).to_pylist())
         if i % 400 == 0:
             print(f"  [sort] coord scan: {i}/{n_rg}, {len(all_coords)} coords so far", flush=True)
@@ -564,7 +564,7 @@ def sort_parquet_by_pixel(
             def _read_and_bucket(rg_idx: int) -> None:
                 batch = pf.read_row_group(rg_idx)
                 ids = batch.column("point_id")
-                row_coords = pc.list_flatten(pc.list_slice(pc.split_pattern(ids, "_"), 1, 2))
+                row_coords = pc.list_flatten(pc.list_slice(pc.split_pattern(ids, "_"), 2, 3))
                 in_pass = pc.is_in(row_coords, value_set=coord_set_arr)
                 if not pc.any(in_pass).as_py():
                     with buckets_lock:

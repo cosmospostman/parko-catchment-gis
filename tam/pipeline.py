@@ -7,7 +7,7 @@ Usage
 
     # Score any location with an existing checkpoint
     python -m tam.pipeline score --checkpoint outputs/tam-v1_spectral \\
-        --location longreach-8x8km --end-year 2024
+        --location longreach --years 2022 2023 2024
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from tam.utils import label_pixels, save_pixel_ranking, summarise
 from signals._shared import ensure_pixel_sorted
 from tam.core.config import TAMConfig
-from tam.core.score import score_location_years
+from tam.core.score import score_location_years, score_tiles_chunked
 from tam.core.train import load_tam, train_tam
 from utils.location import get as get_location
 
@@ -159,13 +159,14 @@ def _cmd_score(args: argparse.Namespace) -> None:
     if not tile_paths_by_year:
         logger.error("No tile parquets found for %s — run `python cli/location.py fetch %s --years ...` first", loc.id, loc.id)
         sys.exit(1)
-    if args.end_year:
-        tile_paths_by_year = {y: ps for y, ps in tile_paths_by_year.items() if y <= args.end_year}
+    if args.years:
+        tile_paths_by_year = {y: ps for y, ps in tile_paths_by_year.items() if y in args.years}
     if not tile_paths_by_year:
-        logger.error("No parquets found for years up to %d", args.end_year)
+        logger.error("No parquets found for years %s", args.years)
         sys.exit(1)
 
     years = sorted(tile_paths_by_year)
+    end_year = max(years)
     out_csv = Path(args.out) if getattr(args, "out", None) else None
     out_dir = out_csv.parent if out_csv else checkpoint_dir
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -226,6 +227,37 @@ def _cmd_score(args: argparse.Namespace) -> None:
     logger.info("Loading checkpoint from %s ...", checkpoint_dir)
     model, band_mean, band_std = load_tam(checkpoint_dir, device=args.device)
 
+    if getattr(args, "out_parquet", False):
+        # Build {tile_id: [(year, pixel-sorted-path), ...]} for score_tiles_chunked
+        tile_year_map: dict[str, list[tuple[int, Path]]] = {}
+        for y, paths in sorted(tile_paths_by_year.items()):
+            for p in paths:
+                tid = p.stem  # e.g. "54LWH"
+                tile_year_map.setdefault(tid, []).append((y, ensure_pixel_sorted(p)))
+
+        parquet_out_dir = (
+            PROJECT_ROOT / "outputs" / loc.id / checkpoint_dir.name / str(end_year)
+        )
+        logger.info(
+            "Scoring %d tiles → parquet shards in %s ...",
+            len(tile_year_map), parquet_out_dir,
+        )
+        final_paths = score_tiles_chunked(
+            tile_year_parquets=tile_year_map,
+            model=model,
+            band_mean=band_mean,
+            band_std=band_std,
+            out_dir=parquet_out_dir,
+            scl_purity_min=args.scl_purity,
+            device=args.device,
+            end_year=end_year,
+            decay=args.decay,
+            batch_size=args.batch_size,
+            n_tile_workers=getattr(args, "n_tile_workers", 1),
+        )
+        logger.info("Done — %d tile parquets in %s", len(final_paths), parquet_out_dir)
+        return
+
     logger.info("Scoring %d tile-year parquets ...", len(year_parquets))
     scores = score_location_years(
         year_parquets=year_parquets,
@@ -234,7 +266,7 @@ def _cmd_score(args: argparse.Namespace) -> None:
         band_std=band_std,
         scl_purity_min=args.scl_purity,
         device=args.device,
-        end_year=args.end_year,
+        end_year=end_year,
         decay=args.decay,
         batch_size=args.batch_size,
         n_total_pixels=len(pixel_coords),
@@ -257,7 +289,7 @@ def _cmd_score(args: argparse.Namespace) -> None:
 def _add_common_score_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--scl-purity",  type=float, default=0.5)
     p.add_argument("--device",      default=None, help="cpu / cuda (auto-detect if omitted)")
-    p.add_argument("--end-year",    type=int, default=None)
+    p.add_argument("--years",       type=int, nargs="+", default=None, metavar="YEAR")
     p.add_argument("--decay",       type=float, default=0.7)
     p.add_argument("--batch-size",  type=int, default=4096)
 
@@ -289,7 +321,9 @@ if __name__ == "__main__":
     p_score = sub.add_parser("score", help="Score a location with an existing checkpoint")
     p_score.add_argument("--checkpoint", required=True, help="Checkpoint directory")
     p_score.add_argument("--location",   required=True, help="Location ID")
-    p_score.add_argument("--out",        default=None, help="Output CSV path (overrides default in checkpoint dir)")
+    p_score.add_argument("--out",          default=None, help="Output CSV path (overrides default in checkpoint dir)")
+    p_score.add_argument("--out-parquet", action="store_true", help="Write tile-sharded parquet instead of CSV")
+    p_score.add_argument("--n-tile-workers", type=int, default=1, help="Parallel tile workers for parquet output (default: 1)")
     _add_common_score_args(p_score)
 
     args = parser.parse_args()

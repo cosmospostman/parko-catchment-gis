@@ -98,3 +98,96 @@ def bbox_to_tile_ids(bbox: tuple[float, float, float, float]) -> list[str]:
     name_col = "Name" if "Name" in grid.columns else "name"
     hits = grid[grid.geometry.intersects(query_box)]
     return sorted(hits[name_col].tolist())
+
+
+def geometry_to_tile_ids(
+    geometry,
+    bbox: tuple[float, float, float, float],
+) -> list[str]:
+    """Return S2 MGRS tile IDs needed to cover all catchment pixels.
+
+    A tile can be skipped if every part of the catchment that falls within it
+    also falls within the overlap zone of at least one neighbouring tile — because
+    those pixels will be read from the neighbour instead.
+
+    The algorithm iterates to convergence: removing a tile may expose another tile
+    as now-entirely-covered, so we repeat until the set stabilises.
+
+    Parameters
+    ----------
+    geometry:
+        Shapely geometry (polygon or multipolygon) of the catchment.
+    bbox:
+        (lon_min, lat_min, lon_max, lat_max) envelope of *geometry*.
+
+    Returns
+    -------
+    list[str]
+        Sorted tile IDs that will actually produce observations.
+    """
+    from shapely.geometry import box
+
+    grid = get_au_tile_grid()
+    name_col = "Name" if "Name" in grid.columns else "name"
+
+    # Candidates: tiles whose footprint intersects the catchment polygon itself
+    # (not just the bbox envelope).
+    candidates = grid[grid.geometry.intersects(geometry)]
+    tile_geoms: dict[str, object] = {
+        row[name_col]: row.geometry for _, row in candidates.iterrows()
+    }
+
+    if len(tile_geoms) <= 1:
+        return sorted(tile_geoms)
+
+    # Precompute: catchment portion inside each tile.
+    catchment_in: dict[str, object] = {
+        tid: tg.intersection(geometry) for tid, tg in tile_geoms.items()
+    }
+    # Precompute: pairwise overlap between tiles (symmetric, skip empties).
+    tile_ids = sorted(tile_geoms)
+    overlaps: dict[str, list[str]] = {tid: [] for tid in tile_ids}
+    for i, a in enumerate(tile_ids):
+        for b in tile_ids[i + 1:]:
+            ov = tile_geoms[a].intersection(tile_geoms[b])
+            if not ov.is_empty:
+                overlaps[a].append(b)
+                overlaps[b].append(a)
+
+    # Iteratively drop tiles whose entire catchment intersection is covered by
+    # the union of overlap zones with tiles that are still in the kept set.
+    kept = set(tile_ids)
+    changed = True
+    while changed:
+        changed = False
+        for tid in sorted(kept):   # deterministic order
+            ci = catchment_in[tid]
+            if ci.is_empty:
+                kept.discard(tid)
+                changed = True
+                continue
+            # Union of overlap zones between this tile and each kept neighbour.
+            covered = None
+            for nbr in overlaps[tid]:
+                if nbr not in kept:
+                    continue
+                ov = tile_geoms[tid].intersection(tile_geoms[nbr])
+                covered = ov if covered is None else covered.union(ov)
+            if covered is None:
+                continue
+            # If the catchment inside this tile is entirely within the covered
+            # zone, this tile adds nothing that a neighbour won't provide.
+            unique = ci.difference(covered)
+            if unique.is_empty:
+                kept.discard(tid)
+                changed = True
+                logger.debug("geometry_to_tile_ids: dropping %s (entirely in overlap zone)", tid)
+
+    skipped = [t for t in tile_ids if t not in kept]
+    if skipped:
+        logger.info(
+            "geometry_to_tile_ids: skipping %d tile(s) whose catchment pixels "
+            "are covered by neighbours: %s",
+            len(skipped), skipped,
+        )
+    return sorted(kept)

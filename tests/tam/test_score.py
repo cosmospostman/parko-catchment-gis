@@ -19,7 +19,7 @@ import torch
 
 from tam.core.dataset import BAND_COLS
 from tam.core.model import TAMClassifier
-from tam.core.score import score_pixels_chunked, score_location_years
+from tam.core.score import score_pixels_chunked, score_location_years, score_tiles_chunked
 from tam.core.config import TAMConfig
 
 
@@ -447,3 +447,288 @@ class TestMultiTileScoring:
         ).sort_values("point_id").reset_index(drop=True)
 
         pd.testing.assert_frame_equal(result_tiled, result_merged, check_like=True)
+
+
+# ---------------------------------------------------------------------------
+# TestTileShardedOutput — score_tiles_chunked
+# ---------------------------------------------------------------------------
+
+class TestTileShardedOutput:
+    """score_tiles_chunked writes one parquet per tile with uint8 prob_tam."""
+
+    def test_one_file_per_tile(self, tmp_path):
+        pixels_a = ["px_0000_0000", "px_0001_0000"]
+        pixels_b = ["px_0002_0000", "px_0003_0000"]
+        path_a = _make_parquet(tmp_path, pixels=pixels_a, years=[2022, 2023],
+                               tile_tag="54LWH", filename="54LWH.parquet")
+        path_b = _make_parquet(tmp_path, pixels=pixels_b, years=[2022, 2023],
+                               tile_tag="54LWJ", filename="54LWJ.parquet")
+        model, band_mean, band_std = _stub_model()
+
+        out_dir = tmp_path / "scores"
+        final_paths = score_tiles_chunked(
+            tile_year_parquets={
+                "54LWH": [(2022, path_a), (2023, path_a)],
+                "54LWJ": [(2022, path_b), (2023, path_b)],
+            },
+            model=model,
+            band_mean=band_mean,
+            band_std=band_std,
+            out_dir=out_dir,
+            device="cpu",
+            end_year=2023,
+        )
+
+        assert len(final_paths) == 2
+        names = {p.name for p in final_paths}
+        assert "54LWH.scores.parquet" in names
+        assert "54LWJ.scores.parquet" in names
+
+    def test_schema_uint8_in_range(self, tmp_path):
+        path = _make_parquet(tmp_path, pixels=["px_0000_0000", "px_0001_0000"],
+                             years=[2022], tile_tag="54LWH", filename="54LWH.parquet")
+        model, band_mean, band_std = _stub_model()
+
+        out_dir = tmp_path / "scores"
+        final_paths = score_tiles_chunked(
+            tile_year_parquets={"54LWH": [(2022, path)]},
+            model=model, band_mean=band_mean, band_std=band_std,
+            out_dir=out_dir, device="cpu", end_year=2022,
+        )
+
+        import pyarrow.parquet as pq
+        tbl = pq.read_table(final_paths[0])
+        assert tbl.schema.field("point_id").type == pa.string()
+        assert tbl.schema.field("prob_tam").type == pa.uint8()
+        scores = tbl.column("prob_tam").to_pylist()
+        assert all(0 <= v <= 100 for v in scores)
+
+    def test_pixels_partitioned_by_tile(self, tmp_path):
+        pixels_a = ["px_0000_0000", "px_0001_0000"]
+        pixels_b = ["px_0002_0000", "px_0003_0000"]
+        path_a = _make_parquet(tmp_path, pixels=pixels_a, years=[2022],
+                               tile_tag="54LWH", filename="54LWH.parquet")
+        path_b = _make_parquet(tmp_path, pixels=pixels_b, years=[2022],
+                               tile_tag="54LWJ", filename="54LWJ.parquet")
+        model, band_mean, band_std = _stub_model()
+
+        out_dir = tmp_path / "scores"
+        final_paths = score_tiles_chunked(
+            tile_year_parquets={
+                "54LWH": [(2022, path_a)],
+                "54LWJ": [(2022, path_b)],
+            },
+            model=model, band_mean=band_mean, band_std=band_std,
+            out_dir=out_dir, device="cpu", end_year=2022,
+        )
+
+        by_name = {p.name: pd.read_parquet(p) for p in final_paths}
+        pids_a = set(by_name["54LWH.scores.parquet"]["point_id"])
+        pids_b = set(by_name["54LWJ.scores.parquet"]["point_id"])
+        assert pids_a == set(pixels_a)
+        assert pids_b == set(pixels_b)
+        assert pids_a.isdisjoint(pids_b)
+
+    def test_staging_cleaned_up(self, tmp_path):
+        path = _make_parquet(tmp_path, pixels=["px_0000_0000"], years=[2022],
+                             tile_tag="54LWH", filename="54LWH.parquet")
+        model, band_mean, band_std = _stub_model()
+
+        out_dir = tmp_path / "scores"
+        score_tiles_chunked(
+            tile_year_parquets={"54LWH": [(2022, path)]},
+            model=model, band_mean=band_mean, band_std=band_std,
+            out_dir=out_dir, device="cpu", end_year=2022,
+        )
+        assert not (out_dir / "staging").exists()
+
+    def test_idempotent_staging_skip(self, tmp_path):
+        """A pre-existing staging file is reused and produces the same final result."""
+        pixels = ["px_0000_0000", "px_0001_0000"]
+        path = _make_parquet(tmp_path, pixels=pixels, years=[2022],
+                             tile_tag="54LWH", filename="54LWH.parquet")
+        model, band_mean, band_std = _stub_model()
+
+        out_dir = tmp_path / "scores"
+        kwargs = dict(
+            tile_year_parquets={"54LWH": [(2022, path)]},
+            model=model, band_mean=band_mean, band_std=band_std,
+            out_dir=out_dir, device="cpu", end_year=2022,
+        )
+
+        paths1 = score_tiles_chunked(**kwargs)
+        df1 = pd.read_parquet(paths1[0]).sort_values("point_id").reset_index(drop=True)
+
+        # Remove final output so phase 2 re-runs, but leave no staging (already cleaned)
+        paths1[0].unlink()
+
+        paths2 = score_tiles_chunked(**kwargs)
+        df2 = pd.read_parquet(paths2[0]).sort_values("point_id").reset_index(drop=True)
+
+        pd.testing.assert_frame_equal(df1, df2)
+
+
+# ---------------------------------------------------------------------------
+# TS-BUF  Reader buffer-split correctness
+#
+# The _reader stage in score_pixels_chunked accumulates row groups into a
+# buffer of size buffer_row_groups, then calls _emit().  _emit() holds back
+# the trailing pixel's rows as a "leftover" so that pixel-year windows are
+# never split across two emitted chunks.
+#
+# These tests verify that scores are identical regardless of how row groups
+# are partitioned into buffers — i.e. the leftover logic is transparent to
+# the inference result.
+# ---------------------------------------------------------------------------
+
+def _make_split_parquet(
+    tmp_path: Path,
+    pixels: list[str],
+    obs_per_rg: int,
+    filename: str = "pixels.parquet",
+) -> Path:
+    """Write a parquet where each pixel's observations are split across
+    multiple small row groups of exactly obs_per_rg rows.
+
+    This maximises the chance that a pixel-year window straddles a buffer
+    boundary when buffer_row_groups=1.
+    """
+    rng = np.random.default_rng(99)
+    n_total = N_OBS_PER_YEAR
+    rows = []
+    for pid in pixels:
+        dates = pd.date_range("2023-01-15", periods=n_total, freq="23D")
+        for d in dates:
+            rows.append({
+                "point_id": pid,
+                "date": d,
+                "scl_purity": 1.0,
+                **_band_row(rng),
+            })
+    df = pd.DataFrame(rows)
+    df["date"] = pd.to_datetime(df["date"]).astype("datetime64[us]")
+    path = tmp_path / filename
+    pq.write_table(
+        pa.Table.from_pandas(df, preserve_index=False),
+        path,
+        row_group_size=obs_per_rg,
+    )
+    return path
+
+
+class TestReaderBufferSplit:
+    """buffer_row_groups=1 forces a flush after every row group, maximising
+    the frequency with which pixel-year windows straddle buffer boundaries.
+    Scores must match those produced with a large buffer (no splitting)."""
+
+    def test_split_scores_match_no_split_single_pixel(self, tmp_path):
+        """Single pixel whose obs span many row groups: split vs no-split must agree."""
+        path = _make_split_parquet(tmp_path, pixels=["px1"], obs_per_rg=3)
+        model, band_mean, band_std = _stub_model()
+
+        r_split = score_pixels_chunked(
+            path, model, band_mean, band_std,
+            device="cpu", buffer_row_groups=1,
+        )
+        r_bulk = score_pixels_chunked(
+            path, model, band_mean, band_std,
+            device="cpu", buffer_row_groups=999,
+        )
+
+        assert set(r_split["point_id"]) == {"px1"}
+        s_split = r_split.loc[r_split["point_id"] == "px1", "prob_tam"].iloc[0]
+        s_bulk  = r_bulk.loc[r_bulk["point_id"] == "px1",  "prob_tam"].iloc[0]
+        assert s_split == pytest.approx(s_bulk, abs=1e-5)
+
+    def test_split_scores_match_no_split_multiple_pixels(self, tmp_path):
+        """Multiple pixels interleaved across many small row groups."""
+        pixels = ["px1", "px2", "px3"]
+        path = _make_split_parquet(tmp_path, pixels=pixels, obs_per_rg=4)
+        model, band_mean, band_std = _stub_model()
+
+        r_split = score_pixels_chunked(
+            path, model, band_mean, band_std,
+            device="cpu", buffer_row_groups=1,
+        ).sort_values("point_id").reset_index(drop=True)
+
+        r_bulk = score_pixels_chunked(
+            path, model, band_mean, band_std,
+            device="cpu", buffer_row_groups=999,
+        ).sort_values("point_id").reset_index(drop=True)
+
+        assert set(r_split["point_id"]) == set(pixels)
+        pd.testing.assert_frame_equal(r_split, r_bulk, check_like=True)
+
+    def test_split_produces_one_row_per_pixel(self, tmp_path):
+        """buffer_row_groups=1 must not create duplicate rows for the same pixel."""
+        pixels = ["px1", "px2", "px3", "px4"]
+        path = _make_split_parquet(tmp_path, pixels=pixels, obs_per_rg=3)
+        model, band_mean, band_std = _stub_model()
+
+        result = score_pixels_chunked(
+            path, model, band_mean, band_std,
+            device="cpu", buffer_row_groups=1,
+        )
+
+        assert result["point_id"].nunique() == len(pixels)
+        assert len(result) == len(pixels)
+
+    def test_split_boundary_pixel_not_dropped(self, tmp_path):
+        """The last pixel in a flushed buffer must not be silently dropped.
+
+        _emit strips the trailing pixel into leftover.  If that leftover is
+        never re-emitted (bug: leftover only emitted when buf is non-empty),
+        the last pixel in the file disappears.
+        """
+        # Write exactly one pixel whose obs fill exactly one row group.
+        # With buffer_row_groups=1 this pixel is always the boundary pixel
+        # at the final flush — it ends up in leftover, then must be emitted
+        # by the post-loop "leftover = _emit(buffer, leftover, is_last=True)"
+        # followed by "if not leftover.empty: raw_q.put(leftover)".
+        rng = np.random.default_rng(42)
+        rows = []
+        for d in pd.date_range("2023-01-15", periods=N_OBS_PER_YEAR, freq="23D"):
+            rows.append({"point_id": "px_last", "date": d, "scl_purity": 1.0, **_band_row(rng)})
+        df = pd.DataFrame(rows)
+        df["date"] = pd.to_datetime(df["date"]).astype("datetime64[us]")
+        path = tmp_path / "last.parquet"
+        # Single row group — pixel is always the boundary/leftover candidate.
+        pq.write_table(pa.Table.from_pandas(df, preserve_index=False), path,
+                       row_group_size=N_OBS_PER_YEAR)
+
+        model, band_mean, band_std = _stub_model()
+        result = score_pixels_chunked(
+            path, model, band_mean, band_std,
+            device="cpu", buffer_row_groups=1,
+        )
+
+        assert "px_last" in result["point_id"].values
+
+    def test_split_leftover_when_entire_buffer_is_one_pixel(self, tmp_path):
+        """When every row in the buffer belongs to the boundary pixel, the chunk
+        after stripping is empty — _emit must not enqueue an empty DataFrame,
+        and the pixel must still be scored correctly on the next flush."""
+        rng = np.random.default_rng(7)
+        # Two pixels, each with exactly obs_per_rg observations, so each row
+        # group is entirely one pixel.  With buffer_row_groups=1, every flush
+        # sees a chunk that is all one pixel — the boundary strip leaves an
+        # empty chunk (not emitted) and the whole thing goes to leftover.
+        # The leftover should then be prepended to the next buffer.
+        rows = []
+        for pid in ["px_a", "px_b"]:
+            for d in pd.date_range("2023-01-15", periods=N_OBS_PER_YEAR, freq="23D"):
+                rows.append({"point_id": pid, "date": d, "scl_purity": 1.0, **_band_row(rng)})
+        df = pd.DataFrame(rows)
+        df["date"] = pd.to_datetime(df["date"]).astype("datetime64[us]")
+        path = tmp_path / "twopix.parquet"
+        pq.write_table(pa.Table.from_pandas(df, preserve_index=False), path,
+                       row_group_size=N_OBS_PER_YEAR)
+
+        model, band_mean, band_std = _stub_model()
+        result = score_pixels_chunked(
+            path, model, band_mean, band_std,
+            device="cpu", buffer_row_groups=1,
+        )
+
+        assert set(result["point_id"]) == {"px_a", "px_b"}
+        assert len(result) == 2

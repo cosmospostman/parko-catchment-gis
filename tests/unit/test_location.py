@@ -354,6 +354,42 @@ def test_parquet_years_returns_sorted_years(tmp_path, monkeypatch):
     assert loc.parquet_years() == [2021, 2023, 2024]
 
 
+# ---------------------------------------------------------------------------
+# Test — Mitchell River tile_ids() returns the expected 17 tiles (integration)
+# ---------------------------------------------------------------------------
+
+def test_mitchell_tile_ids():
+    """tile_ids() for the Mitchell River catchment returns exactly the 17 expected tiles.
+
+    This is an integration test against the real catchment polygon and S2 tile grid.
+    It guards against regressions in geometry_to_tile_ids() — both over-selection
+    (fetching tiles whose catchment pixels are entirely in a neighbour overlap zone)
+    and under-selection (dropping tiles that have genuinely unique catchment coverage).
+    """
+    from utils.location import get
+
+    loc = get("mitchell")
+    assert loc.tile_ids() == [
+        "54KYF",
+        "54KYG",
+        "54KZE",
+        "54KZF",
+        "54KZG",
+        "54LWH",
+        "54LWJ",
+        "54LXH",
+        "54LXJ",
+        "54LYH",
+        "54LYJ",
+        "54LZH",
+        "55KBA",
+        "55KBB",
+        "55KCA",
+        "55KCB",
+        "55LBC",
+    ]
+
+
 def test_parquet_tile_paths_ignores_sidecar_files(tmp_path, monkeypatch):
     """parquet_tile_paths() excludes coords, shard, and by-pixel sidecar files."""
     import utils.location as loc_mod

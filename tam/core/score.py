@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from queue import Queue
 from threading import Thread
@@ -389,3 +390,216 @@ def score_location_years(
 
     logger.info("Aggregating scores across %d years ...", len(year_parquets))
     return aggregate_year_probs(all_pids, all_years, all_probs, end_year=_eff_end_year, decay=decay)
+
+
+_STAGING_WRITE_OPTS = dict(
+    compression="zstd",
+    compression_level=3,
+    use_dictionary=["point_id"],
+    write_statistics=False,
+)
+
+
+def score_tile_year(
+    parquet: Path,
+    tile_id: str,
+    year: int,
+    model: TAMClassifier,
+    band_mean: np.ndarray,
+    band_std: np.ndarray,
+    staging_dir: Path,
+    scl_purity_min: float = 0.5,
+    min_obs_per_year: int = 8,
+    batch_size: int = 4096,
+    n_prep_workers: int = 4,
+    device: str | None = None,
+) -> Path:
+    """Score a single (tile_id, year) parquet and write a staging parquet.
+
+    The staging parquet has columns: point_id (str), year (int16), prob_tam_raw (float32).
+    If the staging file already exists it is returned immediately (idempotent / crash-safe).
+
+    Returns the staging parquet path.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    out_path = staging_dir / f"{tile_id}_{year}.parquet"
+    if out_path.exists():
+        logger.info("Staging file exists, skipping %s year=%d", tile_id, year)
+        return out_path
+
+    logger.info("Scoring tile=%s year=%d ...", tile_id, year)
+    scores = score_pixels_chunked(
+        parquet=parquet,
+        model=model,
+        band_mean=band_mean,
+        band_std=band_std,
+        scl_purity_min=scl_purity_min,
+        min_obs_per_year=min_obs_per_year,
+        batch_size=batch_size,
+        n_prep_workers=n_prep_workers,
+        device=device,
+        tile_id=tile_id,
+        end_year=year,
+        decay=0.0,   # no decay here — aggregation happens in phase 2
+    )
+
+    scores["year"] = np.int16(year)
+    tbl = pa.Table.from_pandas(
+        scores[["point_id", "year", "prob_tam"]].rename(columns={"prob_tam": "prob_tam_raw"}),
+        preserve_index=False,
+    )
+    tmp_path = out_path.with_suffix(".tmp.parquet")
+    pq.write_table(tbl, tmp_path, **_STAGING_WRITE_OPTS)
+    tmp_path.rename(out_path)  # atomic on POSIX; only visible once complete
+    logger.info("Wrote staging %s (%d pixels)", out_path.name, len(scores))
+    return out_path
+
+
+def _score_tile_worker(args: tuple) -> tuple[str, list[Path]]:
+    """Worker target for torch.multiprocessing: score one tile across all years.
+
+    Returns (tile_id, staging_paths).
+    """
+    (
+        tile_id, year_parquets, model, band_mean, band_std,
+        staging_dir, scl_purity_min, min_obs_per_year,
+        batch_size, n_prep_workers, device, n_tile_workers,
+    ) = args
+
+    torch.set_num_threads(max(1, (os.cpu_count() or 1) // n_tile_workers))
+
+    paths = []
+    for year, parquet in year_parquets:
+        p = score_tile_year(
+            parquet=parquet,
+            tile_id=tile_id,
+            year=year,
+            model=model,
+            band_mean=band_mean,
+            band_std=band_std,
+            staging_dir=staging_dir,
+            scl_purity_min=scl_purity_min,
+            min_obs_per_year=min_obs_per_year,
+            batch_size=batch_size,
+            n_prep_workers=n_prep_workers,
+            device=device,
+        )
+        paths.append(p)
+    return tile_id, paths
+
+
+def score_tiles_chunked(
+    tile_year_parquets: dict[str, list[tuple[int, Path]]],
+    model: TAMClassifier,
+    band_mean: np.ndarray,
+    band_std: np.ndarray,
+    out_dir: Path,
+    scl_purity_min: float = 0.5,
+    min_obs_per_year: int = 8,
+    batch_size: int = 4096,
+    n_prep_workers: int = 4,
+    n_tile_workers: int = 1,
+    device: str | None = None,
+    end_year: int | None = None,
+    decay: float = 0.7,
+) -> list[Path]:
+    """Score each S2 tile independently, writing one parquet per tile.
+
+    Two-phase approach:
+      Phase 1 — per-(tile, year): score and write staging parquet
+                  (out_dir/staging/{tile_id}_{year}.parquet).
+                  Idempotent: existing staging files are reused for crash recovery.
+      Phase 2 — per-tile: read staging parquets, apply decay aggregation,
+                  convert to uint8, write final parquet (out_dir/{tile_id}.scores.parquet),
+                  then remove staging files.
+
+    When n_tile_workers > 1, uses torch.multiprocessing.Pool (spawn) with
+    model.share_memory() so workers share weights without copying.
+
+    Returns list of written final parquet paths.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    staging_dir = out_dir / "staging"
+
+    _eff_end_year = end_year or max(y for yps in tile_year_parquets.values() for y, _ in yps)
+
+    # Filter years beyond end_year
+    tile_year_parquets = {
+        tid: [(y, p) for y, p in yps if y <= _eff_end_year]
+        for tid, yps in tile_year_parquets.items()
+    }
+
+    # --- Phase 1: score each (tile, year) ---
+    worker_args = [
+        (
+            tile_id, year_parquets, model, band_mean, band_std,
+            staging_dir, scl_purity_min, min_obs_per_year,
+            batch_size, n_prep_workers, device, n_tile_workers,
+        )
+        for tile_id, year_parquets in tile_year_parquets.items()
+    ]
+
+    staging_by_tile: dict[str, list[Path]] = {}
+
+    if n_tile_workers > 1:
+        model.share_memory()
+        ctx = torch.multiprocessing.get_context("spawn")
+        with ctx.Pool(processes=n_tile_workers) as pool:
+            for tile_id, paths in pool.imap_unordered(_score_tile_worker, worker_args):
+                staging_by_tile[tile_id] = paths
+                logger.info("Tile %s complete (%d year files)", tile_id, len(paths))
+    else:
+        for args in worker_args:
+            tile_id, paths = _score_tile_worker(args)
+            staging_by_tile[tile_id] = paths
+            logger.info("Tile %s complete (%d year files)", tile_id, len(paths))
+
+    # --- Phase 2: aggregate per tile and write final parquet ---
+    final_paths: list[Path] = []
+
+    _FINAL_WRITE_OPTS = dict(
+        compression="zstd",
+        compression_level=3,
+        use_dictionary=["point_id"],
+        write_statistics=True,
+    )
+
+    for tile_id, s_paths in staging_by_tile.items():
+        logger.info("Aggregating tile %s across %d years ...", tile_id, len(s_paths))
+
+        # Read all staging parquets for this tile
+        chunks = [pd.read_parquet(p, columns=["point_id", "year", "prob_tam_raw"]) for p in s_paths]
+        raw = pd.concat(chunks, ignore_index=True)
+
+        all_pids  = [raw["point_id"].values]
+        all_years = [raw["year"].values.astype(np.int32)]
+        all_probs = [raw["prob_tam_raw"].values.astype(np.float32)]
+
+        agg = aggregate_year_probs(all_pids, all_years, all_probs, end_year=_eff_end_year, decay=decay)
+
+        # Convert float [0,1] → uint8 [0,100]
+        agg["prob_tam"] = (agg["prob_tam"].clip(0.0, 1.0) * 100).round().astype(np.uint8)
+
+        tbl = pa.Table.from_pandas(agg[["point_id", "prob_tam"]], preserve_index=False)
+        final_path = out_dir / f"{tile_id}.scores.parquet"
+        pq.write_table(tbl, final_path, **_FINAL_WRITE_OPTS)
+        logger.info("Wrote %s (%d pixels)", final_path.name, len(agg))
+        final_paths.append(final_path)
+
+        # Clean up staging files for this tile
+        for p in s_paths:
+            p.unlink(missing_ok=True)
+
+    # Remove staging dir if empty
+    try:
+        staging_dir.rmdir()
+    except OSError:
+        pass
+
+    return final_paths

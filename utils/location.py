@@ -15,8 +15,8 @@ print(loc.pixel_count)       # ~80000
 print(loc.area_km2)          # ~8.0
 
 # Fetch Sentinel-2 pixel observations for this location:
-loc.fetch(start="2020-01-01", end="2025-12-31")
-# Writes to data/pixels/longreach/longreach.parquet
+loc.fetch(years=[2020, 2021, 2022, 2023, 2024, 2025])
+# Writes to data/pixels/longreach/<year>/<tile_id>.parquet
 """
 
 from __future__ import annotations
@@ -221,6 +221,19 @@ class Location:
         p = _PROJECT_ROOT / "data" / "calibration" / f"{self.id}.parquet"
         return p if p.exists() else None
 
+    def tile_ids(self) -> list[str]:
+        """Return S2 tile IDs that will actually produce observations for this location.
+
+        When a polygon_file is defined, uses geometry_to_tile_ids() to exclude tiles
+        whose overlap with the bbox contains no pixels canonically assigned to them.
+        Falls back to bbox_to_tile_ids() for bbox-only locations.
+        """
+        from utils.s2_tiles import bbox_to_tile_ids, geometry_to_tile_ids  # noqa: PLC0415
+        geom = self.geometry
+        if geom is not None:
+            return geometry_to_tile_ids(geom, tuple(self.bbox))  # type: ignore[arg-type]
+        return bbox_to_tile_ids(tuple(self.bbox))  # type: ignore[arg-type]
+
     def cache_dir(self) -> Path:
         """Chip cache dir for this location.
 
@@ -228,8 +241,7 @@ class Location:
         training and inference pipelines naturally share the same cache tree.
         Multi-tile locations fall back to the per-location chips path.
         """
-        from utils.s2_tiles import bbox_to_tile_ids  # noqa: PLC0415
-        tile_ids = bbox_to_tile_ids(tuple(self.bbox))  # type: ignore[arg-type]
+        tile_ids = self.tile_ids()
         if len(tile_ids) == 1:
             return tile_chips_path(tile_ids[0])
         return self.chips_path()
@@ -253,12 +265,11 @@ class Location:
         Returns the list of written parquet paths.
         """
         from utils.pixel_collector import collect  # noqa: PLC0415
-        from utils.s2_tiles import bbox_to_tile_ids  # noqa: PLC0415
 
         _cache = cache_dir or self.cache_dir()
 
         _cal_out: Path | None = None
-        if len(bbox_to_tile_ids(tuple(self.bbox))) > 1:
+        if len(self.tile_ids()) > 1:
             _cal_out = _PROJECT_ROOT / "data" / "calibration" / f"{self.id}.parquet"
             _cal_out.parent.mkdir(parents=True, exist_ok=True)
 
