@@ -109,8 +109,8 @@ class MemoryChipStore:
             # Vectorised projection — CPU work done outside the lock
             xs, ys = t.transform(self._lons, self._lats)
             cols_f, rows_f = ~transform * (xs, ys)
-            rows = np.clip(rows_f.astype(np.intp), 0, h - 1)
-            cols = np.clip(cols_f.astype(np.intp), 0, w - 1)
+            rows = np.clip(np.round(rows_f).astype(np.intp), 0, h - 1)
+            cols = np.clip(np.round(cols_f).astype(np.intp), 0, w - 1)
 
             with self._lock:
                 self._proj_cache.setdefault(proj_key, (rows, cols))
@@ -236,8 +236,8 @@ class CachedNpzChipStore:
                 self._transformers[crs_key] = t
             xs, ys = t.transform(self._lons, self._lats)
             cols_f, rows_f = ~transform * (xs, ys)
-            rows = np.clip(rows_f.astype(np.intp), 0, h - 1)
-            cols = np.clip(cols_f.astype(np.intp), 0, w - 1)
+            rows = np.clip(np.round(rows_f).astype(np.intp), 0, h - 1)
+            cols = np.clip(np.round(cols_f).astype(np.intp), 0, w - 1)
             self._proj_cache[proj_key] = (rows, cols)
         return self._proj_cache[proj_key]
 

@@ -761,6 +761,7 @@ function setRankingLayer(location, stem) {
 
   activeRankingLocation = stem ? location : null;
   activeRankingStem = stem || null;
+
   if (!stem) return;
 
   const tileUrl = `/ranking-tile/${location}/${stem}/{z}/{x}/{y}?cmap=${currentCmap}&cutoff=${currentCutoff}`;
