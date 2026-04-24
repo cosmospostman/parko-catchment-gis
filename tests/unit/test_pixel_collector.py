@@ -28,9 +28,6 @@ Tests
 16. extract_item_to_df: two items from different tiles produce two rows — no cross-tile dedup.
 16b. extract_item_to_df: band values are aligned to point_ids (regression for set-ordering bug).
  A. extract_item_to_df: tile_id extracted from item.id when s2:mgrs_tile absent.
- B. extract_item_to_df: canonical_tiles mask suppresses non-canonical tile rows.
- C. extract_item_to_df: canonical_tiles=None keeps all clear pixels (no regression).
- D. extract_item_to_df: all non-canonical points → returns None.
 17. Granule dedup regex strips the processing-granule index suffix correctly.
 18. Cross-tile items with matching (date, satellite) both survive per-tile dedup (Bug PC6 — documents).
 19. collect() dedup step removes cross-tile duplicate rows, keeping higher scl_purity.
@@ -38,6 +35,10 @@ Tests
 21. collect() dedup: non-duplicate rows adjacent to a boundary pixel are preserved.
 22. collect() dedup: duplicate pair straddling a row-group boundary is resolved.
 23. collect() dedup: equal scl_purity tie-break keeps the first tile in input order.
+PC-CT. Canonical tile bug: make_pixel_grid snap produces dx=-5 for all pixels, so the
+       old dx-based assignment sent every pixel to tile[0], suppressing all tile[1]
+       observations and producing systematic observation gaps (score strips).
+       After the fix (canonical tile suppression removed), both tiles contribute obs.
 """
 
 from __future__ import annotations
@@ -420,53 +421,75 @@ def test_extract_item_to_df_tile_id_from_item_id():
     assert (df["tile_id"] == "54LWH").all()
 
 
-def test_extract_item_to_df_canonical_tile_mask_filters_rows():
-    """Points whose canonical tile differs from item's tile are suppressed."""
-    item = SimpleNamespace(
-        id="S2A_54LWH_20220815_0_L2A",
-        datetime=_ITEM_DT,
-        properties={},
+def test_canonical_tile_suppression_removed():
+    """Regression: canonical tile suppression silently discarded all observations
+    from one S2 tile, producing systematic score strips.
+
+    The bug (commit 8f601ed) introduced a canonical tile assignment that:
+    1. Projected each pixel to UTM easting.
+    2. Computed dx = (ux % 10) - 5 to split pixels between tiles on the
+       easting axis, assuming tiles are east-west neighbours.
+    3. Suppressed all observations from the non-canonical tile in
+       extract_item_to_df via a canonical_tiles mask.
+
+    For quaids (55KBB / 55KCB), the tiles are north-south neighbours, not
+    east-west, so the easting split was the wrong axis entirely. Combined with
+    make_pixel_grid's floor-snap (which places all pixels at ux%10==0, giving
+    dx=-5 universally), every pixel was assigned to tile[0]=55KBB, and every
+    55KCB observation was silently suppressed — roughly halving each pixel's
+    observation count and causing score strips.
+
+    After the fix, canonical tile suppression is removed from extract_item_to_df.
+    Both tiles must contribute observations regardless of their spatial arrangement.
+    The existing (point_id, date, scl_purity desc) dedup in the sort/concat step
+    handles tile-boundary pixels correctly without per-tile suppression.
+    """
+    import inspect
+
+    # 1. extract_item_to_df must no longer accept canonical_tiles.
+    sig = inspect.signature(extract_item_to_df)
+    assert "canonical_tiles" not in sig.parameters, (
+        "extract_item_to_df still has a canonical_tiles parameter — "
+        "the tile suppression mechanism must be fully removed"
     )
-    N = 4
-    store, lons, lats, _ = _make_store(N, scl_value=4.0, band_value=500.0,
-                                       item_id="S2A_54LWH_20220815_0_L2A")
-    pids = _point_ids(N, "S2A_54LWH_20220815_0_L2A")
-    # px_0000, px_0001 → canonical 54LWH (this item's tile) → kept
-    # px_0002, px_0003 → canonical 54LWJ (other tile) → suppressed
-    canonical = np.array(["54LWH", "54LWH", "54LWJ", "54LWJ"])
-    df = extract_item_to_df(item, store, pids, lons, lats,
-                            apply_nbar=False, canonical_tiles=canonical)
-    assert df is not None
-    assert set(df["point_id"]) == {pids[0], pids[1]}
-    assert pids[2] not in df["point_id"].values
-    assert pids[3] not in df["point_id"].values
 
-
-def test_extract_item_to_df_canonical_tiles_none_keeps_all():
-    """canonical_tiles=None (default) keeps all clear pixels — no regression."""
-    item = _make_item()
-    store, lons, lats, _ = _make_store(3, scl_value=4.0, band_value=500.0)
-    df = extract_item_to_df(item, store, _point_ids(3), lons, lats,
-                            apply_nbar=False, canonical_tiles=None)
-    assert df is not None
-    assert len(df) == 3
-
-
-def test_extract_item_to_df_all_non_canonical_returns_none():
-    """If every point's canonical tile differs from item's tile, returns None."""
-    item = SimpleNamespace(
-        id="S2A_54LWH_20220815_0_L2A",
-        datetime=_ITEM_DT,
-        properties={},
+    # 2. An item from a second tile (e.g. 55KCB when tile[0] is 55KBB) must
+    #    contribute observations — it was silently suppressed by the bug.
+    item_tile1 = SimpleNamespace(
+        id="S2A_55KBB_20220815_0_L2A", datetime=_ITEM_DT, properties={}
     )
-    N = 3
-    store, lons, lats, _ = _make_store(N, scl_value=4.0, band_value=500.0,
-                                       item_id="S2A_54LWH_20220815_0_L2A")
-    pids = _point_ids(N, "S2A_54LWH_20220815_0_L2A")
-    canonical = np.array(["54LWJ", "54LWJ", "54LWJ"])  # none match 54LWH
-    df = extract_item_to_df(item, store, pids, lons, lats,
-                            apply_nbar=False, canonical_tiles=canonical)
-    assert df is None
+    item_tile2 = SimpleNamespace(
+        id="S2A_55KCB_20220815_0_L2A", datetime=_ITEM_DT, properties={}
+    )
+    store1, lons, lats, _ = _make_store(
+        3, scl_value=4.0, band_value=500.0, item_id="S2A_55KBB_20220815_0_L2A"
+    )
+    store2, _, _, _ = _make_store(
+        3, scl_value=4.0, band_value=800.0, item_id="S2A_55KCB_20220815_0_L2A"
+    )
+
+    df1 = extract_item_to_df(item_tile1, store1, _point_ids(3), lons, lats, apply_nbar=False)
+    df2 = extract_item_to_df(item_tile2, store2, _point_ids(3), lons, lats, apply_nbar=False)
+
+    assert df1 is not None, "tile1 (55KBB) must contribute observations"
+    assert df2 is not None, (
+        "tile2 (55KCB) must contribute observations — "
+        "was silently suppressed by the canonical tile bug"
+    )
+    assert len(df1) == 3
+    assert len(df2) == 3
+
+    # 3. The combined observation count must equal both tiles' contributions.
+    #    Before the fix, one tile's rows were zeroed out, halving coverage.
+    import pandas as pd
+    combined = pd.concat([df1, df2], ignore_index=True)
+    assert len(combined) == 6, (
+        f"expected 6 obs (3 per tile), got {len(combined)} — "
+        "one tile's observations are being suppressed"
+    )
+    assert set(combined["tile_id"]) == {"55KBB", "55KCB"}, (
+        "both tiles must appear in combined observations"
+    )
 
 
 # ---------------------------------------------------------------------------

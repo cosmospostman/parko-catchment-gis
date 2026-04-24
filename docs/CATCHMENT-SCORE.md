@@ -151,7 +151,7 @@ python cli/location.py fetch mitchell --years 2025
 ```bash
 # Sequential (safe, lower disk pressure)
 python -m tam.pipeline score \
-    --checkpoint outputs/tam-v1_spectral \
+    --checkpoint outputs/tam-v4 \
     --location mitchell \
     --years 2025 \
     --out-parquet \
@@ -159,14 +159,14 @@ python -m tam.pipeline score \
 
 # Parallel (measure single-tile time first)
 python -m tam.pipeline score \
-    --checkpoint outputs/tam-v1_spectral \
+    --checkpoint outputs/tam-v4 \
     --location mitchell \
     --years 2025 \
     --out-parquet \
     --n-tile-workers 2
 
 # Output
-# outputs/mitchell/tam-v1_spectral/2025/{tile_id}.scores.parquet
+# outputs/mitchell/tam-v4/2025/{tile_id}.scores.parquet
 # Schema: point_id (string), prob_tam (uint8, 0–100)
 ```
 

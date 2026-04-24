@@ -79,8 +79,9 @@ def save_pixel_ranking(
 ) -> None:
     """Write the scored pixel table sorted by rank to a CSV file."""
     prob_cols = [c for c in scored_df.columns if c.startswith("prob_")]
-    cols = ["point_id", "lon", "lat", "is_presence"] + prob_cols + ["rank"] + features
+    extra = [f for f in features if f not in prob_cols]
+    cols = ["point_id", "lon", "lat", "is_presence"] + prob_cols + ["rank"] + extra
     scored_df[[c for c in cols if c in scored_df.columns]].sort_values("rank").to_csv(
-        out_path, index=False, float_format="%.4f"
+        out_path, index=False, float_format="%.6f"
     )
     print(f"Saved: {out_path}")

@@ -156,18 +156,12 @@ def extract_item_to_df(
     lats: np.ndarray,
     apply_nbar: bool = True,
     utm_crs: str = "EPSG:32755",
-    canonical_tiles: np.ndarray | None = None,
 ) -> pd.DataFrame | None:
     """Extract all usable pixels for one STAC item into a DataFrame.
 
     Uses store.get_all_points() to fetch entire bands as numpy arrays,
     avoiding per-point Python loops. Returns None if the item has no
     clear pixels at all (cloud-filtered).
-
-    canonical_tiles : 1-D string array parallel to point_ids.
-        When provided, only points whose canonical tile matches this item's
-        tile_id are included.  Points assigned to the other tile in an overlap
-        zone are suppressed, preventing sub-pixel misalignment artefacts.
     """
     item_id = item.id
     m = _TILE_ID_RE.match(item_id)
@@ -181,8 +175,6 @@ def extract_item_to_df(
         return None
     scl_int = scl_vals.astype(np.int32)
     clear_mask = np.isin(scl_int, list(SCL_CLEAR_VALUES))
-    if canonical_tiles is not None and tile_id:
-        clear_mask &= (canonical_tiles == tile_id)
     if not clear_mask.any():
         return None
     scl_purity = clear_mask.astype(np.float32)  # 1×1 chip → purity = 0 or 1
@@ -368,36 +360,6 @@ def collect(
     # from tile A vs tile B gets a different sub-pixel position, producing
     # spurious spectral variation. Assign each point one canonical tile (the
     # one whose grid it is natively aligned to) and suppress observations from
-    # other tiles in extract_item_to_df.
-    all_tile_ids = sorted({
-        m.group(1) for item in items if (m := _TILE_ID_RE.match(item.id))
-    })
-    canonical_tile: dict[str, str] = {}
-    if len(all_tile_ids) > 1:
-        # Project all points into the shared UTM CRS and compute sub-pixel
-        # offset from the nearest pixel centre (centres at coord % 10 == 5).
-        # The tile whose origin produces the offset closest to 0 on the
-        # boundary axis owns this pixel.  For adjacent MGRS tiles sharing a
-        # UTM zone the boundary is vertical (easting axis), so we compare dx.
-        # all_tile_ids is sorted alphabetically; tile [0] corresponds to lower
-        # eastings (left/west tile).
-        _to_utm = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
-        for pid, lon, lat in points:
-            ux, _uy = _to_utm.transform(lon, lat)
-            dx = (ux % 10.0) - 5.0  # signed distance from pixel centre
-            canonical_tile[pid] = all_tile_ids[0] if dx <= 0.0 else all_tile_ids[1]
-        n_left = sum(1 for t in canonical_tile.values() if t == all_tile_ids[0])
-        logger.info(
-            "Canonical tile assignment: %d tiles (%s), %d/%d points → %s, %d/%d → %s",
-            len(all_tile_ids), ", ".join(all_tile_ids),
-            n_left, len(points), all_tile_ids[0],
-            len(points) - n_left, len(points), all_tile_ids[1],
-        )
-    else:
-        default_tile = all_tile_ids[0] if all_tile_ids else ""
-        for pid, _, _ in points:
-            canonical_tile[pid] = default_tile
-
     col_order = (
         ["point_id", "lon", "lat", "date", "item_id", "tile_id"]
         + list(BANDS)
@@ -523,9 +485,6 @@ def collect(
         shard_lats = np.array([lat for _, _, lat in shard_points], dtype=np.float64)
 
         shard_point_coords = {pid: (lon, lat) for pid, lon, lat in shard_points}
-        shard_canonical_tiles = np.array(
-            [canonical_tile.get(pid, "") for pid in shard_point_ids]
-        )
 
         # Per-shard checkpoint: item ids already written for this shard
         done_ids: set[str] = set()
@@ -572,7 +531,6 @@ def collect(
             df = extract_item_to_df(
                 _item, store, shard_point_ids, shard_lons, shard_lats,
                 apply_nbar=apply_nbar, utm_crs=utm_crs,
-                canonical_tiles=shard_canonical_tiles,
             )
             store.release_item(_item.id)
             return (_item.id, df)
@@ -663,6 +621,9 @@ def collect(
     from utils.tile_harmonisation import calibrate, load_corrections
 
     if not sorted_shard_paths:
+        if all_shards_done:
+            logger.warning("All shards completed but produced no rows — returning empty result.")
+            return []
         raise RuntimeError("No data collected: all shards are empty. Check STAC availability and date range.")
 
     _corrections: dict | None = None

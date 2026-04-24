@@ -27,9 +27,10 @@ interface Grid {
   vals: Float32Array; // corresponding prob values
   lonMin: number;
   latMax: number;
+  resX: number;
+  resY: number;
   width: number;
   height: number;
-  res: number;
 }
 
 const GRID_CACHE_MAX = 3;
@@ -48,7 +49,7 @@ function cacheSet(key: string, grid: Grid): void {
 // .bin build + load
 // ---------------------------------------------------------------------------
 
-const HEADER_BYTES = 32; // 3×f64 + 2×u32
+const HEADER_BYTES = 40; // 4×f64 + 2×u32: lonMin, latMax, resX, resY, width, height
 
 function binPath(location: string, stem: string): string {
   return join(OUTPUTS_DIR, location, `${stem}.bin`);
@@ -57,7 +58,6 @@ function binPath(location: string, stem: string): string {
 async function buildBin(csvPath: string, outPath: string): Promise<void> {
   console.log(`Building binary cache: ${outPath}`);
   const t0 = performance.now();
-  const res = 0.0001;
 
   async function streamLines(cb: (cols: string[], lineNo: number) => void): Promise<void> {
     const file = await Deno.open(csvPath, { read: true });
@@ -76,30 +76,74 @@ async function buildBin(csvPath: string, outPath: string): Promise<void> {
     if (buf.trimEnd()) cb(buf.trimEnd().split(","), lineNo);
   }
 
-  // Pass 0: header
-  let iLon = -1, iLat = -1, iProb = -1;
+  // Pass 0: detect columns
+  let iId = -1, iLon = -1, iLat = -1, iProb = -1;
   await streamLines((cols, lineNo) => {
     if (lineNo !== 0) return;
+    iId   = cols.indexOf("point_id");
     iLon  = cols.indexOf("lon");
     iLat  = cols.indexOf("lat");
     iProb = cols.findIndex((c) => c.startsWith("prob_"));
   });
   if (iLon < 0 || iLat < 0 || iProb < 0) throw new Error(`Missing columns in ${csvPath}`);
 
-  // Pass 1: bounds
+  // Pass 1: grid dimensions and corner pixel coordinates from point_id.
+  // We need the actual lon/lat of the NW corner pixel (xi=0, yi=yiMax) to use
+  // as the grid origin, and the NE/SW corners to derive resX/resY independently.
+  // Using overall min/max lon/lat is wrong because the grid is not axis-aligned
+  // in WGS84 (UTM→WGS84 reprojection means rows/cols are slightly diagonal).
+  let xiMax = -1, yiMax = -1;
   let lonMin = Infinity, lonMax = -Infinity, latMin = Infinity, latMax = -Infinity;
+  // Corner pixel coords: NW=(xi=0,yi=yiMax), NE=(xi=xiMax,yi=yiMax), SW=(xi=0,yi=0)
+  let lonNW = NaN, latNW = NaN, lonNE = NaN, latNE = NaN, lonSW = NaN, latSW = NaN;
   await streamLines((cols, lineNo) => {
     if (lineNo === 0) return;
     const lon = parseFloat(cols[iLon]);
     const lat = parseFloat(cols[iLat]);
+    if (isNaN(lon) || isNaN(lat)) return;
     if (lon < lonMin) lonMin = lon;
     if (lon > lonMax) lonMax = lon;
     if (lat < latMin) latMin = lat;
     if (lat > latMax) latMax = lat;
+    if (iId >= 0) {
+      const parts = cols[iId].split("_");
+      if (parts.length >= 3) {
+        const xi = parseInt(parts[1]), yi = parseInt(parts[2]);
+        if (xi > xiMax) xiMax = xi;
+        if (yi > yiMax) yiMax = yi;
+      }
+    }
   });
+  // Second pass to get corner coords (need yiMax known first)
+  if (iId >= 0 && xiMax > 0 && yiMax > 0) {
+    await streamLines((cols, lineNo) => {
+      if (lineNo === 0) return;
+      const parts = cols[iId].split("_");
+      if (parts.length < 3) return;
+      const xi = parseInt(parts[1]), yi = parseInt(parts[2]);
+      const lon = parseFloat(cols[iLon]), lat = parseFloat(cols[iLat]);
+      if (xi === 0    && yi === yiMax) { lonNW = lon; latNW = lat; }
+      if (xi === xiMax && yi === yiMax) { lonNE = lon; latNE = lat; }
+      if (xi === 0    && yi === 0    ) { lonSW = lon; latSW = lat; }
+    });
+  }
 
-  const width  = Math.round((lonMax - lonMin) / res) + 1;
-  const height = Math.round((latMax - latMin) / res) + 1;
+  // Use point_id grid dimensions when available; fall back to coordinate-derived grid.
+  let width: number, height: number, resX: number, resY: number;
+  if (iId >= 0 && xiMax > 0 && yiMax > 0 && !isNaN(lonNW) && !isNaN(lonNE) && !isNaN(latSW)) {
+    width  = xiMax + 1;
+    height = yiMax + 1;
+    // resX from NW→NE lon span; resY from NW→SW lat span
+    resX = (lonNE - lonNW) / xiMax;
+    resY = (latNW - latSW) / yiMax;
+    // Use NW corner as origin
+    lonMin = lonNW;
+    latMax = latNW;
+  } else {
+    resX = resY = 0.0001;
+    width  = Math.round((lonMax - lonMin) / resX) + 1;
+    height = Math.round((latMax - latMin) / resY) + 1;
+  }
 
   // Count valid rows for pre-allocation
   let count = 0;
@@ -108,18 +152,25 @@ async function buildBin(csvPath: string, outPath: string): Promise<void> {
     if (!isNaN(parseFloat(cols[iProb]))) count++;
   });
 
-  // Pass 2: fill pre-allocated typed arrays (no JS object overhead)
+  // Pass 2: fill pre-allocated typed arrays
   const keys = new Uint32Array(count);
   const vals = new Float32Array(count);
   let idx = 0;
   await streamLines((cols, lineNo) => {
     if (lineNo === 0) return;
-    const lon  = parseFloat(cols[iLon]);
-    const lat  = parseFloat(cols[iLat]);
     const prob = parseFloat(cols[iProb]);
     if (isNaN(prob)) return;
-    const xi = Math.round((lon - lonMin) / res);
-    const yi = Math.round((latMax - lat) / res);
+    let xi: number, yi: number;
+    if (iId >= 0 && xiMax > 0) {
+      const parts = cols[iId].split("_");
+      xi = parseInt(parts[1]);
+      yi = yiMax - parseInt(parts[2]); // yi=0 → northernmost (latMax)
+    } else {
+      const lon = parseFloat(cols[iLon]);
+      const lat = parseFloat(cols[iLat]);
+      xi = Math.round((lon - lonMin) / resX);
+      yi = Math.round((latMax - lat) / resY);
+    }
     keys[idx] = yi * width + xi;
     vals[idx] = prob;
     idx++;
@@ -142,9 +193,10 @@ async function buildBin(csvPath: string, outPath: string): Promise<void> {
   const dv  = new DataView(buf);
   dv.setFloat64(0,  lonMin, true);
   dv.setFloat64(8,  latMax, true);
-  dv.setFloat64(16, res,    true);
-  dv.setUint32(24,  width,  true);
-  dv.setUint32(28,  height, true);
+  dv.setFloat64(16, resX,   true);
+  dv.setFloat64(24, resY,   true);
+  dv.setUint32(32,  width,  true);
+  dv.setUint32(36,  height, true);
   let off = HEADER_BYTES;
   for (let i = 0; i < count; i++) {
     dv.setUint32(off,      sortedKeys[i], true);
@@ -160,9 +212,10 @@ async function loadBin(path: string): Promise<Grid> {
   const dv  = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
   const lonMin  = dv.getFloat64(0,  true);
   const latMax  = dv.getFloat64(8,  true);
-  const res     = dv.getFloat64(16, true);
-  const width   = dv.getUint32(24,  true);
-  const height  = dv.getUint32(28,  true);
+  const resX    = dv.getFloat64(16, true);
+  const resY    = dv.getFloat64(24, true);
+  const width   = dv.getUint32(32,  true);
+  const height  = dv.getUint32(36,  true);
   const n = (raw.byteLength - HEADER_BYTES) / 8;
   const keys = new Uint32Array(n);
   const vals = new Float32Array(n);
@@ -172,7 +225,7 @@ async function loadBin(path: string): Promise<Grid> {
     vals[i] = dv.getFloat32(off + 4, true);
     off += 8;
   }
-  return { keys, vals, lonMin, latMax, width, height, res };
+  return { keys, vals, lonMin, latMax, resX, resY, width, height };
 }
 
 // ---------------------------------------------------------------------------
@@ -360,19 +413,19 @@ export async function renderTile(
   grid: Grid, z: number, x: number, y: number, cmap = "rdylgn", cutoff = 0,
 ): Promise<Uint8Array> {
   const stops = COLORMAPS[cmap] ?? COLORMAPS.rdylgn;
-  const { lonMin: tLonMin, lonMax: tLonMax, latMax: tLatMax } = tileBoundsWGS84(z, x, y);
+  const { lonMin: tLonMin, lonMax: tLonMax, latMax: tLatMax, latMin: tLatMin } = tileBoundsWGS84(z, x, y);
   const rgba = new Uint8ClampedArray(TILE_SIZE * TILE_SIZE * 4);
   const lonStep = (tLonMax - tLonMin) / TILE_SIZE;
-  const latStep = (tLatMax - tileBoundsWGS84(z, x, y).latMin) / TILE_SIZE;
+  const latStep = (tLatMax - tLatMin) / TILE_SIZE;
 
   for (let py = 0; py < TILE_SIZE; py++) {
     const lat = tLatMax - (py + 0.5) * latStep;
-    const yi = Math.round((grid.latMax - lat) / grid.res);
+    const yi = Math.round((grid.latMax - lat) / grid.resY);
     if (yi < 0 || yi >= grid.height) continue;
 
     for (let px = 0; px < TILE_SIZE; px++) {
       const lon = tLonMin + (px + 0.5) * lonStep;
-      const xi = Math.round((lon - grid.lonMin) / grid.res);
+      const xi = Math.round((lon - grid.lonMin) / grid.resX);
       if (xi < 0 || xi >= grid.width) continue;
 
       const idx = bsearch(grid.keys, yi * grid.width + xi);
