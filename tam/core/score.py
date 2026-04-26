@@ -151,6 +151,7 @@ def _gpu_score(
                 doy_th[start:end].to(device, non_blocking=True),
                 mask_th[start:end].to(device, non_blocking=True),
                 n_obs_th[start:end].to(device, non_blocking=True),
+                global_feats=None,  # global features not yet supported in chunked scoring
             )
             prob_np = prob.cpu().numpy()
             all_pids.append(pids[start:end])

@@ -1,0 +1,5 @@
+# Stockholm — arid Queensland.
+name: "Stockholm"
+centroid: null
+bbox: [144.635312, -22.446864, 144.697637, -22.405223]  # [lon_min, lat_min, lon_max, lat_max] — scene extent
+dry_months: [4, 5, 6, 7, 8, 9, 10]  # semi-arid

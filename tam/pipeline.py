@@ -119,16 +119,27 @@ def _cmd_train(args: argparse.Namespace) -> None:
     model_kwargs = dict(exp.model_kwargs)
 
     overrides = {k: v for k, v in {
-        "lr":              args.lr,
-        "dropout":         args.dropout,
-        "n_layers":        args.n_layers,
-        "obs_dropout_min": args.obs_dropout_min,
+        "lr":                    args.lr,
+        "dropout":               args.dropout,
+        "n_layers":              args.n_layers,
+        "d_model":               args.d_model,
+        "obs_dropout_min":       args.obs_dropout_min,
+        "spatial_stride":        args.spatial_stride,
+        "band_noise_std":        args.band_noise_std,
+        "weight_decay":          args.weight_decay,
+        "presence_min_dry_ndvi": args.presence_min_dry_ndvi,
+        "presence_min_rec_p":    args.presence_min_rec_p,
+        "presence_grass_nir_cv": args.presence_grass_nir_cv,
     }.items() if v is not None}
+    if args.val_sites:
+        overrides["val_sites"] = tuple(args.val_sites)
+    if args.stride_exclude_sites:
+        overrides["stride_exclude_sites"] = tuple(args.stride_exclude_sites)
     cfg = TAMConfig(
         n_epochs=args.epochs or TAMConfig.__dataclass_fields__["n_epochs"].default,
         patience=args.patience or TAMConfig.__dataclass_fields__["patience"].default,
         scl_purity_min=args.scl_purity,
-        **{k: v for k, v in train_kwargs.items() if k in TAMConfig.__dataclass_fields__},
+        **{k: v for k, v in train_kwargs.items() if k in TAMConfig.__dataclass_fields__ and k not in overrides},
         **overrides,
     )
 
@@ -313,7 +324,23 @@ if __name__ == "__main__":
     p_train.add_argument("--dropout",          type=float, default=None)
     p_train.add_argument("--obs-dropout-min",  type=int,   default=None,
                          help="Subsample each training window to Uniform(N, n) obs (default: off)")
-    p_train.add_argument("--n-layers", type=int,   default=None)
+    p_train.add_argument("--n-layers",        type=int,   default=None)
+    p_train.add_argument("--d-model",         type=int,   default=None)
+    p_train.add_argument("--spatial-stride",        type=int,  default=None,
+                         help="Thin training pixels spatially — use every Nth pixel per region (default: 1, no thinning)")
+    p_train.add_argument("--stride-exclude-sites",  nargs="+", default=None,
+                         help="Site prefixes exempt from spatial stride (e.g. --stride-exclude-sites barkly stockholm)")
+    p_train.add_argument("--band-noise-std",  type=float, default=None,
+                         help="Std of per-window band offset in normalised space (default: 0.5)")
+    p_train.add_argument("--weight-decay",    type=float, default=None)
+    p_train.add_argument("--val-sites",       nargs="+",  default=None,
+                         help="Hold out these sites entirely for validation (e.g. --val-sites frenchs barcoorah)")
+    p_train.add_argument("--presence-min-dry-ndvi", type=float, default=None,
+                         help="Min dry-season median NDVI for presence pixels (default: 0.10)")
+    p_train.add_argument("--presence-min-rec-p",    type=float, default=None,
+                         help="Min NDVI amplitude for presence pixels (default: 0.20)")
+    p_train.add_argument("--presence-grass-nir-cv", type=float, default=None,
+                         help="Max NIR CV for presence pixels — filters grass (default: 0.20)")
     p_train.add_argument("--scl-purity", type=float, default=0.5)
     p_train.add_argument("--device", default=None)
 

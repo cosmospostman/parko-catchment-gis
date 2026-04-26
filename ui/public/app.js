@@ -88,7 +88,8 @@ document.getElementById('layer-select').addEventListener('change', (e) => {
     tileSize: 256,
     attribution: '© Queensland Globe',
   });
-  map.addLayer({ id: 'qld-globe-layer', type: 'raster', source: 'qld-globe' }, 'loc-fill-location');
+  const firstLayerId = map.getStyle().layers[0]?.id;
+  map.addLayer({ id: 'qld-globe-layer', type: 'raster', source: 'qld-globe' }, firstLayerId);
   // Refresh imagery info for new layer
   fetchImageryInfo();
 });
@@ -231,6 +232,7 @@ function loadSightings() {
           'circle-stroke-color': '#fff',
         },
       });
+      map.moveLayer('sightings-layer');
 
       sightingsTotalCount = geojson.features?.length ?? 0;
       const countEl = document.getElementById('sightings-count');

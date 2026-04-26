@@ -73,19 +73,22 @@ class TAMClassifier(nn.Module):
         n_layers:   int   = 2,
         d_ff:       int   = 128,
         dropout:    float = 0.1,
-        n_bands:    int   = N_BANDS,
-        use_n_obs:  bool  = True,
+        n_bands:          int   = N_BANDS,
+        use_n_obs:        bool  = True,
+        n_global_features: int  = 0,
     ) -> None:
         super().__init__()
-        self.d_model   = d_model
-        self.n_heads   = n_heads
-        self.n_layers  = n_layers
-        self.d_ff      = d_ff
-        self.dropout   = dropout
-        self.n_bands   = n_bands
-        self.use_n_obs = use_n_obs
+        self.d_model           = d_model
+        self.n_heads           = n_heads
+        self.n_layers          = n_layers
+        self.d_ff              = d_ff
+        self.dropout           = dropout
+        self.n_bands           = n_bands
+        self.use_n_obs         = use_n_obs
+        self.n_global_features = n_global_features
 
         self.band_proj = nn.Linear(n_bands, d_model)
+        self.pre_head_dropout = nn.Dropout(dropout)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -95,16 +98,17 @@ class TAMClassifier(nn.Module):
             batch_first=True,
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-        head_in = d_model + (1 if use_n_obs else 0)
+        head_in = d_model + (1 if use_n_obs else 0) + n_global_features
         self.head = nn.Linear(head_in, 1)
 
     # ------------------------------------------------------------------
     def forward(
         self,
-        bands: torch.Tensor,              # (B, T, N_BANDS)
-        doy:   torch.Tensor,              # (B, T)  int, 0=padding
-        key_padding_mask: torch.Tensor,   # (B, T)  bool, True=padding
-        n_obs: torch.Tensor,              # (B,)    float32, n / MAX_SEQ_LEN
+        bands:            torch.Tensor,          # (B, T, N_BANDS)
+        doy:              torch.Tensor,          # (B, T)  int, 0=padding
+        key_padding_mask: torch.Tensor,          # (B, T)  bool, True=padding
+        n_obs:            torch.Tensor,          # (B,)    float32, n / MAX_SEQ_LEN
+        global_feats:     torch.Tensor | None = None,  # (B, n_global_features)
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return (prob, logit), each shape (B,)."""
         x = self.band_proj(bands) + _doy_encoding(doy, self.d_model)  # (B, T, d_model)
@@ -122,9 +126,15 @@ class TAMClassifier(nn.Module):
         x_pool = (x * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1)  # (B, d_model)
 
         if self.use_n_obs:
-            x_pool = torch.cat([x_pool, n_obs.unsqueeze(-1)], dim=-1)  # (B, d_model + 1)
+            x_pool = torch.cat([x_pool, n_obs.unsqueeze(-1)], dim=-1)
 
-        logit = self.head(x_pool).squeeze(-1)   # (B,)
+        if self.n_global_features > 0:
+            if global_feats is None:
+                global_feats = torch.zeros(x_pool.shape[0], self.n_global_features,
+                                           dtype=x_pool.dtype, device=x_pool.device)
+            x_pool = torch.cat([x_pool, global_feats], dim=-1)
+
+        logit = self.head(self.pre_head_dropout(x_pool)).squeeze(-1)   # (B,)
         prob  = torch.sigmoid(logit)
         return prob, logit
 
@@ -169,14 +179,15 @@ class TAMClassifier(nn.Module):
     # ------------------------------------------------------------------
     def config(self) -> dict:
         return {
-            "d_model":       self.d_model,
-            "n_heads":       self.n_heads,
-            "n_layers":      self.n_layers,
-            "d_ff":          self.d_ff,
-            "dropout":       self.dropout,
-            "n_bands":       self.n_bands,
-            "use_n_obs":     self.use_n_obs,
-            "max_seq_len":   MAX_SEQ_LEN,
+            "d_model":            self.d_model,
+            "n_heads":            self.n_heads,
+            "n_layers":           self.n_layers,
+            "d_ff":               self.d_ff,
+            "dropout":            self.dropout,
+            "n_bands":            self.n_bands,
+            "use_n_obs":          self.use_n_obs,
+            "n_global_features":  self.n_global_features,
+            "max_seq_len":        MAX_SEQ_LEN,
         }
 
     @classmethod
@@ -189,4 +200,5 @@ class TAMClassifier(nn.Module):
             dropout=cfg.dropout,
             n_bands=cfg.n_bands,
             use_n_obs=cfg.use_n_obs,
+            n_global_features=cfg.n_global_features,
         )

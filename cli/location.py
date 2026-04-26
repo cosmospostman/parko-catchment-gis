@@ -10,6 +10,7 @@ Usage
   python cli/location.py training list
   python cli/location.py training fetch [--regions ID ...] [--all]
                                          [--cloud-max N] [--no-nbar]
+  python cli/location.py training verify
 
 Examples
 --------
@@ -194,10 +195,93 @@ def cmd_training_fetch(args: argparse.Namespace) -> None:
     )
 
 
+def cmd_training_verify(args: argparse.Namespace) -> None:
+    import numpy as np
+    import pandas as pd
+    from utils.regions import load_regions
+    from utils.training_collector import _region_parquet_path
+
+    BAND_COLS = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12"]
+
+    regions = load_regions()
+    issues: list[str] = []
+    rows = []
+
+    for r in regions:
+        path = _region_parquet_path(r.id)
+        if not path.exists():
+            issues.append(f"MISSING  {r.id} — parquet not found at {path}")
+            continue
+
+        df = pd.read_parquet(path)
+
+        n_pixels = df["point_id"].nunique()
+        n_obs    = len(df)
+        dupes    = df.duplicated(subset=["point_id", "date"]).sum()
+
+        # Observations per pixel
+        obs_per_pixel = df.groupby("point_id").size()
+        obs_min, obs_med, obs_max = obs_per_pixel.min(), obs_per_pixel.median(), obs_per_pixel.max()
+
+        # Band stats — mean and std across all obs
+        band_means = df[BAND_COLS].mean()
+        band_stds  = df[BAND_COLS].std()
+        nan_counts = df[BAND_COLS].isna().sum().sum()
+
+        # Flag suspicious values
+        if dupes > 0:
+            issues.append(f"DUPES    {r.id} — {dupes} duplicate (point_id, date) rows")
+        if n_pixels < 5:
+            issues.append(f"SPARSE   {r.id} — only {n_pixels} pixels")
+        if obs_min < 4:
+            issues.append(f"LOW_OBS  {r.id} — some pixels have <4 observations (min={obs_min})")
+        if nan_counts > 0:
+            issues.append(f"NAN      {r.id} — {nan_counts} NaN band values")
+        if band_means.max() > 1.5 or band_means.min() < -0.5:
+            issues.append(f"RANGE    {r.id} — band means outside expected range [{band_means.min():.2f}, {band_means.max():.2f}]")
+
+        rows.append((r.id, r.label, n_pixels, n_obs, int(obs_min), int(obs_med), int(obs_max),
+                     f"{band_means.mean():.3f}", f"{band_stds.mean():.3f}"))
+
+    # Print table
+    headers = ("REGION", "LABEL", "PIXELS", "OBS", "MIN_OBS", "MED_OBS", "MAX_OBS", "MEAN_BAND", "STD_BAND")
+    widths  = [max(len(h), max((len(str(r[i])) for r in rows), default=0)) for i, h in enumerate(headers)]
+
+    def fmt(cols):
+        return (f"  {str(cols[0]):<{widths[0]}}  {str(cols[1]):<{widths[1]}}"
+                f"  {str(cols[2]):>{widths[2]}}  {str(cols[3]):>{widths[3]}}"
+                f"  {str(cols[4]):>{widths[4]}}  {str(cols[5]):>{widths[5]}}"
+                f"  {str(cols[6]):>{widths[6]}}  {str(cols[7]):>{widths[7]}}"
+                f"  {str(cols[8]):>{widths[8]}}")
+
+    print(fmt(headers))
+    print("  " + "-" * (sum(widths) + 18))
+    for row in rows:
+        print(fmt(row))
+
+    # Summary
+    if rows:
+        total_pixels = sum(r[2] for r in rows)
+        presence_px  = sum(r[2] for r in rows if r[1] == "presence")
+        absence_px   = sum(r[2] for r in rows if r[1] == "absence")
+        print()
+        print(f"  Total pixels: {total_pixels:,}  (presence: {presence_px:,}  absence: {absence_px:,}  ratio: 1:{absence_px//max(presence_px,1)})")
+
+    if issues:
+        print()
+        print(f"  {len(issues)} issue(s) found:")
+        for iss in issues:
+            print(f"    ! {iss}")
+    else:
+        print()
+        print("  No issues found.")
+
+
 def cmd_training(args: argparse.Namespace) -> None:
     {
-        "list":  cmd_training_list,
-        "fetch": cmd_training_fetch,
+        "list":   cmd_training_list,
+        "fetch":  cmd_training_fetch,
+        "verify": cmd_training_verify,
     }[args.training_cmd](args)
 
 
@@ -229,6 +313,8 @@ def main() -> None:
     tsub = pt.add_subparsers(dest="training_cmd", required=True)
 
     tsub.add_parser("list", help="List all training regions with estimated pixel counts")
+
+    tsub.add_parser("verify", help="Verify training data quality and flag issues")
 
     tf = tsub.add_parser("fetch", help="Fetch pixels for training regions")
     grp = tf.add_mutually_exclusive_group(required=True)

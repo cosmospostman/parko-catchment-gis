@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -65,9 +66,61 @@ def spatial_split(
     return train_labels, val_labels
 
 
+def site_holdout_split(
+    labels: pd.Series,
+    val_sites: tuple[str, ...],
+) -> tuple[pd.Series, pd.Series]:
+    """Hold out all pixels whose region ID starts with any of val_sites.
+
+    Point IDs have the form <region_id>_<row>_<col>, and region IDs have the
+    form <site>_presence_N or <site>_absence_N, so the site is the prefix
+    before the first '_presence' or '_absence'.
+    """
+    import re
+    def point_site(pid: str) -> str:
+        m = re.match(r"^(.+?)_(presence|absence)", pid)
+        return m.group(1) if m else pid
+
+    in_val = labels.index.map(lambda pid: point_site(pid) in val_sites)
+    return labels[~in_val], labels[in_val]
+
+
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
+
+def _global_features_cache_key(pixel_df: pd.DataFrame) -> str:
+    """Stable hash of the inputs to compute_global_features (point_id, date, B08, B04)."""
+    cols = [c for c in ("point_id", "date", "B08", "B04") if c in pixel_df.columns]
+    key_df = pixel_df[cols].sort_values(cols).reset_index(drop=True)
+    return hashlib.md5(key_df.to_csv(index=False).encode()).hexdigest()
+
+
+def _load_or_compute_global_features(
+    pixel_df: pd.DataFrame,
+    out_dir: Path,
+    feature_names: list[str],
+) -> pd.DataFrame:
+    from tam.core.global_features import compute_global_features
+    cache_path = out_dir / "global_features_cache.parquet"
+    key_path   = out_dir / "global_features_cache.key"
+    cache_key  = _global_features_cache_key(pixel_df)
+
+    if cache_path.exists() and key_path.exists() and key_path.read_text().strip() == cache_key:
+        logger.info("Loading cached global features from %s", cache_path)
+        return pd.read_parquet(cache_path)
+
+    logger.info("Computing global features: %s", feature_names)
+    global_feat_df = compute_global_features(pixel_df)
+    logger.info(
+        "Global feature means — %s",
+        "  ".join(f"{k}={global_feat_df[k].mean():.4f}" for k in feature_names),
+    )
+    global_feat_df.to_parquet(cache_path)
+    key_path.write_text(cache_key)
+    logger.info("Cached global features to %s", cache_path)
+    return global_feat_df
+
 
 def train_tam(
     pixel_df: pd.DataFrame,
@@ -104,13 +157,89 @@ def train_tam(
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Training on device: %s", device)
 
-    # --- Split labels spatially -------------------------------------------
-    train_labels, val_labels = spatial_split(labels, pixel_coords, cfg.val_frac)
-    logger.info(
-        "Spatial split — train: %d presence / %d absence | val: %d presence / %d absence",
-        (train_labels == 1).sum(), (train_labels == 0).sum(),
-        (val_labels   == 1).sum(), (val_labels   == 0).sum(),
-    )
+    # --- Split labels ---------------------------------------------------------
+    if cfg.val_sites:
+        train_labels, val_labels = site_holdout_split(labels, cfg.val_sites)
+        logger.info(
+            "Site holdout split %s — train: %d presence / %d absence | val: %d presence / %d absence",
+            cfg.val_sites,
+            (train_labels == 1).sum(), (train_labels == 0).sum(),
+            (val_labels   == 1).sum(), (val_labels   == 0).sum(),
+        )
+    else:
+        train_labels, val_labels = spatial_split(labels, pixel_coords, cfg.val_frac)
+        logger.info(
+            "Spatial split — train: %d presence / %d absence | val: %d presence / %d absence",
+            (train_labels == 1).sum(), (train_labels == 0).sum(),
+            (val_labels   == 1).sum(), (val_labels   == 0).sum(),
+        )
+
+    # --- SCL=6 exclusion — strip dark-area misclassifications from all pixels ---
+    if "scl" in pixel_df.columns:
+        n_before = len(pixel_df)
+        pixel_df = pixel_df[pixel_df["scl"] != 6]
+        logger.info("SCL=6 exclusion: removed %d observations", n_before - len(pixel_df))
+
+    # --- Global features -----------------------------------------------------
+    global_feat_df = None
+    if cfg.n_global_features > 0:
+        from tam.core.global_features import GLOBAL_FEATURE_NAMES
+        global_feat_df = _load_or_compute_global_features(pixel_df, out_dir, GLOBAL_FEATURE_NAMES)
+
+    # --- Presence noise filter — remove obvious non-Parkinsonia presence pixels
+    if global_feat_df is not None:
+        def _apply_noise_filter(labels: pd.Series, split: str) -> pd.Series:
+            presence_pids = set(labels[labels == 1].index)
+            gf = global_feat_df.reindex(list(presence_pids))
+            water_mask = gf["dry_ndvi"] < cfg.presence_min_dry_ndvi
+            amp_mask   = gf["rec_p"]    < cfg.presence_min_rec_p
+            grass_mask = gf["nir_cv"]   > cfg.presence_grass_nir_cv
+            noise_mask = water_mask | amp_mask | grass_mask
+            noisy_pids = presence_pids & set(gf[noise_mask].index)
+            remaining = len(presence_pids) - len(noisy_pids)
+            logger.info(
+                "Presence noise filter (%s): removed %d pixels, %d remaining "
+                "(dry_ndvi<%.2f: %d  rec_p<%.2f: %d  nir_cv>%.2f: %d)",
+                split, len(noisy_pids), remaining,
+                cfg.presence_min_dry_ndvi, water_mask.sum(),
+                cfg.presence_min_rec_p,    amp_mask.sum(),
+                cfg.presence_grass_nir_cv, grass_mask.sum(),
+            )
+            return labels[~labels.index.isin(noisy_pids)]
+
+        train_labels = _apply_noise_filter(train_labels, "train")
+        val_labels   = _apply_noise_filter(val_labels,   "val")
+
+    # --- Spatial stride — thin training pixels to reduce within-site redundancy
+    if cfg.spatial_stride > 1:
+        import re
+        coords = pixel_coords.set_index("point_id")
+        candidate = coords.loc[coords.index.intersection(train_labels.index)]
+
+        if cfg.stride_exclude_sites:
+            def _site(pid: str) -> str:
+                m = re.match(r"^(.+?)_(presence|absence)", pid)
+                return m.group(1) if m else pid
+            excluded = candidate.index[candidate.index.map(
+                lambda pid: _site(pid) in cfg.stride_exclude_sites
+            )]
+            to_stride = candidate[~candidate.index.isin(excluded)]
+        else:
+            excluded = candidate.index[[False] * len(candidate)]
+            to_stride = candidate
+
+        strided_ids = set(
+            to_stride.sort_values(["lat", "lon"]).iloc[::cfg.spatial_stride].index
+        ) | set(excluded)
+
+        train_labels = train_labels[train_labels.index.isin(strided_ids)]
+        logger.info(
+            "Spatial stride %d — train pixels reduced to: %d presence / %d absence"
+            " (excluded from stride: %s)",
+            cfg.spatial_stride,
+            (train_labels == 1).sum(), (train_labels == 0).sum(),
+            cfg.stride_exclude_sites or "none",
+        )
 
     # --- Datasets -----------------------------------------------------------
     train_ds = TAMDataset(
@@ -118,7 +247,9 @@ def train_tam(
         scl_purity_min=cfg.scl_purity_min,
         min_obs_per_year=cfg.min_obs_per_year,
         doy_jitter=cfg.doy_jitter,
+        band_noise_std=cfg.band_noise_std,
         obs_dropout_min=cfg.obs_dropout_min,
+        global_features_df=global_feat_df,
     )
     band_mean, band_std = train_ds.band_stats
     val_ds = TAMDataset(
@@ -127,6 +258,9 @@ def train_tam(
         scl_purity_min=cfg.scl_purity_min,
         min_obs_per_year=cfg.min_obs_per_year,
         doy_jitter=0,  # no augmentation at eval time
+        global_features_df=global_feat_df,
+        global_feat_mean=train_ds.global_feat_mean,
+        global_feat_std=train_ds.global_feat_std,
     )
     logger.info("Train windows: %d  |  Val windows: %d", len(train_ds), len(val_ds))
 
@@ -175,15 +309,17 @@ def train_tam(
     for epoch in range(1, cfg.n_epochs + 1):
         model.train()
         epoch_loss = 0.0
+        train_probs, train_labels_list = [], []
         for batch in train_loader:
-            bands  = batch["bands"].to(device)
-            doy    = batch["doy"].to(device)
-            mask   = batch["mask"].to(device)
-            n_obs  = batch["n_obs"].to(device)
-            label  = batch["label"].to(device)
-            weight = batch["weight"].to(device)
+            bands         = batch["bands"].to(device)
+            doy           = batch["doy"].to(device)
+            mask          = batch["mask"].to(device)
+            n_obs         = batch["n_obs"].to(device)
+            global_feats  = batch["global_feats"].to(device)
+            label         = batch["label"].to(device)
+            weight        = batch["weight"].to(device)
 
-            _, logit = model(bands, doy, mask, n_obs)
+            prob, logit = model(bands, doy, mask, n_obs, global_feats)
             loss = (criterion(logit, label) * weight).mean()
 
             optimizer.zero_grad()
@@ -191,8 +327,17 @@ def train_tam(
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             epoch_loss += loss.item()
+            train_probs.extend(prob.detach().cpu().numpy())
+            train_labels_list.extend(label.cpu().numpy())
 
         scheduler.step()
+
+        train_probs_arr = np.array(train_probs)
+        train_labels_arr = np.array(train_labels_list)
+        if len(set(train_labels_arr)) > 1:
+            train_auc = roc_auc_score(train_labels_arr, train_probs_arr)
+        else:
+            train_auc = float("nan")
 
         # --- Validation -------------------------------------------------------
         model.eval()
@@ -204,6 +349,7 @@ def train_tam(
                     batch["doy"].to(device),
                     batch["mask"].to(device),
                     batch["n_obs"].to(device),
+                    batch["global_feats"].to(device),
                 )
                 val_probs.extend(prob.cpu().numpy())
                 val_labels_list.extend(batch["label"].numpy())
@@ -220,9 +366,10 @@ def train_tam(
             val_auc = float("nan")
 
         logger.info(
-            "epoch %3d/%d  loss=%.4f  val_auc=%.3f%s",
+            "epoch %3d/%d  loss=%.4f  train_auc=%.3f  val_auc=%.3f%s",
             epoch, cfg.n_epochs,
             epoch_loss / max(len(train_loader), 1),
+            train_auc,
             val_auc,
             "  *" if (not np.isnan(val_auc) and val_auc >= best_val_auc) else "",
         )
@@ -273,9 +420,11 @@ def load_tam(out_dir: Path, device: str | None = None) -> tuple[TAMClassifier, n
 
     state = torch.load(out_dir / "tam_model.pt", map_location=device, weights_only=True)
 
-    # Infer use_n_obs from saved weights: head input dim == d_model → no n_obs appended
+    # Infer use_n_obs and n_global_features from saved head weight shape
     head_in = state["head.weight"].shape[1]
-    cfg.use_n_obs = (head_in == cfg.d_model + 1)
+    extra = head_in - cfg.d_model          # total scalars appended after pooling
+    cfg.use_n_obs = extra > 0              # n_obs always first if present
+    cfg.n_global_features = extra - (1 if cfg.use_n_obs else 0)
 
     model = TAMClassifier.from_config(cfg)
     model.load_state_dict(state)

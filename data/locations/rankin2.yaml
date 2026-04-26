@@ -1,0 +1,5 @@
+# Rankin2
+name: "Rankin2"
+centroid: null
+bbox: [137.121637, -19.760730, 137.143507, -19.743799]  # [lon_min, lat_min, lon_max, lat_max] — scene extent
+dry_months: [4, 5, 6, 7, 8, 9, 10]  # semi-arid

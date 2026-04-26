@@ -235,16 +235,17 @@ def ensure_training_pixels(
 
         for region in pending:
             out_path = _region_parquet_path(region.id)
+            collect_dir = _TILES_DIR / "regions" / f"{region.id}.collect"
             logger.info(
                 "Collecting region %s: bbox=%s  window=%s→%s",
                 region.id, region.bbox, start, end,
             )
             cache_dir = tile_chips_path(tile_id)
-            collect(
+            tile_paths = collect(
                 bbox_wgs84=list(region.bbox),
                 start=start,
                 end=end,
-                out_path=out_path,
+                out_dir=collect_dir,
                 cloud_max=cloud_max,
                 cache_dir=cache_dir,
                 apply_nbar=apply_nbar,
@@ -252,6 +253,17 @@ def ensure_training_pixels(
                 items=tile_items,
                 point_id_prefix=region.id,
             )
+            # Merge per-tile parquets from collect() into a single region parquet
+            writer = None
+            for tp in tile_paths:
+                pf = pq.ParquetFile(tp)
+                for rg_idx in range(pf.metadata.num_row_groups):
+                    tbl = pf.read_row_group(rg_idx)
+                    if writer is None:
+                        writer = pq.ParquetWriter(out_path, tbl.schema)
+                    writer.write_table(tbl)
+            if writer is not None:
+                writer.close()
             new_regions.append(region.id)
 
         # Rebuild tile parquet if any region is new or the tile parquet was missing

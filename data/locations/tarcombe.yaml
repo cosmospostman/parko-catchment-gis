@@ -1,0 +1,5 @@
+# Tarcombe — arid Queensland.
+name: "Tarcombe"
+centroid: null
+bbox: [143.328195, -24.170331, 143.415194, -24.009989]  # [lon_min, lat_min, lon_max, lat_max] — scene extent
+dry_months: [4, 5, 6, 7, 8, 9, 10]  # semi-arid

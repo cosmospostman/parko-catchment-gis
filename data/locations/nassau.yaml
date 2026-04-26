@@ -1,0 +1,7 @@
+# Nassau — Cape York Peninsula.
+name: "Nassau"
+centroid: null
+bbox: [141.402545, -15.887878, 141.466097, -15.813213]  # [lon_min, lat_min, lon_max, lat_max] — scene extent
+dry_months: [5, 6, 7, 8, 9, 10]  # monsoonal
+notes: >
+  Cape York Peninsula. Monsoonal climate (dry May–October).

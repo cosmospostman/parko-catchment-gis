@@ -297,7 +297,7 @@ def collect(
 
     import hashlib, pickle
     if cache_dir is None:
-        cache_dir = PROJECT_ROOT / "data" / "chips" / (out_path.stem + ".chips")
+        cache_dir = PROJECT_ROOT / "data" / "chips" / out_dir.name
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     # --- 2. STAC search (cached, or use caller-supplied items) ---------------

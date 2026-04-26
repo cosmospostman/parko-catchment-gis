@@ -408,3 +408,71 @@ class TestTD19BandStatsCopies:
         std[:] = 99.0
         np.testing.assert_array_equal(ds.band_mean, original_mean)
         np.testing.assert_array_equal(ds.band_std, original_std)
+
+
+# ---------------------------------------------------------------------------
+# TD-20
+# ---------------------------------------------------------------------------
+
+class TestTD20BandNoiseZeroIsDeterministic:
+    def test_no_noise_same_bands_each_call(self, pixel_df, labels):
+        ds = TAMDataset(pixel_df, labels, band_noise_std=0.0)
+        bands = [ds[0].bands.numpy().copy() for _ in range(10)]
+        for arr in bands[1:]:
+            np.testing.assert_array_equal(arr, bands[0])
+
+
+# ---------------------------------------------------------------------------
+# TD-21
+# ---------------------------------------------------------------------------
+
+class TestTD21BandNoiseVariesAcrossCalls:
+    def test_nonzero_noise_produces_variation(self, pixel_df, labels):
+        ds = TAMDataset(pixel_df, labels, band_noise_std=0.5)
+        bands = [ds[0].bands.numpy().copy() for _ in range(20)]
+        unique = {arr.tobytes() for arr in bands}
+        assert len(unique) >= 2
+
+
+# ---------------------------------------------------------------------------
+# TD-22
+# ---------------------------------------------------------------------------
+
+class TestTD22BandNoiseIsConstantWithinWindow:
+    def test_offset_is_uniform_across_observations(self, pixel_df, labels):
+        # With per-window offset, subtracting any two rows of the non-padded
+        # bands from a noisy dataset should equal the same difference as from
+        # a zero-noise dataset — only the constant shift differs.
+        ds_zero  = TAMDataset(pixel_df, labels, band_noise_std=0.0)
+        ds_noisy = TAMDataset(pixel_df, labels, band_noise_std=0.5)
+
+        # Check across many draws that row0 - row1 is the same in both datasets
+        # (the constant offset cancels out in the diff).
+        zero_sample = ds_zero[0]
+        n = int((~zero_sample.mask).sum())
+        expected_diff = (zero_sample.bands[0] - zero_sample.bands[1]).numpy()
+
+        mismatches = 0
+        for _ in range(200):
+            noisy = ds_noisy[0]
+            diff  = (noisy.bands[0] - noisy.bands[1]).numpy()
+            if not np.allclose(diff, expected_diff, atol=1e-5):
+                mismatches += 1
+
+        assert mismatches == 0, (
+            f"{mismatches}/200 draws had within-window variation — "
+            "offset is not constant across observations"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TD-23
+# ---------------------------------------------------------------------------
+
+class TestTD23BandNoisePaddingStaysZero:
+    def test_padding_positions_remain_zero(self, pixel_df, labels):
+        ds = TAMDataset(pixel_df, labels, band_noise_std=0.5)
+        for _ in range(50):
+            s = ds[0]
+            n = int((~s.mask).sum())
+            assert (s.bands[n:] == 0).all(), "Band jitter leaked into padding positions"

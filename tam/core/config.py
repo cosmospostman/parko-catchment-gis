@@ -13,7 +13,8 @@ class TAMConfig:
     n_layers:   int   = 1
     d_ff:       int   = 64
     dropout:    float = 0.3
-    use_n_obs:  bool  = True   # append normalised obs-count to pooled repr before head
+    use_n_obs:         bool  = True   # append normalised obs-count to pooled repr before head
+    n_global_features: int   = 5     # nir_cv, rec_p, peak_doy, peak_doy_cv, dry_ndvi (0 to disable)
 
     # Data (mirrors dataset.py constants — change both together)
     n_bands:          int   = 13
@@ -21,6 +22,7 @@ class TAMConfig:
     min_obs_per_year: int   = 8
     scl_purity_min:   float = 0.5
     doy_jitter:       int   = 7   # ±days of DOY shift applied per window during training
+    band_noise_std:   float = 0.0 # std of per-window band offset in normalised space (training only)
 
     # Training
     n_epochs:        int   = 30
@@ -28,9 +30,17 @@ class TAMConfig:
     lr:              float = 1e-4
     weight_decay:    float = 1e-3
     val_frac:        float = 0.2
-    patience:        int   = 10
+    val_sites:       tuple = ()   # if non-empty, hold out these sites entirely instead of using val_frac
+    patience:        int   = 5
     min_delta:       float = 1e-4
     obs_dropout_min: int   = 0   # if >0, subsample each window to Uniform(obs_dropout_min, n) during training
+    spatial_stride:       int   = 1   # if >1, thin training pixels spatially (every Nth pixel per region)
+    stride_exclude_sites: tuple = ()  # site prefixes exempt from spatial stride (e.g. small/sparse sites)
+
+    # Presence pixel noise filters (applied before training, using global features)
+    presence_min_dry_ndvi: float = 0.10  # filter water/bare soil (dry-season median NDVI)
+    presence_min_rec_p:    float = 0.20  # filter low-amplitude pixels (bare soil, water, grass)
+    presence_grass_nir_cv: float = 0.20  # filter high-variability pixels (grass)
 
     def to_dict(self) -> dict:
         return asdict(self)

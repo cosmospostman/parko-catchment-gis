@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Repeatedly trains v4_spectral overnight, writing logs to outputs/train-loop/<iteration>/."""
+"""Repeatedly trains v5_spectral overnight, random search over hyperparameters."""
 
+import math
 import random
 import re
 import subprocess
@@ -10,19 +11,17 @@ from datetime import datetime
 from pathlib import Path
 
 OUT_ROOT = Path("outputs/train-loop")
-SUMMARY_LOG = OUT_ROOT / "summary.log"
+SUMMARY_LOG = OUT_ROOT / "summary.log"  # overridden by --out-root
 
-# Search ranges (log-uniform for lr, uniform for the rest)
 LR_RANGE      = (3e-5, 3e-4)
 DROPOUT_RANGE = (0.1, 0.5)
-N_LAYERS_OPTS = [1, 2, 3]
+N_LAYERS_OPTS = [2, 3]
 
 
-def sample_hparams() -> dict:
-    log_lo, log_hi = [__import__("math").log(x) for x in LR_RANGE]
-    lr = __import__("math").exp(random.uniform(log_lo, log_hi))
+def sample_hparams(iteration: int) -> dict:
+    log_lo, log_hi = math.log(LR_RANGE[0]), math.log(LR_RANGE[1])
     return {
-        "lr":       round(lr, 6),
+        "lr":       round(math.exp(random.uniform(log_lo, log_hi)), 6),
         "dropout":  round(random.uniform(*DROPOUT_RANGE), 2),
         "n_layers": random.choice(N_LAYERS_OPTS),
     }
@@ -58,10 +57,10 @@ def run_iteration(iteration: int) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     log_path = out_dir / "train.log"
 
-    hparams = sample_hparams()
+    hparams = sample_hparams(iteration)
     cmd = [
         sys.executable, "-m", "tam.pipeline", "train",
-        "--experiment", "v4_spectral",
+        "--experiment", "v5_spectral",
         "--output-dir", str(out_dir),
         "--lr",       str(hparams["lr"]),
         "--dropout",  str(hparams["dropout"]),
@@ -99,6 +98,16 @@ def run_iteration(iteration: int) -> None:
 
 
 def main() -> None:
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--out-root", default=None, help="Output root directory (default: outputs/train-loop)")
+    args = parser.parse_args()
+
+    if args.out_root:
+        global OUT_ROOT, SUMMARY_LOG
+        OUT_ROOT = Path(args.out_root)
+        SUMMARY_LOG = OUT_ROOT / "summary.log"
+
     iteration = 0
     while True:
         run_iteration(iteration)

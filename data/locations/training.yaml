@@ -30,7 +30,21 @@ regions:
   - id: barcoorah_presence
     name: "Barcoorah — presence"
     label: presence
-    bbox: [145.372762, -22.518720, 145.373829, -22.517807]
+    bbox: [145.371534, -22.519534, 145.374640, -22.516844]
+    year: 2021
+    tags: [arid]
+
+  - id: barcoorah_presence_2
+    name: "Barcoorah — presence 2"
+    label: presence
+    bbox: [145.346104, -22.506298, 145.347410, -22.504508]
+    year: 2021
+    tags: [arid]
+
+  - id: barcoorah_presence_3
+    name: "Barcoorah — presence 3"
+    label: presence
+    bbox: [145.347430, -22.505681, 145.350514, -22.504498]
     year: 2021
     tags: [arid]
 
@@ -91,13 +105,6 @@ regions:
     bbox: [141.537488, -15.784261, 141.540400, -15.780201]
     year: 2023
     tags: [monsoonal, savanna, riparian]
-
-  - id: frenchs_absence_bare_soil_1
-    name: "Frenchs — absence (bare soil 1)"
-    label: absence
-    bbox: [141.551405, -15.795050, 141.560868, -15.787841]
-    year: 2023
-    tags: [monsoonal, bare_soil]
 
   - id: frenchs_absence_bare_soil_2
     name: "Frenchs — absence (bare soil 2)"
@@ -445,3 +452,447 @@ regions:
   #   bbox: [143.274128, -24.312269, 143.275729, -24.310612]
   #   year: 2025
   #   tags: [arid]
+
+  # ---------------------------------------------------------------------------
+  # Nassau — Cape York Peninsula (monsoonal, riparian)
+  # ---------------------------------------------------------------------------
+  - id: nassau_presence_1
+    name: "Nassau — presence 1"
+    label: presence
+    bbox: [141.420312, -15.819269, 141.421631, -15.813479]
+    year: 2025
+    tags: [monsoonal, riparian]
+
+  - id: nassau_presence_2
+    name: "Nassau — presence 2"
+    label: presence
+    bbox: [141.422232, -15.822877, 141.423098, -15.820203]
+    year: 2025
+    tags: [monsoonal, riparian]
+
+  - id: nassau_presence_3
+    name: "Nassau — presence 3"
+    label: presence
+    bbox: [141.413275, -15.872846, 141.417093, -15.871743]
+    year: 2025
+    tags: [monsoonal, riparian]
+
+  - id: nassau_presence_4
+    name: "Nassau — presence 4"
+    label: presence
+    bbox: [141.443329, -15.862262, 141.445001, -15.860220]
+    year: 2025
+    tags: [monsoonal, riparian]
+
+  - id: nassau_absence_1
+    name: "Nassau — absence 1"
+    label: absence
+    bbox: [141.422143, -15.866203, 141.425281, -15.863727]
+    year: 2025
+    tags: [monsoonal]
+
+  - id: nassau_absence_2
+    name: "Nassau — absence 2"
+    label: absence
+    bbox: [141.450794, -15.855611, 141.454076, -15.853388]
+    year: 2025
+    tags: [monsoonal]
+
+  - id: nassau_absence_3
+    name: "Nassau — absence 3"
+    label: absence
+    bbox: [141.429851, -15.871018, 141.432509, -15.869225]
+    year: 2025
+    tags: [monsoonal]
+
+  # ---------------------------------------------------------------------------
+  # Muttaburra — arid Queensland
+  # ---------------------------------------------------------------------------
+  - id: muttaburra_absence_1
+    name: "Muttaburra — absence 1"
+    label: absence
+    bbox: [144.686746, -22.431583, 144.692266, -22.428197]
+    year: 2025
+    tags: [arid]
+
+  - id: muttaburra_absence_2
+    name: "Muttaburra — absence 2"
+    label: absence
+    bbox: [144.559536, -22.468950, 144.563916, -22.465359]
+    year: 2025
+    tags: [arid]
+
+  # ---------------------------------------------------------------------------
+  # Stockholm — arid Queensland
+  # ---------------------------------------------------------------------------
+  - id: stockholm_presence_1
+    name: "Stockholm — presence 1"
+    label: presence
+    bbox: [144.665060, -22.424626, 144.667088, -22.423079]
+    year: 2025
+    tags: [arid]
+
+  - id: stockholm_presence_2
+    name: "Stockholm — presence 2"
+    label: presence
+    bbox: [144.667996, -22.421144, 144.670294, -22.419592]
+    year: 2025
+    tags: [arid]
+
+  - id: stockholm_absence_1
+    name: "Stockholm — absence 1"
+    label: absence
+    bbox: [144.683573, -22.431591, 144.686679, -22.428200]
+    year: 2025
+    tags: [arid]
+
+  # ---------------------------------------------------------------------------
+  # Pormpuraaw — Cape York Peninsula (monsoonal, riparian)
+  # ---------------------------------------------------------------------------
+  - id: pormpuraaw_presence_1
+    name: "Pormpuraaw — presence 1"
+    label: presence
+    bbox: [141.621947, -14.655354, 141.623673, -14.650040]
+    year: 2025
+    tags: [monsoonal, riparian]
+
+  - id: pormpuraaw_presence_2
+    name: "Pormpuraaw — presence 2"
+    label: presence
+    bbox: [141.603585, -14.661627, 141.604773, -14.656725]
+    year: 2025
+    tags: [monsoonal, riparian]
+
+  - id: pormpuraaw_presence_3
+    name: "Pormpuraaw — presence 3"
+    label: presence
+    bbox: [141.586292, -14.730245, 141.587433, -14.726774]
+    year: 2025
+    tags: [monsoonal, riparian]
+
+  - id: pormpuraaw_absence_1
+    name: "Pormpuraaw — absence 1"
+    label: absence
+    bbox: [141.569710, -14.719689, 141.573573, -14.713606]
+    year: 2025
+    tags: [monsoonal]
+
+  - id: pormpuraaw_absence_2
+    name: "Pormpuraaw — absence 2"
+    label: absence
+    bbox: [141.583468, -14.752708, 141.585642, -14.748587]
+    year: 2025
+    tags: [monsoonal]
+
+  - id: barkly_presence_1
+    name: "Barkly — presence 1"
+    label: presence
+    bbox: [139.322531, -17.998868, 139.324887, -17.998016]
+    year: 2025
+    tags: [semi-arid]
+
+  - id: barkly_presence_2
+    name: "Barkly — presence 2"
+    label: presence
+    bbox: [139.327977, -17.999546, 139.329448, -17.999131]
+    year: 2025
+    tags: [semi-arid]
+
+  - id: barkly_presence_3
+    name: "Barkly — presence 3"
+    label: presence
+    bbox: [139.325620, -17.996318, 139.328042, -17.992730]
+    year: 2025
+    tags: [semi-arid]
+
+  - id: barkly_presence_4
+    name: "Barkly — presence 4"
+    label: presence
+    bbox: [139.328491, -17.986926, 139.329970, -17.984397]
+    year: 2025
+    tags: [semi-arid]
+
+  - id: barkly_presence_5
+    name: "Barkly — presence 5"
+    label: presence
+    bbox: [139.347948, -17.986872, 139.349866, -17.984773]
+    year: 2025
+    tags: [semi-arid]
+
+  - id: barkly_absence_1
+    name: "Barkly — absence 1"
+    label: absence
+    bbox: [139.378628, -17.996226, 139.383442, -17.992415]
+    year: 2025
+    tags: [semi-arid]
+
+  - id: wongalee_presence_1
+    name: "Wongalee — presence 1"
+    label: presence
+    bbox: [144.409693, -20.508645, 144.412984, -20.506705]
+    year: 2025
+    tags: [arid]
+
+  - id: wongalee_presence_2
+    name: "Wongalee — presence 2"
+    label: presence
+    bbox: [144.413083, -20.509978, 144.414014, -20.508143]
+    year: 2025
+    tags: [arid]
+
+  - id: wongalee_presence_3
+    name: "Wongalee — presence 3"
+    label: presence
+    bbox: [144.413404, -20.511178, 144.414212, -20.510345]
+    year: 2025
+    tags: [arid]
+
+  - id: wongalee_presence_4
+    name: "Wongalee — presence 4"
+    label: presence
+    bbox: [144.411418, -20.509638, 144.411918, -20.509106]
+    year: 2025
+    tags: [arid]
+
+  - id: wongalee_absence_1
+    name: "Wongalee — absence 1"
+    label: absence
+    bbox: [144.418070, -20.509557, 144.421498, -20.506869]
+    year: 2025
+    tags: [arid]
+
+  - id: wongalee_absence_2
+    name: "Wongalee — absence 2"
+    label: absence
+    bbox: [144.423897, -20.485499, 144.429884, -20.483349]
+    year: 2025
+    tags: [arid]
+
+  # ---------------------------------------------------------------------------
+  # Moroak — Northern Territory (tropical savanna)
+  # ---------------------------------------------------------------------------
+  - id: moroak_presence_1
+    name: "Moroak — presence 1"
+    label: presence
+    bbox: [133.596173, -14.826986, 133.599991, -14.824727]
+    year: 2025
+    tags: [tropical, savanna]
+
+  - id: moroak_presence_2
+    name: "Moroak — presence 2"
+    label: presence
+    bbox: [133.434408, -14.846157, 133.436198, -14.841301]
+    year: 2025
+    tags: [tropical, savanna]
+
+  - id: moroak_presence_3
+    name: "Moroak — presence 3"
+    label: presence
+    bbox: [133.393337, -14.879972, 133.396770, -14.876515]
+    year: 2025
+    tags: [tropical, savanna]
+
+  # ---------------------------------------------------------------------------
+  # Roper River — Northern Territory (tropical savanna-riparian)
+  # ---------------------------------------------------------------------------
+  - id: roper_presence_1
+    name: "Roper — presence 1"
+    label: presence
+    bbox: [135.123581, -14.756182, 135.124651, -14.754421]
+    year: 2025
+    tags: [tropical, riparian]
+
+  - id: roper_presence_2
+    name: "Roper — presence 2"
+    label: presence
+    bbox: [135.122291, -14.756613, 135.123517, -14.754859]
+    year: 2025
+    tags: [tropical, riparian]
+
+  - id: roper_presence_3
+    name: "Roper — presence 3"
+    label: presence
+    bbox: [135.120934, -14.756944, 135.122256, -14.755306]
+    year: 2025
+    tags: [tropical, riparian]
+
+  - id: roper_presence_4
+    name: "Roper — presence 4"
+    label: presence
+    bbox: [135.113339, -14.756968, 135.114890, -14.755859]
+    year: 2025
+    tags: [tropical, riparian]
+
+  - id: roper_absence_1
+    name: "Roper — absence 1"
+    label: absence
+    bbox: [135.145929, -14.746911, 135.147920, -14.742680]
+    year: 2025
+    tags: [tropical, riparian]
+
+  # ---------------------------------------------------------------------------
+  # Ranken River — Northern Territory (semi-arid, riparian)
+  # ---------------------------------------------------------------------------
+  - id: ranken_river_presence_N_1
+    name: "Ranken River — presence N 1"
+    label: presence
+    bbox: [137.215840, -19.590491, 137.217551, -19.589629]
+    year: 2025
+    tags: [semi-arid, riparian]
+
+  - id: ranken_river_presence_N_2
+    name: "Ranken River — presence N 2"
+    label: presence
+    bbox: [137.209362, -19.588610, 137.210481, -19.588180]
+    year: 2025
+    tags: [semi-arid, riparian]
+
+  - id: ranken_river_presence_N_3
+    name: "Ranken River — presence N 3"
+    label: presence
+    bbox: [137.199044, -19.602344, 137.200094, -19.599661]
+    year: 2025
+    tags: [semi-arid, riparian]
+
+  - id: ranken_river_presence_N_4
+    name: "Ranken River — presence N 4"
+    label: presence
+    bbox: [137.196657, -19.604147, 137.198419, -19.602989]
+    year: 2025
+    tags: [semi-arid, riparian]
+
+  - id: ranken_river_presence_N_5
+    name: "Ranken River — presence N 5"
+    label: presence
+    bbox: [137.186043, -19.610109, 137.188735, -19.607694]
+    year: 2025
+    tags: [semi-arid, riparian]
+
+  - id: ranken_river_presence_N_6
+    name: "Ranken River — presence N 6"
+    label: presence
+    bbox: [137.174809, -19.615220, 137.176983, -19.613608]
+    year: 2025
+    tags: [semi-arid, riparian]
+
+  - id: ranken_river_presence_N_7
+    name: "Ranken River — presence N 7"
+    label: presence
+    bbox: [137.164681, -19.622460, 137.165801, -19.620349]
+    year: 2025
+    tags: [semi-arid, riparian]
+
+  - id: ranken_river_presence_N_8
+    name: "Ranken River — presence N 8"
+    label: presence
+    bbox: [137.166185, -19.621176, 137.167174, -19.619693]
+    year: 2025
+    tags: [semi-arid, riparian]
+
+  - id: ranken_river_presence_N_9
+    name: "Ranken River — presence N 9"
+    label: presence
+    bbox: [137.162733, -19.624285, 137.164832, -19.622793]
+    year: 2025
+    tags: [semi-arid, riparian]
+
+  - id: ranken_river_presence_N_10
+    name: "Ranken River — presence N 10"
+    label: presence
+    bbox: [137.135643, -19.610209, 137.138690, -19.608033]
+    year: 2025
+    tags: [semi-arid, riparian]
+
+  - id: ranken_river_presence_N_11
+    name: "Ranken River — presence N 11"
+    label: presence
+    bbox: [137.137392, -19.733780, 137.140028, -19.732034]
+    year: 2025
+    tags: [semi-arid, riparian]
+
+  - id: ranken_river_presence_N_12
+    name: "Ranken River — presence N 12"
+    label: presence
+    bbox: [137.138009, -19.744586, 137.140930, -19.742925]
+    year: 2025
+    tags: [semi-arid, riparian]
+
+  - id: ranken_river_absence_N_1
+    name: "Ranken River — absence N 1"
+    label: absence
+    bbox: [137.213868, -19.591771, 137.215810, -19.590899]
+    year: 2025
+    tags: [semi-arid, riparian]
+
+  - id: ranken_river_absence_N_2
+    name: "Ranken River — absence N 2"
+    label: absence
+    bbox: [137.209390, -19.589400, 137.210676, -19.588997]
+    year: 2025
+    tags: [semi-arid, riparian]
+
+  - id: ranken_river_absence_N_3
+    name: "Ranken River — absence N 3"
+    label: absence
+    bbox: [137.200111, -19.601221, 137.201195, -19.598395]
+    year: 2025
+    tags: [semi-arid, riparian]
+
+  - id: ranken_river_absence_N_4
+    name: "Ranken River — absence N 4"
+    label: absence
+    bbox: [137.195311, -19.602023, 137.196955, -19.601322]
+    year: 2025
+    tags: [semi-arid, riparian]
+
+  - id: ranken_river_absence_N_5
+    name: "Ranken River — absence N 5"
+    label: absence
+    bbox: [137.179434, -19.618404, 137.181842, -19.616927]
+    year: 2025
+    tags: [semi-arid, riparian]
+
+  - id: ranken_river_absence_N_6
+    name: "Ranken River — absence N 6"
+    label: absence
+    bbox: [137.181070, -19.613322, 137.183228, -19.611927]
+    year: 2025
+    tags: [semi-arid, riparian]
+
+  - id: ranken_river_absence_N_7
+    name: "Ranken River — absence N 7"
+    label: absence
+    bbox: [137.160743, -19.628184, 137.162756, -19.625271]
+    year: 2025
+    tags: [semi-arid, riparian]
+
+  - id: ranken_river_absence_N_8
+    name: "Ranken River — absence N 8"
+    label: absence
+    bbox: [137.135314, -19.741917, 137.138945, -19.738601]
+    year: 2025
+    tags: [semi-arid, riparian]
+
+  - id: ranken_river_absence_N_9
+    name: "Ranken River — absence N 9"
+    label: absence
+    bbox: [137.096584, -19.687131, 137.100307, -19.684558]
+    year: 2025
+    tags: [semi-arid, riparian]
+
+  # ---------------------------------------------------------------------------
+  # Alexandria — Northern Territory (semi-arid, riparian)
+  # ---------------------------------------------------------------------------
+  - id: alexandria_presence
+    name: "Alexandria — presence"
+    label: presence
+    bbox: [137.656293, -18.991441, 137.658874, -18.986728]
+    year: 2005
+    tags: [semi-arid, riparian]
+
+  - id: alexandria_absence
+    name: "Alexandria — absence"
+    label: absence
+    bbox: [137.662852, -18.995507, 137.665796, -18.991595]
+    year: 2005
+    tags: [semi-arid, riparian]

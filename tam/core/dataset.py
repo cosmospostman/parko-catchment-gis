@@ -29,24 +29,26 @@ MIN_OBS_PER_YEAR: int = 8
 
 
 class TAMSample(NamedTuple):
-    bands:    torch.Tensor   # (MAX_SEQ_LEN, N_BANDS)  float32, normalised, zero-padded
-    doy:      torch.Tensor   # (MAX_SEQ_LEN,)           int64, 1–365, 0=padding
-    mask:     torch.Tensor   # (MAX_SEQ_LEN,)           bool, True=padding
-    n_obs:    torch.Tensor   # ()                       float32, n / MAX_SEQ_LEN
-    label:    torch.Tensor   # ()                       float32 {0, 1}
-    weight:   torch.Tensor   # ()                       float32 confidence weight
+    bands:        torch.Tensor   # (MAX_SEQ_LEN, N_BANDS)  float32, normalised, zero-padded
+    doy:          torch.Tensor   # (MAX_SEQ_LEN,)           int64, 1–365, 0=padding
+    mask:         torch.Tensor   # (MAX_SEQ_LEN,)           bool, True=padding
+    n_obs:        torch.Tensor   # ()                       float32, n / MAX_SEQ_LEN
+    global_feats: torch.Tensor   # (N_GLOBAL,)              float32, z-scored global features
+    label:        torch.Tensor   # ()                       float32 {0, 1}
+    weight:       torch.Tensor   # ()                       float32 confidence weight
     point_id: str
     year:     int
 
 
 def collate_fn(samples: list[TAMSample]) -> dict:
     return {
-        "bands":    torch.stack([s.bands  for s in samples]),
-        "doy":      torch.stack([s.doy    for s in samples]),
-        "mask":     torch.stack([s.mask   for s in samples]),
-        "n_obs":    torch.stack([s.n_obs  for s in samples]),
-        "label":    torch.stack([s.label  for s in samples]),
-        "weight":   torch.stack([s.weight for s in samples]),
+        "bands":        torch.stack([s.bands        for s in samples]),
+        "doy":          torch.stack([s.doy          for s in samples]),
+        "mask":         torch.stack([s.mask         for s in samples]),
+        "n_obs":        torch.stack([s.n_obs        for s in samples]),
+        "global_feats": torch.stack([s.global_feats for s in samples]),
+        "label":        torch.stack([s.label        for s in samples]),
+        "weight":       torch.stack([s.weight       for s in samples]),
         "point_id": [s.point_id for s in samples],
         "year":     [s.year     for s in samples],
     }
@@ -84,6 +86,9 @@ class TAMDataset(Dataset):
         doy_jitter: int = 0,
         band_noise_std: float = 0.0,
         obs_dropout_min: int = 0,
+        global_features_df: pd.DataFrame | None = None,
+        global_feat_mean: np.ndarray | None = None,
+        global_feat_std: np.ndarray | None = None,
     ) -> None:
         # doy_jitter: max ±days to shift all observations in a window (training only).
         # A single offset is drawn per __getitem__ call and applied uniformly so
@@ -122,23 +127,68 @@ class TAMDataset(Dataset):
 
         # Build index: pre-extract bands and DOY as numpy arrays to avoid
         # pandas overhead in __getitem__ (called from DataLoader workers on CPU).
+        #
+        # Vectorised path: sort once, normalise in bulk, then split on group
+        # boundaries — avoids per-group Python overhead with 100k+ windows.
+        df = df.sort_values(["point_id", "year", "date"])
+
+        if "doy" not in df.columns:
+            df = df.copy()
+            df["doy"] = pd.to_datetime(df["date"]).dt.day_of_year
+
+        bands_all = ((df[feature_cols].values.astype(np.float32) - self.band_mean) / self.band_std)
+        doy_all   = df["doy"].values.astype(np.int32)
+        pid_all   = df["point_id"].values
+        yr_all    = df["year"].values
+
+        group_sizes = df.groupby(["point_id", "year"], sort=False).size()
+        split_points = np.cumsum(group_sizes.values)[:-1]
+
+        bands_split = np.split(bands_all, split_points)
+        doy_split   = np.split(doy_all,   split_points)
+        pid_split   = np.split(pid_all,   split_points)
+        yr_split    = np.split(yr_all,    split_points)
+
         self._windows: list[tuple[str, int, np.ndarray, np.ndarray]] = []
-        for (pid, yr), grp in df.groupby(["point_id", "year"], sort=False):
-            grp = grp.sort_values("date")
-            if len(grp) < min_obs_per_year:
+        for b, d, p, y in zip(bands_split, doy_split, pid_split, yr_split):
+            if len(b) < min_obs_per_year:
                 continue
-            n = min(len(grp), MAX_SEQ_LEN)
-            raw = grp[feature_cols].values[:n].astype(np.float32)
-            bands_np = (raw - self.band_mean) / self.band_std
-            if "doy" in grp.columns:
-                doy_np = grp["doy"].values[:n].astype(np.int32)
-            else:
-                doy_np = pd.to_datetime(grp["date"].values[:n]).day_of_year.values.astype(np.int32)
-            self._windows.append((pid, int(yr), bands_np, doy_np))
+            n = min(len(b), MAX_SEQ_LEN)
+            self._windows.append((p[0], int(y[0]), b[:n], d[:n]))
 
         self._labels = labels
         self._doy_jitter = doy_jitter
+        self._band_noise_std = band_noise_std
         self._obs_dropout_min = obs_dropout_min
+
+        # Global features: per-pixel scalars z-scored and stored as float32 arrays
+        if global_features_df is not None and len(global_features_df) > 0:
+            n_global = global_features_df.shape[1]
+            feat_vals = global_features_df.reindex(
+                [pid for pid, *_ in self._windows]
+            ).values.astype(np.float32)  # (n_windows, n_global) — NaN for missing
+
+            if global_feat_mean is None or global_feat_std is None:
+                # Training mode: compute stats ignoring NaN
+                global_feat_mean = np.nanmean(feat_vals, axis=0)
+                global_feat_std  = np.nanstd(feat_vals, axis=0)
+                global_feat_std  = np.where(global_feat_std < 1e-6, 1.0, global_feat_std)
+
+            self.global_feat_mean = global_feat_mean.astype(np.float32)
+            self.global_feat_std  = global_feat_std.astype(np.float32)
+
+            # Z-score; impute NaN → 0 (feature mean after normalisation)
+            normed = (feat_vals - self.global_feat_mean) / self.global_feat_std
+            normed = np.where(np.isnan(normed), 0.0, normed).astype(np.float32)
+            self._global_feats = {
+                pid: normed[i] for i, (pid, *_) in enumerate(self._windows)
+            }
+            self._n_global = n_global
+        else:
+            self.global_feat_mean = np.zeros(0, dtype=np.float32)
+            self.global_feat_std  = np.ones(0,  dtype=np.float32)
+            self._global_feats = {}
+            self._n_global = 0
 
     # ------------------------------------------------------------------
     def __len__(self) -> int:
@@ -154,6 +204,10 @@ class TAMDataset(Dataset):
             bands_np = bands_np[idx_keep]
             doy_np   = doy_np[idx_keep]
             n        = keep
+
+        if self._band_noise_std > 0.0:
+            offset = np.random.randn(N_BANDS).astype(np.float32) * self._band_noise_std
+            bands_np = bands_np + offset
 
         bands = np.zeros((MAX_SEQ_LEN, N_BANDS), dtype=np.float32)
         bands[:n] = bands_np
@@ -175,15 +229,18 @@ class TAMDataset(Dataset):
         label  = float(self._labels[pid]) if self._labels is not None else 0.0
         weight = 1.0
 
+        gf = self._global_feats.get(pid, np.zeros(self._n_global, dtype=np.float32))
+
         return TAMSample(
-            bands    = torch.from_numpy(bands),
-            doy      = torch.from_numpy(doy),
-            mask     = torch.from_numpy(mask),
-            n_obs    = torch.tensor(n / MAX_SEQ_LEN, dtype=torch.float32),
-            label    = torch.tensor(label,  dtype=torch.float32),
-            weight   = torch.tensor(weight, dtype=torch.float32),
-            point_id = pid,
-            year     = yr,
+            bands        = torch.from_numpy(bands),
+            doy          = torch.from_numpy(doy),
+            mask         = torch.from_numpy(mask),
+            n_obs        = torch.tensor(n / MAX_SEQ_LEN, dtype=torch.float32),
+            global_feats = torch.from_numpy(gf),
+            label        = torch.tensor(label,  dtype=torch.float32),
+            weight       = torch.tensor(weight, dtype=torch.float32),
+            point_id     = pid,
+            year         = yr,
         )
 
     # ------------------------------------------------------------------
