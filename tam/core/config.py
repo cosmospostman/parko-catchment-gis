@@ -34,6 +34,7 @@ class TAMConfig:
     patience:        int   = 5
     min_delta:       float = 1e-4
     obs_dropout_min: int   = 0   # if >0, subsample each window to Uniform(obs_dropout_min, n) during training
+    doy_density_norm: bool = False  # if True, weight mean pool by inverse DOY observation frequency
     spatial_stride:       int   = 1   # if >1, thin training pixels spatially (every Nth pixel per region)
     stride_exclude_sites: tuple = ()  # site prefixes exempt from spatial stride (e.g. small/sparse sites)
 

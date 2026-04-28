@@ -162,6 +162,27 @@ regions:
     year: 2023
     tags: [monsoonal, savanna]
 
+  - id: frenchs_absence_4
+    name: "Frenchs — absence 4"
+    label: absence
+    bbox: [141.578028, -15.770002, 141.585492, -15.768620]
+    year: 2023
+    tags: [monsoonal]
+
+  - id: frenchs_absence_5
+    name: "Frenchs — absence 5"
+    label: absence
+    bbox: [141.624111, -15.866587, 141.631096, -15.864621]
+    year: 2023
+    tags: [monsoonal]
+
+  - id: frenchs_absence_6
+    name: "Frenchs — absence 6"
+    label: absence
+    bbox: [141.624567, -15.878386, 141.632992, -15.874750]
+    year: 2023
+    tags: [monsoonal]
+
   - id: frenchs_absence_water_1
     name: "Frenchs — absence (water 1)"
     label: absence
@@ -294,6 +315,41 @@ regions:
     year: 2025
     tags: [monsoonal]
 
+  - id: norman_road_presence_5
+    name: "Norman Road — presence 5"
+    label: presence
+    bbox: [141.631447, -20.398087, 141.633797, -20.396626]
+    year: 2025
+    tags: [monsoonal]
+
+  - id: norman_road_presence_6
+    name: "Norman Road — presence 6"
+    label: presence
+    bbox: [141.631974, -20.394612, 141.633085, -20.391131]
+    year: 2025
+    tags: [monsoonal]
+
+  - id: norman_road_presence_7
+    name: "Norman Road — presence 7"
+    label: presence
+    bbox: [141.595580, -20.422170, 141.600613, -20.420540]
+    year: 2025
+    tags: [monsoonal]
+
+  - id: norman_road_presence_8
+    name: "Norman Road — presence 8"
+    label: presence
+    bbox: [141.578575, -20.248837, 141.580351, -20.246680]
+    year: 2025
+    tags: [monsoonal]
+
+  - id: norman_road_presence_9
+    name: "Norman Road — presence 9"
+    label: presence
+    bbox: [141.585024, -20.236318, 141.586523, -20.234577]
+    year: 2025
+    tags: [monsoonal]
+
   - id: norman_road_absence_1  # removed — possible label noise
     name: "Norman Road — absence 1"
     label: absence
@@ -305,6 +361,41 @@ regions:
     name: "Norman Road — absence 2"
     label: absence
     bbox: [141.429584, -20.412734, 141.432358, -20.410367]
+    year: 2025
+    tags: [monsoonal]
+
+  - id: norman_road_absence_3
+    name: "Norman Road — absence 3"
+    label: absence
+    bbox: [141.524279, -20.236115, 141.527576, -20.232487]
+    year: 2025
+    tags: [monsoonal]
+
+  - id: norman_road_absence_4
+    name: "Norman Road — absence 4"
+    label: absence
+    bbox: [141.727942, -20.187984, 141.730785, -20.185069]
+    year: 2025
+    tags: [monsoonal]
+
+  - id: norman_road_absence_5
+    name: "Norman Road — absence 5"
+    label: absence
+    bbox: [141.040830, -20.135768, 141.046010, -20.134075]
+    year: 2025
+    tags: [monsoonal]
+
+  - id: norman_road_absence_6
+    name: "Norman Road — absence 6"
+    label: absence
+    bbox: [141.671224, -20.038009, 141.673786, -20.032689]
+    year: 2025
+    tags: [monsoonal]
+
+  - id: norman_road_absence_7
+    name: "Norman Road — absence 7"
+    label: absence
+    bbox: [141.701000, -19.941201, 141.707607, -19.939510]
     year: 2025
     tags: [monsoonal]
 
@@ -887,12 +978,12 @@ regions:
     name: "Alexandria — presence"
     label: presence
     bbox: [137.656293, -18.991441, 137.658874, -18.986728]
-    year: 2005
+    year: 2025
     tags: [semi-arid, riparian]
 
   - id: alexandria_absence
     name: "Alexandria — absence"
     label: absence
     bbox: [137.662852, -18.995507, 137.665796, -18.991595]
-    year: 2005
+    year: 2025
     tags: [semi-arid, riparian]

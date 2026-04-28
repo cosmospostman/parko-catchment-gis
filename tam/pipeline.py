@@ -92,9 +92,6 @@ def _cmd_train(args: argparse.Namespace) -> None:
                 (pixel_df["year"] > region.year)
             )
             keep_mask &= ~out_of_window
-        n_dropped = (~keep_mask).sum()
-        if n_dropped:
-            logger.info("Year-pinning: dropped %d observations outside region windows", n_dropped)
         pixel_df = pixel_df[keep_mask].reset_index(drop=True)
 
     # Build labels from regions
@@ -106,11 +103,6 @@ def _cmd_train(args: argparse.Namespace) -> None:
     labelled = label_pixels(pixel_coords, regions)
     labelled_known = labelled.dropna(subset=["is_presence"])
     labels = labelled_known.set_index("point_id")["is_presence"].map({True: 1.0, False: 0.0})
-
-    logger.info(
-        "Labeled pixels — presence: %d  absence: %d",
-        (labels == 1).sum(), (labels == 0).sum(),
-    )
 
     out_dir = Path(args.output_dir) if args.output_dir else PROJECT_ROOT / "outputs" / f"tam-{exp.name}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -135,11 +127,13 @@ def _cmd_train(args: argparse.Namespace) -> None:
         overrides["val_sites"] = tuple(args.val_sites)
     if args.stride_exclude_sites:
         overrides["stride_exclude_sites"] = tuple(args.stride_exclude_sites)
+    positional = {"n_epochs", "patience", "scl_purity_min"}
     cfg = TAMConfig(
-        n_epochs=args.epochs or TAMConfig.__dataclass_fields__["n_epochs"].default,
-        patience=args.patience or TAMConfig.__dataclass_fields__["patience"].default,
+        n_epochs=args.epochs or train_kwargs.pop("n_epochs", TAMConfig.__dataclass_fields__["n_epochs"].default),
+        patience=args.patience or train_kwargs.pop("patience", TAMConfig.__dataclass_fields__["patience"].default),
         scl_purity_min=args.scl_purity,
-        **{k: v for k, v in train_kwargs.items() if k in TAMConfig.__dataclass_fields__ and k not in overrides},
+        **{k: v for k, v in model_kwargs.items() if k in TAMConfig.__dataclass_fields__ and k not in overrides},
+        **{k: v for k, v in train_kwargs.items() if k in TAMConfig.__dataclass_fields__ and k not in overrides and k not in positional},
         **overrides,
     )
 
