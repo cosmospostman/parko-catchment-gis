@@ -155,10 +155,12 @@ def main() -> None:
         if not path.exists():
             continue
         pf = pq.ParquetFile(path)
+        available = set(pf.schema_arrow.names)
+        s1_cols = [c for c in ("source", "vh", "vv") if c in available]
+        base_cols = ["point_id", "lon", "lat", "date", "scl_purity"]
+        read_cols = base_cols + [c for c in exp.feature_cols if c in available] + s1_cols
         for rg in range(pf.metadata.num_row_groups):
-            tbl = pf.read_row_group(
-                rg, columns=["point_id", "lon", "lat", "date", "scl_purity"] + exp.feature_cols
-            )
+            tbl = pf.read_row_group(rg, columns=read_cols)
             chunks.append(tbl.to_pandas())
 
     pixel_df = pd.concat(chunks, ignore_index=True)
@@ -168,6 +170,10 @@ def main() -> None:
     pixel_coords = pixel_df[["point_id","lon","lat"]].drop_duplicates("point_id").reset_index(drop=True)
     labelled     = label_pixels(pixel_coords, regions).dropna(subset=["is_presence"])
     all_labels   = labelled.set_index("point_id")["is_presence"].map({True: 1.0, False: 0.0})
+
+    # Filter pixel_df to labelled pixels before snap_s1_to_s2 — snap is O(n²)
+    # over rows so running it on the full tile parquet is very slow.
+    pixel_df = pixel_df[pixel_df["point_id"].isin(all_labels.index)]
 
     # --- Load checkpoint ------------------------------------------------------
     model, band_mean, band_std = load_tam(ckpt_dir)
@@ -191,6 +197,7 @@ def main() -> None:
         min_obs_per_year=cfg.min_obs_per_year,
         doy_jitter=0,
         global_features_df=global_feat_df,
+        use_s1={4: "s1_only", 17: True}.get(cfg.n_bands, False),
     )
 
     pid_to_indices: dict[str, list[int]] = {}

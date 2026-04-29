@@ -90,8 +90,9 @@ def site_holdout_split(
 # ---------------------------------------------------------------------------
 
 def _global_features_cache_key(pixel_df: pd.DataFrame) -> str:
-    """Stable hash of the inputs to compute_global_features (point_id, date, B08, B04)."""
-    cols = [c for c in ("point_id", "date", "B08", "B04") if c in pixel_df.columns]
+    """Stable hash of the inputs to compute_global_features."""
+    cols = [c for c in ("point_id", "date", "B08", "B04", "vh", "vv", "source")
+            if c in pixel_df.columns]
     key_df = pixel_df[cols].sort_values(cols).reset_index(drop=True)
     return hashlib.md5(key_df.to_csv(index=False).encode()).hexdigest()
 
@@ -327,6 +328,10 @@ def train_tam(
 
     logger.info("Pixel summary (stride=%d):\n%s", cfg.spatial_stride, "\n".join(lines))
 
+    # Slice global features to exactly the columns the model head expects.
+    if global_feat_df is not None:
+        global_feat_df = global_feat_df.iloc[:, :cfg.n_global_features]
+
     # --- Datasets -----------------------------------------------------------
     train_ds = TAMDataset(
         pixel_df, train_labels,
@@ -336,6 +341,7 @@ def train_tam(
         band_noise_std=cfg.band_noise_std,
         obs_dropout_min=cfg.obs_dropout_min,
         global_features_df=global_feat_df,
+        use_s1=cfg.use_s1,
     )
     band_mean, band_std = train_ds.band_stats
     val_ds = TAMDataset(
@@ -347,6 +353,7 @@ def train_tam(
         global_features_df=global_feat_df,
         global_feat_mean=train_ds.global_feat_mean,
         global_feat_std=train_ds.global_feat_std,
+        use_s1=cfg.use_s1,
     )
     logger.info("Train windows: %d  |  Val windows: %d", len(train_ds), len(val_ds))
 
@@ -392,8 +399,26 @@ def train_tam(
         json.dump(model.config(), fh, indent=2)
 
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight, reduction="none")
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.n_epochs)
+
+    _temporal_modules = [model.band_proj, model.encoder]
+
+    def _set_temporal_frozen(frozen: bool) -> None:
+        for m in _temporal_modules:
+            for p in m.parameters():
+                p.requires_grad = not frozen
+        if frozen:
+            logger.info("Temporal stream frozen — training head only (globals warmup)")
+        else:
+            logger.info("Temporal stream unfrozen — full model training")
+
+    if cfg.warmup_freeze_epochs > 0:
+        _set_temporal_frozen(True)
+        # Head-only warmup: use 10× lr so the head orients correctly before unfreeze
+        optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr * 10, weight_decay=cfg.weight_decay)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.warmup_freeze_epochs)
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.n_epochs)
 
     # --- Training loop ------------------------------------------------------
     best_val_auc = 0.0
@@ -401,6 +426,13 @@ def train_tam(
     checkpoint_path = out_dir / "tam_model.pt"
 
     for epoch in range(1, cfg.n_epochs + 1):
+        if cfg.warmup_freeze_epochs > 0 and epoch == cfg.warmup_freeze_epochs + 1:
+            _set_temporal_frozen(False)
+            # Rebuild optimizer at normal lr for full-model phase
+            optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=cfg.n_epochs - cfg.warmup_freeze_epochs
+            )
         model.train()
         epoch_loss = 0.0
         train_probs, train_labels_list = [], []
@@ -414,6 +446,21 @@ def train_tam(
             weight        = batch["weight"].to(device)
 
             prob, logit = model(bands, doy, mask, n_obs, global_feats)
+
+            if torch.isnan(prob).any():
+                nan_mask = torch.isnan(prob)
+                logger.warning(
+                    "NaN in model output: %d/%d samples. "
+                    "bands NaN=%s, doy NaN=%s, mask all-pad=%s, global_feats NaN=%s",
+                    nan_mask.sum().item(), len(prob),
+                    torch.isnan(bands).any().item(),
+                    torch.isnan(doy.float()).any().item(),
+                    mask.all(dim=1).any().item(),
+                    torch.isnan(global_feats).any().item(),
+                )
+                prob = torch.nan_to_num(prob, nan=0.5)
+                logit = torch.nan_to_num(logit, nan=0.0)
+
             loss = (criterion(logit, label) * weight).mean()
 
             optimizer.zero_grad()

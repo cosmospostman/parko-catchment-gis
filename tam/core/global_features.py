@@ -5,15 +5,24 @@ transformer's pooled representation before the classification head. This gives t
 access to physically-motivated signals that the transformer may not reliably extract from
 raw observation sequences alone.
 
-Features (based on Longreach signal analysis — see docs/research/LONGREACH-STAGE2.md):
+S2-derived features (based on Longreach signal analysis — see docs/research/LONGREACH-STAGE2.md):
 
   nir_cv      Inter-annual CV of dry-season B08 median. Lower = stable evergreen = Parkinsonia.
   rec_p       Mean annual NDVI amplitude (p90 − p10). Higher = deeper wet/dry swing = Parkinsonia.
   peak_doy    Mean annual DOY of NDVI peak. Parkinsonia peaks consistently earlier in wet season.
   peak_doy_cv Per-pixel SD of annual peak DOY. Lower = more consistent timing = Parkinsonia.
+  dry_ndvi    Median dry-season NDVI.
 
-Dry season: May–October (DOY 121–304). Research confirmed this window gives stronger class
-separation than the theoretical April–September prior.
+S1-derived features (structural, intended to aid cross-climate-zone transferability):
+
+  s1_mean_vh_dry       Mean VH backscatter (dB) over dry season (May–Oct). Woody stem density.
+  s1_vh_contrast       Mean VH wet-season (dB) minus mean VH dry-season (dB). Grass fluctuates
+                       strongly; woody Parkinsonia is stable.
+  s1_vh_std            Temporal std of VH (dB) across all observations. Low = stable canopy.
+  s1_mean_rvi          Mean Radar Vegetation Index (4·VH_lin / (VV_lin + VH_lin)) across all
+                       observations. Vegetation density, normalised out soil moisture.
+
+Dry season: May–October (DOY 121–304). Wet season: November–April (DOY 305–365 + 1–120).
 """
 
 from __future__ import annotations
@@ -23,13 +32,19 @@ import os
 import numpy as np
 import pandas as pd
 
-GLOBAL_FEATURE_NAMES: list[str] = ["nir_cv", "rec_p", "peak_doy", "peak_doy_cv", "dry_ndvi"]
+GLOBAL_FEATURE_NAMES: list[str] = [
+    "s1_mean_vh_dry", "s1_vh_contrast", "s1_vh_std", "s1_mean_rvi",
+    "nir_cv", "rec_p", "peak_doy", "peak_doy_cv", "dry_ndvi",
+]
 
 _DRY_DOY_MIN = 121   # May 1
 _DRY_DOY_MAX = 304   # October 31
 _MIN_DRY_OBS = 5
 _MIN_OBS     = 10
 _SMOOTH_DAYS = 30
+
+
+_WET_DOY_RANGES = [(305, 365), (1, 120)]   # Nov–Apr wraps around year boundary
 
 
 def compute_global_features(pixel_df: pd.DataFrame) -> pd.DataFrame:
@@ -49,19 +64,30 @@ def compute_global_features(pixel_df: pd.DataFrame) -> pd.DataFrame:
     if "doy" not in df.columns:
         df["doy"] = pd.to_datetime(df["date"]).dt.day_of_year
 
-    df["_ndvi"] = (df["B08"] - df["B04"]) / (df["B08"] + df["B04"] + 1e-6)
-
-    nir_cv, dry_ndvi = _compute_nir_cv_and_dry_ndvi(df)
-    rec_p      = _compute_rec_p(df)
-    peak_stats = _compute_peak_doy(df)
-
     result = pd.DataFrame(index=df["point_id"].unique())
     result.index.name = "point_id"
-    result["nir_cv"]      = nir_cv
-    result["rec_p"]       = rec_p
-    result["peak_doy"]    = peak_stats["peak_doy"]
-    result["peak_doy_cv"] = peak_stats["peak_doy_cv"]
-    result["dry_ndvi"]    = dry_ndvi
+
+    if "B08" in pixel_df.columns and "B04" in pixel_df.columns:
+        df["_ndvi"] = (df["B08"] - df["B04"]) / (df["B08"] + df["B04"] + 1e-6)
+        nir_cv, dry_ndvi = _compute_nir_cv_and_dry_ndvi(df)
+        rec_p      = _compute_rec_p(df)
+        peak_stats = _compute_peak_doy(df)
+        result["nir_cv"]      = nir_cv
+        result["rec_p"]       = rec_p
+        result["peak_doy"]    = peak_stats["peak_doy"]
+        result["peak_doy_cv"] = peak_stats["peak_doy_cv"]
+        result["dry_ndvi"]    = dry_ndvi
+    else:
+        for col in ["nir_cv", "rec_p", "peak_doy", "peak_doy_cv", "dry_ndvi"]:
+            result[col] = np.nan
+
+    if "vh" in pixel_df.columns and "vv" in pixel_df.columns:
+        s1_feats = _compute_s1_globals(pixel_df)
+        for col in ["s1_mean_vh_dry", "s1_vh_contrast", "s1_vh_std", "s1_mean_rvi"]:
+            result[col] = s1_feats.get(col, pd.Series(dtype=float))
+    else:
+        for col in ["s1_mean_vh_dry", "s1_vh_contrast", "s1_vh_std", "s1_mean_rvi"]:
+            result[col] = np.nan
 
     return result[GLOBAL_FEATURE_NAMES]
 
@@ -142,3 +168,56 @@ def _compute_peak_doy(df: pd.DataFrame) -> pd.DataFrame:
         peak_doy="mean",
         peak_doy_cv="std",
     )
+
+
+def _compute_s1_globals(pixel_df: pd.DataFrame) -> dict[str, pd.Series]:
+    """Compute per-pixel S1 global features from S1 rows in pixel_df.
+
+    Expects rows with source="S1" (or any row where vh/vv are non-null).
+    All backscatter values stored as linear power; converted to dB here.
+    """
+    if "doy" not in pixel_df.columns:
+        df = pixel_df.copy()
+        df["doy"] = pd.to_datetime(df["date"]).dt.day_of_year
+    else:
+        df = pixel_df
+
+    # Keep only S1 rows with at least one valid band
+    if "source" in df.columns:
+        s1 = df[df["source"] == "S1"].copy()
+    else:
+        s1 = df[df["vh"].notna() | df["vv"].notna()].copy()
+
+    if s1.empty:
+        empty = pd.Series(dtype=float)
+        return {k: empty for k in ["s1_mean_vh_dry", "s1_vh_contrast", "s1_vh_std", "s1_mean_rvi"]}
+
+    # Convert linear power → dB (guard against zero/negative)
+    s1["_vh_db"] = 10 * np.log10(s1["vh"].clip(lower=1e-10))
+    s1["_vv_db"] = 10 * np.log10(s1["vv"].clip(lower=1e-10))
+
+    # RVI: 4·VH_lin / (VV_lin + VH_lin); requires both bands
+    both = s1["vh"].notna() & s1["vv"].notna()
+    s1["_rvi"] = np.nan
+    s1.loc[both, "_rvi"] = (
+        4 * s1.loc[both, "vh"] / (s1.loc[both, "vv"] + s1.loc[both, "vh"])
+    )
+
+    dry_mask = (s1["doy"] >= _DRY_DOY_MIN) & (s1["doy"] <= _DRY_DOY_MAX)
+    wet_mask = (s1["doy"] > _DRY_DOY_MAX) | (s1["doy"] < _DRY_DOY_MIN)
+
+    dry = s1[dry_mask & s1["_vh_db"].notna()]
+    wet = s1[wet_mask & s1["_vh_db"].notna()]
+
+    mean_vh_dry = dry.groupby("point_id")["_vh_db"].mean().rename("s1_mean_vh_dry")
+    mean_vh_wet = wet.groupby("point_id")["_vh_db"].mean()
+    vh_contrast = (mean_vh_wet - mean_vh_dry).rename("s1_vh_contrast")
+    vh_std      = s1[s1["_vh_db"].notna()].groupby("point_id")["_vh_db"].std().rename("s1_vh_std")
+    mean_rvi    = s1[s1["_rvi"].notna()].groupby("point_id")["_rvi"].mean().rename("s1_mean_rvi")
+
+    return {
+        "s1_mean_vh_dry": mean_vh_dry,
+        "s1_vh_contrast": vh_contrast,
+        "s1_vh_std":      vh_std,
+        "s1_mean_rvi":    mean_rvi,
+    }

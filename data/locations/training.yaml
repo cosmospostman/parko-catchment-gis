@@ -247,6 +247,13 @@ regions:
     notes: >
       Absence site. Lake Mueller area. Confirmed absence region.
 
+  - id: lake_mueller_absence_2
+    name: "Lake Mueller — absence 2"
+    label: absence
+    bbox: [145.550678, -22.784887, 145.554010, -22.781183]
+    year: 2021
+    tags: [arid, riparian]
+
   # ---------------------------------------------------------------------------
   # Mitchell River — Cape York Peninsula (monsoonal, riparian)
   # ---------------------------------------------------------------------------
@@ -398,6 +405,61 @@ regions:
     bbox: [141.701000, -19.941201, 141.707607, -19.939510]
     year: 2025
     tags: [monsoonal]
+
+  # ---------------------------------------------------------------------------
+  # Cloncurry — Gulf savanna woodland (monsoonal, woody absence)
+  # Variety of woody vegetation ~100km SW of Norman Road, same climate zone.
+  # Added to provide hard woody negative examples for v8 S1 training.
+  # ---------------------------------------------------------------------------
+
+  - id: cloncurry_absence_1
+    name: "Cloncurry — absence 1"
+    label: absence
+    bbox: [140.277733, -20.414733, 140.282275, -20.412022]
+    year: 2025
+    tags: [monsoonal, woodland]
+
+  - id: cloncurry_absence_2
+    name: "Cloncurry — absence 2"
+    label: absence
+    bbox: [140.278461, -20.420451, 140.282120, -20.417678]
+    year: 2025
+    tags: [monsoonal, woodland]
+
+  - id: cloncurry_absence_3
+    name: "Cloncurry — absence 3"
+    label: absence
+    bbox: [140.311856, -20.428356, 140.315913, -20.426106]
+    year: 2025
+    tags: [monsoonal, woodland]
+
+  - id: cloncurry_absence_4
+    name: "Cloncurry — absence 4"
+    label: absence
+    bbox: [140.183241, -20.385046, 140.187299, -20.382684]
+    year: 2025
+    tags: [monsoonal, woodland]
+
+  - id: cloncurry_absence_5
+    name: "Cloncurry — absence 5"
+    label: absence
+    bbox: [140.159042, -20.401051, 140.163190, -20.398079]
+    year: 2025
+    tags: [monsoonal, woodland]
+
+  - id: cloncurry_absence_6
+    name: "Cloncurry — absence 6"
+    label: absence
+    bbox: [140.098673, -20.412939, 140.101500, -20.409283]
+    year: 2025
+    tags: [monsoonal, woodland]
+
+  - id: cloncurry_absence_7
+    name: "Cloncurry — absence 7"
+    label: absence
+    bbox: [139.755355, -20.170009, 139.757782, -20.166276]
+    year: 2025
+    tags: [monsoonal, woodland]
 
   # ---------------------------------------------------------------------------
   # Quaids — Gulf savanna (monsoonal, open savanna woodland + floodplain)

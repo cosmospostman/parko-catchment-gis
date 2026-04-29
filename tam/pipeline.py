@@ -59,8 +59,14 @@ def _cmd_train(args: argparse.Namespace) -> None:
             logger.warning("Missing tile parquet: %s — run training_collector first", path)
             continue
         pf = pq.ParquetFile(path)
+        available = set(pf.schema_arrow.names)
+        # Always load source/vh/vv when present — needed for S1 global features
+        # even when use_s1=False (time series S1 disabled but globals still wanted).
+        s1_cols = [c for c in ("source", "vh", "vv", "scl") if c in available]
+        base_cols = ["point_id", "lon", "lat", "date", "scl_purity"]
+        read_cols = base_cols + [c for c in exp.feature_cols if c in available] + s1_cols
         for rg in range(pf.metadata.num_row_groups):
-            tbl = pf.read_row_group(rg, columns=["point_id", "lon", "lat", "date", "scl_purity"] + exp.feature_cols)
+            tbl = pf.read_row_group(rg, columns=read_cols)
             chunks.append(tbl.to_pandas())
 
     if not chunks:

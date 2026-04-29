@@ -14,10 +14,12 @@ class TAMConfig:
     d_ff:       int   = 64
     dropout:    float = 0.3
     use_n_obs:         bool  = True   # append normalised obs-count to pooled repr before head
-    n_global_features: int   = 5     # nir_cv, rec_p, peak_doy, peak_doy_cv, dry_ndvi (0 to disable)
+    n_global_features: int   = 9     # 5 S2 globals + 4 S1 globals (0 to disable)
+    use_s1:  bool | str  = True   # True=snap S1 to S2, "s1_only"=S1 sequence only, False=S2 only
 
     # Data (mirrors dataset.py constants — change both together)
-    n_bands:          int   = 13
+    # 13 S2 features + 4 S1 features (s1_vh, s1_vv, s1_vh_vv, s1_rvi) when use_s1=True
+    n_bands:          int   = 17
     max_seq_len:      int   = 128
     min_obs_per_year: int   = 8
     scl_purity_min:   float = 0.5
@@ -34,6 +36,7 @@ class TAMConfig:
     patience:        int   = 5
     min_delta:       float = 1e-4
     obs_dropout_min: int   = 0   # if >0, subsample each window to Uniform(obs_dropout_min, n) during training
+    warmup_freeze_epochs: int = 0  # if >0, freeze temporal stream for first N epochs (head-only warmup)
     doy_density_norm: bool = False  # if True, weight mean pool by inverse DOY observation frequency
     spatial_stride:       int   = 1   # if >1, thin training pixels spatially (every Nth pixel per region)
     stride_exclude_sites: tuple = ()  # site prefixes exempt from spatial stride (e.g. small/sparse sites)

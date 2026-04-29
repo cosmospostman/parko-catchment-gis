@@ -48,11 +48,43 @@ a generalisation feature.
 - **Temporal resolution:** ~6-12 day revisit over Australia
 - **Polarisations:** VV (vertical transmit, vertical receive) and VH (vertical
   transmit, horizontal receive)
-- **Key derived features:**
-  - VH backscatter — sensitive to volume scattering (canopy complexity)
-  - VV backscatter — sensitive to surface/double-bounce scattering (woody stems)
-  - VH/VV ratio — canopy complexity relative to surface roughness
-  - Temporal std of VH — seasonal variability in canopy volume (phenology proxy)
+
+### Per-observation features (instantaneous)
+
+- **VH backscatter (dB)** — sensitive to volume scattering from canopy foliage and
+  woody stems. Parkinsonia's fine pinnate foliage produces distinctive volume scattering.
+- **VV backscatter (dB)** — sensitive to surface and double-bounce scattering from
+  woody stems and soil. Higher in open/sparse canopy.
+- **VH−VV ratio (dB)** — canopy complexity relative to surface roughness. High ratio
+  indicates dense, complex canopy; low ratio indicates bare soil or smooth surfaces.
+- **Radar Vegetation Index (RVI):** `4 × VH / (VV + VH)` — normalises out soil
+  moisture effects, directly targets vegetation density. Well established for woody
+  vegetation monitoring. Ranges 0 (bare) to 1 (dense canopy). Strong candidate for
+  a climate-zone-invariant feature.
+- **VH × VV** — product sensitive to combined volume and double-bounce scattering;
+  sometimes more discriminative than either band alone for woody structure.
+
+### Temporal/global features (derived from time series)
+
+- **Mean VH / mean VV** — baseline backscatter level over the observation period.
+  Captures average canopy density independent of seasonal fluctuation.
+- **Temporal std of VH** — seasonal variability in volume scattering. Grassland
+  fluctuates strongly with rainfall and senescence; dense woody canopy is more stable.
+  Low std → structurally stable canopy → evidence of woody perennial vegetation.
+- **Wet/dry season contrast (VH wet − VH dry)** — grass shows large contrast as it
+  senesces in the dry season; Parkinsonia and native woodland retain more canopy.
+  Could be a useful phenological proxy where optical data is cloud-obscured.
+- **Mean RVI** — temporal mean of the Radar Vegetation Index; integrates vegetation
+  density across the full observation period.
+
+### Preprocessing note
+
+The raw S1 GRD COGs from Element84 STAC are in linear power units and have no
+embedded CRS or affine transform — georeferencing must be reconstructed from the
+STAC item's `proj:transform` property. Conversion to dB (10 × log₁₀) is applied
+before any analysis. Thermal noise removal and terrain correction are not applied
+in the current diagnostic scripts — this is acceptable for a signal check but
+should be addressed before production integration.
 
 ## Integration with TAM
 
