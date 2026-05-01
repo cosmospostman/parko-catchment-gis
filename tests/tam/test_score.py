@@ -74,11 +74,15 @@ def _make_parquet(
 
 def _stub_model() -> tuple[TAMClassifier, np.ndarray, np.ndarray]:
     """Tiny seeded model + zero-mean unit-std stats — enough for shape checks."""
-    cfg = TAMConfig(d_model=16, n_heads=2, n_layers=1, d_ff=32)
+    from tam.core.dataset import ALL_FEATURE_COLS
+    n_features = len(ALL_FEATURE_COLS)  # 13: S2-only features
+    cfg = TAMConfig(d_model=16, n_heads=2, n_layers=1, d_ff=32,
+                    n_bands=n_features, use_s1=False, n_global_features=0)
     torch.manual_seed(42)
     model = TAMClassifier.from_config(cfg)
+    model._use_s1 = False
+    model._pixel_zscore = False
     model.eval()
-    n_features = 13  # ALL_FEATURE_COLS length
     band_mean = np.zeros(n_features, dtype=np.float32)
     band_std  = np.ones(n_features, dtype=np.float32)
     return model, band_mean, band_std

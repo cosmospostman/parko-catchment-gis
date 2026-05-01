@@ -205,9 +205,9 @@ def train_tam(
             presence_pids = set(lbl[lbl == 1].index)
             gf = global_feat_df.reindex(list(presence_pids))
             noise_mask = (
-                (gf["dry_ndvi"] < cfg.presence_min_dry_ndvi) |
-                (gf["rec_p"]    < cfg.presence_min_rec_p) |
-                (gf["nir_cv"]   > cfg.presence_grass_nir_cv)
+                (gf["dry_ndvi"].fillna(cfg.presence_min_dry_ndvi) < cfg.presence_min_dry_ndvi) |
+                (gf["rec_p"].fillna(cfg.presence_min_rec_p)       < cfg.presence_min_rec_p) |
+                (gf["nir_cv"].fillna(cfg.presence_grass_nir_cv)   > cfg.presence_grass_nir_cv)
             )
             noisy_pids = presence_pids & set(gf[noise_mask].index)
             for pid in noisy_pids:
@@ -542,8 +542,10 @@ def train_tam(
 
     # Save final band stats + config (may differ from mid-training save if interrupted)
     np.savez(out_dir / "tam_band_stats.npz", mean=band_mean, std=band_std)
+    cfg_dict = model.config()
+    cfg_dict["best_val_auc"] = round(best_val_auc, 6)
     with open(out_dir / "tam_config.json", "w") as fh:
-        json.dump(model.config(), fh, indent=2)
+        json.dump(cfg_dict, fh, indent=2)
 
     # If val AUC never improved (e.g. tiny smoke datasets), save current weights so
     # the checkpoint always exists for the load below.
@@ -553,7 +555,7 @@ def train_tam(
     # Load best weights before returning
     model.load_state_dict(torch.load(checkpoint_path, map_location=device, weights_only=True))
     model.eval()
-    return model
+    return model, best_val_auc
 
 
 # ---------------------------------------------------------------------------
@@ -570,7 +572,8 @@ def load_tam(out_dir: Path, device: str | None = None) -> tuple[TAMClassifier, n
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
     with open(out_dir / "tam_config.json") as fh:
-        cfg = TAMConfig.from_dict(json.load(fh))
+        cfg_dict = json.load(fh)
+    cfg = TAMConfig.from_dict(cfg_dict)
 
     state = torch.load(out_dir / "tam_model.pt", map_location=device, weights_only=True)
 
@@ -583,6 +586,8 @@ def load_tam(out_dir: Path, device: str | None = None) -> tuple[TAMClassifier, n
     model = TAMClassifier.from_config(cfg)
     # Allow loading checkpoints saved before doy_inv_freq buffer was added
     model.load_state_dict(state, strict=False)
+    model._use_s1 = cfg_dict.get("use_s1", None)
+    model._pixel_zscore = cfg_dict.get("pixel_zscore", None)
     model.to(device)
     model.eval()
 

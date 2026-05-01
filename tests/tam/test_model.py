@@ -35,7 +35,8 @@ def _random_batch(B: int, T: int, n_valid: int, d_model: int = 16):
 
 
 def _small_model(n_layers=1) -> TAMClassifier:
-    cfg = TAMConfig(d_model=16, n_heads=2, n_layers=n_layers, d_ff=32, dropout=0.0)
+    cfg = TAMConfig(d_model=16, n_heads=2, n_layers=n_layers, d_ff=32, dropout=0.0,
+                    n_bands=N_BANDS, use_s1=False, n_global_features=0)
     m = TAMClassifier.from_config(cfg)
     m.eval()
     return m

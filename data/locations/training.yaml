@@ -268,6 +268,20 @@ regions:
     year: 2021
     tags: [arid, riparian]
 
+  - id: lake_mueller_absence_3
+    name: "Lake Mueller — absence 3"
+    label: absence
+    bbox: [145.425406, -22.728124, 145.429087, -22.725397]
+    year: 2021
+    tags: [arid, riparian]
+
+  - id: lake_mueller_presence_4
+    name: "Lake Mueller — presence 4"
+    label: presence
+    bbox: [145.425007, -22.762711, 145.427751, -22.761800]
+    year: 2021
+    tags: [arid, riparian]
+
   # ---------------------------------------------------------------------------
   # Mitchell River — Cape York Peninsula (monsoonal, riparian)
   # ---------------------------------------------------------------------------
@@ -1181,3 +1195,63 @@ regions:
     bbox: [137.662852, -18.995507, 137.665796, -18.991595]
     year: 2025
     tags: [semi-arid, riparian]
+
+  # ---------------------------------------------------------------------------
+  # Corfield — northwest Queensland (semi-arid, cropland false-positive site)
+  # ---------------------------------------------------------------------------
+  - id: corfield_absence_1
+    name: "Corfield — absence 1 (cropland)"
+    label: absence
+    bbox: [143.144183, -21.509954, 143.146936, -21.504262]
+    year: 2023
+    tags: [semi-arid, cropland]
+    notes: "Irrigated cropland — false-positive on initial scoring; added as hard negative"
+
+  - id: corfield_absence_2
+    name: "Corfield — absence 2 (cropland)"
+    label: absence
+    bbox: [143.133995, -21.516025, 143.136602, -21.509924]
+    year: 2023
+    tags: [semi-arid, cropland]
+
+  - id: corfield_presence_1
+    name: "Corfield — presence 1"
+    label: presence
+    bbox: [143.165458, -21.500180, 143.167455, -21.498009]
+    year: 2023
+    tags: [semi-arid]
+
+  - id: corfield_presence_2
+    name: "Corfield — presence 2"
+    label: presence
+    bbox: [143.169919, -21.500191, 143.172483, -21.497328]
+    year: 2023
+    tags: [semi-arid]
+
+  - id: corfield_presence_3
+    name: "Corfield — presence 3"
+    label: presence
+    bbox: [143.173783, -21.502555, 143.176158, -21.501788]
+    year: 2023
+    tags: [semi-arid]
+
+  - id: corfield_absence_3
+    name: "Corfield — absence 3 (cropland, 2018)"
+    label: absence
+    bbox: [143.146553, -21.513805, 143.148885, -21.509914]
+    year: 2018
+    tags: [semi-arid, cropland]
+
+  - id: corfield_presence_4
+    name: "Corfield — presence 4 (2018)"
+    label: presence
+    bbox: [143.197452, -21.502793, 143.200494, -21.502121]
+    year: 2018
+    tags: [semi-arid]
+
+  - id: corfield_presence_5
+    name: "Corfield — presence 5 (2018)"
+    label: presence
+    bbox: [143.198975, -21.503427, 143.200475, -21.502821]
+    year: 2018
+    tags: [semi-arid]

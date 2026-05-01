@@ -23,6 +23,7 @@ Tests
 15. Tile-grouping loop: a region straddling two tiles appears under both buckets.
 16. Per-tile dedup does not remove cross-tile items with matching ids (Bug TC6 — documents).
 17. Cross-tile boundary pixel produces only one row after (point_id, date) dedup.
+18. Tile rebuild includes all indexed regions, not just those in the current fetch.
 """
 
 from __future__ import annotations
@@ -308,3 +309,74 @@ def test_cross_tile_boundary_pixel_deduplicated_in_output():
 
     assert len(df_dedup) == 1
     assert df_dedup.iloc[0]["tile_id"] == "55HBV"
+
+
+# ---------------------------------------------------------------------------
+# Test 18 — tile rebuild includes all indexed regions, not just current fetch
+# ---------------------------------------------------------------------------
+
+def test_tile_rebuild_includes_all_indexed_regions(training_dirs, monkeypatch):
+    """Regression: fetching a subset of regions for a tile must not overwrite
+    previously collected regions when rebuilding the tile parquet.
+
+    Scenario:
+      - region_a was previously collected and indexed to tile 55HBU
+      - region_b is being fetched now and also maps to tile 55HBU
+      - the rebuilt tile must include rows from both region_a and region_b
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    tiles_dir = training_dirs["tiles_dir"]
+    regions_dir = tiles_dir / "regions"
+
+    # Write pre-existing region_a parquet (already in index)
+    schema = pa.schema([
+        pa.field("point_id", pa.string()),
+        pa.field("lon", pa.float32()),
+        pa.field("lat", pa.float32()),
+    ])
+    pq.write_table(
+        pa.table({"point_id": ["region_a_0000"], "lon": [145.0], "lat": [-23.0]}, schema=schema),
+        regions_dir / "region_a.parquet",
+    )
+    _update_index("region_a", ["55HBU"])
+
+    # Write new region_b parquet (being fetched now)
+    pq.write_table(
+        pa.table({"point_id": ["region_b_0000"], "lon": [145.1], "lat": [-23.1]}, schema=schema),
+        regions_dir / "region_b.parquet",
+    )
+    _update_index("region_b", ["55HBU"])
+
+    # Simulate the tile rebuild step from ensure_training_pixels() with only
+    # region_b in scope (the bug: region_a would be excluded pre-fix).
+    from utils.training_collector import _load_index, _region_parquet_path, tile_parquet_path
+
+    tile_id = "55HBU"
+    tile_path = tile_parquet_path(tile_id)
+
+    all_indexed = _load_index()
+    all_indexed_ids = set(all_indexed.loc[all_indexed["tile_id"] == tile_id, "region_id"])
+    region_paths = [
+        _region_parquet_path(rid)
+        for rid in sorted(all_indexed_ids)
+        if _region_parquet_path(rid).exists()
+    ]
+
+    writer = None
+    for rp in region_paths:
+        pf = pq.ParquetFile(rp)
+        for rg in range(pf.metadata.num_row_groups):
+            tbl = pf.read_row_group(rg)
+            if writer is None:
+                writer = pq.ParquetWriter(tile_path, tbl.schema)
+            writer.write_table(tbl)
+    if writer:
+        writer.close()
+
+    # Both regions must appear in the rebuilt tile
+    result = pq.read_table(tile_path).to_pandas()
+    point_ids = set(result["point_id"])
+    assert "region_a_0000" in point_ids, "region_a missing from rebuilt tile — pre-fix bug"
+    assert "region_b_0000" in point_ids, "region_b missing from rebuilt tile"

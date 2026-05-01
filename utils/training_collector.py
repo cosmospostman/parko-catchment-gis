@@ -378,10 +378,19 @@ def ensure_training_pixels(
                 writer.close()
             new_regions.append(region.id)
 
-        # Rebuild tile parquet if any region is new or the tile parquet was missing
+        # Rebuild tile parquet if any region is new or the tile parquet was missing.
+        # Include ALL regions indexed for this tile (not just the ones being fetched
+        # now) so that a partial fetch never overwrites previously collected data.
         if new_regions or tile_missing:
-            region_paths = [_region_parquet_path(r.id) for r in tile_regions
-                            if _region_parquet_path(r.id).exists()]
+            all_indexed = _load_index()
+            all_indexed_ids = set(
+                all_indexed.loc[all_indexed["tile_id"] == tile_id, "region_id"]
+            )
+            region_paths = [
+                _region_parquet_path(rid)
+                for rid in sorted(all_indexed_ids)
+                if _region_parquet_path(rid).exists()
+            ]
             logger.info(
                 "Building tile %s from %d region parquets → %s",
                 tile_id, len(region_paths), tile_path.name,

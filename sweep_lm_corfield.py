@@ -1,15 +1,21 @@
-"""sweep_zscore_etna_landsend.py — Hyperparam sweep over v8_s1_zscore_nr_etna_landsend.
+"""sweep_lm_corfield.py — Hyperparam sweep over v8_s1_zscore_nr_etna_landsend_lm_corfield.
+
+Explores the neighbourhood of the best config from sweep_zscore_etna_landsend
+(lr=5e-5, d_model=128, n_layers=2, val_auc=0.955 on etna holdout).
 
 Grid:
-  lr:      1e-5, 5e-5
-  d_model: 64, 128
+  anchor:           lr=5e-5  d_model=128  n_layers=2   (reference)
+  lr up:            lr=1e-4  d_model=128  n_layers=2
+  wider:            lr=5e-5  d_model=256  n_layers=2
+  deeper (3):       lr=5e-5  d_model=128  n_layers=3
+  deeper (4):       lr=5e-5  d_model=128  n_layers=4
 
-= 4 runs total. All other settings identical to v8_s1_zscore_nr_etna_landsend.
+= 5 runs total. Etna held out as validation site throughout.
 
 Usage:
-    python sweep_zscore_etna_landsend.py
-    python sweep_zscore_etna_landsend.py --out outputs/sweep_zscore_etna_landsend
-    python sweep_zscore_etna_landsend.py --dry-run
+    python sweep_lm_corfield.py
+    python sweep_lm_corfield.py --out outputs/sweep_lm_corfield
+    python sweep_lm_corfield.py --dry-run
 """
 
 from __future__ import annotations
@@ -36,10 +42,10 @@ def _setup_logging(log_path: Path | None = None) -> None:
     )
 
 
-logger = logging.getLogger("sweep_zscore")
+logger = logging.getLogger("sweep_lm_corfield")
 
 
-def run_one(run_id: str, out_dir: Path, lr: float, d_model: int) -> float | None:
+def run_one(run_id: str, out_dir: Path, lr: float, d_model: int, n_layers: int) -> float | None:
     """Train one variant, tee all output to a per-run log, return best val_auc."""
     import importlib
     import pyarrow.parquet as pq
@@ -54,15 +60,13 @@ def run_one(run_id: str, out_dir: Path, lr: float, d_model: int) -> float | None
     out_dir.mkdir(parents=True, exist_ok=True)
     run_log = out_dir / "train.log"
 
-    # Add a per-run file handler so all output (including tam.core.train epoch lines)
-    # goes to both console and the run's own log file.
     run_handler = logging.FileHandler(run_log)
     run_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
     root = logging.getLogger()
     root.addHandler(run_handler)
 
     try:
-        return _run(run_id, out_dir, lr, d_model,
+        return _run(run_id, out_dir, lr, d_model, n_layers,
                     importlib, pq, pd, TAMConfig, train_tam,
                     label_pixels, select_regions, tile_ids_for_regions, tile_parquet_path)
     finally:
@@ -70,15 +74,15 @@ def run_one(run_id: str, out_dir: Path, lr: float, d_model: int) -> float | None
         run_handler.close()
 
 
-def _run(run_id, out_dir, lr, d_model,
+def _run(run_id, out_dir, lr, d_model, n_layers,
          importlib, pq, pd, TAMConfig, train_tam,
          label_pixels, select_regions, tile_ids_for_regions, tile_parquet_path):
 
-    exp = importlib.import_module("tam.experiments.v8_s1_zscore_nr_etna_landsend").EXPERIMENT
+    exp = importlib.import_module("tam.experiments.v8_s1_zscore_nr_etna_landsend_lm_corfield").EXPERIMENT
 
     cfg = TAMConfig(
         d_model=d_model,
-        n_layers=2,
+        n_layers=n_layers,
         dropout=0.5,
         n_bands=4,
         n_global_features=0,
@@ -96,7 +100,7 @@ def _run(run_id, out_dir, lr, d_model,
     )
 
     logger.info("=" * 60)
-    logger.info("START %s  lr=%s  d_model=%d", run_id, lr, d_model)
+    logger.info("START %s  lr=%s  d_model=%d  n_layers=%d", run_id, lr, d_model, n_layers)
     logger.info("=" * 60)
 
     regions = select_regions(exp.region_ids)
@@ -111,7 +115,6 @@ def _run(run_id, out_dir, lr, d_model,
         pf = pq.ParquetFile(path)
         available = set(pf.schema_arrow.names)
         s1_cols = [c for c in ("source", "vh", "vv", "scl") if c in available]
-        # B08/B04 needed by compute_global_features (noise filter) even in S1-only experiments
         s2_global_cols = [c for c in ("B08", "B04") if c in available and c not in exp.feature_cols]
         base_cols = ["point_id", "lon", "lat", "date", "scl_purity"]
         read_cols = base_cols + [c for c in exp.feature_cols if c in available] + s1_cols + s2_global_cols
@@ -149,7 +152,7 @@ def _run(run_id, out_dir, lr, d_model,
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--out", default="outputs/sweep_zscore_etna_landsend")
+    parser.add_argument("--out", default="outputs/sweep_lm_corfield")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -159,28 +162,29 @@ def main() -> None:
     _setup_logging(base_out / "sweep.log")
 
     grid = [
-        # (lr,    d_model)
-        (1e-5,   64),
-        (5e-5,   64),
-        (1e-5,  128),
-        (5e-5,  128),
+        # (lr,    d_model, n_layers, label)
+        (5e-5,  128, 2, "anchor"),
+        (1e-4,  128, 2, "lr_up"),
+        (5e-5,  256, 2, "wider"),
+        (5e-5,  128, 3, "deeper3"),
+        (5e-5,  128, 4, "deeper4"),
     ]
 
     summary_path = base_out / "summary.tsv"
-    header = "run_id\tlr\td_model\tbest_val_auc"
+    header = "run_id\tlr\td_model\tn_layers\tbest_val_auc"
     logger.info(header.replace("\t", "  "))
     with open(summary_path, "w") as fh:
         fh.write(header + "\n")
 
-    for lr, d_model in grid:
-        run_id = f"lr{lr:.0e}_dm{d_model}"
+    for lr, d_model, n_layers, label in grid:
+        run_id = f"lr{lr:.0e}_dm{d_model}_nl{n_layers}_{label}"
         out_dir = base_out / run_id
 
         if args.dry_run:
             logger.info("DRY RUN — would run %s", run_id)
             continue
 
-        val_auc = run_one(run_id, out_dir, lr, d_model)
+        val_auc = run_one(run_id, out_dir, lr, d_model, n_layers)
 
         if val_auc is not None:
             attn_dir = out_dir / "attention"
@@ -189,12 +193,12 @@ def main() -> None:
                 subprocess.run(
                     [sys.executable, "-m", "tam.viz_attention",
                      "--checkpoint", str(out_dir),
-                     "--experiment", "v8_s1_zscore_nr_etna_landsend"],
+                     "--experiment", "v8_s1_zscore_nr_etna_landsend_lm_corfield"],
                     cwd=PROJECT_ROOT,
                 )
 
         val_str = f"{val_auc:.4f}" if val_auc is not None else "FAILED"
-        row = f"{run_id}\t{lr:.0e}\t{d_model}\t{val_str}"
+        row = f"{run_id}\t{lr:.0e}\t{d_model}\t{n_layers}\t{val_str}"
         logger.info(row.replace("\t", "  "))
         with open(summary_path, "a") as fh:
             fh.write(row + "\n")

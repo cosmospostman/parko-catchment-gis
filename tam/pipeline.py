@@ -64,8 +64,11 @@ def _cmd_train(args: argparse.Namespace) -> None:
         # Always load source/vh/vv when present — needed for S1 global features
         # even when use_s1=False (time series S1 disabled but globals still wanted).
         s1_cols = [c for c in ("source", "vh", "vv", "scl") if c in available]
+        # B08/B04 needed by compute_global_features (noise filter + S2 globals)
+        # even in S1-only experiments where they are not model input features.
+        s2_global_cols = [c for c in ("B08", "B04") if c in available and c not in exp.feature_cols]
         base_cols = ["point_id", "lon", "lat", "date", "scl_purity"]
-        read_cols = base_cols + [c for c in exp.feature_cols if c in available] + s1_cols
+        read_cols = base_cols + [c for c in exp.feature_cols if c in available] + s1_cols + s2_global_cols
         for rg in range(pf.metadata.num_row_groups):
             tbl = pf.read_row_group(rg, columns=read_cols)
             chunks.append(tbl.to_pandas())
@@ -144,7 +147,7 @@ def _cmd_train(args: argparse.Namespace) -> None:
         **overrides,
     )
 
-    train_tam(
+    _, best_val_auc = train_tam(
         pixel_df=pixel_df[pixel_df["point_id"].isin(labels.index)],
         labels=labels,
         pixel_coords=pixel_coords,
@@ -152,7 +155,7 @@ def _cmd_train(args: argparse.Namespace) -> None:
         cfg=cfg,
         device=args.device,
     )
-    logger.info("Checkpoint saved to %s", out_dir)
+    logger.info("Checkpoint saved to %s  best_val_auc=%.3f", out_dir, best_val_auc)
 
 
 # ---------------------------------------------------------------------------
