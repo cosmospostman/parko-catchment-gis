@@ -13,12 +13,13 @@ import numpy as np
 import pandas as pd
 import torch
 
-from tam.core.dataset import ALL_FEATURE_COLS, BAND_COLS, MAX_SEQ_LEN
+from tam.core.dataset import ALL_FEATURE_COLS, BAND_COLS, MAX_SEQ_LEN, S1_FEATURE_COLS
 from tam.core.model import TAMClassifier
 
 logger = logging.getLogger(__name__)
 
 _N_FEATURES = len(ALL_FEATURE_COLS)
+_N_FEATURES_S1 = len(S1_FEATURE_COLS)
 _SENTINEL = object()
 
 # Precomputed offset for fast numpy year/doy extraction (no pd.to_datetime)
@@ -26,6 +27,76 @@ _EPOCH_D = np.datetime64("1970-01-01", "D")
 
 # Band column positions in the feature matrix (matches ALL_FEATURE_COLS order)
 _BAND_INDICES = {c: i for i, c in enumerate(ALL_FEATURE_COLS)}
+
+
+def _compute_pixel_s1_stats(parquet: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """One-pass pre-read to compute per-pixel VH/VV mean/std for z-scoring.
+
+    Returns (pids, vh_mean, vv_mean, vh_std, vv_std) as parallel arrays indexed
+    by unique point_id. Called once before the main scoring pipeline when
+    pixel_zscore=True so that _extract_s1_features can normalise on the fly.
+    """
+    import pyarrow.parquet as pq
+    pf = pq.ParquetFile(parquet)
+    available = set(pf.schema_arrow.names)
+    read_cols = [c for c in ["point_id", "source", "vh", "vv"] if c in available]
+    chunks = []
+    for rg in range(pf.metadata.num_row_groups):
+        df = pf.read_row_group(rg, columns=read_cols).to_pandas()
+        if "source" in df.columns:
+            df = df[df["source"] == "S1"]
+        df = df.dropna(subset=["vh", "vv"])
+        if not df.empty:
+            chunks.append(df[["point_id", "vh", "vv"]])
+    if not chunks:
+        return {}, {}
+    all_s1 = pd.concat(chunks, ignore_index=True)
+    all_s1["vh_db"] = np.where(all_s1["vh"] > 0, 10 * np.log10(all_s1["vh"]), np.nan)
+    all_s1["vv_db"] = np.where(all_s1["vv"] > 0, 10 * np.log10(all_s1["vv"]), np.nan)
+    grp = all_s1.groupby("point_id")
+    vh_mean = grp["vh_db"].mean()
+    vh_std  = grp["vh_db"].std().clip(lower=0.1)
+    vv_mean = grp["vv_db"].mean()
+    vv_std  = grp["vv_db"].std().clip(lower=0.1)
+    return (vh_mean.to_dict(), vh_std.to_dict(),
+            vv_mean.to_dict(), vv_std.to_dict())
+
+
+def _extract_s1_features(
+    chunk: pd.DataFrame,
+    pixel_zscore: bool = False,
+    vh_mean: dict | None = None,
+    vh_std:  dict | None = None,
+    vv_mean: dict | None = None,
+    vv_std:  dict | None = None,
+) -> np.ndarray:
+    """Extract 4 S1 features (vh_db, vv_db, vh_vv, rvi) from linear vh/vv columns.
+
+    When pixel_zscore=True, VH and VV are z-scored by each pixel's own multi-year
+    mean/std (pre-computed via _compute_pixel_s1_stats). VH-VV and RVI are left
+    in their natural units — they are self-normalising ratios that carry absolute
+    canopy structure signal.
+    """
+    vh_lin = chunk["vh"].values.astype(np.float32)
+    vv_lin = chunk["vv"].values.astype(np.float32)
+    vh_db  = np.where(vh_lin > 0, 10 * np.log10(vh_lin), np.nan)
+    vv_db  = np.where(vv_lin > 0, 10 * np.log10(vv_lin), np.nan)
+    vh_vv  = vh_db - vv_db
+    denom  = vh_lin + vv_lin
+    rvi    = np.where(denom > 0, 4 * vh_lin / denom, np.nan)
+
+    if pixel_zscore and vh_mean is not None:
+        pids = chunk["point_id"].values
+        p_vh_mean = np.array([vh_mean.get(p, 0.0) for p in pids], dtype=np.float32)
+        p_vh_std  = np.array([vh_std.get(p,  1.0) for p in pids], dtype=np.float32)
+        p_vv_mean = np.array([vv_mean.get(p, 0.0) for p in pids], dtype=np.float32)
+        p_vv_std  = np.array([vv_std.get(p,  1.0) for p in pids], dtype=np.float32)
+        vh_db = (vh_db - p_vh_mean) / p_vh_std
+        vv_db = (vv_db - p_vv_mean) / p_vv_std
+
+    feat = np.stack([vh_db, vv_db, vh_vv, rvi], axis=1).astype(np.float32)
+    feat = np.where(np.isnan(feat), 0.0, feat)
+    return feat
 
 
 def _extract_year_doy(ts_us: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -54,6 +125,12 @@ def _preprocess(
     scl_purity_min: float,
     min_obs_per_year: int,
     pin: bool = False,
+    s1_only: bool = False,
+    pixel_zscore: bool = False,
+    vh_mean: dict | None = None,
+    vh_std:  dict | None = None,
+    vv_mean: dict | None = None,
+    vv_std:  dict | None = None,
 ) -> _PreparedBatch | None:
     """CPU-side preprocessing using numba kernels for maximum throughput.
 
@@ -65,22 +142,32 @@ def _preprocess(
     """
     from tam.core._preprocess_numba import extract_features, fill_windows
 
-    if "scl_purity" in chunk.columns:
+    if s1_only:
+        chunk = chunk[chunk["source"] == "S1"].copy() if "source" in chunk.columns else chunk
+        chunk = chunk.dropna(subset=["vh", "vv"])
+    elif "scl_purity" in chunk.columns:
         chunk = chunk[chunk["scl_purity"] >= scl_purity_min]
     if chunk.empty:
         return None
 
     N = len(chunk)
 
-    # Step 1: extract feature matrix — bands are already float32, zero-copy .values
-    feat = np.empty((N, _N_FEATURES), dtype=np.float32)
-    extract_features(
-        chunk["B02"].values, chunk["B03"].values, chunk["B04"].values,
-        chunk["B05"].values, chunk["B06"].values, chunk["B07"].values,
-        chunk["B08"].values, chunk["B8A"].values, chunk["B11"].values,
-        chunk["B12"].values,
-        feat,
-    )
+    if s1_only:
+        feat = _extract_s1_features(chunk, pixel_zscore=pixel_zscore,
+                                    vh_mean=vh_mean, vh_std=vh_std,
+                                    vv_mean=vv_mean, vv_std=vv_std)
+        n_feat = _N_FEATURES_S1
+    else:
+        # Step 1: extract feature matrix — bands are already float32, zero-copy .values
+        n_feat = _N_FEATURES
+        feat = np.empty((N, n_feat), dtype=np.float32)
+        extract_features(
+            chunk["B02"].values, chunk["B03"].values, chunk["B04"].values,
+            chunk["B05"].values, chunk["B06"].values, chunk["B07"].values,
+            chunk["B08"].values, chunk["B8A"].values, chunk["B11"].values,
+            chunk["B12"].values,
+            feat,
+        )
 
     # Step 2: find group boundaries (pixel-year windows)
     pid_arr  = chunk["point_id"].values
@@ -106,7 +193,7 @@ def _preprocess(
     W = int(valid.sum())
 
     # Step 3: fill padded tensors with normalisation via numba parallel kernel
-    bands_np = np.zeros((W, MAX_SEQ_LEN, _N_FEATURES), dtype=np.float32)
+    bands_np = np.zeros((W, MAX_SEQ_LEN, n_feat), dtype=np.float32)
     doy_np   = np.zeros((W, MAX_SEQ_LEN), dtype=np.int64)
     mask_np  = np.ones( (W, MAX_SEQ_LEN), dtype=np.bool_)
 
@@ -202,6 +289,8 @@ def score_pixels_chunked(
     end_year: int | None = None,
     decay: float = 0.7,
     n_total_pixels: int | None = None,
+    s1_only: bool = False,
+    pixel_zscore: bool = False,
     # accumulators — pass across years to merge results before final aggregation
     _all_pids:  list | None = None,
     _all_years: list | None = None,
@@ -231,15 +320,33 @@ def score_pixels_chunked(
     logger.info("Warming up numba kernels ...")
     _numba_warmup()
 
+    # Pre-pass: compute per-pixel VH/VV stats for z-scoring (s1_only mode only).
+    # Must happen before the main pipeline so chunked preprocessors have full-pixel history.
+    _vh_mean = _vh_std = _vv_mean = _vv_std = None
+    if s1_only and pixel_zscore:
+        logger.info("Computing per-pixel S1 z-score stats (pre-pass) ...")
+        _vh_mean, _vh_std, _vv_mean, _vv_std = _compute_pixel_s1_stats(parquet)
+        logger.info("Z-score stats computed for %d pixels", len(_vh_mean))
+
     pf = pq.ParquetFile(parquet)
     n_rg = pf.metadata.num_row_groups
     tile_prefix = f"_{tile_id}_" if tile_id else None
 
-    read_cols = (
-        ["point_id", "date", "scl_purity"]
-        + (["item_id"] if tile_id else [])
-        + BAND_COLS
-    )
+    if s1_only:
+        read_cols = (
+            ["point_id", "date", "source"]
+            + (["item_id"] if tile_id else [])
+            + ["vh", "vv"]
+        )
+    else:
+        read_cols = (
+            ["point_id", "date", "scl_purity"]
+            + (["item_id"] if tile_id else [])
+            + BAND_COLS
+        )
+    # Only read columns that exist in this parquet
+    available = set(pf.schema_arrow.names)
+    read_cols = [c for c in read_cols if c in available]
 
     # Stage 1→2: raw DataFrames
     raw_q: Queue = Queue(maxsize=n_prep_workers * 2)
@@ -271,7 +378,8 @@ def score_pixels_chunked(
             chunk = pf.read_row_group(rg, columns=read_cols).to_pandas()
             if tile_prefix:
                 chunk = chunk[chunk["item_id"].str.contains(tile_prefix, regex=False)]
-            chunk = chunk[chunk["scl_purity"] >= scl_purity_min]
+            if not s1_only and "scl_purity" in chunk.columns:
+                chunk = chunk[chunk["scl_purity"] >= scl_purity_min]
             if chunk.empty:
                 continue
             ts_us = pd.to_datetime(chunk["date"]).values.astype("datetime64[us]").astype("int64")
@@ -297,7 +405,9 @@ def score_pixels_chunked(
             item = raw_q.get()
             if item is _SENTINEL:
                 break
-            prepared = _preprocess(item, band_mean, band_std, scl_purity_min, min_obs_per_year, pin=pin)
+            prepared = _preprocess(item, band_mean, band_std, scl_purity_min, min_obs_per_year, pin=pin, s1_only=s1_only,
+                                   pixel_zscore=pixel_zscore, vh_mean=_vh_mean, vh_std=_vh_std,
+                                   vv_mean=_vv_mean, vv_std=_vv_std)
             if prepared is not None:
                 prep_q.put(prepared)
         prep_q.put(_SENTINEL)
@@ -351,6 +461,8 @@ def score_location_years(
     end_year: int | None = None,
     decay: float = 0.7,
     n_total_pixels: int | None = None,
+    s1_only: bool = False,
+    pixel_zscore: bool = False,
 ) -> pd.DataFrame:
     """Score a location across multiple annual parquets and aggregate.
 
@@ -384,6 +496,8 @@ def score_location_years(
             end_year=_eff_end_year,
             decay=decay,
             n_total_pixels=n_total_pixels,
+            s1_only=s1_only,
+            pixel_zscore=pixel_zscore,
             _all_pids=all_pids,
             _all_years=all_years,
             _all_probs=all_probs,
@@ -414,6 +528,7 @@ def score_tile_year(
     batch_size: int = 4096,
     n_prep_workers: int = 4,
     device: str | None = None,
+    s1_only: bool = False,
 ) -> Path:
     """Score a single (tile_id, year) parquet and write a staging parquet.
 
@@ -445,6 +560,7 @@ def score_tile_year(
         tile_id=tile_id,
         end_year=year,
         decay=0.0,   # no decay here — aggregation happens in phase 2
+        s1_only=s1_only,
     )
 
     scores["year"] = np.int16(year)
@@ -467,7 +583,7 @@ def _score_tile_worker(args: tuple) -> tuple[str, list[Path]]:
     (
         tile_id, year_parquets, model, band_mean, band_std,
         staging_dir, scl_purity_min, min_obs_per_year,
-        batch_size, n_prep_workers, device, n_tile_workers,
+        batch_size, n_prep_workers, device, n_tile_workers, s1_only,
     ) = args
 
     torch.set_num_threads(max(1, (os.cpu_count() or 1) // n_tile_workers))
@@ -487,6 +603,7 @@ def _score_tile_worker(args: tuple) -> tuple[str, list[Path]]:
             batch_size=batch_size,
             n_prep_workers=n_prep_workers,
             device=device,
+            s1_only=s1_only,
         )
         paths.append(p)
     return tile_id, paths
@@ -506,6 +623,7 @@ def score_tiles_chunked(
     device: str | None = None,
     end_year: int | None = None,
     decay: float = 0.7,
+    s1_only: bool = False,
 ) -> list[Path]:
     """Score each S2 tile independently, writing one parquet per tile.
 
@@ -541,7 +659,7 @@ def score_tiles_chunked(
         (
             tile_id, year_parquets, model, band_mean, band_std,
             staging_dir, scl_purity_min, min_obs_per_year,
-            batch_size, n_prep_workers, device, n_tile_workers,
+            batch_size, n_prep_workers, device, n_tile_workers, s1_only,
         )
         for tile_id, year_parquets in tile_year_parquets.items()
     ]

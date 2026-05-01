@@ -1,0 +1,4 @@
+name: "Winton"
+centroid: [-22.605, 143.116]  # [lat, lon]
+bbox: [143.033938, -22.658838, 143.198841, -22.551966]  # [lon_min, lat_min, lon_max, lat_max]
+dry_months: [6, 7, 8, 9, 10]

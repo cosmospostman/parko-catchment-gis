@@ -528,6 +528,112 @@ def test_extract_item_to_df_two_tiles_produce_separate_rows():
 
 
 # ---------------------------------------------------------------------------
+# Tests 19–21 — NBAR c-factor NaN propagation (regression)
+#
+# Root cause: get_item_angles() interpolates angle grids from the granule XML.
+# Pixels near or outside the granule's angle grid boundary receive NaN vza/vaa.
+# np.clip(band * cf, 0, 1) propagates NaN, silently zeroing out valid observations.
+# Fix: fall back to uncorrected reflectance where cf is NaN.
+# ---------------------------------------------------------------------------
+
+def _make_angles(n: int, *, nan_indices: list[int] | None = None) -> dict:
+    """Return a plausible angles dict for n points, with NaN at nan_indices."""
+    sza = np.full(n, 30.0, dtype=np.float64)
+    vza = np.full(n, 5.0,  dtype=np.float64)
+    saa = np.full(n, 150.0, dtype=np.float64)
+    vaa = np.full(n, 100.0, dtype=np.float64)
+    if nan_indices:
+        vza[nan_indices] = np.nan
+        vaa[nan_indices] = np.nan
+    return {band: {"sza": sza.copy(), "vza": vza.copy(),
+                   "saa": saa.copy(), "vaa": vaa.copy()}
+            for band in BANDS}
+
+
+def test_nbar_nan_angles_do_not_produce_nan_bands():
+    """Regression PC-NBAR1: NaN vza from angle interpolation must not write NaN bands.
+
+    When get_item_angles returns NaN for some pixels (tile-edge pixels outside the
+    granule angle grid), c_factor(sza, nan_vza, raa) = NaN, and
+    np.clip(band * NaN, 0, 1) = NaN — silently corrupting valid reflectance.
+    The fix falls back to uncorrected reflectance for those pixels.
+    """
+    from unittest.mock import patch
+
+    item = _make_item()
+    store, lons, lats, _ = _make_store(4, scl_value=4.0, band_value=500.0)
+    pids = _point_ids(4)
+
+    # Pixels 0 and 2 have NaN vza/vaa; pixels 1 and 3 have valid angles.
+    angles = _make_angles(4, nan_indices=[0, 2])
+
+    with patch("utils.granule_angles.get_item_angles", return_value=angles):
+        df = extract_item_to_df(item, store, pids, lons, lats, apply_nbar=True)
+
+    assert df is not None, "NaN angles must not cause all rows to be dropped"
+    assert df[list(BANDS)].isna().sum().sum() == 0, (
+        "NaN c-factors must not propagate to band columns — "
+        "fall back to uncorrected reflectance instead"
+    )
+
+
+def test_nbar_all_nan_angles_do_not_produce_nan_bands():
+    """Regression PC-NBAR2: all-NaN angles (entire grid missing) must not corrupt bands.
+
+    If the angle XML is unavailable or all pixels are outside the grid,
+    get_item_angles returns a dict where every vza is NaN.  Every c-factor is NaN,
+    so every band value would become NaN without the fallback.
+    """
+    from unittest.mock import patch
+
+    item = _make_item()
+    store, lons, lats, _ = _make_store(3, scl_value=4.0, band_value=800.0)
+    pids = _point_ids(3)
+
+    angles = _make_angles(3, nan_indices=[0, 1, 2])
+
+    with patch("utils.granule_angles.get_item_angles", return_value=angles):
+        df = extract_item_to_df(item, store, pids, lons, lats, apply_nbar=True)
+
+    assert df is not None
+    assert df[list(BANDS)].isna().sum().sum() == 0, (
+        "All-NaN angles must not corrupt any band — fall back to uncorrected"
+    )
+    # Values should be the uncorrected raw/10000 = 800/10000 = 0.08
+    assert abs(float(df["B02"].iloc[0]) - 0.08) < 1e-4, (
+        "Uncorrected fallback value should be raw DN / 10000"
+    )
+
+
+def test_nbar_valid_angles_are_still_applied():
+    """Sanity check PC-NBAR3: the NaN fallback must not suppress valid NBAR correction.
+
+    Pixels with valid angles must still receive c-factor correction, not be left
+    at uncorrected reflectance.
+    """
+    from unittest.mock import patch
+    from utils.nbar import c_factor as compute_cf
+
+    item = _make_item()
+    store, lons, lats, _ = _make_store(2, scl_value=4.0, band_value=500.0)
+    pids = _point_ids(2)
+
+    angles = _make_angles(2)  # no NaN — all valid
+
+    with patch("utils.granule_angles.get_item_angles", return_value=angles):
+        df = extract_item_to_df(item, store, pids, lons, lats, apply_nbar=True)
+
+    assert df is not None
+    # Compute expected c-factor for these angles
+    a = angles["B02"]
+    cf = compute_cf(a["sza"], a["vza"], a["saa"] - a["vaa"], "B02")
+    expected = float(np.clip(500.0 / 10000.0 * cf[0], 0.0, 1.0))
+    actual = float(df["B02"].iloc[0])
+    assert abs(actual - expected) < 1e-4, (
+        f"Valid-angle pixels should be NBAR-corrected: expected {expected:.4f}, got {actual:.4f}"
+    )
+
+# ---------------------------------------------------------------------------
 # Test 19 — granule dedup regex strips index suffix (regression)
 # ---------------------------------------------------------------------------
 

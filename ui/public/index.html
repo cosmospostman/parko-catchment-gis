@@ -98,6 +98,12 @@
       transform: rotate(90deg);
     }
 
+    #sightings-accordion-header input[type="checkbox"] {
+      accent-color: #f97316;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+
     #training-accordion-body {
       display: none;
       flex-direction: column;
@@ -435,12 +441,14 @@
       flex-shrink: 0;
     }
 
-    #sightings-accordion {
+    #sightings-accordion,
+    #s1-accordion {
       border-bottom: 1px solid #333;
       flex-shrink: 0;
     }
 
-    #sightings-accordion-header {
+    #sightings-accordion-header,
+    #s1-accordion-header {
       display: flex;
       align-items: center;
       gap: 7px;
@@ -451,13 +459,29 @@
       color: #aaa;
     }
 
-    #sightings-accordion-header:hover { background: #2e2e2e; }
+    #sightings-accordion-header:hover,
+    #s1-accordion-header:hover { background: #2e2e2e; }
 
-    #sightings-accordion-header .accordion-label {
+    #s1-accordion-header input[type="checkbox"] {
+      accent-color: #38bdf8;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+
+    #sightings-accordion-header .accordion-label,
+    #s1-accordion-header .accordion-label {
       flex: 1;
       font-weight: 500;
       color: #c0c0c0;
     }
+
+    #s1-accordion-header .accordion-chevron {
+      font-size: 10px;
+      color: #555;
+      transition: transform 0.15s;
+    }
+
+    #s1-accordion-header.open .accordion-chevron { transform: rotate(90deg); }
 
     #sightings-accordion-body {
       display: none;
@@ -465,6 +489,57 @@
     }
 
     #sightings-accordion-body.open { display: block; }
+
+    #s1-accordion-body {
+      display: none;
+      flex-direction: column;
+      background: #1e1e1e;
+      padding: 8px 16px 10px 16px;
+      gap: 2px;
+    }
+
+    #s1-accordion-body.open { display: flex; }
+
+    #s1-accordion-body .irow {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      color: #b0b0b0;
+      margin: 0;
+      padding: 2px 14px 2px 14px;
+    }
+
+    #s1-accordion-body .ikey {
+      font-size: 11px;
+      color: #555;
+      min-width: 44px;
+      flex-shrink: 0;
+    }
+
+    #s1-accordion-body select {
+      flex: 1;
+      background: #1a1a1a;
+      color: #d0d0d0;
+      border: 1px solid #444;
+      border-radius: 4px;
+      padding: 3px 4px;
+      font-size: 11px;
+      cursor: pointer;
+      min-width: 0;
+    }
+
+    #s1-accordion-body input[type="range"] {
+      flex: 1;
+      accent-color: #38bdf8;
+    }
+
+    #s1-status {
+      font-size: 11px;
+      color: #555;
+      padding: 2px 14px;
+      min-height: 16px;
+    }
 
     .sightings-body-inner {
       display: flex;
@@ -682,6 +757,35 @@
               <span id="sightings-year-label" style="font-size:11px;color:#888;">all years</span>
             </div>
           </div>
+        </div>
+      </div>
+      <div id="s1-accordion">
+        <div id="s1-accordion-header">
+          <input type="checkbox" id="s1-toggle" checked>
+          <span class="accordion-label">Sentinel 1 Renderer</span>
+          <span class="accordion-chevron">&#9658;</span>
+        </div>
+        <div id="s1-accordion-body">
+          <div class="irow">
+            <span class="ikey">parquet</span>
+            <select id="s1-location"><option value="">loading…</option></select>
+          </div>
+          <div class="irow">
+            <span class="ikey">band</span>
+            <select id="s1-band">
+              <option value="vh">VH</option>
+              <option value="vv">VV</option>
+            </select>
+          </div>
+          <div class="irow">
+            <span class="ikey">date</span>
+            <select id="s1-date"><option value="">—</option></select>
+          </div>
+          <div class="irow">
+            <span class="ikey">opacity</span>
+            <input type="range" id="s1-opacity" min="0" max="100" value="70" step="1">
+          </div>
+          <div id="s1-status"></div>
         </div>
       </div>
       <ul id="location-list"></ul>

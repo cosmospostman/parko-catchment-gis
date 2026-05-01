@@ -11,6 +11,7 @@ Usage
   python cli/location.py training fetch [--regions ID ...] [--all]
                                          [--cloud-max N] [--no-nbar]
   python cli/location.py training verify
+  python cli/location.py validate <id> [--year YYYY ...] [--verbose]
 
 Examples
 --------
@@ -204,6 +205,11 @@ def cmd_training_verify(args: argparse.Namespace) -> None:
     BAND_COLS = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12"]
 
     regions = load_regions()
+    if args.prefix:
+        regions = [r for r in regions if r.id.startswith(args.prefix)]
+        if not regions:
+            print(f"  No regions match prefix {args.prefix!r}.")
+            return
     issues: list[str] = []
     rows = []
 
@@ -214,31 +220,37 @@ def cmd_training_verify(args: argparse.Namespace) -> None:
             continue
 
         df = pd.read_parquet(path)
+        s2 = df[df["source"] == "S2"] if "source" in df.columns else df
 
-        n_pixels = df["point_id"].nunique()
-        n_obs    = len(df)
-        dupes    = df.duplicated(subset=["point_id", "date"]).sum()
+        n_pixels = s2["point_id"].nunique()
+        n_obs    = len(s2)
+        dupes    = s2.duplicated(subset=["point_id", "date"]).sum()
 
         # Observations per pixel
-        obs_per_pixel = df.groupby("point_id").size()
+        obs_per_pixel = s2.groupby("point_id").size()
         obs_min, obs_med, obs_max = obs_per_pixel.min(), obs_per_pixel.median(), obs_per_pixel.max()
 
-        # Band stats — mean and std across all obs
-        band_means = df[BAND_COLS].mean()
-        band_stds  = df[BAND_COLS].std()
-        nan_counts = df[BAND_COLS].isna().sum().sum()
+        # Band stats — mean and std across S2 obs only
+        band_means = s2[BAND_COLS].mean()
+        band_stds  = s2[BAND_COLS].std()
+        nan_counts = s2[BAND_COLS].isna().sum().sum()
 
         # Flag suspicious values
+        region_issues = []
         if dupes > 0:
-            issues.append(f"DUPES    {r.id} — {dupes} duplicate (point_id, date) rows")
+            region_issues.append(f"DUPES    {r.id} — {dupes} duplicate (point_id, date) rows")
         if n_pixels < 5:
-            issues.append(f"SPARSE   {r.id} — only {n_pixels} pixels")
+            region_issues.append(f"SPARSE   {r.id} — only {n_pixels} pixels")
         if obs_min < 4:
-            issues.append(f"LOW_OBS  {r.id} — some pixels have <4 observations (min={obs_min})")
+            region_issues.append(f"LOW_OBS  {r.id} — some pixels have <4 observations (min={obs_min})")
         if nan_counts > 0:
-            issues.append(f"NAN      {r.id} — {nan_counts} NaN band values")
+            region_issues.append(f"NAN      {r.id} — {nan_counts} NaN band values")
         if band_means.max() > 1.5 or band_means.min() < -0.5:
-            issues.append(f"RANGE    {r.id} — band means outside expected range [{band_means.min():.2f}, {band_means.max():.2f}]")
+            region_issues.append(f"RANGE    {r.id} — band means outside expected range [{band_means.min():.2f}, {band_means.max():.2f}]")
+        if not region_issues and args.prefix:
+            issues.append(f"OK       {r.id}")
+        else:
+            issues.extend(region_issues)
 
         rows.append((r.id, r.label, n_pixels, n_obs, int(obs_min), int(obs_med), int(obs_max),
                      f"{band_means.mean():.3f}", f"{band_stds.mean():.3f}"))
@@ -271,10 +283,77 @@ def cmd_training_verify(args: argparse.Namespace) -> None:
         print()
         print(f"  {len(issues)} issue(s) found:")
         for iss in issues:
-            print(f"    ! {iss}")
+            marker = " " if iss.startswith("OK") else "!"
+            print(f"    {marker} {iss}")
     else:
         print()
         print("  No issues found.")
+
+
+def _print_validate_table(reports: list, verbose: bool) -> None:
+    from utils.parquet_validator import Status
+
+    use_color = sys.stdout.isatty()
+    _COLOR = {Status.PASS: "\033[32m", Status.WARN: "\033[33m", Status.FAIL: "\033[31m"}
+    _RESET = "\033[0m"
+
+    def colored(text: str, status: "Status") -> str:
+        if use_color:
+            return f"{_COLOR[status]}{text}{_RESET}"
+        return text
+
+    header = f"  {'TILE':<12} {'YEAR':<6} {'ROWS':>12} {'PIXELS':>9} {'DATES':>6} {'S1':<5} STATUS"
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+
+    issue_lines: list[str] = []
+    for r in reports:
+        rows_str   = f"{r.n_rows:>12,}" if r.n_rows else f"{'—':>12}"
+        pixels_str = f"{r.n_pixels:>9,}" if r.n_pixels else f"{'—':>9}"
+        dates_str  = f"{r.n_dates:>6}" if r.n_dates else f"{'—':>6}"
+        if r.path is None or not r.path.exists():
+            s1_str = f"{'—':<5}"
+        elif r.s1_old_format:
+            s1_str = colored(f"{'OLD':<5}", Status.FAIL)
+        elif r.has_s1:
+            s1_str = f"{'YES':<5}"
+        else:
+            s1_str = colored(f"{'NO':<5}", Status.WARN)
+
+        status_str = colored(r.status.value, r.status)
+        issue_names = ", ".join(i.name for i in r.issues)
+        print(f"  {r.tile_id:<12} {r.year:<6} {rows_str} {pixels_str} {dates_str} {s1_str} {status_str}  {issue_names}")
+
+        for i in r.issues:
+            issue_lines.append(f"    {r.tile_id} ({r.year})  {colored(i.status.value, i.status)}  {i.name}: {i.message}")
+
+    if verbose and issue_lines:
+        print()
+        print("  Issues:")
+        for line in issue_lines:
+            print(line)
+
+
+def cmd_validate(args: argparse.Namespace) -> None:
+    from utils.parquet_validator import validate_location, Status
+
+    try:
+        loc = get(args.id)
+    except KeyError:
+        print(f"Unknown location: {args.id!r}", file=sys.stderr)
+        sys.exit(1)
+
+    years = args.years if args.years else None
+    reports = validate_location(loc, years=years)
+
+    if not reports:
+        print(f"  No parquet data found for {args.id!r}.")
+        sys.exit(0)
+
+    _print_validate_table(reports, verbose=args.verbose)
+
+    any_fail = any(r.status == Status.FAIL for r in reports)
+    sys.exit(1 if any_fail else 0)
 
 
 def cmd_training(args: argparse.Namespace) -> None:
@@ -309,12 +388,21 @@ def main() -> None:
     pf.add_argument("--no-nbar", action="store_true",
                     help="Disable BRDF NBAR c-factor correction")
 
+    pv = sub.add_parser("validate", help="Validate parquet data quality for a location")
+    pv.add_argument("id", help="Location id (e.g. longreach, flinders0)")
+    pv.add_argument("--year", dest="years", nargs="+", type=int, metavar="YYYY",
+                    help="Year(s) to validate; default: all fetched years")
+    pv.add_argument("--verbose", action="store_true",
+                    help="Print full issue details below the summary table")
+
     pt = sub.add_parser("training", help="Manage training regions and pixel collection")
     tsub = pt.add_subparsers(dest="training_cmd", required=True)
 
     tsub.add_parser("list", help="List all training regions with estimated pixel counts")
 
-    tsub.add_parser("verify", help="Verify training data quality and flag issues")
+    tvfy = tsub.add_parser("verify", help="Verify training data quality and flag issues")
+    tvfy.add_argument("--prefix", metavar="STR",
+                      help="Only verify regions whose id starts with this prefix")
 
     tf = tsub.add_parser("fetch", help="Fetch pixels for training regions")
     grp = tf.add_mutually_exclusive_group(required=True)
@@ -333,6 +421,7 @@ def main() -> None:
         "info":     cmd_info,
         "bbox":     cmd_bbox,
         "fetch":    cmd_fetch,
+        "validate": cmd_validate,
         "training": cmd_training,
     }[args.cmd](args)
 

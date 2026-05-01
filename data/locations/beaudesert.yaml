@@ -1,0 +1,7 @@
+# Beaudesert — Queensland.
+name: "Beaudesert"
+centroid: null
+bbox: [140.992355, -21.557112, 141.158673, -21.472819]  # [lon_min, lat_min, lon_max, lat_max]
+dry_months: [5, 6, 7, 8, 9, 10]
+notes: >
+  Beaudesert, Queensland.

@@ -257,14 +257,16 @@ class Location:
         cache_dir: Optional[Path] = None,
         apply_nbar: bool = True,
     ) -> list[Path]:
-        """Fetch Sentinel-2 pixel observations for this location, one parquet per S2 tile per year.
+        """Fetch Sentinel-2 and Sentinel-1 pixel observations for this location.
 
-        Output is written to data/pixels/<id>/<year>/<tile_id>.parquet.
-        The chip cache is shared across years.
+        Writes one parquet per S2 tile per year to data/pixels/<id>/<year>/<tile_id>.parquet.
+        Each parquet contains S2 rows (source="S2") interleaved with S1 rows (source="S1",
+        vh, vv columns populated, S2 band columns null).
 
         Returns the list of written parquet paths.
         """
         from utils.pixel_collector import collect  # noqa: PLC0415
+        from utils.s1_collector import collect_s1, _DEFAULT_CACHE_DIR as _S1_CACHE_DIR  # noqa: PLC0415
 
         _cache = cache_dir or self.cache_dir()
 
@@ -288,8 +290,111 @@ class Location:
                 calibration_out=_cal_out,
                 geometry=self.geometry,
             )
+
+            # collect() returns [] when all shards were already done AND the
+            # sorted shard files have been consumed into tile parquets (deleted
+            # after the concat step).  Fall back to existing tile parquets so
+            # the S1 append step below still runs.
+            if not tile_paths:
+                tile_paths = [
+                    p for p in sorted(_out_dir.glob("*.parquet"))
+                    if not p.name.startswith("_") and ".coords." not in p.name
+                ]
+
+            # Append S1 rows to each tile parquet in-place
+            for tile_path in tile_paths:
+                _append_s1_to_tile_parquet(
+                    tile_path=tile_path,
+                    bbox_wgs84=self.bbox,
+                    year=year,
+                    collect_s1_fn=collect_s1,
+                    s1_cache_dir=_S1_CACHE_DIR,
+                )
+
             written.extend(tile_paths)
         return written
+
+
+# ---------------------------------------------------------------------------
+# S1 append helper — extracted for testability
+# ---------------------------------------------------------------------------
+
+def _append_s1_to_tile_parquet(
+    tile_path: Path,
+    bbox_wgs84: list[float],
+    year: int,
+    collect_s1_fn,
+    s1_cache_dir: Path | None = None,
+) -> None:
+    """Append S1 rows to an existing S2-only tile parquet, in-place and atomically.
+
+    Idempotent: skips the file if it already contains at least one S1 row.
+
+    The parquet is pixel-sorted, so distinct pixels are spread across all row
+    groups.  This function scans *all* row groups to collect the full pixel grid
+    before calling collect_s1_fn — the original inline code only scanned the
+    first row group, producing S1 coverage for a single pixel strip.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from utils.training_collector import _extend_schema, _conform_table, _s1_df_to_arrow  # noqa: PLC0415
+
+    pf = pq.ParquetFile(tile_path)
+
+    # Already has S1 rows — skip (idempotent re-fetch).
+    # Check for actual S1 rows, not just schema presence: schema columns may
+    # exist from a prior incomplete fetch that returned empty data.
+    if "source" in pf.schema_arrow.names and "vh" in pf.schema_arrow.names:
+        has_s1 = any(
+            "S1" in pf.read_row_group(rg, columns=["source"]).column("source").to_pylist()
+            for rg in range(pf.metadata.num_row_groups)
+        )
+        if has_s1:
+            return
+
+    # Scan ALL row groups for pixel coords.  A pixel-sorted parquet places each
+    # pixel's observations in a contiguous block, so the first row group only
+    # covers the first ~N pixels — not the full grid.
+    combined_schema = _extend_schema(pf.read_row_group(0).schema)
+    seen: dict[str, tuple[float, float]] = {}
+    n_rg = pf.metadata.num_row_groups
+    for rg_idx in range(n_rg):
+        coord_tbl = pf.read_row_group(rg_idx, columns=["point_id", "lon", "lat"])
+        for pid, lon, lat in zip(
+            coord_tbl.column("point_id").to_pylist(),
+            coord_tbl.column("lon").to_pylist(),
+            coord_tbl.column("lat").to_pylist(),
+        ):
+            if pid not in seen:
+                seen[pid] = (lon, lat)
+
+    points_for_s1: list[tuple[str, float, float]] = [
+        (p, lo, la) for p, (lo, la) in seen.items()
+    ]
+
+    df_s1 = collect_s1_fn(
+        bbox_wgs84=bbox_wgs84,
+        start=f"{year}-01-01",
+        end=f"{year}-12-31",
+        points=points_for_s1,
+        cache_dir=s1_cache_dir,
+    )
+
+    # Rewrite atomically — stream S2 row groups to avoid loading the full file
+    # into RAM, then append sorted S1 rows as a final row group.
+    tmp_path = tile_path.with_suffix(".tmp.parquet")
+    writer = pq.ParquetWriter(tmp_path, combined_schema)
+    for rg_idx in range(n_rg):
+        tbl = pf.read_row_group(rg_idx)
+        tbl = _conform_table(tbl, combined_schema)
+        source_col = pa.array(["S2"] * len(tbl), type=pa.string())
+        tbl = tbl.set_column(tbl.schema.get_field_index("source"), "source", source_col)
+        writer.write_table(tbl)
+    if df_s1 is not None and not df_s1.empty:
+        df_s1 = df_s1.sort_values(["point_id", "date"]).reset_index(drop=True)
+        writer.write_table(_s1_df_to_arrow(df_s1, combined_schema))
+    writer.close()
+    tmp_path.replace(tile_path)
 
 
 # ---------------------------------------------------------------------------

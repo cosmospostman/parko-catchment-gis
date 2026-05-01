@@ -205,7 +205,10 @@ def extract_item_to_df(
                 a = angles[band]
                 raa = a["saa"] - a["vaa"]
                 cf = compute_cf(a["sza"], a["vza"], raa, band)
-                band_arrays[band] = np.clip(band_arrays[band] * cf, 0.0, 1.0)
+                corrected = np.clip(band_arrays[band] * cf, 0.0, 1.0)
+                # Fall back to uncorrected value where cf is NaN (angle interpolation
+                # outside granule grid — affects pixels near tile edges)
+                band_arrays[band] = np.where(np.isnan(cf), band_arrays[band], corrected)
         # If angles is None (fetch failed), band_arrays are left uncorrected
 
     # --- Zenith quality columns ---------------------------------------------

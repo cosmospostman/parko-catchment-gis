@@ -13,6 +13,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from pathlib import Path
@@ -178,8 +179,11 @@ def _cmd_score(args: argparse.Namespace) -> None:
 
     years = sorted(tile_paths_by_year)
     end_year = max(years)
-    out_csv = Path(args.out) if getattr(args, "out", None) else None
-    out_dir = out_csv.parent if out_csv else checkpoint_dir
+    if getattr(args, "out", None):
+        out_csv = Path(args.out)
+    else:
+        out_csv = PROJECT_ROOT / "outputs" / loc.id / f"{checkpoint_dir.name}.csv"
+    out_dir = out_csv.parent
     out_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info("Location: %s  years: %s  checkpoint: %s", loc.name, years, checkpoint_dir)
@@ -238,6 +242,12 @@ def _cmd_score(args: argparse.Namespace) -> None:
     logger.info("Loading checkpoint from %s ...", checkpoint_dir)
     model, band_mean, band_std = load_tam(checkpoint_dir, device=args.device)
 
+    with open(checkpoint_dir / "tam_config.json") as _fh:
+        _cfg_dict = json.load(_fh)
+    _n_bands = _cfg_dict.get("n_bands", 13)
+    s1_only = _n_bands == 4
+    pixel_zscore = _cfg_dict.get("pixel_zscore", False)
+
     if getattr(args, "out_parquet", False):
         # Build {tile_id: [(year, pixel-sorted-path), ...]} for score_tiles_chunked
         tile_year_map: dict[str, list[tuple[int, Path]]] = {}
@@ -265,6 +275,7 @@ def _cmd_score(args: argparse.Namespace) -> None:
             decay=args.decay,
             batch_size=args.batch_size,
             n_tile_workers=getattr(args, "n_tile_workers", 1),
+            s1_only=s1_only,
         )
         logger.info("Done — %d tile parquets in %s", len(final_paths), parquet_out_dir)
         return
@@ -281,6 +292,8 @@ def _cmd_score(args: argparse.Namespace) -> None:
         decay=args.decay,
         batch_size=args.batch_size,
         n_total_pixels=len(pixel_coords),
+        s1_only=s1_only,
+        pixel_zscore=pixel_zscore,
     )
 
     scored = pixel_coords.merge(scores, on="point_id", how="left")

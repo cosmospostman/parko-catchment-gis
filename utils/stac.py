@@ -42,11 +42,12 @@ def search_sentinel1(
     end: str,
     endpoint: str,
     collection: str,
+    modifier=None,
 ) -> List[Any]:
-    """Search a STAC endpoint for Sentinel-1 GRD items."""
+    """Search a STAC endpoint for Sentinel-1 items."""
     import pystac_client
 
-    catalog = pystac_client.Client.open(endpoint)
+    catalog = pystac_client.Client.open(endpoint, modifier=modifier)
     search = catalog.search(
         collections=[collection],
         bbox=bbox,

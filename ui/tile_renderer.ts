@@ -409,6 +409,143 @@ async function encodePng(rgba: Uint8ClampedArray, width: number, height: number)
 const TILE_SIZE = 256;
 const ALPHA = 200;
 
+// ---------------------------------------------------------------------------
+// S1 grid support
+// ---------------------------------------------------------------------------
+
+const S1_CACHE_DIR_NAME = "s1_tiles";
+const s1GridCache = new Map<string, Grid>();
+const s1GridLoading = new Map<string, Promise<Grid | null>>();
+
+function s1BinPath(location: string, band: string, date: string): string {
+  return join(__dirname, "..", "data", "cache", S1_CACHE_DIR_NAME, location, `${band}_${date}.bin`);
+}
+
+async function buildS1Bin(location: string, band: string, date: string, outPath: string): Promise<void> {
+  console.log(`Building S1 bin: ${location}/${band}/${date}`);
+  const scriptPath = join(__dirname, "s1_tile_builder.py");
+  const python = pythonExe();
+  const cmd = new Deno.Command(python, {
+    args: [scriptPath, location, band, date, outPath],
+    stdout: "inherit",
+    stderr: "inherit",
+  });
+  const { code } = await cmd.output();
+  if (code !== 0) throw new Error(`s1_tile_builder.py exited with code ${code}`);
+}
+
+export function getS1BinState(location: string, band: string, date: string): "ready" | "building" | "missing" {
+  const cacheKey = `${location}/${band}/${date}`;
+  if (s1GridCache.has(cacheKey)) return "ready";
+  if (s1GridLoading.has(cacheKey)) return "building";
+  try { Deno.statSync(s1BinPath(location, band, date)); return "ready"; } catch { /* absent */ }
+  return "missing";
+}
+
+export function loadS1Grid(location: string, band: string, date: string): Promise<Grid | null> {
+  const cacheKey = `${location}/${band}/${date}`;
+  if (s1GridCache.has(cacheKey)) {
+    const hit = s1GridCache.get(cacheKey)!;
+    s1GridCache.delete(cacheKey);
+    s1GridCache.set(cacheKey, hit);
+    return Promise.resolve(hit);
+  }
+  if (s1GridLoading.has(cacheKey)) return s1GridLoading.get(cacheKey)!;
+
+  const promise = (async () => {
+    const bin = s1BinPath(location, band, date);
+    let binExists = false;
+    try { Deno.statSync(bin); binExists = true; } catch { /* absent */ }
+    if (!binExists) await buildS1Bin(location, band, date, bin);
+    const grid = await loadBin(bin);
+    s1GridCache.delete(cacheKey);
+    s1GridCache.set(cacheKey, grid);
+    if (s1GridCache.size > GRID_CACHE_MAX) s1GridCache.delete(s1GridCache.keys().next().value!);
+    console.log(`S1 grid loaded: ${cacheKey} (${grid.keys.length} pixels)`);
+    return grid;
+  })().finally(() => s1GridLoading.delete(cacheKey));
+
+  s1GridLoading.set(cacheKey, promise);
+  return promise;
+}
+
+// ---------------------------------------------------------------------------
+// S1 location / date enumeration
+// ---------------------------------------------------------------------------
+
+const PIXELS_DIR = join(__dirname, "..", "data", "pixels");
+
+function pythonExe(): string {
+  if (Deno.env.get("PYTHON")) return Deno.env.get("PYTHON")!;
+  const venvPy = join(__dirname, "..", ".venv", "bin", "python3");
+  try { Deno.statSync(venvPy); return venvPy; } catch { /* no venv */ }
+  return "python3";
+}
+
+export function listS1Locations(): string[] {
+  const locations: string[] = [];
+  try {
+    for (const entry of Deno.readDirSync(PIXELS_DIR)) {
+      if (!entry.isDirectory) continue;
+      // Check it has at least one S1 parquet (not a .chips subdir)
+      const locDir = join(PIXELS_DIR, entry.name);
+      let hasParquet = false;
+      try {
+        for (const sub of Deno.readDirSync(locDir)) {
+          if (!sub.isDirectory || !(/^\d{4}$/.test(sub.name))) continue;
+          for (const f of Deno.readDirSync(join(locDir, sub.name))) {
+            if (f.name.endsWith(".parquet") && !f.name.includes("coords")) {
+              hasParquet = true;
+              break;
+            }
+          }
+          if (hasParquet) break;
+        }
+      } catch { /* unreadable */ }
+      if (hasParquet) locations.push(entry.name);
+    }
+  } catch { /* no pixels dir */ }
+  return locations.sort();
+}
+
+export async function listS1Dates(location: string): Promise<string[]> {
+  // Find the first non-coords parquet in this location to sample dates from.
+  // All tiles in a location share the same acquisition dates.
+  const locDir = join(PIXELS_DIR, location);
+  let firstParquet: string | null = null;
+  try {
+    for (const sub of Deno.readDirSync(locDir)) {
+      if (!sub.isDirectory || !(/^\d{4}$/.test(sub.name))) continue;
+      for (const f of Deno.readDirSync(join(locDir, sub.name))) {
+        if (f.name.endsWith(".parquet") && !f.name.includes("coords") && !f.name.includes("by-pixel")) {
+          firstParquet = join(locDir, sub.name, f.name);
+          break;
+        }
+      }
+      if (firstParquet) break;
+    }
+  } catch { /* unreadable */ }
+  if (!firstParquet) return [];
+
+  const python = pythonExe();
+  const pq = firstParquet.replace(/\\/g, "\\\\");
+  const script = [
+    "import pandas as pd, json",
+    `df = pd.read_parquet(r'${pq}', columns=['date','source'])`,
+    "dates = sorted(str(d) for d in df[df['source']=='S1']['date'].unique())",
+    "print(json.dumps(dates))",
+  ].join("\n");
+
+  const cmd = new Deno.Command(python, {
+    args: ["-c", script],
+    stdout: "piped",
+    stderr: "inherit",
+  });
+  const { code, stdout } = await cmd.output();
+  if (code !== 0) return [];
+  return JSON.parse(new TextDecoder().decode(stdout)) as string[];
+}
+
 export async function renderTile(
   grid: Grid, z: number, x: number, y: number, cmap = "rdylgn", cutoff = 0,
 ): Promise<Uint8Array> {

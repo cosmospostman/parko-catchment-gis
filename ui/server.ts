@@ -3,7 +3,7 @@ import { join, dirname, fromFileUrl } from "jsr:@std/path";
 import { serveDir } from "jsr:@std/http/file-server";
 import { ensureDirSync } from "jsr:@std/fs";
 import { encodeHex } from "jsr:@std/encoding/hex";
-import { listRankings, loadGrid, renderTile } from "./tile_renderer.ts";
+import { listRankings, loadGrid, renderTile, listS1Locations, listS1Dates, loadS1Grid, getS1BinState } from "./tile_renderer.ts";
 
 const __dirname = dirname(fromFileUrl(import.meta.url));
 const LOCATIONS_DIR = join(__dirname, "..", "data", "locations");
@@ -565,6 +565,61 @@ async function handler(req: Request): Promise<Response> {
         status: 500,
         headers: { "content-type": "application/json" },
       });
+    }
+  }
+
+  const s1StatusMatch = url.pathname.match(/^\/api\/s1-status\/([^/]+)\/([^/]+)\/([^/]+)$/);
+  if (s1StatusMatch) {
+    const [, location, band, date] = s1StatusMatch;
+    let state = getS1BinState(location, band, date);
+    if (state === "missing") {
+      // Kick off the build in the background; immediately return "building"
+      loadS1Grid(location, band, date).catch(err => console.error("S1 build error:", err));
+      state = "building";
+    }
+    return new Response(JSON.stringify({ state }), {
+      headers: { "content-type": "application/json", "cache-control": "no-store" },
+    });
+  }
+
+  if (url.pathname === "/api/s1-locations") {
+    return new Response(JSON.stringify(listS1Locations()), {
+      headers: { "content-type": "application/json", "cache-control": "public, max-age=60" },
+    });
+  }
+
+  const s1DatesMatch = url.pathname.match(/^\/api\/s1-dates\/([^/]+)$/);
+  if (s1DatesMatch) {
+    const location = s1DatesMatch[1];
+    try {
+      const dates = await listS1Dates(location);
+      return new Response(JSON.stringify(dates), {
+        headers: { "content-type": "application/json", "cache-control": "public, max-age=60" },
+      });
+    } catch (err) {
+      console.error("listS1Dates failed:", err);
+      return new Response(JSON.stringify([]), {
+        headers: { "content-type": "application/json" },
+      });
+    }
+  }
+
+  const s1TileMatch = url.pathname.match(/^\/s1-tile\/([^/]+)\/([^/]+)\/([^/]+)\/(\d+)\/(\d+)\/(\d+)$/);
+  if (s1TileMatch) {
+    const [, location, band, date, zs, xs, ys] = s1TileMatch;
+    if (!["vh", "vv"].includes(band)) return new Response("Unknown band", { status: 400 });
+    const z = parseInt(zs), x = parseInt(xs), y = parseInt(ys);
+    try {
+      const grid = await loadS1Grid(location, band, date);
+      if (!grid) return new Response("No data", { status: 404 });
+      const cmap = url.searchParams.get("cmap") ?? "plasma";
+      const png = await renderTile(grid, z, x, y, cmap, 0);
+      return new Response(png as unknown as BodyInit, {
+        headers: { "content-type": "image/png", "cache-control": "public, max-age=3600" },
+      });
+    } catch (err) {
+      console.error("S1 tile render error:", err);
+      return new Response("Render error", { status: 500 });
     }
   }
 

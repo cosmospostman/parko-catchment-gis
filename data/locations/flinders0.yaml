@@ -1,0 +1,7 @@
+# Flinders0 — Queensland.
+name: "Flinders0"
+centroid: null
+bbox: [141.604507, -20.092296, 141.701200, -20.040486]  # [lon_min, lat_min, lon_max, lat_max]
+dry_months: [5, 6, 7, 8, 9, 10]
+notes: >
+  Flinders0, Queensland.

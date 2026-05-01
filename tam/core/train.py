@@ -170,15 +170,23 @@ def train_tam(
     else:
         train_labels, val_labels = spatial_split(labels, pixel_coords, cfg.val_frac)
 
-    # --- SCL=6 exclusion — strip dark-area misclassifications from all pixels ---
+    # --- SCL=6 exclusion — strip dark-area misclassifications from S2 rows only ---
     if "scl" in pixel_df.columns:
         n_before = len(pixel_df)
-        pixel_df = pixel_df[pixel_df["scl"] != 6]
+        is_s1 = pixel_df["source"] == "S1" if "source" in pixel_df.columns else pd.Series(False, index=pixel_df.index)
+        pixel_df = pixel_df[is_s1 | (pixel_df["scl"] != 6)]
         logger.info("SCL=6 exclusion: removed %d observations", n_before - len(pixel_df))
 
     # --- Global features -----------------------------------------------------
+    # Always compute when the noise filter is active (needs dry_ndvi/rec_p/nir_cv)
+    # even if the model head uses no global features (n_global_features == 0).
+    _noise_filter_active = (
+        cfg.presence_min_dry_ndvi > 0
+        or cfg.presence_min_rec_p > 0
+        or cfg.presence_grass_nir_cv < 1.0
+    )
     global_feat_df = None
-    if cfg.n_global_features > 0:
+    if cfg.n_global_features > 0 or _noise_filter_active:
         from tam.core.global_features import GLOBAL_FEATURE_NAMES
         global_feat_df = _load_or_compute_global_features(pixel_df, out_dir, GLOBAL_FEATURE_NAMES)
 
@@ -192,7 +200,7 @@ def train_tam(
     noise_removed: dict[tuple[str, str], int] = {}
 
     # --- Presence noise filter — remove obvious non-Parkinsonia presence pixels
-    if global_feat_df is not None:
+    if global_feat_df is not None and _noise_filter_active:
         def _apply_noise_filter(lbl: pd.Series) -> pd.Series:
             presence_pids = set(lbl[lbl == 1].index)
             gf = global_feat_df.reindex(list(presence_pids))
@@ -338,10 +346,12 @@ def train_tam(
         scl_purity_min=cfg.scl_purity_min,
         min_obs_per_year=cfg.min_obs_per_year,
         doy_jitter=cfg.doy_jitter,
+        doy_phase_shift=cfg.doy_phase_shift,
         band_noise_std=cfg.band_noise_std,
         obs_dropout_min=cfg.obs_dropout_min,
         global_features_df=global_feat_df,
         use_s1=cfg.use_s1,
+        pixel_zscore=cfg.pixel_zscore,
     )
     band_mean, band_std = train_ds.band_stats
     val_ds = TAMDataset(
@@ -354,6 +364,7 @@ def train_tam(
         global_feat_mean=train_ds.global_feat_mean,
         global_feat_std=train_ds.global_feat_std,
         use_s1=cfg.use_s1,
+        pixel_zscore=cfg.pixel_zscore,
     )
     logger.info("Train windows: %d  |  Val windows: %d", len(train_ds), len(val_ds))
 
@@ -378,6 +389,8 @@ def train_tam(
 
     # --- Model + optimiser --------------------------------------------------
     model = TAMClassifier.from_config(cfg)
+    model._use_s1 = cfg.use_s1          # persisted to tam_config.json for score pipeline
+    model._pixel_zscore = cfg.pixel_zscore
     model.to(device)
     logger.info(
         "Model: d_model=%d n_heads=%d n_layers=%d d_ff=%d  params=%d",
@@ -413,8 +426,8 @@ def train_tam(
 
     if cfg.warmup_freeze_epochs > 0:
         _set_temporal_frozen(True)
-        # Head-only warmup: use 10× lr so the head orients correctly before unfreeze
-        optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr * 10, weight_decay=cfg.weight_decay)
+        # Head-only warmup: use 3× lr so the head orients correctly before unfreeze
+        optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr * 3, weight_decay=cfg.weight_decay)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.warmup_freeze_epochs)
     else:
         optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)

@@ -179,12 +179,14 @@ class TAMDataset(Dataset):
         scl_purity_min: float = 0.5,
         min_obs_per_year: int = MIN_OBS_PER_YEAR,
         doy_jitter: int = 0,
+        doy_phase_shift: bool = False,  # if True, randomly shift full time series by 0–364d with wraparound
         band_noise_std: float = 0.0,
         obs_dropout_min: int = 0,
         global_features_df: pd.DataFrame | None = None,
         global_feat_mean: np.ndarray | None = None,
         global_feat_std: np.ndarray | None = None,
         use_s1: bool = False,
+        pixel_zscore: bool = False,  # if True, z-score each pixel's S1 bands by its own multi-year mean/std
     ) -> None:
         # doy_jitter: max ±days to shift all observations in a window (training only).
         # A single offset is drawn per __getitem__ call and applied uniformly so
@@ -211,6 +213,19 @@ class TAMDataset(Dataset):
             feature_cols = S1_FEATURE_COLS  # 4 bands: vh, vv, vh_vv, rvi
             # No SCL filter for S1 (no cloud mask); drop rows where all S1 bands NaN
             df = df.dropna(subset=S1_FEATURE_COLS, how="all")
+
+            if pixel_zscore:
+                # Per-pixel z-scoring: remove each pixel's multi-year backscatter mean/std.
+                # Applied to VH and VV only — removes site-level offsets (incidence angle,
+                # soil type) that cause between-site shortcuts.
+                # VH-VV and RVI are ratios and already self-normalised against geometry;
+                # z-scoring them would destroy the real canopy structure signal in their
+                # absolute values (e.g. Parkinsonia's more negative VH-VV vs open cover).
+                for col, min_std in [("s1_vh", 0.1), ("s1_vv", 0.1)]:
+                    if col in df.columns:
+                        pix_mean = df.groupby("point_id")[col].transform("mean")
+                        pix_std  = df.groupby("point_id")[col].transform("std").clip(lower=min_std)
+                        df[col]  = (df[col] - pix_mean) / pix_std
         elif use_s1:
             df = snap_s1_to_s2(pixel_df)
             feature_cols = ALL_FEATURE_COLS + S1_FEATURE_COLS
@@ -288,6 +303,7 @@ class TAMDataset(Dataset):
         self._n_features = len(feature_cols)
         self._labels = labels
         self._doy_jitter = doy_jitter
+        self._doy_phase_shift = doy_phase_shift
         self._band_noise_std = band_noise_std
         self._obs_dropout_min = obs_dropout_min
 
@@ -345,15 +361,24 @@ class TAMDataset(Dataset):
             offset[:n_s2] = np.random.randn(n_s2).astype(np.float32) * self._band_noise_std
             bands_np = bands_np + offset
 
-        bands = np.zeros((MAX_SEQ_LEN, self._n_features), dtype=np.float32)
-        bands[:n] = bands_np
-
         doy_vals = doy_np.astype(np.int64)
-        if self._doy_jitter > 0:
+        if self._doy_phase_shift:
+            # Random full-year phase shift with wraparound — forces model to learn
+            # shape of curve relative to concurrent bands (e.g. VV) not calendar time.
+            phase_offset = np.random.randint(0, 365)
+            doy_vals = ((doy_vals - 1 + phase_offset) % 365) + 1
+            # Re-sort observations by shifted DOY to maintain temporal order
+            sort_idx = np.argsort(doy_vals, kind="stable")
+            doy_vals = doy_vals[sort_idx]
+            bands_np = bands_np[sort_idx]
+        elif self._doy_jitter > 0:
             offset = np.random.randint(-self._doy_jitter, self._doy_jitter + 1)
             # Clamp to 1–365 rather than wrapping: wrapping would reorder observations
             # that straddle the year boundary, misaligning the band and DOY sequences.
             doy_vals = np.clip(doy_vals + offset, 1, 365)
+
+        bands = np.zeros((MAX_SEQ_LEN, self._n_features), dtype=np.float32)
+        bands[:n] = bands_np
 
         doy = np.zeros(MAX_SEQ_LEN, dtype=np.int64)
         doy[:n] = doy_vals

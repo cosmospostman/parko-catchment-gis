@@ -74,6 +74,7 @@ map.on('load', () => {
   loadSightings();
   loadCatchments();
   loadS2Tiles();
+  loadS1();
 });
 
 document.getElementById('layer-select').addEventListener('change', (e) => {
@@ -829,6 +830,153 @@ function applySightingsYearFilter() {
 }
 
 sightingsYearSlider.addEventListener('input', applySightingsYearFilter);
+
+// ---------------------------------------------------------------------------
+// Sentinel 1 Renderer
+// ---------------------------------------------------------------------------
+
+const s1AccordionHeader = document.getElementById('s1-accordion-header');
+const s1AccordionBody   = document.getElementById('s1-accordion-body');
+const s1LocationSel     = document.getElementById('s1-location');
+const s1BandSel         = document.getElementById('s1-band');
+const s1DateSel         = document.getElementById('s1-date');
+const s1OpacitySlider   = document.getElementById('s1-opacity');
+const s1StatusEl        = document.getElementById('s1-status');
+
+s1AccordionHeader.addEventListener('click', (e) => {
+  if (e.target.closest('input[type="checkbox"]')) return;
+  s1AccordionHeader.classList.toggle('open');
+  s1AccordionBody.classList.toggle('open');
+});
+
+document.getElementById('s1-toggle').addEventListener('change', (e) => {
+  if (map.getLayer('s1-layer')) {
+    map.setLayoutProperty('s1-layer', 'visibility', e.target.checked ? 'visible' : 'none');
+  }
+});
+
+s1OpacitySlider.addEventListener('input', () => {
+  if (map.getLayer('s1-layer')) {
+    map.setPaintProperty('s1-layer', 'raster-opacity', Number(s1OpacitySlider.value) / 100);
+  }
+});
+
+function s1TileUrl(location, band, date) {
+  return `/s1-tile/${location}/${band}/${date}/{z}/{x}/{y}?cmap=plasma`;
+}
+
+let s1PollTimer = null;
+let s1ActiveKey = null;  // "location/band/date" of the layer currently shown or building
+
+function s1ClearLayer() {
+  try { if (map.getLayer('s1-layer'))  map.removeLayer('s1-layer'); } catch {}
+  try { if (map.getSource('s1-source')) map.removeSource('s1-source'); } catch {}
+}
+
+function s1AddLayer(location, band, date) {
+  s1ClearLayer();
+  try {
+    map.addSource('s1-source', {
+      type: 'raster',
+      tiles: [s1TileUrl(location, band, date)],
+      tileSize: 256,
+      minzoom: 6,
+      maxzoom: 14,
+    });
+    map.addLayer({
+      id: 's1-layer',
+      type: 'raster',
+      source: 's1-source',
+      paint: { 'raster-opacity': Number(s1OpacitySlider.value) / 100 },
+      layout: { visibility: document.getElementById('s1-toggle').checked ? 'visible' : 'none' },
+    });
+    s1StatusEl.textContent = `${location} · ${band.toUpperCase()} · ${date}`;
+    s1StatusEl.style.color = '';
+  } catch (err) {
+    console.error('s1AddLayer failed:', err);
+    s1StatusEl.textContent = 'error adding layer';
+    s1StatusEl.style.color = '#f87171';
+  }
+}
+
+let s1Dots = 0;
+function s1BuildingMessage() {
+  s1Dots = (s1Dots + 1) % 4;
+  s1StatusEl.textContent = 'building' + '.'.repeat(s1Dots);
+  s1StatusEl.style.color = '#38bdf8';
+}
+
+function applyS1Layer() {
+  const location = s1LocationSel.value;
+  const band     = s1BandSel.value;
+  const date     = s1DateSel.value;
+  if (!location || !date) return;
+
+  const key = `${location}/${band}/${date}`;
+  s1ActiveKey = key;
+
+  clearInterval(s1PollTimer);
+  s1ClearLayer();
+  s1StatusEl.textContent = 'checking…';
+  s1StatusEl.style.color = '';
+
+  async function poll() {
+    if (s1ActiveKey !== key) return;
+    let state;
+    try {
+      ({ state } = await fetch(`/api/s1-status/${location}/${band}/${date}`).then(r => r.json()));
+    } catch {
+      if (s1ActiveKey !== key) return;
+      s1StatusEl.textContent = 'error';
+      s1StatusEl.style.color = '#f87171';
+      clearInterval(s1PollTimer);
+      return;
+    }
+    if (s1ActiveKey !== key) return;
+    if (state === 'ready') {
+      clearInterval(s1PollTimer);
+      s1AddLayer(location, band, date);
+    } else {
+      s1BuildingMessage();
+    }
+  }
+
+  poll();
+  s1PollTimer = setInterval(poll, 3000);
+}
+
+async function loadS1Dates(location) {
+  clearInterval(s1PollTimer);
+  s1ActiveKey = null;
+  s1ClearLayer();
+  s1DateSel.innerHTML = '<option value="">loading…</option>';
+  s1StatusEl.textContent = '';
+  try {
+    const dates = await fetch(`/api/s1-dates/${location}`).then(r => r.json());
+    s1DateSel.innerHTML = dates.length
+      ? dates.map(d => `<option value="${d}">${d}</option>`).join('')
+      : '<option value="">no data</option>';
+    if (dates.length) applyS1Layer();
+  } catch {
+    s1DateSel.innerHTML = '<option value="">error</option>';
+  }
+}
+
+s1LocationSel.addEventListener('change', () => loadS1Dates(s1LocationSel.value));
+s1BandSel.addEventListener('change', applyS1Layer);
+s1DateSel.addEventListener('change', applyS1Layer);
+
+function loadS1() {
+  fetch('/api/s1-locations')
+    .then(r => r.json())
+    .then(locations => {
+      s1LocationSel.innerHTML = locations.length
+        ? locations.map(l => `<option value="${l}">${l}</option>`).join('')
+        : '<option value="">no data</option>';
+      if (locations.length) loadS1Dates(locations[0]);
+    })
+    .catch(() => { s1LocationSel.innerHTML = '<option value="">error</option>'; });
+}
 
 // ---------------------------------------------------------------------------
 // Imagery info sidebar section

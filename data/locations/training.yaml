@@ -62,6 +62,20 @@ regions:
     year: 2021
     tags: [arid, woodland]
 
+  - id: barcoorah_absence_2
+    name: "Barcoorah — absence 2"
+    label: absence
+    bbox: [145.352771, -22.496644, 145.355447, -22.495557]
+    year: 2021
+    tags: [arid]
+
+  - id: barcoorah_absence_3
+    name: "Barcoorah — absence 3"
+    label: absence
+    bbox: [145.355539, -22.475455, 145.357807, -22.473024]
+    year: 2021
+    tags: [arid]
+
   # ---------------------------------------------------------------------------
   # Frenchs — Cape York Peninsula (monsoonal, savanna-riparian)
   # ---------------------------------------------------------------------------
@@ -1030,6 +1044,124 @@ regions:
     name: "Ranken River — absence N 9"
     label: absence
     bbox: [137.096584, -19.687131, 137.100307, -19.684558]
+    year: 2025
+    tags: [semi-arid, riparian]
+
+  # ---------------------------------------------------------------------------
+  # Etna Creek — central Queensland (semi-arid)
+  # ---------------------------------------------------------------------------
+  - id: etna_presence_1
+    name: "Etna Creek — presence 1"
+    label: presence
+    bbox: [142.248561, -21.667037, 142.249777, -21.664947]
+    year: 2025
+    tags: [semi-arid]
+
+  - id: etna_presence_2
+    name: "Etna Creek — presence 2"
+    label: presence
+    bbox: [142.242799, -21.673102, 142.245353, -21.671612]
+    year: 2025
+    tags: [semi-arid]
+
+  - id: etna_presence_3
+    name: "Etna Creek — presence 3"
+    label: presence
+    bbox: [142.255786, -21.698680, 142.258950, -21.695426]
+    year: 2025
+    tags: [semi-arid]
+
+  - id: etna_presence_4
+    name: "Etna Creek — presence 4"
+    label: presence
+    bbox: [142.133158, -21.589486, 142.137474, -21.585983]
+    year: 2025
+    tags: [semi-arid]
+
+  - id: etna_absence_1
+    name: "Etna Creek — absence 1"
+    label: absence
+    bbox: [142.247766, -21.636182, 142.251024, -21.633042]
+    year: 2025
+    tags: [semi-arid]
+
+  - id: etna_absence_2
+    name: "Etna Creek — absence 2"
+    label: absence
+    bbox: [141.932247, -21.797016, 141.933938, -21.792433]
+    year: 2025
+    tags: [semi-arid]
+
+  - id: etna_absence_3
+    name: "Etna Creek — absence 3"
+    label: absence
+    bbox: [141.940074, -21.862968, 141.945192, -21.858838]
+    year: 2025
+    tags: [semi-arid]
+
+  - id: etna_absence_4
+    name: "Etna Creek — absence 4"
+    label: absence
+    bbox: [142.094102, -21.996812, 142.100772, -21.994215]
+    year: 2025
+    tags: [semi-arid]
+
+  - id: etna_absence_5
+    name: "Etna Creek — absence 5"
+    label: absence
+    bbox: [142.117515, -21.990142, 142.122422, -21.986755]
+    year: 2025
+    tags: [semi-arid]
+
+  # ---------------------------------------------------------------------------
+  # Landsend — northwest Queensland (semi-arid, riparian)
+  # ---------------------------------------------------------------------------
+  - id: landsend_presence_1
+    name: "Landsend — presence 1"
+    label: presence
+    bbox: [141.393387, -20.452586, 141.396196, -20.450650]
+    year: 2025
+    tags: [semi-arid, riparian]
+
+  - id: landsend_presence_2
+    name: "Landsend — presence 2"
+    label: presence
+    bbox: [141.392547, -20.454472, 141.397246, -20.452700]
+    year: 2025
+    tags: [semi-arid, riparian]
+
+  - id: landsend_presence_3
+    name: "Landsend — presence 3"
+    label: presence
+    bbox: [141.391728, -20.456644, 141.398662, -20.454502]
+    year: 2025
+    tags: [semi-arid, riparian]
+
+  - id: landsend_presence_4
+    name: "Landsend — presence 4"
+    label: presence
+    bbox: [141.386586, -20.457690, 141.389421, -20.455896]
+    year: 2025
+    tags: [semi-arid, riparian]
+
+  - id: landsend_absence_1
+    name: "Landsend — absence 1"
+    label: absence
+    bbox: [141.434331, -20.457928, 141.438577, -20.454228]
+    year: 2025
+    tags: [semi-arid, riparian]
+
+  - id: landsend_absence_2
+    name: "Landsend — absence 2"
+    label: absence
+    bbox: [141.453316, -20.456495, 141.459351, -20.453052]
+    year: 2025
+    tags: [semi-arid, riparian]
+
+  - id: landsend_absence_3
+    name: "Landsend — absence 3"
+    label: absence
+    bbox: [141.414406, -20.430621, 141.418610, -20.428686]
     year: 2025
     tags: [semi-arid, riparian]
 

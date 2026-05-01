@@ -110,6 +110,7 @@ class TAMClassifier(nn.Module):
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
         head_in = d_model + (1 if use_n_obs else 0) + n_global_features
         self.head = nn.Linear(head_in, 1)
+        nn.init.constant_(self.head.bias, 0.1)  # positive bias → always starts predicting presence > 0.5
 
     # ------------------------------------------------------------------
     def set_doy_frequencies(self, doy_counts: "np.ndarray") -> None:
@@ -223,6 +224,9 @@ class TAMClassifier(nn.Module):
             "n_global_features":  self.n_global_features,
             "doy_density_norm":   self.doy_density_norm,
             "max_seq_len":        MAX_SEQ_LEN,
+            # Data/inference config — needed by score pipeline
+            "use_s1":             getattr(self, "_use_s1", None),
+            "pixel_zscore":       getattr(self, "_pixel_zscore", None),
         }
 
     @classmethod

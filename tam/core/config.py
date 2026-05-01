@@ -24,6 +24,8 @@ class TAMConfig:
     min_obs_per_year: int   = 8
     scl_purity_min:   float = 0.5
     doy_jitter:       int   = 7   # ±days of DOY shift applied per window during training
+    doy_phase_shift:  bool  = False  # if True, random full-year phase shift with wraparound (overrides doy_jitter)
+    pixel_zscore:     bool  = False  # if True, z-score each pixel's S1 bands by its own multi-year mean/std
     band_noise_std:   float = 0.0 # std of per-window band offset in normalised space (training only)
 
     # Training

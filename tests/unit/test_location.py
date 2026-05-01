@@ -29,7 +29,7 @@ from typing import Any
 import pytest
 import yaml
 
-from utils.location import Location, SubBbox, _bbox_pixel_count, _load_registry, _PROJECT_ROOT
+from utils.location import Location, SubBbox, _bbox_pixel_count, _load_registry, _PROJECT_ROOT, _append_s1_to_tile_parquet
 
 
 # ---------------------------------------------------------------------------
@@ -406,3 +406,84 @@ def test_parquet_tile_paths_ignores_sidecar_files(tmp_path, monkeypatch):
     result = loc.parquet_tile_paths()
     names = {p.name for p in result[2022]}
     assert names == {"55HBU.parquet"}
+
+
+# ---------------------------------------------------------------------------
+# Test — _append_s1_to_tile_parquet collects pixel coords from ALL row groups
+#
+# Bug: the original code built points_for_s1 only from the first row group.
+# A pixel-sorted parquet spreads distinct pixels across all row groups, so
+# only the pixels whose first observation falls in rg0 were passed to
+# collect_s1 — producing S1 coverage for ~1 row-strip instead of the full grid.
+# ---------------------------------------------------------------------------
+
+def _make_multi_rg_s2_parquet(path: Path, pixel_rows: list[dict]) -> None:
+    """Write a pixel-sorted parquet with one row group per pixel (worst-case).
+
+    Each row dict must have: point_id, lon, lat, date, B02..B12, scl_purity, scl.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import pandas as pd
+
+    schema = pa.schema([
+        pa.field("point_id",   pa.string()),
+        pa.field("lon",        pa.float32()),
+        pa.field("lat",        pa.float32()),
+        pa.field("date",       pa.timestamp("us")),
+        pa.field("B02",        pa.float32()),
+        pa.field("B08",        pa.float32()),
+        pa.field("scl_purity", pa.float32()),
+        pa.field("scl",        pa.int32()),
+    ])
+    writer = pq.ParquetWriter(path, schema)
+    for row in pixel_rows:
+        df = pd.DataFrame([row])
+        df["date"] = pd.to_datetime(df["date"]).astype("datetime64[us]")
+        writer.write_table(pa.Table.from_pandas(df, schema=schema, preserve_index=False))
+    writer.close()
+
+
+def test_append_s1_collects_coords_from_all_row_groups(tmp_path):
+    """S1 rows must be generated for every unique pixel, not just those in rg0.
+
+    Setup: a parquet with 3 pixels spread across 3 row groups (one per group).
+    The mock collect_s1 records which point_ids it was asked about.
+    After _append_s1_to_tile_parquet, all 3 pixels must appear in the call.
+    """
+    import pyarrow.parquet as pq
+
+    tile_path = tmp_path / "55HBU.parquet"
+    pixels = [
+        {"point_id": "px_0000_0000", "lon": 145.410, "lat": -22.810,
+         "date": "2022-08-15", "B02": 0.1, "B08": 0.4, "scl_purity": 1.0, "scl": 4},
+        {"point_id": "px_0001_0000", "lon": 145.420, "lat": -22.800,
+         "date": "2022-08-15", "B02": 0.1, "B08": 0.4, "scl_purity": 1.0, "scl": 4},
+        {"point_id": "px_0002_0000", "lon": 145.430, "lat": -22.790,
+         "date": "2022-08-15", "B02": 0.1, "B08": 0.4, "scl_purity": 1.0, "scl": 4},
+    ]
+    _make_multi_rg_s2_parquet(tile_path, pixels)
+
+    pf = pq.ParquetFile(tile_path)
+    assert pf.metadata.num_row_groups == 3, "test requires one row group per pixel"
+
+    captured_points: list[list[str]] = []
+
+    def mock_collect_s1(bbox_wgs84, start, end, points, cache_dir=None):
+        import pandas as pd
+        captured_points.append([pid for pid, _, _ in points])
+        return pd.DataFrame()   # no actual S1 data needed for this test
+
+    _append_s1_to_tile_parquet(
+        tile_path=tile_path,
+        bbox_wgs84=[145.40, -22.82, 145.44, -22.78],
+        year=2022,
+        collect_s1_fn=mock_collect_s1,
+    )
+
+    assert len(captured_points) == 1, "collect_s1 should be called exactly once"
+    called_pids = set(captured_points[0])
+    assert called_pids == {"px_0000_0000", "px_0001_0000", "px_0002_0000"}, (
+        f"collect_s1 was only given coords for: {called_pids} — "
+        "pixels in row groups > 0 were missed (first-row-group-only bug)"
+    )

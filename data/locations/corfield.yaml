@@ -1,0 +1,4 @@
+name: "Corfield"
+centroid: [-21.499, 143.164]  # [lat, lon]
+bbox: [143.119582, -21.520402, 143.207510, -21.478445]  # [lon_min, lat_min, lon_max, lat_max]
+dry_months: [6, 7, 8, 9, 10]

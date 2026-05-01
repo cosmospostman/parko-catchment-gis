@@ -1,7 +1,7 @@
-"""utils/s1_collector.py — Fetch Sentinel-1 GRD observations for a pixel grid.
+"""utils/s1_collector.py — Fetch Sentinel-1 RTC observations for a pixel grid.
 
-Fetches S1 VH and VV backscatter (linear power) for a bbox and date window,
-aligning observations to the same pixel grid used by pixel_collector.py.
+Fetches S1 VH and VV backscatter (linear power) from the Microsoft Planetary
+Computer sentinel-1-rtc collection (gamma0 radiometrically terrain corrected).
 Results are returned as a DataFrame with the same schema conventions as S2
 rows, with `source="S1"` and S2-specific columns set to NaN.
 
@@ -13,6 +13,7 @@ Output rows (one per pixel per S1 acquisition):
     source    : str    — "S1"
     vh        : float  — VH backscatter (linear power, not dB)
     vv        : float  — VV backscatter (linear power, not dB)
+    orbit     : str    — "ascending" or "descending" (sat:orbit_state from STAC item)
 
 All S2 band columns (B02…B12, scl_purity, scl, aot, etc.) are absent from S1
 rows and will be NaN when the two DataFrames are concatenated.
@@ -38,9 +39,10 @@ from utils.pipeline import setup_gdal_env
 
 logger = logging.getLogger(__name__)
 
-_STAC_ENDPOINT  = "https://earth-search.aws.element84.com/v1"
-_S1_COLLECTION  = "sentinel-1-grd"
+_STAC_ENDPOINT  = "https://planetarycomputer.microsoft.com/api/stac/v1"
+_S1_COLLECTION  = "sentinel-1-rtc"
 _S1_BANDS       = ["vh", "vv"]
+_S1_NODATA      = -32768   # RTC nodata value (GRD used 0)
 
 _DEFAULT_CACHE_DIR = PROJECT_ROOT / "data" / "chips" / "s1"
 
@@ -53,6 +55,24 @@ def _reconstruct_affine(item):
         return None
     # proj:transform: [xres, xskew, x_origin, yskew, yres, y_origin, ...]
     return Affine(pt[0], pt[1], pt[2], pt[3], pt[4], pt[5])
+
+
+def _item_crs(item) -> str | None:
+    """Return the CRS of a STAC item as an EPSG string, or None."""
+    code = item.properties.get("proj:code") or item.properties.get("proj:epsg")
+    if code:
+        return str(code) if str(code).startswith("EPSG:") else f"EPSG:{code}"
+    return None
+
+
+def _reproject_bbox(bbox_wgs84: list[float], target_crs: str) -> list[float]:
+    """Reproject [lon_min, lat_min, lon_max, lat_max] from WGS84 to target_crs."""
+    from pyproj import Transformer
+    transformer = Transformer.from_crs("EPSG:4326", target_crs, always_xy=True)
+    x_min, y_min = transformer.transform(bbox_wgs84[0], bbox_wgs84[1])
+    x_max, y_max = transformer.transform(bbox_wgs84[2], bbox_wgs84[3])
+    return [min(x_min, x_max), min(y_min, y_max),
+            max(x_min, x_max), max(y_min, y_max)]
 
 
 def _chip_cache_path(cache_dir: Path, item_id: str, band: str, bbox: list[float] | None = None) -> Path:
@@ -90,17 +110,16 @@ def _save_chip(path: Path, arr: np.ndarray, win_affine) -> None:
     )
 
 
-def _pixel_window(affine, bbox_wgs84: list[float], src_width: int, src_height: int):
-    """Return a rasterio Window for bbox_wgs84 clipped to raster bounds, or None.
+def _pixel_window(affine, bbox_native: list[float], src_width: int, src_height: int):
+    """Return a rasterio Window for bbox_native clipped to raster bounds, or None.
 
-    Returns None when the bbox falls outside the raster extent — this happens
-    when filter_items_by_bbox accepts an item whose envelope overlaps but whose
-    actual raster data does not reach the target area.
+    bbox_native must be in the same CRS as the raster (may be projected).
+    Returns None when the bbox falls outside the raster extent.
     """
     import rasterio.windows
-    lon_min, lat_min, lon_max, lat_max = bbox_wgs84
+    x_min, y_min, x_max, y_max = bbox_native
     win = rasterio.windows.from_bounds(
-        lon_min, lat_min, lon_max, lat_max, transform=affine
+        x_min, y_min, x_max, y_max, transform=affine
     )
     try:
         return win.intersection(
@@ -113,11 +132,13 @@ def _pixel_window(affine, bbox_wgs84: list[float], src_width: int, src_height: i
 def _read_band_array(
     href: str,
     affine,
-    bbox_wgs84: list[float],
+    bbox_native: list[float],
     cache_path: Path | None = None,
+    nodata: float = _S1_NODATA,
 ) -> tuple[np.ndarray, object] | None:
     """Read a single S1 band COG, returning (2D float32 array, win_affine) or None.
 
+    bbox_native is in the raster's native CRS (projected for RTC items).
     Loads from cache_path if it exists; writes to cache_path after a successful read.
     """
     import rasterio
@@ -130,10 +151,11 @@ def _read_band_array(
 
     try:
         with rasterio.open(href) as src:
-            win = _pixel_window(affine, bbox_wgs84, src.width, src.height)
+            win = _pixel_window(affine, bbox_native, src.width, src.height)
             if win is None or win.width <= 0 or win.height <= 0:
                 return None
             arr = src.read(1, window=win).astype(np.float32)
+            arr[arr == nodata] = np.nan
             arr[arr == 0] = np.nan
             win_affine = rasterio.windows.transform(win, affine)
     except Exception as exc:
@@ -161,7 +183,28 @@ def _extract_item(
     Returns a list of row dicts (one per pixel with valid data), or None if
     the item has no overlap with bbox_wgs84.
     """
+    from pyproj import Transformer
+
     date = pd.to_datetime(item.datetime).date()
+    orbit_state = item.properties.get("sat:orbit_state", None)
+
+    # Add a small margin so edge pixels whose centres fall just outside the
+    # nominal bbox are still captured.  Apply before reprojection so the margin
+    # is in degrees and consistent across CRS variants.
+    _MARGIN = 0.01
+    bbox_fetch = [
+        bbox_wgs84[0] - _MARGIN, bbox_wgs84[1] - _MARGIN,
+        bbox_wgs84[2] + _MARGIN, bbox_wgs84[3] + _MARGIN,
+    ]
+
+    # Reproject fetch bbox to raster CRS if needed (RTC items are in UTM)
+    crs = _item_crs(item)
+    if crs and crs != "EPSG:4326":
+        bbox_native = _reproject_bbox(bbox_fetch, crs)
+        pt_transformer = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+    else:
+        bbox_native = bbox_fetch
+        pt_transformer = None
 
     vh_arr = vv_arr = None
     win_affine = None
@@ -171,7 +214,7 @@ def _extract_item(
             continue
         href = item.assets[band].href
         cache_path = _chip_cache_path(cache_dir, item.id, band, bbox_wgs84) if cache_dir else None
-        result = _read_band_array(href, affine, bbox_wgs84, cache_path)
+        result = _read_band_array(href, affine, bbox_native, cache_path)
         if result is None:
             continue
         arr, band_win_affine = result
@@ -191,8 +234,14 @@ def _extract_item(
 
     rows_out = []
     for pid, lon, lat in points:
-        col_f = (lon - win_affine.c) / win_affine.a
-        row_f = (lat - win_affine.f) / win_affine.e
+        # Convert WGS84 point to raster CRS if projected
+        if pt_transformer is not None:
+            px, py = pt_transformer.transform(lon, lat)
+        else:
+            px, py = lon, lat
+
+        col_f = (px - win_affine.c) / win_affine.a
+        row_f = (py - win_affine.f) / win_affine.e
         c = int(np.floor(col_f))
         r = int(np.floor(row_f))
         if not (0 <= r < nrows and 0 <= c < ncols):
@@ -212,6 +261,7 @@ def _extract_item(
             "source":   "S1",
             "vh":       vh_val,
             "vv":       vv_val,
+            "orbit":    orbit_state,
         })
 
     return rows_out if rows_out else None
@@ -223,6 +273,8 @@ def collect_s1(
     end: str,
     points: list[tuple[str, float, float]],
     cache_dir: Path | None = None,
+    point_shard_size: int = 50_000,
+    n_workers: int = 4,
 ) -> pd.DataFrame:
     """Fetch S1 VH/VV observations for a pixel grid and return as a DataFrame.
 
@@ -237,12 +289,26 @@ def collect_s1(
     cache_dir:
         Directory for per-(item, band) .npz patch caches. Mirrors S2 chip cache
         layout: {cache_dir}/{item_id}/{band}.npz. Defaults to data/chips/s1/.
+    point_shard_size:
+        Max points per shard. Each shard's rows are spilled to a temp parquet
+        before the next shard is processed, bounding peak memory use. Defaults
+        to 50 000 — at ~100 S1 items that's ~5 M rows peak per shard (~400 MB).
+    n_workers:
+        Number of parallel threads for item fetches. Each worker holds at most
+        two band arrays (~15 MB each for a typical bbox) in memory, so peak
+        array memory is roughly n_workers × 30 MB. Defaults to 4.
 
     Returns
     -------
-    DataFrame with columns [point_id, lon, lat, date, source, vh, vv].
+    DataFrame with columns [point_id, lon, lat, date, source, vh, vv, orbit].
     Empty DataFrame if no S1 data is found.
     """
+    import tempfile
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
     setup_gdal_env()
 
     resolved_cache = cache_dir if cache_dir is not None else _DEFAULT_CACHE_DIR
@@ -269,21 +335,125 @@ def collect_s1(
         len(items), cached_count, bbox_wgs84,
     )
 
-    all_rows: list[dict] = []
-    for item in items:
-        affine = _reconstruct_affine(item)
-        if affine is None:
-            logger.warning("S1 item %s has no proj:transform — skipping", item.id)
-            continue
-        rows = _extract_item(item, affine, bbox_wgs84, points, cache_dir=resolved_cache)
-        if rows:
-            all_rows.extend(rows)
+    # Import signer for per-item token refresh (tokens expire during long fetches)
+    try:
+        import planetary_computer as pc
+        _sign = pc.sign
+    except ImportError:
+        _sign = None
 
-    if not all_rows:
-        logger.info("S1: no usable observations extracted")
-        return pd.DataFrame()
+    _ARROW_SCHEMA = pa.schema([
+        pa.field("point_id", pa.string()),
+        pa.field("lon",      pa.float64()),
+        pa.field("lat",      pa.float64()),
+        pa.field("date",     pa.timestamp("ms")),
+        pa.field("source",   pa.string()),
+        pa.field("vh",       pa.float32()),
+        pa.field("vv",       pa.float32()),
+        pa.field("orbit",    pa.string()),
+    ])
+    _FLUSH_ROWS = 500_000
 
-    df = pd.DataFrame(all_rows)
+    # Shard points to bound peak memory: process point_shard_size points at a
+    # time across all items, spilling each shard to a temp parquet before moving
+    # on. This mirrors S2's row-budget sharding strategy.
+    n_shards = max(1, (len(points) + point_shard_size - 1) // point_shard_size)
+    use_sharding = n_shards > 1
+
+    with tempfile.TemporaryDirectory(prefix="s1_collect_") as _tmp:
+        tmp_dir = Path(_tmp)
+        shard_paths: list[Path] = []
+
+        for shard_idx in range(n_shards):
+            shard_points = points[shard_idx * point_shard_size : (shard_idx + 1) * point_shard_size]
+            if use_sharding:
+                logger.info(
+                    "S1: shard %d/%d — %d points",
+                    shard_idx + 1, n_shards, len(shard_points),
+                )
+
+            shard_path = tmp_dir / f"shard_{shard_idx:04d}.parquet"
+            writer = pq.ParquetWriter(shard_path, _ARROW_SCHEMA)
+            buf: list[dict] = []
+            total_rows = 0
+            n_items_done = 0
+            log_interval = max(1, len(items) // 10)
+
+            write_lock = threading.Lock()
+            buf: list[dict] = []
+
+            def _flush_locked() -> None:
+                """Write buf to parquet under the write lock. Caller must hold lock."""
+                if not buf:
+                    return
+                tbl = pa.table({
+                    "point_id": pa.array([r["point_id"] for r in buf], pa.string()),
+                    "lon":      pa.array([r["lon"]      for r in buf], pa.float64()),
+                    "lat":      pa.array([r["lat"]      for r in buf], pa.float64()),
+                    "date":     pa.array([pd.Timestamp(r["date"]) for r in buf], pa.timestamp("ms")),
+                    "source":   pa.array([r["source"]   for r in buf], pa.string()),
+                    "vh":       pa.array([r["vh"]       for r in buf], pa.float32()),
+                    "vv":       pa.array([r["vv"]       for r in buf], pa.float32()),
+                    "orbit":    pa.array([r["orbit"]    for r in buf], pa.string()),
+                })
+                writer.write_table(tbl)
+                buf.clear()
+
+            def _fetch_item(item) -> int:
+                """Fetch one item and append rows to buf. Returns row count."""
+                if _sign is not None:
+                    try:
+                        item = _sign(item)
+                    except TypeError:
+                        pass
+                affine = _reconstruct_affine(item)
+                if affine is None:
+                    logger.warning("S1 item %s has no proj:transform — skipping", item.id)
+                    return 0
+                rows = _extract_item(item, affine, bbox_wgs84, shard_points, cache_dir=resolved_cache)
+                if not rows:
+                    return 0
+                with write_lock:
+                    buf.extend(rows)
+                    if len(buf) >= _FLUSH_ROWS:
+                        _flush_locked()
+                return len(rows)
+
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                futures = {pool.submit(_fetch_item, item): item for item in items}
+                for fut in as_completed(futures):
+                    n_items_done += 1
+                    total_rows += fut.result()
+                    if n_items_done % log_interval == 0 or n_items_done == len(items):
+                        prefix = f"shard {shard_idx + 1}/{n_shards}  " if use_sharding else ""
+                        logger.info(
+                            "S1: %sitem %d/%d  %d rows so far",
+                            prefix, n_items_done, len(items), total_rows,
+                        )
+
+            with write_lock:
+                _flush_locked()
+            writer.close()
+
+            if use_sharding:
+                logger.info(
+                    "S1: shard %d/%d complete — %d rows",
+                    shard_idx + 1, n_shards, total_rows,
+                )
+            if total_rows > 0:
+                shard_paths.append(shard_path)
+            else:
+                shard_path.unlink(missing_ok=True)
+
+        if not shard_paths:
+            logger.info("S1: no usable observations extracted")
+            return pd.DataFrame()
+
+        if len(shard_paths) == 1:
+            df = pq.read_table(shard_paths[0]).to_pandas()
+        else:
+            df = pq.read_table(shard_paths).to_pandas()
+
     df["date"] = pd.to_datetime(df["date"])
     logger.info("S1: %d observations for %d unique dates", len(df), df["date"].nunique())
     return df
