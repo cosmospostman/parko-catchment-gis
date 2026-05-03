@@ -46,6 +46,17 @@ _S1_NODATA      = -32768   # RTC nodata value (GRD used 0)
 
 _DEFAULT_CACHE_DIR = PROJECT_ROOT / "data" / "chips" / "s1"
 
+_transformer_cache: dict[str, object] = {}
+
+
+def _get_transformer(src_crs: str, dst_crs: str):
+    """Return a cached pyproj Transformer for the given CRS pair."""
+    from pyproj import Transformer
+    key = (src_crs, dst_crs)
+    if key not in _transformer_cache:
+        _transformer_cache[key] = Transformer.from_crs(src_crs, dst_crs, always_xy=True)
+    return _transformer_cache[key]
+
 
 def _reconstruct_affine(item):
     """Return rasterio Affine from a STAC item's proj:transform property, or None."""
@@ -177,31 +188,27 @@ def _extract_item(
     bbox_wgs84: list[float],
     points: list[tuple[str, float, float]],
     cache_dir: Path | None = None,
-) -> list[dict] | None:
+) -> tuple[list, list, list, list, list, list, list] | None:
     """Extract per-pixel VH/VV for one S1 item.
 
-    Returns a list of row dicts (one per pixel with valid data), or None if
-    the item has no overlap with bbox_wgs84.
+    Returns a 7-tuple of per-column lists
+    (point_ids, lons, lats, dates, vh_vals, vv_vals, orbits)
+    for all pixels with at least one valid observation, or None if the item
+    has no overlap with bbox_wgs84.
     """
-    from pyproj import Transformer
-
     date = pd.to_datetime(item.datetime).date()
     orbit_state = item.properties.get("sat:orbit_state", None)
 
-    # Add a small margin so edge pixels whose centres fall just outside the
-    # nominal bbox are still captured.  Apply before reprojection so the margin
-    # is in degrees and consistent across CRS variants.
     _MARGIN = 0.01
     bbox_fetch = [
         bbox_wgs84[0] - _MARGIN, bbox_wgs84[1] - _MARGIN,
         bbox_wgs84[2] + _MARGIN, bbox_wgs84[3] + _MARGIN,
     ]
 
-    # Reproject fetch bbox to raster CRS if needed (RTC items are in UTM)
     crs = _item_crs(item)
     if crs and crs != "EPSG:4326":
         bbox_native = _reproject_bbox(bbox_fetch, crs)
-        pt_transformer = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+        pt_transformer = _get_transformer("EPSG:4326", crs)
     else:
         bbox_native = bbox_fetch
         pt_transformer = None
@@ -232,39 +239,47 @@ def _extract_item(
     ref_arr = vh_arr if vh_arr is not None else vv_arr
     nrows, ncols = ref_arr.shape
 
-    rows_out = []
-    for pid, lon, lat in points:
-        # Convert WGS84 point to raster CRS if projected
-        if pt_transformer is not None:
-            px, py = pt_transformer.transform(lon, lat)
-        else:
-            px, py = lon, lat
+    pids_arr = [p[0] for p in points]
+    lons_arr = np.array([p[1] for p in points], dtype=np.float64)
+    lats_arr = np.array([p[2] for p in points], dtype=np.float64)
 
-        col_f = (px - win_affine.c) / win_affine.a
-        row_f = (py - win_affine.f) / win_affine.e
-        c = int(np.floor(col_f))
-        r = int(np.floor(row_f))
-        if not (0 <= r < nrows and 0 <= c < ncols):
-            continue
+    if pt_transformer is not None:
+        px, py = pt_transformer.transform(lons_arr, lats_arr)
+    else:
+        px, py = lons_arr, lats_arr
 
-        vh_val = float(vh_arr[r, c]) if vh_arr is not None else np.nan
-        vv_val = float(vv_arr[r, c]) if vv_arr is not None else np.nan
+    cols = np.floor((px - win_affine.c) / win_affine.a).astype(np.int32)
+    rows = np.floor((py - win_affine.f) / win_affine.e).astype(np.int32)
 
-        if np.isnan(vh_val) and np.isnan(vv_val):
-            continue
+    in_bounds = (rows >= 0) & (rows < nrows) & (cols >= 0) & (cols < ncols)
+    idx = np.where(in_bounds)[0]
+    if idx.size == 0:
+        return None
 
-        rows_out.append({
-            "point_id": pid,
-            "lon":      lon,
-            "lat":      lat,
-            "date":     date,
-            "source":   "S1",
-            "vh":       vh_val,
-            "vv":       vv_val,
-            "orbit":    orbit_state,
-        })
+    r_idx = rows[idx]
+    c_idx = cols[idx]
 
-    return rows_out if rows_out else None
+    vh_vals = vh_arr[r_idx, c_idx] if vh_arr is not None else np.full(idx.size, np.nan, np.float32)
+    vv_vals = vv_arr[r_idx, c_idx] if vv_arr is not None else np.full(idx.size, np.nan, np.float32)
+
+    keep = ~(np.isnan(vh_vals) & np.isnan(vv_vals))
+    idx = idx[keep]
+    vh_vals = vh_vals[keep]
+    vv_vals = vv_vals[keep]
+
+    if idx.size == 0:
+        return None
+
+    n = idx.size
+    return (
+        [pids_arr[i] for i in idx],
+        lons_arr[idx].tolist(),
+        lats_arr[idx].tolist(),
+        [date] * n,
+        vh_vals.tolist(),
+        vv_vals.tolist(),
+        [orbit_state] * n,
+    )
 
 
 def collect_s1(
@@ -414,33 +429,39 @@ def collect_s1(
 
             shard_path = tmp_dir / f"shard_{shard_idx:04d}.parquet"
             writer = pq.ParquetWriter(shard_path, _ARROW_SCHEMA)
-            buf: list[dict] = []
             total_rows = 0
             n_items_done = 0
             log_interval = max(1, len(items) // 10)
 
             write_lock = threading.Lock()
-            buf: list[dict] = []
+            # Per-column lists: far lower Python object overhead than list-of-dicts.
+            buf_pid:    list = []
+            buf_lon:    list = []
+            buf_lat:    list = []
+            buf_date:   list = []
+            buf_vh:     list = []
+            buf_vv:     list = []
+            buf_orbit:  list = []
 
             def _flush_locked() -> None:
-                """Write buf to parquet under the write lock. Caller must hold lock."""
-                if not buf:
+                if not buf_pid:
                     return
                 tbl = pa.table({
-                    "point_id": pa.array([r["point_id"] for r in buf], pa.string()),
-                    "lon":      pa.array([r["lon"]      for r in buf], pa.float64()),
-                    "lat":      pa.array([r["lat"]      for r in buf], pa.float64()),
-                    "date":     pa.array([pd.Timestamp(r["date"]) for r in buf], pa.timestamp("ms")),
-                    "source":   pa.array([r["source"]   for r in buf], pa.string()),
-                    "vh":       pa.array([r["vh"]       for r in buf], pa.float32()),
-                    "vv":       pa.array([r["vv"]       for r in buf], pa.float32()),
-                    "orbit":    pa.array([r["orbit"]    for r in buf], pa.string()),
+                    "point_id": pa.array(buf_pid,  pa.string()),
+                    "lon":      pa.array(buf_lon,  pa.float64()),
+                    "lat":      pa.array(buf_lat,  pa.float64()),
+                    "date":     pa.array([pd.Timestamp(d) for d in buf_date], pa.timestamp("ms")),
+                    "source":   pa.array(["S1"] * len(buf_pid), pa.string()),
+                    "vh":       pa.array(buf_vh,   pa.float32()),
+                    "vv":       pa.array(buf_vv,   pa.float32()),
+                    "orbit":    pa.array(buf_orbit, pa.string()),
                 })
                 writer.write_table(tbl)
-                buf.clear()
+                buf_pid.clear(); buf_lon.clear(); buf_lat.clear(); buf_date.clear()
+                buf_vh.clear();  buf_vv.clear();  buf_orbit.clear()
 
             def _fetch_item(item) -> int:
-                """Fetch one item and append rows to buf. Returns row count."""
+                """Fetch one item and append columns to buf. Returns row count."""
                 if _sign is not None:
                     try:
                         item = _sign(item)
@@ -450,14 +471,17 @@ def collect_s1(
                 if affine is None:
                     logger.warning("S1 item %s has no proj:transform — skipping", item.id)
                     return 0
-                rows = _extract_item(item, affine, bbox_wgs84, shard_points, cache_dir=resolved_cache)
-                if not rows:
+                cols = _extract_item(item, affine, bbox_wgs84, shard_points, cache_dir=resolved_cache)
+                if cols is None:
                     return 0
+                pids, lons, lats, dates, vhs, vvs, orbits = cols
                 with write_lock:
-                    buf.extend(rows)
-                    if len(buf) >= _FLUSH_ROWS:
+                    buf_pid.extend(pids);   buf_lon.extend(lons);   buf_lat.extend(lats)
+                    buf_date.extend(dates); buf_vh.extend(vhs);     buf_vv.extend(vvs)
+                    buf_orbit.extend(orbits)
+                    if len(buf_pid) >= _FLUSH_ROWS:
                         _flush_locked()
-                return len(rows)
+                return len(pids)
 
             with ThreadPoolExecutor(max_workers=n_workers) as pool:
                 futures = {pool.submit(_fetch_item, item): item for item in items}

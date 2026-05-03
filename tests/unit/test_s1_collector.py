@@ -226,13 +226,14 @@ def test_extract_item_pixel_alignment():
     points = [("px_0000", target_lon, target_lat)]
     bbox = [lon_origin, lat_origin - nrows * res, lon_origin + ncols * res, lat_origin]
 
-    rows = _extract_item(item, affine, bbox, points)
-    assert rows is not None and len(rows) == 1
-    row = rows[0]
-    assert row["point_id"] == "px_0000"
+    cols = _extract_item(item, affine, bbox, points)
+    assert cols is not None
+    pids, lons, lats, dates, vhs, vvs, orbits = cols
+    assert len(pids) == 1
+    assert pids[0] == "px_0000"
     # row=1, col=2 → vh_arr[1, 2] = 1*5 + 2 + 0.001 = 7.001
-    assert abs(row["vh"] - vh_arr[1, 2]) < 1e-5
-    assert abs(row["vv"] - vv_arr[1, 2]) < 1e-5
+    assert abs(vhs[0] - vh_arr[1, 2]) < 1e-5
+    assert abs(vvs[0] - vv_arr[1, 2]) < 1e-5
 
 
 # ---------------------------------------------------------------------------
@@ -247,8 +248,8 @@ def test_extract_item_outside_window():
 
     # Point far outside
     points = [("px_far", 200.0, 0.0)]
-    rows = _extract_item(item, affine, bbox, points)
-    assert rows is None or len(rows) == 0
+    cols = _extract_item(item, affine, bbox, points)
+    assert cols is None or len(cols[0]) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -265,9 +266,9 @@ def test_extract_item_zero_is_nodata():
     bbox = [145.0, -22.9 - 5 * res, 145.0 + 5 * res, -22.9]
 
     points = [("px_0000", 145.0 + 0.5 * res, -22.9 - 0.5 * res)]
-    rows = _extract_item(item, affine, bbox, points)
+    cols = _extract_item(item, affine, bbox, points)
     # All zeros → NaN → no valid rows
-    assert rows is None or len(rows) == 0
+    assert cols is None or len(cols[0]) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -281,8 +282,8 @@ def test_extract_item_no_bands():
     affine = _reconstruct_affine(item)
     bbox = [145.0, -22.9 - 5 * res, 145.0 + 5 * res, -22.9]
     points = [("px_0000", 145.0 + 0.5 * res, -22.9 - 0.5 * res)]
-    rows = _extract_item(item, affine, bbox, points)
-    assert rows is None or len(rows) == 0
+    cols = _extract_item(item, affine, bbox, points)
+    assert cols is None or len(cols[0]) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -297,10 +298,11 @@ def test_extract_item_only_vh():
     affine = _reconstruct_affine(item)
     bbox = [145.0, -22.9 - 5 * res, 145.0 + 5 * res, -22.9]
     points = [("px_0000", 145.0 + 0.5 * res, -22.9 - 0.5 * res)]
-    rows = _extract_item(item, affine, bbox, points)
-    assert rows and len(rows) == 1
-    assert abs(rows[0]["vh"] - 0.005) < 1e-6
-    assert np.isnan(rows[0]["vv"])
+    cols = _extract_item(item, affine, bbox, points)
+    assert cols is not None and len(cols[0]) == 1
+    pids, lons, lats, dates, vhs, vvs, orbits = cols
+    assert abs(vhs[0] - 0.005) < 1e-6
+    assert np.isnan(vvs[0])
 
 
 # ---------------------------------------------------------------------------
