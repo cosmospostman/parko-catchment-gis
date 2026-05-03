@@ -4,28 +4,46 @@
 
 V8 is the first generation of TAM trained on Sentinel-1 only (no S2 bands). The goal is a model that discriminates Parkinsonia using SAR backscatter temporal signatures, which would complement S2-based models by operating through cloud cover and adding an independent signal.
 
-### Best result so far: `sweep_zscore_etna_landsend` — 0.955 val AUC (etna holdout)
+**Val protocol (all sweeps below):** Etna Creek held out entirely as a site holdout — 3,193 presence + 8,319 absence pixels, geographically independent of training. All runs use `lr=5e-5` as the settled optimum; `lr=1e-5` consistently fails to converge within 60 epochs.
 
-| run | lr | d_model | n_layers | val_auc |
+### Sweep comparison
+
+| sweep | train sites (presence) | train sites (absence) | lr5e-05_dm64 | lr5e-05_dm128 |
 |---|---|---|---|---|
-| lr1e-05_dm64 | 1e-5 | 64 | 2 | 0.522 |
-| lr5e-05_dm64 | 5e-5 | 64 | 2 | 0.899 |
-| lr1e-05_dm128 | 1e-5 | 128 | 2 | 0.681 |
-| **lr5e-05_dm128** | **5e-5** | **128** | **2** | **0.955** |
+| `sweep_zscore_etna_landsend` | Norman Road, Landsend | Cloncurry | 0.899 | **0.956** |
+| `sweep_zscore_lm_corfield` | Norman Road, Landsend, Lake Mueller | Cloncurry, Corfield† | 0.879 | 0.937 |
 
-Val set: **etna held out entirely** (site holdout, not spatial split) — 3,193 presence + 8,319 absence pixels, geographically independent of training.
+†Corfield presence was filtered out (noise filter); absence only included. The 0.019 AUC regression is attributed to the unbalanced corfield site — will re-run once corfield presence is fixed.
 
-Key ingredients of the best config:
-- **Sites (train):** Norman Road + Cloncurry + Landsend
-- **Sites (val):** Etna Creek (held out)
-- **Features:** VH, VV, VH−VV, RVI (4 S1 bands, no S2)
-- **Per-pixel z-score normalisation** + **DOY phase-shift augmentation**
+### `sweep_zscore_etna_landsend` — full results
+
+| run | lr | d_model | val_auc |
+|---|---|---|---|
+| lr1e-05_dm64 | 1e-5 | 64 | 0.522 |
+| lr5e-05_dm64 | 5e-5 | 64 | 0.899 |
+| lr1e-05_dm128 | 1e-5 | 128 | 0.681 |
+| **lr5e-05_dm128** | **5e-5** | **128** | **0.956** |
+
+Train sites: Norman Road (presence + absence) + Cloncurry (absence) + Landsend (presence + absence). `d_model=128` added ~6 AUC points over 64 at the same lr.
+
+### `sweep_zscore_lm_corfield` — full results
+
+| run | lr | d_model | val_auc |
+|---|---|---|---|
+| lr1e-05_dm64 | 1e-5 | 64 | 0.476 |
+| lr5e-05_dm64 | 5e-5 | 64 | 0.879 |
+| lr1e-05_dm128 | 1e-5 | 128 | 0.526 |
+| **lr5e-05_dm128** | **5e-5** | **128** | **0.937** |
+
+Adds Lake Mueller (presence + absence) and Corfield (absence only — presence filtered). Regression vs previous sweep likely due to absence-only corfield skewing the decision boundary.
+
+### Best config (settled hyperparams)
+
+- **Features:** VH, VV, VH−VV, RVI (4 S1 bands, no S2, no global features)
 - **lr=5e-5, d_model=128, n_layers=2, dropout=0.5, weight_decay=0.1**
-- **No global features, no S2**
+- **Per-pixel z-score normalisation** + **DOY phase-shift augmentation** + **DOY density normalisation**
 
-`lr=1e-5` was definitively too small — dm64 peaked at epoch 1, dm128 plateaued at 0.681 after all 60 epochs. `d_model=128` added ~6 AUC points over 64 at the same lr. dm128 hadn't fully converged at epoch 50, suggesting headroom remains.
-
-### Previous baseline: `v8_s1_zscore_nr` — 0.816 val AUC
+### Previous baseline: `v8_s1_zscore_nr` — val AUC unreliable
 
 - **Sites:** Norman Road presence (9 regions) + Cloncurry absence (7 regions) only
 - Val AUC used a spatial (latitude) split — known to be unreliable; numbers not directly comparable to etna holdout results
@@ -53,24 +71,9 @@ Key ingredients of the best config:
 
 ## Where We're Headed
 
-### Immediate: `sweep_lm_corfield`
+### Immediate: fix corfield presence, re-run `sweep_lm_corfield`
 
-Adds **Lake Mueller** and **Corfield** to the training corpus. Grid explores the neighbourhood of the best config (lr=5e-5, d_model=128, n_layers=2):
-
-| run | lr | d_model | n_layers |
-|---|---|---|---|
-| anchor | 5e-5 | 128 | 2 |
-| lr_up | 1e-4 | 128 | 2 |
-| wider | 5e-5 | 256 | 2 |
-| deeper3 | 5e-5 | 128 | 3 |
-| deeper4 | 5e-5 | 128 | 4 |
-
-Etna remains the holdout site. Fetch data then run:
-```
-python -m cli.location training fetch --prefix corfield && \
-python -m cli.location training fetch --prefix lake_mueller && \
-python sweep_lm_corfield.py
-```
+Corfield presence pixels were fully removed by the noise filter (S1-only run, `rec_p=nan` before the fillna fix). With the fix applied, re-collect corfield presence and re-run the sweep to get a clean like-for-like comparison with `sweep_zscore_etna_landsend`.
 
 ### Medium term
 

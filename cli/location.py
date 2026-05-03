@@ -145,6 +145,8 @@ def cmd_bbox(args: argparse.Namespace) -> None:
 def cmd_fetch(args: argparse.Namespace) -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     logging.getLogger("rasterio").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("requests").setLevel(logging.WARNING)
 
     try:
         loc = get(args.id)
@@ -184,6 +186,8 @@ def cmd_training_list(args: argparse.Namespace) -> None:
 def cmd_training_fetch(args: argparse.Namespace) -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     logging.getLogger("rasterio").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("requests").setLevel(logging.WARNING)
     from utils.regions import load_regions, select_regions
     from utils.training_collector import ensure_training_pixels
 

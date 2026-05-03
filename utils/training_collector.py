@@ -319,6 +319,18 @@ def ensure_training_pixels(
                 items=tile_items,
                 point_id_prefix=region.id,
             )
+            # collect() returns [] when all shards were already marked done but no
+            # sorted intermediate exists (happens when a previous run completed the
+            # shard and wrote the tile parquet but crashed before writing the region
+            # parquet).  Recover by scanning the collect dir for existing outputs.
+            if not tile_paths:
+                tile_paths = sorted(collect_dir.glob("*.parquet"))
+                if tile_paths:
+                    logger.info(
+                        "Region %s: collect() returned no paths but found %d existing "
+                        "parquet(s) in collect dir — using those",
+                        region.id, len(tile_paths),
+                    )
             # Merge per-tile S2 parquets into a single region parquet,
             # then fetch and append S1 rows using the same pixel grid.
 

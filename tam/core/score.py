@@ -29,7 +29,7 @@ _EPOCH_D = np.datetime64("1970-01-01", "D")
 _BAND_INDICES = {c: i for i, c in enumerate(ALL_FEATURE_COLS)}
 
 
-def _compute_pixel_s1_stats(parquet: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _compute_pixel_s1_stats(parquet: Path) -> tuple[dict, dict, dict, dict]:
     """One-pass pre-read to compute per-pixel VH/VV mean/std for z-scoring.
 
     Returns (pids, vh_mean, vv_mean, vh_std, vv_std) as parallel arrays indexed
@@ -49,7 +49,7 @@ def _compute_pixel_s1_stats(parquet: Path) -> tuple[np.ndarray, np.ndarray, np.n
         if not df.empty:
             chunks.append(df[["point_id", "vh", "vv"]])
     if not chunks:
-        return {}, {}
+        return {}, {}, {}, {}
     all_s1 = pd.concat(chunks, ignore_index=True)
     all_s1["vh_db"] = np.where(all_s1["vh"] > 0, 10 * np.log10(all_s1["vh"]), np.nan)
     all_s1["vv_db"] = np.where(all_s1["vv"] > 0, 10 * np.log10(all_s1["vv"]), np.nan)

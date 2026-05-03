@@ -1,0 +1,5 @@
+# Roper — Northern Territory, Roper River district.
+name: "Roper"
+centroid: null
+bbox: [135.104557, -14.873877, 135.171666, -14.729068]  # [lon_min, lat_min, lon_max, lat_max]
+dry_months: [5, 6, 7, 8, 9, 10]  # monsoonal

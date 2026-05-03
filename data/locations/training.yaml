@@ -420,12 +420,12 @@ regions:
     year: 2025
     tags: [monsoonal]
 
-  - id: norman_road_absence_6
-    name: "Norman Road — absence 6"
-    label: absence
-    bbox: [141.671224, -20.038009, 141.673786, -20.032689]
-    year: 2025
-    tags: [monsoonal]
+  # - id: norman_road_absence_6  # removed — uncertain labels (possible Parkinsonia present)
+  #   name: "Norman Road — absence 6"
+  #   label: absence
+  #   bbox: [141.671224, -20.038009, 141.673786, -20.032689]
+  #   year: 2025
+  #   tags: [monsoonal]
 
   - id: norman_road_absence_7
     name: "Norman Road — absence 7"
@@ -911,6 +911,20 @@ regions:
     year: 2025
     tags: [tropical, riparian]
 
+  - id: roper_absence_2
+    name: "Roper — absence 2"
+    label: absence
+    bbox: [135.117435, -14.786065, 135.119685, -14.780715]
+    year: 2025
+    tags: [tropical, riparian]
+
+  - id: roper_absence_3
+    name: "Roper — absence 3"
+    label: absence
+    bbox: [135.106985, -14.848985, 135.110751, -14.846419]
+    year: 2025
+    tags: [tropical, riparian]
+
   # ---------------------------------------------------------------------------
   # Ranken River — Northern Territory (semi-arid, riparian)
   # ---------------------------------------------------------------------------
@@ -1239,19 +1253,40 @@ regions:
     name: "Corfield — absence 3 (cropland, 2018)"
     label: absence
     bbox: [143.146553, -21.513805, 143.148885, -21.509914]
-    year: 2018
+    year: 2023
     tags: [semi-arid, cropland]
 
   - id: corfield_presence_4
-    name: "Corfield — presence 4 (2018)"
+    name: "Corfield — presence 4"
     label: presence
-    bbox: [143.197452, -21.502793, 143.200494, -21.502121]
-    year: 2018
+    bbox: [143.173146, -21.498764, 143.174960, -21.497077]
+    year: 2023
     tags: [semi-arid]
 
   - id: corfield_presence_5
-    name: "Corfield — presence 5 (2018)"
+    name: "Corfield — presence 5"
     label: presence
-    bbox: [143.198975, -21.503427, 143.200475, -21.502821]
-    year: 2018
+    bbox: [143.164436, -21.501829, 143.165615, -21.500377]
+    year: 2023
     tags: [semi-arid]
+
+  - id: corfield_presence_6
+    name: "Corfield — presence 6"
+    label: presence
+    bbox: [143.176356, -21.499278, 143.179833, -21.498236]
+    year: 2023
+    tags: [semi-arid]
+
+  # - id: corfield_presence_4  # removed — predominantly open water (SCL=6, NDVI=-0.28)
+  #   name: "Corfield — presence 4"
+  #   label: presence
+  #   bbox: [143.197452, -21.502793, 143.200494, -21.502121]
+  #   year: 2025
+  #   tags: [semi-arid]
+
+  # - id: corfield_presence_5  # removed — ambiguous (mixed water/bare, very low NDVI ~0.05)
+  #   name: "Corfield — presence 5"
+  #   label: presence
+  #   bbox: [143.198975, -21.503427, 143.200475, -21.502821]
+  #   year: 2025
+  #   tags: [semi-arid]

@@ -303,8 +303,11 @@ def collect_s1(
     DataFrame with columns [point_id, lon, lat, date, source, vh, vv, orbit].
     Empty DataFrame if no S1 data is found.
     """
+    import hashlib
+    import pickle
     import tempfile
     import threading
+    import time
     from concurrent.futures import ThreadPoolExecutor, as_completed
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -313,13 +316,41 @@ def collect_s1(
 
     resolved_cache = cache_dir if cache_dir is not None else _DEFAULT_CACHE_DIR
 
-    items = search_sentinel1(
-        bbox=bbox_wgs84,
-        start=start,
-        end=end,
-        endpoint=_STAC_ENDPOINT,
-        collection=_S1_COLLECTION,
-    )
+    # Cache S1 STAC search results to avoid repeated round-trips on re-runs.
+    stac_key = hashlib.md5(
+        f"{bbox_wgs84}|{start}|{end}".encode()
+    ).hexdigest()
+    stac_cache_dir = resolved_cache / "stac"
+    stac_cache_dir.mkdir(parents=True, exist_ok=True)
+    stac_cache = stac_cache_dir / f"{stac_key}.pkl"
+
+    if stac_cache.exists():
+        with stac_cache.open("rb") as fh:
+            items = pickle.load(fh)
+        logger.info("S1 STAC: %d items loaded from cache (%s)", len(items), stac_cache.name)
+    else:
+        try:
+            import planetary_computer as _pc
+            _modifier = _pc.sign_inplace
+        except ImportError:
+            _modifier = None
+
+        logger.info(
+            "S1 STAC search: endpoint=%s collection=%s bbox=%s start=%s end=%s",
+            _STAC_ENDPOINT, _S1_COLLECTION, bbox_wgs84, start, end,
+        )
+        items = search_sentinel1(
+            bbox=bbox_wgs84,
+            start=start,
+            end=end,
+            endpoint=_STAC_ENDPOINT,
+            collection=_S1_COLLECTION,
+            modifier=_modifier,
+        )
+        with stac_cache.open("wb") as fh:
+            pickle.dump(items, fh)
+        logger.info("S1 STAC: %d items found and cached (%s)", len(items), stac_cache.name)
+
     items = filter_items_by_bbox(items, bbox_wgs84)
     if not items:
         logger.info("No S1 items found for bbox %s in %s/%s", bbox_wgs84, start, end)

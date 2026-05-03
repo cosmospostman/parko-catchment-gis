@@ -91,6 +91,28 @@ def _load_patch_cache(path: Path) -> tuple[np.ndarray, object, object] | None:
         return None
 
 
+def _patch_covers_bbox(
+    data: tuple[np.ndarray, object, object],
+    bbox_wgs84: list[float],
+) -> bool:
+    """Return True if the cached patch fully covers bbox_wgs84."""
+    from pyproj import Transformer, CRS
+    arr, transform, crs = data
+    h, w = arr.shape
+    crs_obj = CRS.from_wkt(crs.to_wkt()) if hasattr(crs, "to_wkt") else crs
+    t = Transformer.from_crs("EPSG:4326", crs_obj, always_xy=True)
+    lon_min, lat_min, lon_max, lat_max = bbox_wgs84
+    xs, ys = t.transform(
+        [lon_min, lon_max, lon_min, lon_max],
+        [lat_min, lat_min, lat_max, lat_max],
+    )
+    a = transform
+    cols_f = (np.array(xs) - float(a.c)) / float(a.a)
+    rows_f = (np.array(ys) - float(a.f)) / float(a.e)
+    return bool(cols_f.min() >= 0 and cols_f.max() < w and
+                rows_f.min() >= 0 and rows_f.max() < h)
+
+
 def _save_patch_cache(path: Path, data: tuple[np.ndarray, object, object]) -> None:
     """Save a patch to a .npz file, creating parent dirs as needed."""
     arr, transform, crs = data
@@ -169,8 +191,16 @@ async def fetch_patches(
             if path.exists():
                 data = await loop.run_in_executor(executor, _load_patch_cache, path)
                 if data is not None:
-                    cached += 1
-                    return data
+                    covers = await loop.run_in_executor(
+                        executor, _patch_covers_bbox, data, bbox_wgs84
+                    )
+                    if covers:
+                        cached += 1
+                        return data
+                    logger.debug(
+                        "Cached patch for %s/%s does not cover bbox — re-fetching",
+                        item_id, band,
+                    )
         async with sem:
             data = await loop.run_in_executor(executor, _read_bbox_patch, href, bbox_wgs84)
         if data is None:

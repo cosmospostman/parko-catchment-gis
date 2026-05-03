@@ -584,7 +584,14 @@ def load_tam(out_dir: Path, device: str | None = None) -> tuple[TAMClassifier, n
     cfg.n_global_features = extra - (1 if cfg.use_n_obs else 0)
 
     model = TAMClassifier.from_config(cfg)
-    # Allow loading checkpoints saved before doy_inv_freq buffer was added
+    # Allow loading checkpoints saved before doy_inv_freq buffer was added,
+    # or with a mismatched size (old checkpoints used minlength=367 → shape (367,);
+    # current model registers (366,)). Truncate or pad to match.
+    if "doy_inv_freq" in state:
+        ckpt_freq = state["doy_inv_freq"]
+        expected = model.doy_inv_freq.shape[0]
+        if ckpt_freq.shape[0] != expected:
+            state["doy_inv_freq"] = ckpt_freq[:expected] if ckpt_freq.shape[0] > expected else torch.nn.functional.pad(ckpt_freq, (0, expected - ckpt_freq.shape[0]), value=1.0)
     model.load_state_dict(state, strict=False)
     model._use_s1 = cfg_dict.get("use_s1", None)
     model._pixel_zscore = cfg_dict.get("pixel_zscore", None)
