@@ -12,8 +12,8 @@ Outputs:
 
 Usage:
     python utils/site_similarity.py \
-        --cache outputs/sweep_zscore_etna_landsend/lr5e-05_dm64/global_features_cache.parquet \
-        --out outputs/sweep_zscore_etna_landsend/site_similarity
+        --cache outputs/models/sweep_zscore_etna_landsend/lr5e-05_dm64/global_features_cache.parquet \
+        --out outputs/models/sweep_zscore_etna_landsend/site_similarity
 """
 
 from __future__ import annotations

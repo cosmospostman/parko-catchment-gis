@@ -81,11 +81,11 @@ Adds Lake Mueller (presence + absence) and Corfield (absence only — presence f
 
 ### ~~Add Roper site~~ — DONE
 
-`v8_roper` adds Roper (937 presence + 3,635 absence, northern Gulf lowlands) to the full site set. Val AUC rose from 0.964 → **0.989** — the largest single-site gain yet. Checkpoint: `outputs/train_v8_roper/tam_model.pt`.
+`v8_roper` adds Roper (937 presence + 3,635 absence, northern Gulf lowlands) to the full site set. Val AUC rose from 0.964 → **0.989** — the largest single-site gain yet. Checkpoint: `outputs/models/train_v8_roper/tam_model.pt`.
 
 ### Attention visualisation — `v8_roper`
 
-Full outputs in `outputs/train_v8_roper/attention/`. Key findings:
+Full outputs in `outputs/models/train_v8_roper/attention/`. Key findings:
 
 The model attends to different periods of the year at different locations, reflecting local rainfall seasonality rather than a fixed global window. This is the right behaviour — Parkinsonia's phenological signature relative to background vegetation shifts with the local wet/dry cycle.
 

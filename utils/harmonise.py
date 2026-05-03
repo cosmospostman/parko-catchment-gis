@@ -18,7 +18,7 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from signals._shared import _WRITE_OPTS, _optimise_schema
+from utils.parquet_utils import _WRITE_OPTS, _optimise_schema
 from utils.tile_harmonisation import calibrate, load_corrections
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent

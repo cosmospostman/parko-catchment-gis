@@ -1,15 +1,18 @@
-"""sweep_zscore_etna_landsend.py — Hyperparam sweep over v8_s1_zscore_nr_etna_landsend.
+"""sweep_zscore_lm_corfield.py — Hyperparam sweep over v8_s1_zscore_nr_etna_landsend_lm_corfield.
+
+Extends sweep_zscore_etna_landsend with Lake Mueller and Corfield training sites.
+Etna remains the holdout (val_sites=("etna",)) for direct AUC comparison.
 
 Grid:
   lr:      1e-5, 5e-5
   d_model: 64, 128
 
-= 4 runs total. All other settings identical to v8_s1_zscore_nr_etna_landsend.
+= 4 runs total. All other settings identical to sweep_zscore_etna_landsend.
 
 Usage:
-    python sweep_zscore_etna_landsend.py
-    python sweep_zscore_etna_landsend.py --out outputs/sweep_zscore_etna_landsend
-    python sweep_zscore_etna_landsend.py --dry-run
+    python sweep_zscore_lm_corfield.py
+    python sweep_zscore_lm_corfield.py --out outputs/models/sweep_zscore_lm_corfield
+    python sweep_zscore_lm_corfield.py --dry-run
 """
 
 from __future__ import annotations
@@ -74,7 +77,7 @@ def _run(run_id, out_dir, lr, d_model,
          importlib, pq, pd, TAMConfig, train_tam,
          label_pixels, select_regions, tile_ids_for_regions, tile_parquet_path):
 
-    exp = importlib.import_module("tam.experiments.v8_s1_zscore_nr_etna_landsend").EXPERIMENT
+    exp = importlib.import_module("tam.experiments.v8_s1_zscore_nr_etna_landsend_lm_corfield").EXPERIMENT
 
     cfg = TAMConfig(
         d_model=d_model,
@@ -149,7 +152,7 @@ def _run(run_id, out_dir, lr, d_model,
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--out", default="outputs/sweep_zscore_etna_landsend")
+    parser.add_argument("--out", default="outputs/models/sweep_zscore_lm_corfield")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -189,7 +192,7 @@ def main() -> None:
                 subprocess.run(
                     [sys.executable, "-m", "tam.viz_attention",
                      "--checkpoint", str(out_dir),
-                     "--experiment", "v8_s1_zscore_nr_etna_landsend"],
+                     "--experiment", "v8_s1_zscore_nr_etna_landsend_lm_corfield"],
                     cwd=PROJECT_ROOT,
                 )
 

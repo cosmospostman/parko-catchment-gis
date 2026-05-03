@@ -74,7 +74,7 @@ python -m tam.pipeline train --experiment v1_spectral
 
 ```bash
 python -m tam.pipeline score \
-    --checkpoint outputs/tam-v1_spectral \
+    --checkpoint outputs/models/tam-v1_spectral \
     --location frenchs --end-year 2025
 ```
 

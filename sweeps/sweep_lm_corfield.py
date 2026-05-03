@@ -14,7 +14,7 @@ Grid:
 
 Usage:
     python sweep_lm_corfield.py
-    python sweep_lm_corfield.py --out outputs/sweep_lm_corfield
+    python sweep_lm_corfield.py --out outputs/models/sweep_lm_corfield
     python sweep_lm_corfield.py --dry-run
 """
 
@@ -152,7 +152,7 @@ def _run(run_id, out_dir, lr, d_model, n_layers,
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--out", default="outputs/sweep_lm_corfield")
+    parser.add_argument("--out", default="outputs/models/sweep_lm_corfield")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 

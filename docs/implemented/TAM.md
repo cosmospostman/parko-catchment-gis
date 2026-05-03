@@ -19,7 +19,7 @@ tam/
 └── pipeline.py        # run() — load → train → infer → plot
 ```
 
-Outputs go to `outputs/tam-<location>/`.
+Outputs go to `outputs/models/tam-<location>/`.
 
 ---
 
@@ -84,7 +84,7 @@ prob = sigmoid(head(x_pool))                # (B,)
 
 **Batch size:** 32. DataLoader shuffle=True. ~100 epochs for PoC.
 
-**Checkpoint:** Save best val-AUC model to `outputs/tam-<location>/tam_model.pt` + `tam_config.json` (hyperparams) + `tam_band_stats.npz`.
+**Checkpoint:** Save best val-AUC model to `outputs/models/tam-<location>/tam_model.pt` + `tam_config.json` (hyperparams) + `tam_band_stats.npz`.
 
 ---
 
@@ -98,7 +98,7 @@ prob = sigmoid(head(x_pool))                # (B,)
 
 **Output compatibility:** Rename `prob_tam → prob_lr` before calling `utils/heatmap.py:plot_prob_heatmaps()`. Reuse `pipelines/common.py:save_pixel_ranking()` for CSV.
 
-Output dir: `outputs/tam-<location>/`:
+Output dir: `outputs/models/tam-<location>/`:
 - `tam_model.pt`, `tam_band_stats.npz`, `tam_config.json`
 - `tam_<location>_prob_vs_imagery.png`, `tam_<location>_prob_black.png`
 - `tam_pixel_ranking.csv`
@@ -135,7 +135,7 @@ TAM does **not** use `extract_parko_features()`, `ParkoClassifier`, or `Standard
 ## Verification
 
 1. `python -m tam.pipeline --location longreach --train` — trains on 748 labeled pixels, saves checkpoint
-2. Inspect `outputs/tam-longreach/tam_longreach_prob_vs_imagery.png` — presence sub-bbox should score visibly higher than absence
+2. Inspect `outputs/models/tam-longreach/tam_longreach_prob_vs_imagery.png` — presence sub-bbox should score visibly higher than absence
 3. Check `tam_pixel_ranking.csv` — verify presence pixels cluster at top of ranking
 4. Run `plot_tam_attention()` on 3–5 high-scoring presence pixels — attention peaks should fall in dry season (DOY 150–300 for QLD)
 5. Check val-AUC logged during training — target > 0.75 for PoC acceptance

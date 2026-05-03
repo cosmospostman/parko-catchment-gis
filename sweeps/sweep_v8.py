@@ -9,7 +9,7 @@ Grid explores:
 
 Usage:
     python sweep_v8.py
-    python sweep_v8.py --out outputs/sweep_v8
+    python sweep_v8.py --out outputs/models/sweep_v8
 """
 
 from __future__ import annotations
@@ -150,7 +150,7 @@ def run_one(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--out", default="outputs/sweep_v8")
+    parser.add_argument("--out", default="outputs/models/sweep_v8")
     args = parser.parse_args()
 
     base_out = Path(args.out)

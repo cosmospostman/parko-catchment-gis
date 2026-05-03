@@ -39,7 +39,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from signals._shared import ensure_pixel_sorted, is_pixel_sorted
+from utils.parquet_utils import ensure_pixel_sorted, is_pixel_sorted
 
 
 # ---------------------------------------------------------------------------
@@ -283,7 +283,7 @@ def test_sort_parquet_by_pixel_requires_underscore_ids(tmp_path):
     This documents that the real pipeline pixel IDs must follow the
     'px_<easting>_<northing>' convention for the sort to work.
     """
-    from signals._shared import sort_parquet_by_pixel
+    from utils.parquet_utils import sort_parquet_by_pixel
     from tam.core.dataset import BAND_COLS
 
     rng = np.random.default_rng(11)
@@ -325,7 +325,7 @@ def test_sort_groups_by_northing_not_easting(tmp_path):
     easting (0000, 0001) instead — the assertion below would still pass for
     count but the northing-per-group check catches the axis confusion.
     """
-    from signals._shared import sort_parquet_by_pixel
+    from utils.parquet_utils import sort_parquet_by_pixel
     from tam.core.dataset import BAND_COLS
 
     rng = np.random.default_rng(12)
@@ -413,7 +413,7 @@ def test_sort_does_not_mix_northing_rows(tmp_path):
     output row group.  With 3 distinct northing rows the output must have
     exactly 3 row groups (one per northing), not 1 (merged) or more than 3.
     """
-    from signals._shared import sort_parquet_by_pixel
+    from utils.parquet_utils import sort_parquet_by_pixel
     from tam.core.dataset import BAND_COLS
 
     rng = np.random.default_rng(13)

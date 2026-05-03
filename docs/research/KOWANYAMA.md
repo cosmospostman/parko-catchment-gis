@@ -7,7 +7,7 @@ Fetch bbox: `141.47528, −15.51051, 141.66922, −15.41736` (~21 km × 10 km).
 Monsoonal climate; dry season May–October.
 
 **Script:** `longreach/kowanyama-score.py`
-**Outputs:** `outputs/kowanyama/`
+**Outputs:** `outputs/scores/kowanyama/`
 
 ---
 

@@ -1,7 +1,7 @@
 """Evaluate a saved TAM checkpoint against each site's pixels individually.
 
 Usage:
-    python -m tam.eval_per_site --checkpoint outputs/sweep_loso/train_all \
+    python -m tam.eval_per_site --checkpoint outputs/models/sweep_loso/train_all \
         --experiment v6_spectral --sites frenchs barcoorah ...
 """
 

@@ -324,11 +324,17 @@ def collect_s1(
     stac_cache_dir.mkdir(parents=True, exist_ok=True)
     stac_cache = stac_cache_dir / f"{stac_key}.pkl"
 
+    items = None
     if stac_cache.exists():
-        with stac_cache.open("rb") as fh:
-            items = pickle.load(fh)
-        logger.info("S1 STAC: %d items loaded from cache (%s)", len(items), stac_cache.name)
-    else:
+        try:
+            with stac_cache.open("rb") as fh:
+                items = pickle.load(fh)
+            logger.info("S1 STAC: %d items loaded from cache (%s)", len(items), stac_cache.name)
+        except Exception:
+            logger.warning("S1 STAC cache corrupt — re-fetching (%s)", stac_cache.name)
+            stac_cache.unlink(missing_ok=True)
+
+    if items is None:
         try:
             import planetary_computer as _pc
             _modifier = _pc.sign_inplace
@@ -347,9 +353,12 @@ def collect_s1(
             collection=_S1_COLLECTION,
             modifier=_modifier,
         )
-        with stac_cache.open("wb") as fh:
-            pickle.dump(items, fh)
-        logger.info("S1 STAC: %d items found and cached (%s)", len(items), stac_cache.name)
+        try:
+            with stac_cache.open("wb") as fh:
+                pickle.dump(items, fh)
+            logger.info("S1 STAC: %d items found and cached (%s)", len(items), stac_cache.name)
+        except Exception:
+            logger.debug("S1 STAC: items not picklable — skipping cache write")
 
     items = filter_items_by_bbox(items, bbox_wgs84)
     if not items:

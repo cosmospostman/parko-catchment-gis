@@ -12,11 +12,11 @@ Grid:
   - S1-only temporal (4 bands, no globals)
   - patience=20, n_epochs=80
 
-Results written to outputs/sweep_multisite_phase/summary.csv
+Results written to outputs/models/sweep_multisite_phase/summary.csv
 
 Usage:
     python sweep_multisite_phase.py
-    python sweep_multisite_phase.py --out outputs/sweep_multisite_phase
+    python sweep_multisite_phase.py --out outputs/models/sweep_multisite_phase
 """
 
 from __future__ import annotations
@@ -168,7 +168,7 @@ def run_one(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--out", default="outputs/sweep_multisite_phase")
+    parser.add_argument("--out", default="outputs/models/sweep_multisite_phase")
     args = parser.parse_args()
 
     base_out = Path(args.out)

@@ -15,7 +15,7 @@
 set -euo pipefail
 
 EXPERIMENT="v6_spectral"
-BASE_OUT="outputs/sweep_loso"
+BASE_OUT="outputs/models/sweep_loso"
 LOG_DIR="$BASE_OUT/logs"
 mkdir -p "$LOG_DIR"
 

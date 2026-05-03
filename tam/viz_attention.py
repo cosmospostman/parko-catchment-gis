@@ -7,10 +7,10 @@ Outputs all files into a single subdirectory alongside the checkpoint:
     perhead_<site>_<cls>.png — per-head attention for last layer
 
 Usage:
-    python -m tam.viz_attention --checkpoint outputs/tam-v7_norman_road_only \
+    python -m tam.viz_attention --checkpoint outputs/models/tam-v7_norman_road_only \
         --experiment v7_norman_road_only
 
-    python -m tam.viz_attention --checkpoint outputs/tam-v7_frenchs_only \
+    python -m tam.viz_attention --checkpoint outputs/models/tam-v7_frenchs_only \
         --experiment v7_frenchs_only --sites frenchs --n-pixels 50
 """
 

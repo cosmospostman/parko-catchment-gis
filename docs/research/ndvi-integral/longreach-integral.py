@@ -79,7 +79,7 @@ from signals._shared import annual_ndvi_curve_chunked
 # ---------------------------------------------------------------------------
 
 SCENE_LOC_ID = "longreach-8x8km"
-RANKING_CSV  = PROJECT_ROOT / "outputs" / "longreach-8x8" / "longreach_8x8km_pixel_ranking.csv"
+RANKING_CSV  = PROJECT_ROOT / "outputs" / "scores" / "longreach-8x8km" / "longreach_8x8km_pixel_ranking.csv"
 
 # Reuse the NDVI curve cache from recession-and-greenup (same scene, same params).
 CURVE_CACHE = (

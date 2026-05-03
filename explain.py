@@ -7,7 +7,7 @@ For the top-N and bottom-N scoring pixels from a TAM pixel ranking CSV, produces
 Usage
 -----
     python explain.py
-    python explain.py --checkpoint outputs/tam-frenchs --ranking outputs/tam-kowanyama/tam_pixel_ranking.csv
+    python explain.py --checkpoint outputs/models/tam-frenchs --ranking outputs/scores/tam-kowanyama/tam_pixel_ranking.csv
     python explain.py --n 5 --out outputs/explain
 """
 
@@ -115,7 +115,7 @@ def _load_tam_compat(
 
 # Defaults
 DEFAULT_CHECKPOINT = PROJECT_ROOT / "outputs" / "tam-frenchs"
-DEFAULT_RANKING    = PROJECT_ROOT / "outputs" / "tam-kowanyama" / "tam_pixel_ranking.csv"
+DEFAULT_RANKING    = PROJECT_ROOT / "outputs" / "scores" / "tam-kowanyama" / "tam_pixel_ranking.csv"
 DEFAULT_PARQUET    = PROJECT_ROOT / "data" / "kowanyama.parquet"
 DEFAULT_OUT        = PROJECT_ROOT / "outputs" / "explain"
 DEFAULT_N          = 5

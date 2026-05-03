@@ -151,7 +151,7 @@ python cli/location.py fetch mitchell --years 2025
 ```bash
 # Sequential (safe, lower disk pressure)
 python -m tam.pipeline score \
-    --checkpoint outputs/tam-v4 \
+    --checkpoint outputs/models/tam-v4 \
     --location mitchell \
     --years 2025 \
     --out-parquet \
@@ -159,7 +159,7 @@ python -m tam.pipeline score \
 
 # Parallel (measure single-tile time first)
 python -m tam.pipeline score \
-    --checkpoint outputs/tam-v4 \
+    --checkpoint outputs/models/tam-v4 \
     --location mitchell \
     --years 2025 \
     --out-parquet \

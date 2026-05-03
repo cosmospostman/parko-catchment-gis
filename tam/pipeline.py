@@ -6,7 +6,7 @@ Usage
     python -m tam.pipeline train --experiment v1_spectral
 
     # Score any location with an existing checkpoint
-    python -m tam.pipeline score --checkpoint outputs/tam-v1_spectral \\
+    python -m tam.pipeline score --checkpoint outputs/models/tam-v1_spectral \\
         --location longreach --years 2022 2023 2024
 """
 
@@ -24,7 +24,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from tam.utils import label_pixels, save_pixel_ranking, summarise
-from signals._shared import ensure_pixel_sorted
+from utils.parquet_utils import ensure_pixel_sorted
 from tam.core.config import TAMConfig
 from tam.core.score import score_location_years, score_tiles_chunked
 from tam.core.train import load_tam, train_tam
@@ -114,7 +114,7 @@ def _cmd_train(args: argparse.Namespace) -> None:
     labelled_known = labelled.dropna(subset=["is_presence"])
     labels = labelled_known.set_index("point_id")["is_presence"].map({True: 1.0, False: 0.0})
 
-    out_dir = Path(args.output_dir) if args.output_dir else PROJECT_ROOT / "outputs" / f"tam-{exp.name}"
+    out_dir = Path(args.output_dir) if args.output_dir else PROJECT_ROOT / "outputs" / "models" / f"tam-{exp.name}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     train_kwargs = dict(exp.train_kwargs)
@@ -186,7 +186,7 @@ def _cmd_score(args: argparse.Namespace) -> None:
     if getattr(args, "out", None):
         out_csv = Path(args.out)
     else:
-        out_csv = PROJECT_ROOT / "outputs" / loc.id / f"{checkpoint_dir.name}.csv"
+        out_csv = PROJECT_ROOT / "outputs" / "scores" / loc.id / f"{checkpoint_dir.name}.csv"
     out_dir = out_csv.parent
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -262,7 +262,7 @@ def _cmd_score(args: argparse.Namespace) -> None:
                 tile_year_map.setdefault(tid, []).append((y, ensure_pixel_sorted(p)))
 
         parquet_out_dir = (
-            PROJECT_ROOT / "outputs" / loc.id / checkpoint_dir.name / str(end_year)
+            PROJECT_ROOT / "outputs" / "scores" / loc.id / checkpoint_dir.name / str(end_year)
         )
         logger.info(
             "Scoring %d tiles → parquet shards in %s ...",
@@ -337,7 +337,7 @@ if __name__ == "__main__":
     # --- train ---
     p_train = sub.add_parser("train", help="Train a named experiment")
     p_train.add_argument("--experiment", required=True, help="Experiment module name (e.g. v1_spectral)")
-    p_train.add_argument("--output-dir", default=None, help="Override output directory (default: outputs/tam-<experiment>)")
+    p_train.add_argument("--output-dir", default=None, help="Override output directory (default: outputs/models/tam-<experiment>)")
     p_train.add_argument("--epochs",           type=int,   default=None)
     p_train.add_argument("--patience",         type=int,   default=None)
     p_train.add_argument("--lr",               type=float, default=None)

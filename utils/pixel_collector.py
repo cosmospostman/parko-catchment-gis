@@ -455,7 +455,7 @@ def collect(
         else:
             logger.info("All %d items already in cache — no network fetch needed", len(items))
 
-    from signals._shared import sort_parquet_by_pixel, _optimise_schema, _WRITE_OPTS
+    from utils.parquet_utils import sort_parquet_by_pixel, _optimise_schema, _WRITE_OPTS
 
     sorted_shard_paths: list[Path] = []
 
@@ -799,7 +799,7 @@ def collect(
         n = pq.ParquetFile(p).metadata.num_rows
         logger.info("Written: %s  (%d rows)", p.name, n)
 
-    from signals._shared import is_pixel_sorted
+    from utils.parquet_utils import is_pixel_sorted
     for p in written_paths:
         if not is_pixel_sorted(p, n_check=10):
             logger.warning("%s is NOT pixel-sorted — sorting now ...", p.name)

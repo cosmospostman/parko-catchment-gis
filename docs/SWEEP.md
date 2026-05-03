@@ -2,7 +2,7 @@
 
 ## 1. Hyperparameter sweep (2026-04-27)
 
-**Script:** `sweep.sh`  
+**Script:** `sweeps/sweep.sh`  
 **Output:** `outputs/sweep/summary.txt`  
 **Grid:** lr × weight_decay × dropout (2 × 3 × 2 = 12 runs)
 
@@ -37,8 +37,8 @@
 
 ## 2. Leave-one-site-out sweep (2026-04-28)
 
-**Script:** `sweep_loso.sh`  
-**Output:** `outputs/sweep_loso/loso_summary.txt`  
+**Script:** `sweeps/sweep_loso.sh`  
+**Output:** `outputs/models/sweep_loso/loso_summary.txt`  
 **Hyperparams:** fixed at best from sweep above.  
 **Method:** Hold out each site entirely as the validation set; train on all remaining sites.  
 Sites excluded from LOSO (absence-only or commented out of experiment): `quaids`, `mitchell_river`, `muttaburra`, `barkly`, `ranken_river`.

@@ -80,7 +80,7 @@ python -m tam.pipeline train --experiment v1_spectral \
     --start 2020-01-01 --end 2025-12-31
 
 # Score any location with an existing checkpoint
-python -m tam.pipeline score --checkpoint outputs/tam-v1_spectral \
+python -m tam.pipeline score --checkpoint outputs/models/tam-v1_spectral \
     --location longreach-8x8km --end-year 2024
 ```
 
