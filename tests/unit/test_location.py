@@ -29,7 +29,8 @@ from typing import Any
 import pytest
 import yaml
 
-from utils.location import Location, SubBbox, _bbox_pixel_count, _load_registry, _PROJECT_ROOT, _append_s1_to_tile_parquet
+from utils.location import Location, SubBbox, _bbox_pixel_count, _load_registry, _PROJECT_ROOT
+from utils.parquet_utils import append_s1_to_tile_parquet
 
 
 # ---------------------------------------------------------------------------
@@ -474,10 +475,11 @@ def test_append_s1_collects_coords_from_all_row_groups(tmp_path):
         captured_points.append([pid for pid, _, _ in points])
         return pd.DataFrame()   # no actual S1 data needed for this test
 
-    _append_s1_to_tile_parquet(
+    append_s1_to_tile_parquet(
         tile_path=tile_path,
         bbox_wgs84=[145.40, -22.82, 145.44, -22.78],
-        year=2022,
+        start="2022-01-01",
+        end="2022-12-31",
         collect_s1_fn=mock_collect_s1,
     )
 

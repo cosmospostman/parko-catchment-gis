@@ -100,10 +100,26 @@ The model attends to different periods of the year at different locations, refle
 
 The transformer is inferring local phenological context from the S1 time series shape itself — no site ID is passed as input. Lake Mueller's Nov/Dec cluster (vs the Jan–Mar cluster at northern sites) confirms the model is picking up on the structural difference in seasonality, not memorising site-level offsets.
 
+### Bhattacharyya separability — `v8_roper`
+
+Run via `utils/site_similarity.py` against `outputs/models/train_v8_roper/global_features_cache.parquet`. Outputs in `outputs/models/train_v8_roper/site_similarity/`.
+
+| Site | Separability | n_presence | n_absence |
+|---|---|---|---|
+| Landsend | 1.253 | 3,954 | 5,147 |
+| Corfield | 1.186 | 2,109 | 4,710 |
+| Lake Mueller | 0.712 | 1,019 | 1,835 |
+| Etna | 0.437 | 3,633 | 8,319 |
+| **Roper** | **0.275** | **937** | **3,635** |
+| Norman Road | 0.200 | 5,189 | 6,021 |
+| Cloncurry | NaN | 0 | 2,228 |
+
+Roper sits near the bottom of the separability ranking — presence and absence overlap heavily in the S1 global feature space, consistent with the nearly-identical attention profiles noted above. Despite this, it produced the largest single-site AUC jump (0.964 → 0.989), so its value is in signature diversity rather than intrinsic separability. Presence-median profile confirms this: highest `s1_vh_contrast` of all sites (z=+1.26) and most distinct `peak_doy` (z=−1.22), pointing to a phenologically-offset signature that complements the other northern sites.
+
 ### Next steps
 
 - **More seasonality diversity:** Lake Mueller is the only southern (Nov/Dec-phase) site — one more like it would strengthen that regime. Barkly Tableland (west) likely adds a distinct dry-season onset and is the priority new site.
-- **Roper presence quality:** Roper presence (937 px) and absence attention profiles are nearly identical — may indicate weak presence signal. Worth checking separability before adding more Gulf-region sites.
+- **Roper presence quality:** Low separability (0.275) and near-identical presence/absence attention profiles confirm weak within-site discrimination. Worth auditing the presence polygons before adding more Gulf-region sites.
 - **Val strategy:** At 0.989 on a single fixed holdout, Etna may be flattering or hiding weaknesses. LOSO across all sites should be run before committing to this architecture for inference.
 - **Ensemble with S2:** S1 model doesn't need to discriminate alone — even a weak orthogonal signal adds value in a fused model.
 - **Input smoothing:** A temporal median filter on S1 input (or learned smoothing) would reduce per-observation backscatter noise in scoring maps.

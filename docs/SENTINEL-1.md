@@ -77,6 +77,12 @@ a generalisation feature.
 - **Mean RVI** — temporal mean of the Radar Vegetation Index; integrates vegetation
   density across the full observation period.
 
+### Orbit geometry over Australia
+
+Australia is predominantly covered under **IW mode, dual polarisation (VV+VH), descending passes**. This is confirmed by the ESA Sentinel-1 observation scenario map ([2019 reference](https://sentinels.copernicus.eu/documents/247904/3944045/Sentinel-1-Mode-Polarisation-Observation-Geometry-2019.jpeg)) and is consistent with STAC queries over training sites — e.g. Quaids (Cape York) shows 231 scenes across 2017–2024, all descending, all relative orbit 162, with zero ascending passes.
+
+The practical implication is that **orbit-direction mixing is not a significant concern for Australian sites** — a given location is typically covered by a single relative orbit in a single direction. Per-pixel z-score normalisation (applied to VH and VV) is therefore sufficient to remove the incidence-angle offset introduced by that fixed orbit geometry. If a future site does show ascending/descending mixing, the `sat:orbit_state` and `sat:relative_orbit` fields are already captured in the STAC query and stored in the collector output, so orbit-stratified normalisation could be added if needed.
+
 ### Preprocessing note
 
 The raw S1 GRD COGs from Element84 STAC are in linear power units and have no

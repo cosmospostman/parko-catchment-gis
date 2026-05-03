@@ -20,7 +20,6 @@ import sys
 from pathlib import Path
 
 import pandas as pd
-import pyarrow as pa
 import pyarrow.parquet as pq
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -32,6 +31,7 @@ import re as _re
 
 from utils.regions import TrainingRegion, load_regions, select_regions
 from utils.location import tile_chips_path
+from utils.parquet_utils import append_s1_to_tile_parquet
 from utils.pixel_collector import collect
 from utils.s2_tiles import bbox_to_tile_ids
 from utils.stac import search_sentinel2
@@ -39,70 +39,6 @@ from utils.s1_collector import collect_s1, _DEFAULT_CACHE_DIR as _S1_CHIP_CACHE_
 
 logger = logging.getLogger(__name__)
 
-
-def _extend_schema(s2_schema: "pa.Schema") -> "pa.Schema":
-    """Return s2_schema extended with source, vh, vv columns if not present."""
-    import pyarrow as pa
-    extra = []
-    names = set(s2_schema.names)
-    if "source" not in names:
-        extra.append(pa.field("source", pa.string()))
-    if "vh" not in names:
-        extra.append(pa.field("vh", pa.float32()))
-    if "vv" not in names:
-        extra.append(pa.field("vv", pa.float32()))
-    if not extra:
-        return s2_schema
-    return pa.schema(list(s2_schema) + extra)
-
-
-def _conform_table(tbl: "pa.Table", schema: "pa.Schema") -> "pa.Table":
-    """Return tbl conformed to schema: add missing columns as null, cast types."""
-    import pyarrow as pa
-    for field in schema:
-        if field.name not in tbl.schema.names:
-            tbl = tbl.append_column(
-                field,
-                pa.array([None] * len(tbl), type=field.type),
-            )
-    # Reorder and cast to match schema exactly
-    arrays = []
-    for field in schema:
-        col = tbl.column(field.name)
-        try:
-            col = col.cast(field.type)
-        except Exception:
-            pass
-        arrays.append(col)
-    return pa.table(
-        {field.name: arrays[i] for i, field in enumerate(schema)},
-        schema=schema,
-    )
-
-
-def _s1_df_to_arrow(df_s1: "pd.DataFrame", schema: "pa.Schema") -> "pa.Table":
-    """Convert an S1 DataFrame to a PyArrow table conforming to the combined schema.
-
-    S2-only columns (B02…B12, scl_purity, etc.) are filled with null.
-    """
-    import pyarrow as pa
-
-    s1_cols = set(df_s1.columns)
-    rows = len(df_s1)
-    arrays = []
-    for field in schema:
-        if field.name in s1_cols:
-            col = df_s1[field.name]
-            try:
-                arrays.append(pa.array(col.tolist(), type=field.type))
-            except Exception:
-                arrays.append(pa.array([None] * rows, type=field.type))
-        else:
-            arrays.append(pa.array([None] * rows, type=field.type))
-    return pa.table(
-        {field.name: arrays[i] for i, field in enumerate(schema)},
-        schema=schema,
-    )
 
 _TRAINING_DIR = PROJECT_ROOT / "data" / "training"
 _TILES_DIR    = _TRAINING_DIR / "tiles"
@@ -333,61 +269,21 @@ def ensure_training_pixels(
                     )
             # Merge per-tile S2 parquets into a single region parquet,
             # then fetch and append S1 rows using the same pixel grid.
-
-            # --- Pass 1: read S2 tile parquets, build extended schema & pixel grid ---
-            writer = None
-            combined_schema = None
-            points_for_s1: list[tuple[str, float, float]] = []
-            s2_tables: list = []
-
-            for tp in tile_paths:
-                pf = pq.ParquetFile(tp)
-                for rg_idx in range(pf.metadata.num_row_groups):
-                    tbl = pf.read_row_group(rg_idx)
-                    if combined_schema is None:
-                        # Build the combined schema once: S2 schema + source/vh/vv
-                        combined_schema = _extend_schema(tbl.schema)
-                        # Extract pixel grid for S1 alignment
-                        seen: dict[str, tuple[float, float]] = {}
-                        for pid, lon, lat in zip(
-                            tbl.column("point_id").to_pylist(),
-                            tbl.column("lon").to_pylist(),
-                            tbl.column("lat").to_pylist(),
-                        ):
-                            if pid not in seen:
-                                seen[pid] = (lon, lat)
-                        points_for_s1 = [(p, lo, la) for p, (lo, la) in seen.items()]
-                    s2_tables.append(tbl)
-
-            # --- Fetch S1 rows ---
-            df_s1 = None
-            if combined_schema is not None and points_for_s1:
-                df_s1 = collect_s1(
+            if tile_paths:
+                writer = pq.ParquetWriter(out_path, pq.ParquetFile(tile_paths[0]).schema_arrow)
+                for tp in tile_paths:
+                    pf = pq.ParquetFile(tp)
+                    for rg_idx in range(pf.metadata.num_row_groups):
+                        writer.write_table(pf.read_row_group(rg_idx))
+                writer.close()
+                append_s1_to_tile_parquet(
+                    tile_path=out_path,
                     bbox_wgs84=list(region.bbox),
                     start=start,
                     end=end,
-                    points=points_for_s1,
-                    cache_dir=_S1_CHIP_CACHE_DIR,
+                    collect_s1_fn=collect_s1,
+                    s1_cache_dir=_S1_CHIP_CACHE_DIR,
                 )
-
-            # --- Pass 2: write S2 rows (conformed to combined schema) then S1 rows ---
-            if combined_schema is not None:
-                writer = pq.ParquetWriter(out_path, combined_schema)
-                for tbl in s2_tables:
-                    tbl = _conform_table(tbl, combined_schema)
-                    # Set source="S2" on every S2 row (column exists but is null after conform)
-                    source_col = pa.array(["S2"] * len(tbl), type=pa.string())
-                    tbl = tbl.set_column(
-                        tbl.schema.get_field_index("source"), "source", source_col
-                    )
-                    writer.write_table(tbl)
-                if df_s1 is not None and not df_s1.empty:
-                    s1_tbl = _s1_df_to_arrow(df_s1, combined_schema)
-                    writer.write_table(s1_tbl)
-                    logger.info(
-                        "Region %s: appended %d S1 rows", region.id, len(s1_tbl)
-                    )
-                writer.close()
             new_regions.append(region.id)
 
         # Rebuild tile parquet if any region is new or the tile parquet was missing.

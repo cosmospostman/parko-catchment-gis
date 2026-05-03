@@ -1,4 +1,4 @@
-"""utils/parquet_utils.py — Parquet write options and pixel-sort utilities.
+"""utils/parquet_utils.py — Parquet write options, schema helpers, and pixel-sort utilities.
 
 Functions previously in signals/_shared.py that are needed by multiple modules.
 """
@@ -6,8 +6,12 @@ Functions previously in signals/_shared.py that are needed by multiple modules.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import polars as pl
+
+if TYPE_CHECKING:
+    import pyarrow as pa
 
 
 _WRITE_OPTS = dict(
@@ -17,6 +21,147 @@ _WRITE_OPTS = dict(
     write_statistics=True,
 )
 
+
+# ---------------------------------------------------------------------------
+# S1/S2 schema helpers — shared by training_collector and location pipelines
+# ---------------------------------------------------------------------------
+
+def _extend_schema(s2_schema: "pa.Schema") -> "pa.Schema":
+    """Return s2_schema extended with source, vh, vv columns if not already present."""
+    import pyarrow as pa
+    extra = []
+    names = set(s2_schema.names)
+    if "source" not in names:
+        extra.append(pa.field("source", pa.string()))
+    if "vh" not in names:
+        extra.append(pa.field("vh", pa.float32()))
+    if "vv" not in names:
+        extra.append(pa.field("vv", pa.float32()))
+    if not extra:
+        return s2_schema
+    return pa.schema(list(s2_schema) + extra)
+
+
+def _conform_table(tbl: "pa.Table", schema: "pa.Schema") -> "pa.Table":
+    """Return tbl conformed to schema: add missing columns as null, cast types."""
+    import pyarrow as pa
+    for field in schema:
+        if field.name not in tbl.schema.names:
+            tbl = tbl.append_column(
+                field,
+                pa.array([None] * len(tbl), type=field.type),
+            )
+    arrays = []
+    for field in schema:
+        col = tbl.column(field.name)
+        try:
+            col = col.cast(field.type)
+        except Exception:
+            pass
+        arrays.append(col)
+    return pa.table(
+        {field.name: arrays[i] for i, field in enumerate(schema)},
+        schema=schema,
+    )
+
+
+def _s1_df_to_arrow(df_s1: "pd.DataFrame", schema: "pa.Schema") -> "pa.Table":
+    """Convert an S1 DataFrame to a PyArrow table conforming to the combined schema.
+
+    S2-only columns (B02…B12, scl_purity, etc.) are filled with null.
+    """
+    import pyarrow as pa
+
+    s1_cols = set(df_s1.columns)
+    rows = len(df_s1)
+    arrays = []
+    for field in schema:
+        if field.name in s1_cols:
+            col = df_s1[field.name]
+            try:
+                arrays.append(pa.array(col.tolist(), type=field.type))
+            except Exception:
+                arrays.append(pa.array([None] * rows, type=field.type))
+        else:
+            arrays.append(pa.array([None] * rows, type=field.type))
+    return pa.table(
+        {field.name: arrays[i] for i, field in enumerate(schema)},
+        schema=schema,
+    )
+
+
+def append_s1_to_tile_parquet(
+    tile_path: Path,
+    bbox_wgs84: list[float],
+    start: str,
+    end: str,
+    collect_s1_fn,
+    s1_cache_dir: Path | None = None,
+) -> None:
+    """Append S1 rows to an existing S2-only tile parquet, in-place and atomically.
+
+    Idempotent: skips the file if it already contains at least one S1 row.
+
+    Scans all row groups to collect the full pixel grid before calling
+    collect_s1_fn — necessary because pixel-sorted parquets spread distinct
+    pixels across all row groups.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    pf = pq.ParquetFile(tile_path)
+
+    if "source" in pf.schema_arrow.names and "vh" in pf.schema_arrow.names:
+        has_s1 = any(
+            "S1" in pf.read_row_group(rg, columns=["source"]).column("source").to_pylist()
+            for rg in range(pf.metadata.num_row_groups)
+        )
+        if has_s1:
+            return
+
+    combined_schema = _extend_schema(pf.read_row_group(0).schema)
+    seen: dict[str, tuple[float, float]] = {}
+    n_rg = pf.metadata.num_row_groups
+    for rg_idx in range(n_rg):
+        coord_tbl = pf.read_row_group(rg_idx, columns=["point_id", "lon", "lat"])
+        for pid, lon, lat in zip(
+            coord_tbl.column("point_id").to_pylist(),
+            coord_tbl.column("lon").to_pylist(),
+            coord_tbl.column("lat").to_pylist(),
+        ):
+            if pid not in seen:
+                seen[pid] = (lon, lat)
+
+    points_for_s1: list[tuple[str, float, float]] = [
+        (p, lo, la) for p, (lo, la) in seen.items()
+    ]
+
+    df_s1 = collect_s1_fn(
+        bbox_wgs84=bbox_wgs84,
+        start=start,
+        end=end,
+        points=points_for_s1,
+        cache_dir=s1_cache_dir,
+    )
+
+    tmp_path = tile_path.with_suffix(".tmp.parquet")
+    writer = pq.ParquetWriter(tmp_path, combined_schema)
+    for rg_idx in range(n_rg):
+        tbl = pf.read_row_group(rg_idx)
+        tbl = _conform_table(tbl, combined_schema)
+        source_col = pa.array(["S2"] * len(tbl), type=pa.string())
+        tbl = tbl.set_column(tbl.schema.get_field_index("source"), "source", source_col)
+        writer.write_table(tbl)
+    if df_s1 is not None and not df_s1.empty:
+        df_s1 = df_s1.sort_values(["point_id", "date"]).reset_index(drop=True)
+        writer.write_table(_s1_df_to_arrow(df_s1, combined_schema))
+    writer.close()
+    tmp_path.replace(tile_path)
+
+
+# ---------------------------------------------------------------------------
+# Schema optimisation
+# ---------------------------------------------------------------------------
 
 def _optimise_schema(tbl: "pa.Table") -> "pa.Table":
     """Cast lon/lat → float32 and date → date32 to reduce parquet file size."""

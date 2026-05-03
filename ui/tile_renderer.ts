@@ -17,6 +17,7 @@ import { join, dirname, fromFileUrl } from "jsr:@std/path";
 
 const __dirname = dirname(fromFileUrl(import.meta.url));
 const OUTPUTS_DIR = join(__dirname, "..", "outputs");
+const SCORES_DIR  = join(OUTPUTS_DIR, "scores");
 
 // ---------------------------------------------------------------------------
 // Grid
@@ -52,7 +53,7 @@ function cacheSet(key: string, grid: Grid): void {
 const HEADER_BYTES = 40; // 4×f64 + 2×u32: lonMin, latMax, resX, resY, width, height
 
 function binPath(location: string, stem: string): string {
-  return join(OUTPUTS_DIR, location, `${stem}.bin`);
+  return join(SCORES_DIR, location, `${stem}.bin`);
 }
 
 async function buildBin(csvPath: string, outPath: string): Promise<void> {
@@ -235,9 +236,9 @@ async function loadBin(path: string): Promise<Grid> {
 export function listRankings(): Record<string, Array<{ stem: string; label: string }>> {
   const results: Record<string, Array<{ stem: string; label: string }>> = {};
   try {
-    for (const entry of Deno.readDirSync(OUTPUTS_DIR)) {
+    for (const entry of Deno.readDirSync(SCORES_DIR)) {
       if (!entry.isDirectory) continue;
-      const dir = join(OUTPUTS_DIR, entry.name);
+      const dir = join(SCORES_DIR, entry.name);
       const runs: Array<{ stem: string; label: string }> = [];
       try {
         for (const f of Deno.readDirSync(dir)) {
@@ -270,7 +271,7 @@ export function loadGrid(location: string, stem: string): Promise<Grid | null> {
 
   const promise = (async () => {
     const bin = binPath(location, stem);
-    const csv = join(OUTPUTS_DIR, location, `${stem}.csv`);
+    const csv = join(SCORES_DIR, location, `${stem}.csv`);
 
     let binExists = false;
     try { Deno.statSync(bin); binExists = true; } catch { /* absent */ }

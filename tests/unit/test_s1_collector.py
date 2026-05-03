@@ -62,7 +62,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from utils.s1_collector import _reconstruct_affine, _extract_item, collect_s1, _chip_cache_path, _load_chip, _save_chip
-from utils.training_collector import _extend_schema, _conform_table, _s1_df_to_arrow
+from utils.parquet_utils import _extend_schema, _conform_table, _s1_df_to_arrow
 
 
 # ---------------------------------------------------------------------------

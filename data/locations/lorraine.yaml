@@ -1,5 +1,5 @@
-# Lorraine — Northern Territory.
+# Lorraine — Queensland.
 name: "Lorraine"
 centroid: null
-bbox: [129.338405, -15.301871, 129.519582, -15.111105]  # [lon_min, lat_min, lon_max, lat_max]
+bbox: [139.780416, -18.983679, 139.936588, -18.818795]  # [lon_min, lat_min, lon_max, lat_max]
 dry_months: [5, 6, 7, 8, 9, 10]  # monsoonal
