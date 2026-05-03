@@ -64,5 +64,6 @@ EXPERIMENT = Experiment(
         "doy_phase_shift": True,
         "pixel_zscore":    True,
         "use_s1":          "s1_only",
+        "val_sites":       ("etna",),
     },
 )

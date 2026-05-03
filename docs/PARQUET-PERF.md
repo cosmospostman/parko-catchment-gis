@@ -110,33 +110,6 @@ def _optimise_schema(tbl: pa.Table) -> pa.Table:
 Apply `_optimise_schema` before every `write_table` call in both `sort_parquet_by_pixel`
 and the concat loop in `pixel_collector.py`.
 
-### Migration tool (`cli/migrate_parquet.py`)
-
-Rewrites an existing location parquet in-place using a shard-by-shard approach to
-avoid needing a full second copy on disk.
-
-```
-python cli/migrate_parquet.py <location>  [--zstd-level 3] [--dry-run]
-```
-
-**Algorithm:**
-1. Open source file; compute total row groups.
-2. Stream row groups in chunks of `--chunk-rgs` (default 50, ~2 GB RAM).
-3. Apply `_optimise_schema`, write chunk to `<file>.migrating.parquet`.
-4. After all chunks written successfully, atomically replace: `rename(migrating → original)`.
-5. On any error, delete the partial `.migrating` file and exit non-zero.
-
-Peak extra disk = size of one chunk (~2 GB), not the full file.
-
-**Options:**
-
-| Flag | Default | Notes |
-|---|---|---|
-| `--chunk-rgs` | 50 | Row groups per write batch |
-| `--zstd-level` | 3 | ZSTD compression level |
-| `--dry-run` | off | Report schema changes and estimated size without writing |
-| `--verify` | off | Read back and row-count check after migration |
-
 ### Migration order (given current disk constraints)
 
 1. Migrate `kowanyama-town` first (once fetch completes) — already on current disk.

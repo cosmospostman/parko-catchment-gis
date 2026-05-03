@@ -29,7 +29,7 @@ class TAMConfig:
     # Temporal despeckle window for S1 backscatter (rolling median over N acquisitions per pixel).
     # Applied to linear vh/vv before dB conversion. 0 = disabled.
     # Conservative starting value is 3; other reasonable values are 5, 7.
-    s1_despeckle_window: int = 3
+    s1_despeckle_window: int = 0
     band_noise_std:   float = 0.0 # std of per-window band offset in normalised space (training only)
 
     # Training
