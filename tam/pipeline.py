@@ -250,6 +250,7 @@ def _cmd_score(args: argparse.Namespace) -> None:
     _n_bands = _cfg_dict.get("n_bands", 13)
     s1_only = _n_bands == 4
     pixel_zscore = _cfg_dict.get("pixel_zscore", False)
+    s1_despeckle_window = _cfg_dict.get("s1_despeckle_window", 0)
 
     if getattr(args, "out_parquet", False):
         # Build {tile_id: [(year, pixel-sorted-path), ...]} for score_tiles_chunked
@@ -279,6 +280,7 @@ def _cmd_score(args: argparse.Namespace) -> None:
             batch_size=args.batch_size,
             n_tile_workers=getattr(args, "n_tile_workers", 1),
             s1_only=s1_only,
+            s1_despeckle_window=s1_despeckle_window,
         )
         logger.info("Done — %d tile parquets in %s", len(final_paths), parquet_out_dir)
         return
@@ -297,6 +299,7 @@ def _cmd_score(args: argparse.Namespace) -> None:
         n_total_pixels=len(pixel_coords),
         s1_only=s1_only,
         pixel_zscore=pixel_zscore,
+        s1_despeckle_window=s1_despeckle_window,
     )
 
     scored = pixel_coords.merge(scores, on="point_id", how="left")

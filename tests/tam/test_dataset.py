@@ -12,9 +12,12 @@ from tam.core.dataset import (
     MAX_SEQ_LEN,
     MIN_OBS_PER_YEAR,
     N_BANDS,
+    S1_FEATURE_COLS,
     TAMDataset,
     TAMSample,
     collate_fn,
+    despeckle_s1,
+    snap_s1_to_s2,
 )
 
 
@@ -476,3 +479,223 @@ class TestTD23BandNoisePaddingStaysZero:
             s = ds[0]
             n = int((~s.mask).sum())
             assert (s.bands[n:] == 0).all(), "Band jitter leaked into padding positions"
+
+
+# ---------------------------------------------------------------------------
+# Helpers for S1 despeckle tests
+# ---------------------------------------------------------------------------
+
+def _make_s1_df(pids: list[str], n_obs: int = 20, rng=None) -> pd.DataFrame:
+    """Make a minimal S1 DataFrame with vh/vv linear power columns."""
+    if rng is None:
+        rng = np.random.default_rng(0)
+    rows = []
+    for pid in pids:
+        dates = pd.date_range("2023-01-01", periods=n_obs, freq="6D")
+        for d in dates:
+            rows.append({
+                "point_id": pid,
+                "date": str(d.date()),
+                "source": "S1",
+                "vh": float(rng.uniform(1e-4, 1e-2)),
+                "vv": float(rng.uniform(1e-4, 1e-2)),
+                "orbit": "ascending",
+            })
+    return pd.DataFrame(rows)
+
+
+def _make_combined_df(band_cols, pids, n_s2=20, n_s1=20, rng=None) -> pd.DataFrame:
+    """Make a combined S2+S1 DataFrame for snap_s1_to_s2 / TAMDataset tests."""
+    if rng is None:
+        rng = np.random.default_rng(1)
+    rows = []
+    for pid in pids:
+        s2_dates = pd.date_range("2023-01-10", periods=n_s2, freq="15D")
+        for d in s2_dates:
+            rows.append({
+                "point_id": pid,
+                "date": str(d.date()),
+                "source": "S2",
+                "scl_purity": 1.0,
+                "year": 2023,
+                "vh": np.nan, "vv": np.nan, "orbit": None,
+                **{b: float(rng.uniform(0.01, 0.5)) for b in band_cols},
+            })
+        s1_dates = pd.date_range("2023-01-08", periods=n_s1, freq="6D")
+        for d in s1_dates:
+            rows.append({
+                "point_id": pid,
+                "date": str(d.date()),
+                "source": "S1",
+                "scl_purity": np.nan,
+                "year": 2023,
+                "vh": float(rng.uniform(1e-4, 1e-2)),
+                "vv": float(rng.uniform(1e-4, 1e-2)),
+                "orbit": "ascending",
+                **{b: np.nan for b in band_cols},
+            })
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# TD-24  despeckle_s1 — core function
+# ---------------------------------------------------------------------------
+
+class TestTD24DespeckleS1Core:
+    def test_noop_when_window_less_than_2(self):
+        df = _make_s1_df(["px1"])
+        original_vh = df["vh"].values.copy()
+        result = despeckle_s1(df, window=0)
+        np.testing.assert_array_equal(result["vh"].values, original_vh)
+
+    def test_noop_when_window_1(self):
+        df = _make_s1_df(["px1"])
+        original_vh = df["vh"].values.copy()
+        result = despeckle_s1(df, window=1)
+        np.testing.assert_array_equal(result["vh"].values, original_vh)
+
+    def test_output_shape_unchanged(self):
+        df = _make_s1_df(["px1", "px2"], n_obs=15)
+        result = despeckle_s1(df, window=3)
+        assert result.shape == df.shape
+
+    def test_smoothed_values_differ_from_original(self):
+        rng = np.random.default_rng(42)
+        df = _make_s1_df(["px1"], n_obs=20, rng=rng)
+        result = despeckle_s1(df, window=5)
+        # Rolling median must change at least some values
+        assert not np.allclose(result["vh"].values, df["vh"].values)
+
+    def test_smoothing_is_per_pixel_not_across_pixels(self):
+        # Give px1 and px2 very different vh ranges; smoothing must not bleed across
+        rng = np.random.default_rng(7)
+        rows = []
+        for d in pd.date_range("2023-01-01", periods=15, freq="6D"):
+            rows.append({"point_id": "px_low",  "date": str(d.date()), "source": "S1",
+                         "vh": 1e-5, "vv": 1e-5, "orbit": "ascending"})
+            rows.append({"point_id": "px_high", "date": str(d.date()), "source": "S1",
+                         "vh": 1e-1, "vv": 1e-1, "orbit": "ascending"})
+        df = pd.DataFrame(rows)
+        result = despeckle_s1(df, window=3)
+        low_vh  = result.loc[result["point_id"] == "px_low",  "vh"].values
+        high_vh = result.loc[result["point_id"] == "px_high", "vh"].values
+        assert (low_vh  < 1e-3).all(), "px_low smoothed values unexpectedly large"
+        assert (high_vh > 1e-3).all(), "px_high smoothed values unexpectedly small"
+
+    def test_wider_window_produces_smoother_result(self):
+        rng = np.random.default_rng(3)
+        df = _make_s1_df(["px1"], n_obs=30, rng=rng)
+        r3 = despeckle_s1(df, window=3)
+        r7 = despeckle_s1(df, window=7)
+        std3 = r3["vh"].std()
+        std7 = r7["vh"].std()
+        assert std7 <= std3, "Wider window should produce equal or lower variance"
+
+    def test_does_not_modify_input(self):
+        df = _make_s1_df(["px1"])
+        original = df["vh"].values.copy()
+        despeckle_s1(df, window=5)
+        np.testing.assert_array_equal(df["vh"].values, original)
+
+
+# ---------------------------------------------------------------------------
+# TD-25  snap_s1_to_s2 with despeckle
+# ---------------------------------------------------------------------------
+
+class TestTD25SnapS1ToS2WithDespeckle:
+    def test_despeckle_window_0_and_no_despeckle_are_equivalent(self, band_cols):
+        df = _make_combined_df(band_cols, ["px1"])
+        r_none = snap_s1_to_s2(df, despeckle_window=0)
+        r_zero = snap_s1_to_s2(df, despeckle_window=0)
+        pd.testing.assert_frame_equal(r_none, r_zero)
+
+    def test_despeckle_changes_snapped_s1_values(self, band_cols):
+        df = _make_combined_df(band_cols, ["px1"])
+        r_raw   = snap_s1_to_s2(df, despeckle_window=0)
+        r_clean = snap_s1_to_s2(df, despeckle_window=5)
+        # At least some snapped S1 values should differ after smoothing
+        assert not r_raw["s1_vh"].equals(r_clean["s1_vh"])
+
+    def test_output_contains_s2_rows_only(self, band_cols):
+        df = _make_combined_df(band_cols, ["px1"])
+        result = snap_s1_to_s2(df, despeckle_window=3)
+        assert set(result["source"].unique()) == {"S2"}
+
+    def test_s1_feature_cols_present(self, band_cols):
+        df = _make_combined_df(band_cols, ["px1"])
+        result = snap_s1_to_s2(df, despeckle_window=3)
+        for col in S1_FEATURE_COLS:
+            assert col in result.columns
+
+
+# ---------------------------------------------------------------------------
+# TD-26  TAMDataset with s1_only + despeckle
+# ---------------------------------------------------------------------------
+
+class TestTD26TAMDatasetS1OnlyDespeckle:
+    def _make_s1_pixel_df(self, pids, n_obs=20):
+        rng = np.random.default_rng(5)
+        rows = []
+        for pid in pids:
+            for d in pd.date_range("2023-01-01", periods=n_obs, freq="6D"):
+                rows.append({
+                    "point_id": pid,
+                    "date": str(d.date()),
+                    "source": "S1",
+                    "year": 2023,
+                    "vh": float(rng.uniform(1e-4, 1e-2)),
+                    "vv": float(rng.uniform(1e-4, 1e-2)),
+                    "orbit": "ascending",
+                })
+        return pd.DataFrame(rows)
+
+    def test_constructs_without_error(self):
+        df = self._make_s1_pixel_df(["px_pres", "px_abs"])
+        labels = pd.Series({"px_pres": 1.0, "px_abs": 0.0})
+        ds = TAMDataset(df, labels, use_s1="s1_only", s1_despeckle_window=3)
+        assert len(ds) == 2
+
+    def test_despeckle_changes_band_values(self):
+        df = self._make_s1_pixel_df(["px_pres", "px_abs"])
+        labels = pd.Series({"px_pres": 1.0, "px_abs": 0.0})
+        ds_raw   = TAMDataset(df, labels, use_s1="s1_only", s1_despeckle_window=0)
+        ds_clean = TAMDataset(df, labels, use_s1="s1_only", s1_despeckle_window=5)
+        raw_bands   = ds_raw[0].bands.numpy()
+        clean_bands = ds_clean[0].bands.numpy()
+        assert not np.allclose(raw_bands, clean_bands), \
+            "Despeckle window=5 should change band values vs window=0"
+
+    def test_sample_shape_unchanged(self):
+        df = self._make_s1_pixel_df(["px_pres"])
+        labels = pd.Series({"px_pres": 1.0})
+        ds = TAMDataset(df, labels, use_s1="s1_only", s1_despeckle_window=3)
+        s = ds[0]
+        assert s.bands.shape == (MAX_SEQ_LEN, len(S1_FEATURE_COLS))
+
+
+# ---------------------------------------------------------------------------
+# TD-27  TAMDataset with use_s1=True + despeckle
+# ---------------------------------------------------------------------------
+
+class TestTD27TAMDatasetUseS1TrueDespeckle:
+    def test_despeckle_changes_s1_columns_in_sequence(self, band_cols, labels):
+        df = _make_combined_df(band_cols, ["px_pres", "px_abs"])
+        from tam.core.dataset import ALL_FEATURE_COLS
+        n_bands = len(ALL_FEATURE_COLS) + len(S1_FEATURE_COLS)
+        ds_raw   = TAMDataset(df, labels, use_s1=True, s1_despeckle_window=0)
+        ds_clean = TAMDataset(df, labels, use_s1=True, s1_despeckle_window=5)
+        raw_bands   = ds_raw[0].bands.numpy()
+        clean_bands = ds_clean[0].bands.numpy()
+        # S1 columns (last 4) should differ; S2 columns should be identical
+        s2_end = len(ALL_FEATURE_COLS)
+        np.testing.assert_allclose(
+            raw_bands[:, :s2_end], clean_bands[:, :s2_end], atol=1e-5,
+            err_msg="S2 bands must not be affected by S1 despeckle",
+        )
+        assert not np.allclose(raw_bands[:, s2_end:], clean_bands[:, s2_end:]), \
+            "S1 bands should differ after despeckle"
+
+    def test_constructs_without_error(self, band_cols, labels):
+        df = _make_combined_df(band_cols, ["px_pres", "px_abs"])
+        ds = TAMDataset(df, labels, use_s1=True, s1_despeckle_window=3)
+        assert len(ds) == 2

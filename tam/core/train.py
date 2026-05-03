@@ -352,6 +352,7 @@ def train_tam(
         global_features_df=global_feat_df,
         use_s1=cfg.use_s1,
         pixel_zscore=cfg.pixel_zscore,
+        s1_despeckle_window=cfg.s1_despeckle_window,
     )
     band_mean, band_std = train_ds.band_stats
     val_ds = TAMDataset(
@@ -365,6 +366,7 @@ def train_tam(
         global_feat_std=train_ds.global_feat_std,
         use_s1=cfg.use_s1,
         pixel_zscore=cfg.pixel_zscore,
+        s1_despeckle_window=cfg.s1_despeckle_window,
     )
     logger.info("Train windows: %d  |  Val windows: %d", len(train_ds), len(val_ds))
 

@@ -17,9 +17,12 @@ import pyarrow.parquet as pq
 import pytest
 import torch
 
-from tam.core.dataset import BAND_COLS
+from tam.core.dataset import BAND_COLS, S1_FEATURE_COLS
 from tam.core.model import TAMClassifier
-from tam.core.score import score_pixels_chunked, score_location_years, score_tiles_chunked
+from tam.core.score import (
+    score_pixels_chunked, score_location_years, score_tiles_chunked,
+    _compute_s1_despeckle_lookup,
+)
 from tam.core.config import TAMConfig
 
 
@@ -736,3 +739,140 @@ class TestReaderBufferSplit:
 
         assert set(result["point_id"]) == {"px_a", "px_b"}
         assert len(result) == 2
+
+
+# ---------------------------------------------------------------------------
+# Helpers for S1 despeckle tests
+# ---------------------------------------------------------------------------
+
+def _make_s1_parquet(tmp_path: Path, pixels: list[str], years: list[int],
+                     filename: str = "s1.parquet") -> Path:
+    """Write a minimal S1-only parquet with vh/vv linear power columns."""
+    rng = np.random.default_rng(99)
+    rows = []
+    for pid in pixels:
+        for yr in years:
+            dates = pd.date_range(f"{yr}-01-01", periods=N_OBS_PER_YEAR, freq="6D")
+            for d in dates:
+                rows.append({
+                    "point_id": pid,
+                    "date": d,
+                    "source": "S1",
+                    "vh": float(rng.uniform(1e-4, 1e-2)),
+                    "vv": float(rng.uniform(1e-4, 1e-2)),
+                    "orbit": "ascending",
+                })
+    df = pd.DataFrame(rows)
+    df["date"] = pd.to_datetime(df["date"]).astype("datetime64[us]")
+    path = tmp_path / filename
+    pq.write_table(pa.Table.from_pandas(df, preserve_index=False), path,
+                   row_group_size=N_OBS_PER_YEAR)
+    return path
+
+
+def _stub_s1_model(n_features: int = 4) -> tuple[TAMClassifier, np.ndarray, np.ndarray]:
+    """Tiny S1-only model stub."""
+    cfg = TAMConfig(d_model=16, n_heads=2, n_layers=1, d_ff=32,
+                    n_bands=n_features, use_s1="s1_only", n_global_features=0)
+    torch.manual_seed(7)
+    model = TAMClassifier.from_config(cfg)
+    model._use_s1 = "s1_only"
+    model._pixel_zscore = False
+    model.eval()
+    band_mean = np.zeros(n_features, dtype=np.float32)
+    band_std  = np.ones(n_features, dtype=np.float32)
+    return model, band_mean, band_std
+
+
+# ---------------------------------------------------------------------------
+# TS-DS-1  _compute_s1_despeckle_lookup
+# ---------------------------------------------------------------------------
+
+class TestTSDS1DespeckleLookup:
+    def test_returns_dataframe_with_expected_columns(self, tmp_path):
+        path = _make_s1_parquet(tmp_path, pixels=["px1", "px2"], years=[2023])
+        result = _compute_s1_despeckle_lookup(path, window=3)
+        assert isinstance(result, pd.DataFrame)
+        for col in ("point_id", "date", "vh", "vv"):
+            assert col in result.columns, f"Missing column: {col}"
+
+    def test_row_count_matches_input_s1_rows(self, tmp_path):
+        pixels = ["px1", "px2"]
+        path = _make_s1_parquet(tmp_path, pixels=pixels, years=[2023])
+        result = _compute_s1_despeckle_lookup(path, window=3)
+        assert len(result) == len(pixels) * N_OBS_PER_YEAR
+
+    def test_smoothed_values_differ_from_raw(self, tmp_path):
+        path = _make_s1_parquet(tmp_path, pixels=["px1"], years=[2023])
+        raw = _compute_s1_despeckle_lookup(path, window=1)   # no-op
+        smoothed = _compute_s1_despeckle_lookup(path, window=5)
+        # window=5 should change at least some values vs window=1 (no-op)
+        assert not raw["vh"].reset_index(drop=True).equals(
+            smoothed["vh"].reset_index(drop=True)
+        )
+
+    def test_empty_parquet_returns_empty_dataframe(self, tmp_path):
+        # Parquet with no S1 rows (S2 only — no vh/vv columns at all)
+        rng = np.random.default_rng(0)
+        rows = [{"point_id": "px1", "date": pd.Timestamp("2023-01-01"),
+                 "scl_purity": 1.0, **{b: 0.1 for b in BAND_COLS}}]
+        df = pd.DataFrame(rows)
+        df["date"] = pd.to_datetime(df["date"]).astype("datetime64[us]")
+        path = tmp_path / "s2only.parquet"
+        pq.write_table(pa.Table.from_pandas(df, preserve_index=False), path)
+        result = _compute_s1_despeckle_lookup(path, window=3)
+        assert isinstance(result, pd.DataFrame)
+        assert len(result) == 0
+
+
+# ---------------------------------------------------------------------------
+# TS-DS-2  score_pixels_chunked with s1_only + despeckle
+# ---------------------------------------------------------------------------
+
+class TestTSDS2ScorePixelsChunkedS1Despeckle:
+    def test_scores_produced_with_despeckle_window(self, tmp_path):
+        path = _make_s1_parquet(tmp_path, pixels=["px1", "px2"], years=[2023])
+        model, band_mean, band_std = _stub_s1_model()
+        result = score_pixels_chunked(
+            path, model, band_mean, band_std,
+            device="cpu", s1_only=True, s1_despeckle_window=3,
+        )
+        assert set(result["point_id"]) == {"px1", "px2"}
+        assert result["prob_tam"].between(0, 1).all()
+
+    def test_despeckle_changes_scores_vs_no_despeckle(self, tmp_path):
+        path = _make_s1_parquet(tmp_path, pixels=["px1", "px2"], years=[2023])
+        model, band_mean, band_std = _stub_s1_model()
+        r_raw   = score_pixels_chunked(
+            path, model, band_mean, band_std,
+            device="cpu", s1_only=True, s1_despeckle_window=0,
+        ).set_index("point_id")
+        r_clean = score_pixels_chunked(
+            path, model, band_mean, band_std,
+            device="cpu", s1_only=True, s1_despeckle_window=5,
+        ).set_index("point_id")
+        # At least one pixel's score should differ after smoothing
+        diffs = (r_raw["prob_tam"] - r_clean["prob_tam"]).abs()
+        assert diffs.max() > 1e-4, "Expected scores to differ after despeckle"
+
+    def test_output_schema_unchanged_with_despeckle(self, tmp_path):
+        path = _make_s1_parquet(tmp_path, pixels=["px1"], years=[2023])
+        model, band_mean, band_std = _stub_s1_model()
+        result = score_pixels_chunked(
+            path, model, band_mean, band_std,
+            device="cpu", s1_only=True, s1_despeckle_window=3,
+        )
+        assert list(result.columns) == ["point_id", "prob_tam"]
+
+    def test_despeckle_window_0_matches_no_flag(self, tmp_path):
+        path = _make_s1_parquet(tmp_path, pixels=["px1", "px2"], years=[2023])
+        model, band_mean, band_std = _stub_s1_model()
+        r_default = score_pixels_chunked(
+            path, model, band_mean, band_std,
+            device="cpu", s1_only=True,
+        ).set_index("point_id")
+        r_zero = score_pixels_chunked(
+            path, model, band_mean, band_std,
+            device="cpu", s1_only=True, s1_despeckle_window=0,
+        ).set_index("point_id")
+        pd.testing.assert_frame_equal(r_default, r_zero)

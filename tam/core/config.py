@@ -26,6 +26,10 @@ class TAMConfig:
     doy_jitter:       int   = 7   # ±days of DOY shift applied per window during training
     doy_phase_shift:  bool  = False  # if True, random full-year phase shift with wraparound (overrides doy_jitter)
     pixel_zscore:     bool  = False  # if True, z-score each pixel's S1 bands by its own multi-year mean/std
+    # Temporal despeckle window for S1 backscatter (rolling median over N acquisitions per pixel).
+    # Applied to linear vh/vv before dB conversion. 0 = disabled.
+    # Conservative starting value is 3; other reasonable values are 5, 7.
+    s1_despeckle_window: int = 3
     band_noise_std:   float = 0.0 # std of per-window band offset in normalised space (training only)
 
     # Training

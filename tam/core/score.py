@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from tam.core.dataset import ALL_FEATURE_COLS, BAND_COLS, MAX_SEQ_LEN, S1_FEATURE_COLS
+from tam.core.dataset import ALL_FEATURE_COLS, BAND_COLS, MAX_SEQ_LEN, S1_FEATURE_COLS, despeckle_s1
 from tam.core.model import TAMClassifier
 
 logger = logging.getLogger(__name__)
@@ -62,6 +62,33 @@ def _compute_pixel_s1_stats(parquet: Path) -> tuple[dict, dict, dict, dict]:
             vv_mean.to_dict(), vv_std.to_dict())
 
 
+def _compute_s1_despeckle_lookup(parquet: Path, window: int) -> pd.DataFrame:
+    """One-pass pre-read to compute despeckled linear vh/vv per pixel.
+
+    Returns a DataFrame with columns [point_id, date, vh, vv] where vh/vv are
+    the temporally smoothed values. Only called when s1_only=True and
+    s1_despeckle_window >= 2.
+    """
+    import pyarrow.parquet as pq
+    pf = pq.ParquetFile(parquet)
+    available = set(pf.schema_arrow.names)
+    read_cols = [c for c in ["point_id", "date", "source", "vh", "vv"] if c in available]
+    chunks = []
+    for rg in range(pf.metadata.num_row_groups):
+        df = pf.read_row_group(rg, columns=read_cols).to_pandas()
+        if "source" in df.columns:
+            df = df[df["source"] == "S1"]
+        if "vh" not in df.columns or "vv" not in df.columns:
+            continue
+        df = df.dropna(subset=["vh", "vv"])
+        if not df.empty:
+            chunks.append(df[["point_id", "date", "vh", "vv"]])
+    if not chunks:
+        return pd.DataFrame(columns=["point_id", "date", "vh", "vv"])
+    all_s1 = pd.concat(chunks, ignore_index=True)
+    return despeckle_s1(all_s1, window)[["point_id", "date", "vh", "vv"]]
+
+
 def _extract_s1_features(
     chunk: pd.DataFrame,
     pixel_zscore: bool = False,
@@ -69,6 +96,7 @@ def _extract_s1_features(
     vh_std:  dict | None = None,
     vv_mean: dict | None = None,
     vv_std:  dict | None = None,
+    despeckle_lookup: dict | None = None,
 ) -> np.ndarray:
     """Extract 4 S1 features (vh_db, vv_db, vh_vv, rvi) from linear vh/vv columns.
 
@@ -76,7 +104,21 @@ def _extract_s1_features(
     mean/std (pre-computed via _compute_pixel_s1_stats). VH-VV and RVI are left
     in their natural units — they are self-normalising ratios that carry absolute
     canopy structure signal.
+
+    When despeckle_lookup is provided (a DataFrame with columns [point_id, date,
+    vh, vv] from _compute_s1_despeckle_lookup), smoothed linear vh/vv values are
+    substituted before dB conversion via a (point_id, date) merge.
     """
+    if despeckle_lookup is not None and not despeckle_lookup.empty and "date" in chunk.columns:
+        idx = chunk.index
+        merged = chunk[["point_id", "date"]].merge(
+            despeckle_lookup.rename(columns={"vh": "_vh_s", "vv": "_vv_s"}),
+            on=["point_id", "date"], how="left",
+        )
+        chunk = chunk.copy()
+        chunk["vh"] = merged["_vh_s"].where(merged["_vh_s"].notna(), chunk["vh"]).values
+        chunk["vv"] = merged["_vv_s"].where(merged["_vv_s"].notna(), chunk["vv"]).values
+        chunk.index = idx
     vh_lin = chunk["vh"].values.astype(np.float32)
     vv_lin = chunk["vv"].values.astype(np.float32)
     vh_db  = np.where(vh_lin > 0, 10 * np.log10(vh_lin), np.nan)
@@ -131,6 +173,7 @@ def _preprocess(
     vh_std:  dict | None = None,
     vv_mean: dict | None = None,
     vv_std:  dict | None = None,
+    despeckle_lookup: pd.DataFrame | None = None,
 ) -> _PreparedBatch | None:
     """CPU-side preprocessing using numba kernels for maximum throughput.
 
@@ -155,7 +198,8 @@ def _preprocess(
     if s1_only:
         feat = _extract_s1_features(chunk, pixel_zscore=pixel_zscore,
                                     vh_mean=vh_mean, vh_std=vh_std,
-                                    vv_mean=vv_mean, vv_std=vv_std)
+                                    vv_mean=vv_mean, vv_std=vv_std,
+                                    despeckle_lookup=despeckle_lookup)
         n_feat = _N_FEATURES_S1
     else:
         # Step 1: extract feature matrix — bands are already float32, zero-copy .values
@@ -291,6 +335,7 @@ def score_pixels_chunked(
     n_total_pixels: int | None = None,
     s1_only: bool = False,
     pixel_zscore: bool = False,
+    s1_despeckle_window: int = 0,
     # accumulators — pass across years to merge results before final aggregation
     _all_pids:  list | None = None,
     _all_years: list | None = None,
@@ -327,6 +372,12 @@ def score_pixels_chunked(
         logger.info("Computing per-pixel S1 z-score stats (pre-pass) ...")
         _vh_mean, _vh_std, _vv_mean, _vv_std = _compute_pixel_s1_stats(parquet)
         logger.info("Z-score stats computed for %d pixels", len(_vh_mean))
+
+    _despeckle_lookup = None
+    if s1_only and s1_despeckle_window >= 2:
+        logger.info("Computing S1 despeckle lookup (window=%d, pre-pass) ...", s1_despeckle_window)
+        _despeckle_lookup = _compute_s1_despeckle_lookup(parquet, s1_despeckle_window)
+        logger.info("Despeckle lookup computed for %d S1 rows", len(_despeckle_lookup))
 
     pf = pq.ParquetFile(parquet)
     n_rg = pf.metadata.num_row_groups
@@ -407,7 +458,8 @@ def score_pixels_chunked(
                 break
             prepared = _preprocess(item, band_mean, band_std, scl_purity_min, min_obs_per_year, pin=pin, s1_only=s1_only,
                                    pixel_zscore=pixel_zscore, vh_mean=_vh_mean, vh_std=_vh_std,
-                                   vv_mean=_vv_mean, vv_std=_vv_std)
+                                   vv_mean=_vv_mean, vv_std=_vv_std,
+                                   despeckle_lookup=_despeckle_lookup)
             if prepared is not None:
                 prep_q.put(prepared)
         prep_q.put(_SENTINEL)
@@ -463,6 +515,7 @@ def score_location_years(
     n_total_pixels: int | None = None,
     s1_only: bool = False,
     pixel_zscore: bool = False,
+    s1_despeckle_window: int = 0,
 ) -> pd.DataFrame:
     """Score a location across multiple annual parquets and aggregate.
 
@@ -498,6 +551,7 @@ def score_location_years(
             n_total_pixels=n_total_pixels,
             s1_only=s1_only,
             pixel_zscore=pixel_zscore,
+            s1_despeckle_window=s1_despeckle_window,
             _all_pids=all_pids,
             _all_years=all_years,
             _all_probs=all_probs,
@@ -529,6 +583,7 @@ def score_tile_year(
     n_prep_workers: int = 4,
     device: str | None = None,
     s1_only: bool = False,
+    s1_despeckle_window: int = 0,
 ) -> Path:
     """Score a single (tile_id, year) parquet and write a staging parquet.
 
@@ -561,6 +616,7 @@ def score_tile_year(
         end_year=year,
         decay=0.0,   # no decay here — aggregation happens in phase 2
         s1_only=s1_only,
+        s1_despeckle_window=s1_despeckle_window,
     )
 
     scores["year"] = np.int16(year)
@@ -584,6 +640,7 @@ def _score_tile_worker(args: tuple) -> tuple[str, list[Path]]:
         tile_id, year_parquets, model, band_mean, band_std,
         staging_dir, scl_purity_min, min_obs_per_year,
         batch_size, n_prep_workers, device, n_tile_workers, s1_only,
+        s1_despeckle_window,
     ) = args
 
     torch.set_num_threads(max(1, (os.cpu_count() or 1) // n_tile_workers))
@@ -604,6 +661,7 @@ def _score_tile_worker(args: tuple) -> tuple[str, list[Path]]:
             n_prep_workers=n_prep_workers,
             device=device,
             s1_only=s1_only,
+            s1_despeckle_window=s1_despeckle_window,
         )
         paths.append(p)
     return tile_id, paths
@@ -624,6 +682,7 @@ def score_tiles_chunked(
     end_year: int | None = None,
     decay: float = 0.7,
     s1_only: bool = False,
+    s1_despeckle_window: int = 0,
 ) -> list[Path]:
     """Score each S2 tile independently, writing one parquet per tile.
 
@@ -660,6 +719,7 @@ def score_tiles_chunked(
             tile_id, year_parquets, model, band_mean, band_std,
             staging_dir, scl_purity_min, min_obs_per_year,
             batch_size, n_prep_workers, device, n_tile_workers, s1_only,
+            s1_despeckle_window,
         )
         for tile_id, year_parquets in tile_year_parquets.items()
     ]

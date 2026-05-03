@@ -6,14 +6,18 @@ V8 is the first generation of TAM trained on Sentinel-1 only (no S2 bands). The 
 
 **Val protocol (all sweeps below):** Etna Creek held out entirely as a site holdout — 3,193 presence + 8,319 absence pixels, geographically independent of training. All runs use `lr=5e-5` as the settled optimum; `lr=1e-5` consistently fails to converge within 60 epochs.
 
-### Sweep comparison
+### Site expansion comparison
 
-| sweep | train sites (presence) | train sites (absence) | lr5e-05_dm64 | lr5e-05_dm128 |
+| sweep | train sites | holdout | best val AUC | params |
 |---|---|---|---|---|
-| `sweep_zscore_etna_landsend` | Norman Road, Landsend | Cloncurry | 0.899 | **0.956** |
-| `sweep_zscore_lm_corfield` | Norman Road, Landsend, Lake Mueller | Cloncurry, Corfield† | 0.879 | 0.937 |
+| `sweep_zscore_etna_landsend` | NR + Cloncurry + Landsend | Etna | 0.956 | lr=5e-5, d_model=128 |
+| `sweep_zscore_lm_corfield` | NR + Cloncurry + Landsend + Lake Mueller + Corfield† | Etna | 0.937 | lr=5e-5, d_model=128 |
+| `v8_s1_zscore_nr_etna_landsend_lm_corfield` | NR + Cloncurry + Landsend + Lake Mueller + Corfield‡ | Etna | 0.964 | lr=5e-5, d_model=128 |
+| `v8_roper` | NR + Cloncurry + Landsend + Lake Mueller + Corfield + Roper§ | Etna | **0.989** | lr=5e-5, d_model=128 |
 
-†Corfield presence was filtered out (noise filter); absence only included. The 0.019 AUC regression is attributed to the unbalanced corfield site — will re-run once corfield presence is fixed.
+†Corfield presence was filtered out by the noise filter (absence only); regression attributed to site imbalance.
+‡Corfield presence re-collected after noise-filter NaN fix — 2,109 presence + 4,710 absence pixels included. Surpasses all previous runs; 32,203 train pixels total.
+§Roper adds 937 presence + 3,635 absence pixels (36,775 train pixels total). Northern Gulf-region site; large AUC jump likely reflects independent S1 signature complementary to existing sites.
 
 ### `sweep_zscore_etna_landsend` — full results
 
@@ -71,17 +75,35 @@ Adds Lake Mueller (presence + absence) and Corfield (absence only — presence f
 
 ## Where We're Headed
 
-### Immediate: fix corfield presence, re-run `sweep_lm_corfield`
+### ~~Immediate: fix corfield presence, re-run `sweep_lm_corfield`~~ — DONE
 
-Corfield presence pixels were fully removed by the noise filter (S1-only run, `rec_p=nan` before the fillna fix). With the fix applied, re-collect corfield presence and re-run the sweep to get a clean like-for-like comparison with `sweep_zscore_etna_landsend`.
+`v8_s1_zscore_nr_etna_landsend_lm_corfield` confirmed Corfield presence fix: val AUC rose from 0.937 → 0.964, surpassing the previous best (0.956). Task complete.
 
-### Medium term
+### ~~Add Roper site~~ — DONE
 
-- **Directions still needed:** north (Gulf lowlands), west (Barkly Tableland)
-- **Ensemble with S2:** S1 model doesn't need to discriminate alone — even a weak orthogonal signal adds value in a fused model
-- **Longreach comparison:** need S1 tile data for longreach to place it in the site similarity space; currently only S2 features (nir_cv=0.046, rec_p=0.279) are available
+`v8_roper` adds Roper (937 presence + 3,635 absence, northern Gulf lowlands) to the full site set. Val AUC rose from 0.964 → **0.989** — the largest single-site gain yet. Checkpoint: `outputs/train_v8_roper/tam_model.pt`.
 
-### Longer term
+### Attention visualisation — `v8_roper`
 
-- **Input smoothing:** S1 output is noisy due to unsmoothed per-observation backscatter. A temporal median filter on the input (or learned smoothing) would clean up scoring maps
-- **Revisit val strategy:** once more sites are added, consider rotating holdout across sites (LOSO) rather than fixing etna, to get a more robust estimate of generalisation
+Full outputs in `outputs/train_v8_roper/attention/`. Key findings:
+
+The model attends to different periods of the year at different locations, reflecting local rainfall seasonality rather than a fixed global window. This is the right behaviour — Parkinsonia's phenological signature relative to background vegetation shifts with the local wet/dry cycle.
+
+| site | presence peak months | interpretation |
+|---|---|---|
+| Roper | Mar, Mar, Jan | wet-season dominant; h2/h3 also pull Jun–Sep (dry) |
+| Norman Road | Mar, Sep, Jul | wet-season primary with dry-season secondary |
+| Corfield | Feb, Feb, Dec | wet-season |
+| Landsend | Mar, Sep, Sep | wet-season primary, strong dry-season secondary |
+| Lake Mueller | Nov, Oct, Oct | southern site — opposite-phase calendar; all 4 heads agree tightly |
+| Etna (holdout) | Mar, Mar, Apr | wet/dry transition; consistent with its mixed-pixel character |
+
+The transformer is inferring local phenological context from the S1 time series shape itself — no site ID is passed as input. Lake Mueller's Nov/Dec cluster (vs the Jan–Mar cluster at northern sites) confirms the model is picking up on the structural difference in seasonality, not memorising site-level offsets.
+
+### Next steps
+
+- **More seasonality diversity:** Lake Mueller is the only southern (Nov/Dec-phase) site — one more like it would strengthen that regime. Barkly Tableland (west) likely adds a distinct dry-season onset and is the priority new site.
+- **Roper presence quality:** Roper presence (937 px) and absence attention profiles are nearly identical — may indicate weak presence signal. Worth checking separability before adding more Gulf-region sites.
+- **Val strategy:** At 0.989 on a single fixed holdout, Etna may be flattering or hiding weaknesses. LOSO across all sites should be run before committing to this architecture for inference.
+- **Ensemble with S2:** S1 model doesn't need to discriminate alone — even a weak orthogonal signal adds value in a fused model.
+- **Input smoothing:** A temporal median filter on S1 input (or learned smoothing) would reduce per-observation backscatter noise in scoring maps.

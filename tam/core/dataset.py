@@ -46,7 +46,32 @@ class TAMSample(NamedTuple):
     year:     int
 
 
-def snap_s1_to_s2(pixel_df: pd.DataFrame, window_days: int = S1_SNAP_WINDOW_DAYS) -> pd.DataFrame:
+def despeckle_s1(s1: pd.DataFrame, window: int) -> pd.DataFrame:
+    """Apply temporal despeckle to S1 linear backscatter via a per-pixel rolling median.
+
+    Operates on the raw linear vh/vv columns in-place (on a copy). Speckle is
+    independent between acquisitions, so a rolling median across N passes suppresses
+    it without spatial blurring. window=3 is conservative; 5 and 7 are also reasonable
+    but risk smoothing real wet/dry seasonal transitions.
+
+    Applied before dB conversion so that derived features (VH-VV, RVI) also benefit.
+    window=0 or window=1 is a no-op.
+    """
+    if window < 2:
+        return s1
+    s1 = s1.copy()
+    s1 = s1.sort_values(["point_id", "date"])
+    for col in ("vh", "vv"):
+        if col in s1.columns:
+            s1[col] = (
+                s1.groupby("point_id")[col]
+                .transform(lambda x: x.rolling(window, min_periods=1, center=True).median())
+                .astype(np.float32)
+            )
+    return s1
+
+
+def snap_s1_to_s2(pixel_df: pd.DataFrame, window_days: int = S1_SNAP_WINDOW_DAYS, despeckle_window: int = 0) -> pd.DataFrame:
     """Snap S1 observations to their nearest S2 date per pixel.
 
     For each S2 observation, finds the closest S1 observation within ±window_days.
@@ -73,6 +98,9 @@ def snap_s1_to_s2(pixel_df: pd.DataFrame, window_days: int = S1_SNAP_WINDOW_DAYS
         for col in S1_FEATURE_COLS:
             s2[col] = np.nan
         return s2
+
+    # Despeckle before dB conversion so derived features (VH-VV, RVI) also benefit
+    s1 = despeckle_s1(s1, despeckle_window)
 
     # Compute dB and derived S1 columns once
     s1 = s1.copy()
@@ -187,6 +215,7 @@ class TAMDataset(Dataset):
         global_feat_std: np.ndarray | None = None,
         use_s1: bool = False,
         pixel_zscore: bool = False,  # if True, z-score each pixel's S1 bands by its own multi-year mean/std
+        s1_despeckle_window: int = 0,
     ) -> None:
         # doy_jitter: max ±days to shift all observations in a window (training only).
         # A single offset is drawn per __getitem__ call and applied uniformly so
@@ -202,6 +231,7 @@ class TAMDataset(Dataset):
             s1_rows = pixel_df[pixel_df["source"] == "S1"].copy() if "source" in pixel_df.columns else pd.DataFrame()
             if s1_rows.empty:
                 raise ValueError("s1_only mode requires S1 rows in pixel_df (source='S1')")
+            s1_rows = despeckle_s1(s1_rows, s1_despeckle_window)
             vh_lin = s1_rows["vh"].values.astype(np.float32)
             vv_lin = s1_rows["vv"].values.astype(np.float32)
             s1_rows["s1_vh"]    = np.where(vh_lin > 0, 10 * np.log10(vh_lin), np.nan).astype(np.float32)
@@ -227,7 +257,7 @@ class TAMDataset(Dataset):
                         pix_std  = df.groupby("point_id")[col].transform("std").clip(lower=min_std)
                         df[col]  = (df[col] - pix_mean) / pix_std
         elif use_s1:
-            df = snap_s1_to_s2(pixel_df)
+            df = snap_s1_to_s2(pixel_df, despeckle_window=s1_despeckle_window)
             feature_cols = ALL_FEATURE_COLS + S1_FEATURE_COLS
         else:
             if "source" in pixel_df.columns:
