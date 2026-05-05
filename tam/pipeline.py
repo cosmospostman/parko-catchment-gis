@@ -133,6 +133,7 @@ def _cmd_train(args: argparse.Namespace) -> None:
         "presence_min_rec_p":    args.presence_min_rec_p,
         "presence_grass_nir_cv": args.presence_grass_nir_cv,
         "s1_despeckle_window":   args.s1_despeckle_window,
+        "batch_size":            args.batch_size,
     }.items() if v is not None}
     if args.val_sites:
         overrides["val_sites"] = tuple(args.val_sites)
@@ -361,6 +362,7 @@ if __name__ == "__main__":
                          help="Min NDVI amplitude for presence pixels (default: 0.20)")
     p_train.add_argument("--s1-despeckle-window",  type=int,   default=None,
                          help="Temporal despeckle window for S1 (rolling median over N acquisitions). 0=off, default=3. Other reasonable values: 5, 7.")
+    p_train.add_argument("--batch-size",           type=int,   default=None)
     p_train.add_argument("--presence-grass-nir-cv", type=float, default=None,
                          help="Max NIR CV for presence pixels — filters grass (default: 0.20)")
     p_train.add_argument("--scl-purity", type=float, default=0.5)

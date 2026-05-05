@@ -26,6 +26,13 @@ ALL_FEATURE_COLS: list[str] = BAND_COLS + INDEX_COLS
 
 # S1-derived per-observation features, snapped to nearest S2 date
 S1_FEATURE_COLS: list[str] = ["s1_vh", "s1_vv", "s1_vh_vv", "s1_rvi"]
+
+# V9-SPECTRAL feature set: B06 excluded (calibration artefacts), EVI excluded
+# (additive denominator behaves poorly under pixel z-score), NDWI retained.
+V9_FEATURE_COLS: list[str] = [
+    "B02", "B03", "B04", "B05", "B07", "B08", "B8A", "B11", "B12",
+    "NDVI", "NDWI",
+]
 S1_SNAP_WINDOW_DAYS: int = 7   # max |S1_date - S2_date| to accept a snap
 
 N_BANDS: int = len(ALL_FEATURE_COLS)          # 13: S2 only (no S1 in time series yet)
@@ -216,6 +223,7 @@ class TAMDataset(Dataset):
         use_s1: bool = False,
         pixel_zscore: bool = False,  # if True, z-score each pixel's S1 bands by its own multi-year mean/std
         s1_despeckle_window: int = 0,
+        feature_cols_override: list[str] | None = None,  # if set, replaces default feature cols for S2-only mode
     ) -> None:
         # doy_jitter: max ±days to shift all observations in a window (training only).
         # A single offset is drawn per __getitem__ call and applied uniformly so
@@ -263,8 +271,17 @@ class TAMDataset(Dataset):
             if "source" in pixel_df.columns:
                 df = pixel_df[pixel_df["source"] == "S2"].copy()
             else:
-                df = pixel_df
-            feature_cols = ALL_FEATURE_COLS
+                df = pixel_df.copy()
+            feature_cols = feature_cols_override if feature_cols_override is not None else ALL_FEATURE_COLS
+
+            if pixel_zscore:
+                # Per-pixel z-score for S2 bands: removes between-tile and between-site
+                # absolute reflectance offsets; preserves phenological curve shape.
+                for col in feature_cols:
+                    if col in df.columns:
+                        pix_mean = df.groupby("point_id")[col].transform("mean")
+                        pix_std  = df.groupby("point_id")[col].transform("std").clip(lower=1e-6)
+                        df[col]  = (df[col] - pix_mean) / pix_std
 
         if use_s1 != "s1_only":
             if any(c not in df.columns for c in INDEX_COLS):

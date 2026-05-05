@@ -1,5 +1,5 @@
 # Kowanyama town area — smaller bbox centred on the town itself
-name: "Kowanyama Town"
+name: "kowtown"
 centroid: null
 bbox: [141.669329, -15.530804, 141.833942, -15.417604]  # [lon_min, lat_min, lon_max, lat_max]
 dry_months: [5, 6, 7, 8, 9, 10]  # monsoonal — one month earlier than inland sites

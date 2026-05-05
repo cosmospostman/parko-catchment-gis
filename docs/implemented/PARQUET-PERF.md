@@ -112,7 +112,7 @@ and the concat loop in `pixel_collector.py`.
 
 ### Migration order (given current disk constraints)
 
-1. Migrate `kowanyama-town` first (once fetch completes) — already on current disk.
+1. Migrate `kowtown` first (once fetch completes) — already on current disk.
 2. Use the freed space to migrate `kowanyama` (79 GB → est. 55–65 GB).
 3. Migrate remaining locations (longreach-8x8km, frenchs, etc.) in any order.
 
@@ -148,7 +148,7 @@ is storage reduction only.
 | File | Current | Estimated post |
 |---|---|---|
 | kowanyama.parquet | 79 GB | 55–65 GB |
-| kowanyama-town.parquet | ~70 GB (est.) | 48–58 GB |
+| kowtown.parquet | ~70 GB (est.) | 48–58 GB |
 | Total /data/pixels | ~337 GB | ~230–270 GB |
 
 These are conservative estimates; actual savings depend on spectral variability

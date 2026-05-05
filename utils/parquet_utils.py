@@ -102,12 +102,17 @@ def append_s1_to_tile_parquet(
 
     Idempotent: skips the file if it already contains at least one S1 row.
 
-    Scans all row groups to collect the full pixel grid before calling
-    collect_s1_fn — necessary because pixel-sorted parquets spread distinct
-    pixels across all row groups.
+    Streams S1 shard parquets row-group by row-group to avoid materialising
+    the full S1 dataset in memory (which OOMs on large tiles like legune).
     """
+    import tempfile
     import pyarrow as pa
     import pyarrow.parquet as pq
+    from utils.s1_collector import (
+        _resolve_s1_items,
+        _collect_s1_shards,
+        _DEFAULT_CACHE_DIR as _S1_DEFAULT_CACHE_DIR,
+    )
 
     pf = pq.ParquetFile(tile_path)
 
@@ -136,27 +141,46 @@ def append_s1_to_tile_parquet(
         (p, lo, la) for p, (lo, la) in seen.items()
     ]
 
-    df_s1 = collect_s1_fn(
-        bbox_wgs84=bbox_wgs84,
-        start=start,
-        end=end,
-        points=points_for_s1,
-        cache_dir=s1_cache_dir,
-    )
+    resolved_cache = s1_cache_dir if s1_cache_dir is not None else _S1_DEFAULT_CACHE_DIR
+    items = _resolve_s1_items(bbox_wgs84, start, end, resolved_cache)
 
     tmp_path = tile_path.with_suffix(".tmp.parquet")
-    writer = pq.ParquetWriter(tmp_path, combined_schema)
-    for rg_idx in range(n_rg):
-        tbl = pf.read_row_group(rg_idx)
-        tbl = _conform_table(tbl, combined_schema)
-        source_col = pa.array(["S2"] * len(tbl), type=pa.string())
-        tbl = tbl.set_column(tbl.schema.get_field_index("source"), "source", source_col)
-        writer.write_table(tbl)
-    if df_s1 is not None and not df_s1.empty:
-        df_s1 = df_s1.sort_values(["point_id", "date"]).reset_index(drop=True)
-        writer.write_table(_s1_df_to_arrow(df_s1, combined_schema))
-    writer.close()
-    tmp_path.replace(tile_path)
+    with tempfile.TemporaryDirectory(prefix="s1_merge_") as _tmp:
+        if items:
+            shard_paths = _collect_s1_shards(
+                out_dir=Path(_tmp),
+                items=items,
+                bbox_wgs84=bbox_wgs84,
+                points=points_for_s1,
+                resolved_cache=resolved_cache,
+            )
+        else:
+            shard_paths = []
+
+        writer = pq.ParquetWriter(tmp_path, combined_schema)
+        for rg_idx in range(n_rg):
+            tbl = pf.read_row_group(rg_idx)
+            tbl = _conform_table(tbl, combined_schema)
+            source_col = pa.array(["S2"] * len(tbl), type=pa.string())
+            tbl = tbl.set_column(tbl.schema.get_field_index("source"), "source", source_col)
+            writer.write_table(tbl)
+
+        for shard_path in shard_paths:
+            s1_pf = pq.ParquetFile(shard_path)
+            for rg_idx in range(s1_pf.metadata.num_row_groups):
+                tbl = s1_pf.read_row_group(rg_idx)
+                tbl = _conform_table(tbl, combined_schema)
+                writer.write_table(tbl)
+
+        writer.close()
+
+    # S2 rows followed by S1 rows are source-separated, not pixel-sorted.
+    # Sort by pixel so all observations for each pixel are contiguous.
+    sorted_tmp = tile_path.with_suffix(".sorted_tmp.parquet")
+    sorted_tmp.unlink(missing_ok=True)
+    sort_parquet_by_pixel(tmp_path, sorted_tmp, row_group_size=5_000_000)
+    tmp_path.unlink(missing_ok=True)
+    sorted_tmp.replace(tile_path)
 
 
 # ---------------------------------------------------------------------------
@@ -180,11 +204,17 @@ def _optimise_schema(tbl: "pa.Table") -> "pa.Table":
     return tbl
 
 
-def is_pixel_sorted(path: Path, n_check: int = 2) -> bool:
+def is_pixel_sorted(path: Path, n_check: int = 20) -> bool:
     """Return True if ``path`` is pixel-sorted (no point_id overlap between adjacent row groups).
 
-    Checks the first ``n_check`` pairs of adjacent row groups. A file with
-    only one row group is trivially sorted.
+    Checks ``n_check`` adjacent pairs sampled evenly across the file. Files
+    written by this module are always sorted on write, so this is a safety-net
+    check rather than the primary enforcement. n_check=20 gives one sample per
+    ~70 row groups on a 1380-rg file, which is sufficient to catch gross
+    violations while remaining fast (< 1 s on typical tile parquets).
+
+    Note: point_id strings like ``px_{xi}_{yi}`` are NOT in lexicographic order
+    so min/max Parquet statistics cannot be used for this check.
     """
     import pyarrow.parquet as pq
 
@@ -193,14 +223,17 @@ def is_pixel_sorted(path: Path, n_check: int = 2) -> bool:
     if n_rg <= 1:
         return True
 
-    pairs = min(n_check, n_rg - 1)
-    for i in range(pairs):
-        ids_a = set(
-            pl.from_arrow(pf.read_row_groups([i],     columns=["point_id"]))["point_id"].to_list()
-        )
-        ids_b = set(
-            pl.from_arrow(pf.read_row_groups([i + 1], columns=["point_id"]))["point_id"].to_list()
-        )
+    n_pairs = n_rg - 1
+    if n_pairs <= n_check:
+        pair_indices = list(range(n_pairs))
+    else:
+        step = n_pairs / n_check
+        pair_indices = sorted({0, n_pairs - 1} | {round(i * step) for i in range(n_check)})
+        pair_indices = [i for i in pair_indices if i < n_pairs]
+
+    for i in pair_indices:
+        ids_a = set(pl.from_arrow(pf.read_row_groups([i],     columns=["point_id"]))["point_id"].to_list())
+        ids_b = set(pl.from_arrow(pf.read_row_groups([i + 1], columns=["point_id"]))["point_id"].to_list())
         if ids_a & ids_b:
             return False
     return True

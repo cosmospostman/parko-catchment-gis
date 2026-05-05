@@ -205,12 +205,13 @@ def phase2_laso(
     device: str | None,
     dry_run: bool,
     summary_path: Path,
+    sites: list[str] | None = None,
 ) -> None:
     logger.info("=" * 60)
     logger.info("PHASE 2: LASO sweep  despeckle=%d", best_despeckle)
     logger.info("=" * 60)
 
-    for site in LASO_SITES:
+    for site in (sites if sites is not None else LASO_SITES):
         run_id = f"laso_{site}_despeckle{best_despeckle}"
         out_dir = base_out / run_id
 
@@ -240,6 +241,8 @@ def main() -> None:
     parser.add_argument("--despeckle-only", action="store_true",
                         help="Run only phase 1")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--sites", default=None,
+                        help="Comma-separated list of sites for phase 2 (default: all LASO_SITES)")
     args = parser.parse_args()
 
     if args.laso_only and args.best_despeckle is None:
@@ -277,8 +280,9 @@ def main() -> None:
                 "Phase 1 complete — pass --best-despeckle <val> --laso-only to run phase 2 "
                 "with the winning value. Continuing with despeckle=%d.", best
             )
+        sites = [s.strip() for s in args.sites.split(",")] if args.sites else None
         phase2_laso(base_out, pixel_df, pixel_coords, labels,
-                    best, args.device, args.dry_run, summary_path)
+                    best, args.device, args.dry_run, summary_path, sites=sites)
 
     logger.info("Done. Results: %s", summary_path)
     if summary_path.exists():

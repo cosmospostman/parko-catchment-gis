@@ -282,56 +282,16 @@ def _extract_item(
     )
 
 
-def collect_s1(
+def _resolve_s1_items(
     bbox_wgs84: list[float],
     start: str,
     end: str,
-    points: list[tuple[str, float, float]],
-    cache_dir: Path | None = None,
-    point_shard_size: int = 50_000,
-    n_workers: int = 4,
-) -> pd.DataFrame:
-    """Fetch S1 VH/VV observations for a pixel grid and return as a DataFrame.
-
-    Parameters
-    ----------
-    bbox_wgs84:
-        [lon_min, lat_min, lon_max, lat_max] — same bbox used for S2 collect.
-    start, end:
-        ISO date strings ("YYYY-MM-DD") — same window used for S2 collect.
-    points:
-        List of (point_id, lon, lat) — same grid produced by make_pixel_grid().
-    cache_dir:
-        Directory for per-(item, band) .npz patch caches. Mirrors S2 chip cache
-        layout: {cache_dir}/{item_id}/{band}.npz. Defaults to data/chips/s1/.
-    point_shard_size:
-        Max points per shard. Each shard's rows are spilled to a temp parquet
-        before the next shard is processed, bounding peak memory use. Defaults
-        to 50 000 — at ~100 S1 items that's ~5 M rows peak per shard (~400 MB).
-    n_workers:
-        Number of parallel threads for item fetches. Each worker holds at most
-        two band arrays (~15 MB each for a typical bbox) in memory, so peak
-        array memory is roughly n_workers × 30 MB. Defaults to 4.
-
-    Returns
-    -------
-    DataFrame with columns [point_id, lon, lat, date, source, vh, vv, orbit].
-    Empty DataFrame if no S1 data is found.
-    """
+    resolved_cache: Path,
+):
+    """STAC search + cache for S1 items. Returns filtered item list or []."""
     import hashlib
     import pickle
-    import tempfile
-    import threading
-    import time
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    import pyarrow as pa
-    import pyarrow.parquet as pq
 
-    setup_gdal_env()
-
-    resolved_cache = cache_dir if cache_dir is not None else _DEFAULT_CACHE_DIR
-
-    # Cache S1 STAC search results to avoid repeated round-trips on re-runs.
     stac_key = hashlib.md5(
         f"{bbox_wgs84}|{start}|{end}".encode()
     ).hexdigest()
@@ -376,21 +336,28 @@ def collect_s1(
             logger.debug("S1 STAC: items not picklable — skipping cache write")
 
     items = filter_items_by_bbox(items, bbox_wgs84)
-    if not items:
-        logger.info("No S1 items found for bbox %s in %s/%s", bbox_wgs84, start, end)
-        return pd.DataFrame()
+    return items
 
-    cached_count = sum(
-        1 for item in items
-        if all(_chip_cache_path(resolved_cache, item.id, b, bbox_wgs84).exists() for b in _S1_BANDS
-               if b in item.assets)
-    )
-    logger.info(
-        "S1: %d items (%d fully cached) for bbox %s",
-        len(items), cached_count, bbox_wgs84,
-    )
 
-    # Import signer for per-item token refresh (tokens expire during long fetches)
+def _collect_s1_shards(
+    out_dir: Path,
+    items: list,
+    bbox_wgs84: list[float],
+    points: list[tuple[str, float, float]],
+    resolved_cache: Path,
+    point_shard_size: int = 50_000,
+    n_workers: int = 4,
+) -> list[Path]:
+    """Write S1 observations to per-point-shard parquets in out_dir.
+
+    Returns list of written shard paths (empty if no data).  Caller owns
+    out_dir lifetime — shards are NOT deleted here.
+    """
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
     try:
         import planetary_computer as pc
         _sign = pc.sign
@@ -409,105 +376,163 @@ def collect_s1(
     ])
     _FLUSH_ROWS = 500_000
 
-    # Shard points to bound peak memory: process point_shard_size points at a
-    # time across all items, spilling each shard to a temp parquet before moving
-    # on. This mirrors S2's row-budget sharding strategy.
+    cached_count = sum(
+        1 for item in items
+        if all(_chip_cache_path(resolved_cache, item.id, b, bbox_wgs84).exists() for b in _S1_BANDS
+               if b in item.assets)
+    )
+    logger.info(
+        "S1: %d items (%d fully cached) for bbox %s",
+        len(items), cached_count, bbox_wgs84,
+    )
+
     n_shards = max(1, (len(points) + point_shard_size - 1) // point_shard_size)
     use_sharding = n_shards > 1
+    shard_paths: list[Path] = []
+
+    for shard_idx in range(n_shards):
+        shard_points = points[shard_idx * point_shard_size : (shard_idx + 1) * point_shard_size]
+        if use_sharding:
+            logger.info("S1: shard %d/%d — %d points", shard_idx + 1, n_shards, len(shard_points))
+
+        shard_path = out_dir / f"shard_{shard_idx:04d}.parquet"
+        writer = pq.ParquetWriter(shard_path, _ARROW_SCHEMA)
+        total_rows = 0
+        n_items_done = 0
+        log_interval = max(1, len(items) // 10)
+
+        write_lock = threading.Lock()
+        buf_pid:   list = []
+        buf_lon:   list = []
+        buf_lat:   list = []
+        buf_date:  list = []
+        buf_vh:    list = []
+        buf_vv:    list = []
+        buf_orbit: list = []
+
+        def _flush_locked() -> None:
+            if not buf_pid:
+                return
+            tbl = pa.table({
+                "point_id": pa.array(buf_pid,  pa.string()),
+                "lon":      pa.array(buf_lon,  pa.float64()),
+                "lat":      pa.array(buf_lat,  pa.float64()),
+                "date":     pa.array([pd.Timestamp(d) for d in buf_date], pa.timestamp("ms")),
+                "source":   pa.array(["S1"] * len(buf_pid), pa.string()),
+                "vh":       pa.array(buf_vh,   pa.float32()),
+                "vv":       pa.array(buf_vv,   pa.float32()),
+                "orbit":    pa.array(buf_orbit, pa.string()),
+            })
+            writer.write_table(tbl)
+            buf_pid.clear(); buf_lon.clear(); buf_lat.clear(); buf_date.clear()
+            buf_vh.clear();  buf_vv.clear();  buf_orbit.clear()
+
+        def _fetch_item(item) -> int:
+            if _sign is not None:
+                try:
+                    item = _sign(item)
+                except TypeError:
+                    pass
+            affine = _reconstruct_affine(item)
+            if affine is None:
+                logger.warning("S1 item %s has no proj:transform — skipping", item.id)
+                return 0
+            cols = _extract_item(item, affine, bbox_wgs84, shard_points, cache_dir=resolved_cache)
+            if cols is None:
+                return 0
+            pids, lons, lats, dates, vhs, vvs, orbits = cols
+            with write_lock:
+                buf_pid.extend(pids);   buf_lon.extend(lons);   buf_lat.extend(lats)
+                buf_date.extend(dates); buf_vh.extend(vhs);     buf_vv.extend(vvs)
+                buf_orbit.extend(orbits)
+                if len(buf_pid) >= _FLUSH_ROWS:
+                    _flush_locked()
+            return len(pids)
+
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futures = {pool.submit(_fetch_item, item): item for item in items}
+            for fut in as_completed(futures):
+                n_items_done += 1
+                total_rows += fut.result()
+                if n_items_done % log_interval == 0 or n_items_done == len(items):
+                    prefix = f"shard {shard_idx + 1}/{n_shards}  " if use_sharding else ""
+                    logger.info(
+                        "S1: %sitem %d/%d  %d rows so far",
+                        prefix, n_items_done, len(items), total_rows,
+                    )
+
+        with write_lock:
+            _flush_locked()
+        writer.close()
+
+        if use_sharding:
+            logger.info("S1: shard %d/%d complete — %d rows", shard_idx + 1, n_shards, total_rows)
+        if total_rows > 0:
+            shard_paths.append(shard_path)
+        else:
+            shard_path.unlink(missing_ok=True)
+
+    return shard_paths
+
+
+def collect_s1(
+    bbox_wgs84: list[float],
+    start: str,
+    end: str,
+    points: list[tuple[str, float, float]],
+    cache_dir: Path | None = None,
+    point_shard_size: int = 50_000,
+    n_workers: int = 4,
+) -> pd.DataFrame:
+    """Fetch S1 VH/VV observations for a pixel grid and return as a DataFrame.
+
+    Parameters
+    ----------
+    bbox_wgs84:
+        [lon_min, lat_min, lon_max, lat_max] — same bbox used for S2 collect.
+    start, end:
+        ISO date strings ("YYYY-MM-DD") — same window used for S2 collect.
+    points:
+        List of (point_id, lon, lat) — same grid produced by make_pixel_grid().
+    cache_dir:
+        Directory for per-(item, band) .npz patch caches. Mirrors S2 chip cache
+        layout: {cache_dir}/{item_id}/{band}.npz. Defaults to data/chips/s1/.
+    point_shard_size:
+        Max points per shard. Each shard's rows are spilled to a temp parquet
+        before the next shard is processed, bounding peak memory use. Defaults
+        to 50 000 — at ~100 S1 items that's ~5 M rows peak per shard (~400 MB).
+    n_workers:
+        Number of parallel threads for item fetches. Each worker holds at most
+        two band arrays (~15 MB each for a typical bbox) in memory, so peak
+        array memory is roughly n_workers × 30 MB. Defaults to 4.
+
+    Returns
+    -------
+    DataFrame with columns [point_id, lon, lat, date, source, vh, vv, orbit].
+    Empty DataFrame if no S1 data is found.
+    """
+    import tempfile
+    import pyarrow.parquet as pq
+
+    setup_gdal_env()
+
+    resolved_cache = cache_dir if cache_dir is not None else _DEFAULT_CACHE_DIR
+
+    items = _resolve_s1_items(bbox_wgs84, start, end, resolved_cache)
+    if not items:
+        logger.info("No S1 items found for bbox %s in %s/%s", bbox_wgs84, start, end)
+        return pd.DataFrame()
 
     with tempfile.TemporaryDirectory(prefix="s1_collect_") as _tmp:
-        tmp_dir = Path(_tmp)
-        shard_paths: list[Path] = []
-
-        for shard_idx in range(n_shards):
-            shard_points = points[shard_idx * point_shard_size : (shard_idx + 1) * point_shard_size]
-            if use_sharding:
-                logger.info(
-                    "S1: shard %d/%d — %d points",
-                    shard_idx + 1, n_shards, len(shard_points),
-                )
-
-            shard_path = tmp_dir / f"shard_{shard_idx:04d}.parquet"
-            writer = pq.ParquetWriter(shard_path, _ARROW_SCHEMA)
-            total_rows = 0
-            n_items_done = 0
-            log_interval = max(1, len(items) // 10)
-
-            write_lock = threading.Lock()
-            # Per-column lists: far lower Python object overhead than list-of-dicts.
-            buf_pid:    list = []
-            buf_lon:    list = []
-            buf_lat:    list = []
-            buf_date:   list = []
-            buf_vh:     list = []
-            buf_vv:     list = []
-            buf_orbit:  list = []
-
-            def _flush_locked() -> None:
-                if not buf_pid:
-                    return
-                tbl = pa.table({
-                    "point_id": pa.array(buf_pid,  pa.string()),
-                    "lon":      pa.array(buf_lon,  pa.float64()),
-                    "lat":      pa.array(buf_lat,  pa.float64()),
-                    "date":     pa.array([pd.Timestamp(d) for d in buf_date], pa.timestamp("ms")),
-                    "source":   pa.array(["S1"] * len(buf_pid), pa.string()),
-                    "vh":       pa.array(buf_vh,   pa.float32()),
-                    "vv":       pa.array(buf_vv,   pa.float32()),
-                    "orbit":    pa.array(buf_orbit, pa.string()),
-                })
-                writer.write_table(tbl)
-                buf_pid.clear(); buf_lon.clear(); buf_lat.clear(); buf_date.clear()
-                buf_vh.clear();  buf_vv.clear();  buf_orbit.clear()
-
-            def _fetch_item(item) -> int:
-                """Fetch one item and append columns to buf. Returns row count."""
-                if _sign is not None:
-                    try:
-                        item = _sign(item)
-                    except TypeError:
-                        pass
-                affine = _reconstruct_affine(item)
-                if affine is None:
-                    logger.warning("S1 item %s has no proj:transform — skipping", item.id)
-                    return 0
-                cols = _extract_item(item, affine, bbox_wgs84, shard_points, cache_dir=resolved_cache)
-                if cols is None:
-                    return 0
-                pids, lons, lats, dates, vhs, vvs, orbits = cols
-                with write_lock:
-                    buf_pid.extend(pids);   buf_lon.extend(lons);   buf_lat.extend(lats)
-                    buf_date.extend(dates); buf_vh.extend(vhs);     buf_vv.extend(vvs)
-                    buf_orbit.extend(orbits)
-                    if len(buf_pid) >= _FLUSH_ROWS:
-                        _flush_locked()
-                return len(pids)
-
-            with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                futures = {pool.submit(_fetch_item, item): item for item in items}
-                for fut in as_completed(futures):
-                    n_items_done += 1
-                    total_rows += fut.result()
-                    if n_items_done % log_interval == 0 or n_items_done == len(items):
-                        prefix = f"shard {shard_idx + 1}/{n_shards}  " if use_sharding else ""
-                        logger.info(
-                            "S1: %sitem %d/%d  %d rows so far",
-                            prefix, n_items_done, len(items), total_rows,
-                        )
-
-            with write_lock:
-                _flush_locked()
-            writer.close()
-
-            if use_sharding:
-                logger.info(
-                    "S1: shard %d/%d complete — %d rows",
-                    shard_idx + 1, n_shards, total_rows,
-                )
-            if total_rows > 0:
-                shard_paths.append(shard_path)
-            else:
-                shard_path.unlink(missing_ok=True)
+        shard_paths = _collect_s1_shards(
+            out_dir=Path(_tmp),
+            items=items,
+            bbox_wgs84=bbox_wgs84,
+            points=points,
+            resolved_cache=resolved_cache,
+            point_shard_size=point_shard_size,
+            n_workers=n_workers,
+        )
 
         if not shard_paths:
             logger.info("S1: no usable observations extracted")

@@ -625,6 +625,18 @@ def collect(
 
     if not sorted_shard_paths:
         if all_shards_done:
+            existing = sorted(
+                p for p in out_dir.iterdir()
+                if p.suffix == ".parquet"
+                and not p.stem.startswith("_")
+                and ".tmp" not in p.stem
+            )
+            if existing:
+                logger.info(
+                    "All shards already complete and tile outputs exist — returning %d existing tile(s).",
+                    len(existing),
+                )
+                return existing
             logger.warning("All shards completed but produced no rows — returning empty result.")
             return []
         raise RuntimeError("No data collected: all shards are empty. Check STAC availability and date range.")

@@ -89,6 +89,27 @@ def site_holdout_split(
 # Training
 # ---------------------------------------------------------------------------
 
+def _compute_band_summaries(pixel_df: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
+    """Per-pixel [p5, p95, std] for each feature column, computed from S2 rows.
+
+    Returns a DataFrame indexed by point_id with columns
+    <col>_p5, <col>_p95, <col>_std for each col in feature_cols.
+    Used as global features when cfg.use_band_summaries=True.
+    """
+    s2 = pixel_df[pixel_df["source"] == "S2"].copy() if "source" in pixel_df.columns else pixel_df.copy()
+    cols = [c for c in feature_cols if c in s2.columns]
+    grp = s2.groupby("point_id")[cols]
+    p5  = grp.quantile(0.05).rename(columns={c: f"{c}_p5"  for c in cols})
+    p95 = grp.quantile(0.95).rename(columns={c: f"{c}_p95" for c in cols})
+    std = grp.std().rename(columns={c: f"{c}_std" for c in cols})
+    result = pd.concat([p5, p95, std], axis=1)
+    # interleave columns as p5/p95/std per band rather than all-p5 then all-p95
+    ordered = []
+    for c in cols:
+        ordered += [f"{c}_p5", f"{c}_p95", f"{c}_std"]
+    return result[ordered]
+
+
 def _global_features_cache_key(pixel_df: pd.DataFrame) -> str:
     """Stable hash of the inputs to compute_global_features."""
     cols = [c for c in ("point_id", "date", "B08", "B04", "vh", "vv", "source")
@@ -186,7 +207,19 @@ def train_tam(
         or cfg.presence_grass_nir_cv < 1.0
     )
     global_feat_df = None
-    if cfg.n_global_features > 0 or _noise_filter_active:
+    _named_globals_for_noise: pd.DataFrame | None = None
+    if cfg.use_band_summaries:
+        from tam.core.dataset import V9_FEATURE_COLS
+        from analysis.constants import add_spectral_indices
+        _df_for_summaries = pixel_df.copy()
+        if "NDVI" not in _df_for_summaries.columns or "NDWI" not in _df_for_summaries.columns:
+            _df_for_summaries = add_spectral_indices(_df_for_summaries)
+        global_feat_df = _compute_band_summaries(_df_for_summaries, V9_FEATURE_COLS)
+        logger.info("Band summaries computed: %d pixels, %d features", len(global_feat_df), global_feat_df.shape[1])
+        if _noise_filter_active:
+            from tam.core.global_features import GLOBAL_FEATURE_NAMES
+            _named_globals_for_noise = _load_or_compute_global_features(pixel_df, out_dir, GLOBAL_FEATURE_NAMES)
+    elif cfg.n_global_features > 0 or _noise_filter_active:
         from tam.core.global_features import GLOBAL_FEATURE_NAMES
         global_feat_df = _load_or_compute_global_features(pixel_df, out_dir, GLOBAL_FEATURE_NAMES)
 
@@ -200,10 +233,11 @@ def train_tam(
     noise_removed: dict[tuple[str, str], int] = {}
 
     # --- Presence noise filter — remove obvious non-Parkinsonia presence pixels
-    if global_feat_df is not None and _noise_filter_active:
+    _noise_filter_df = _named_globals_for_noise if _named_globals_for_noise is not None else global_feat_df
+    if _noise_filter_df is not None and _noise_filter_active:
         def _apply_noise_filter(lbl: pd.Series) -> pd.Series:
             presence_pids = set(lbl[lbl == 1].index)
-            gf = global_feat_df.reindex(list(presence_pids))
+            gf = _noise_filter_df.reindex(list(presence_pids))
             noise_mask = (
                 (gf["dry_ndvi"].fillna(cfg.presence_min_dry_ndvi) < cfg.presence_min_dry_ndvi) |
                 (gf["rec_p"].fillna(cfg.presence_min_rec_p)       < cfg.presence_min_rec_p) |
@@ -337,10 +371,12 @@ def train_tam(
     logger.info("Pixel summary (stride=%d):\n%s", cfg.spatial_stride, "\n".join(lines))
 
     # Slice global features to exactly the columns the model head expects.
-    if global_feat_df is not None:
+    # Band-summary mode supplies all columns; named-global mode slices to n_global_features.
+    if global_feat_df is not None and not cfg.use_band_summaries:
         global_feat_df = global_feat_df.iloc[:, :cfg.n_global_features]
 
     # --- Datasets -----------------------------------------------------------
+    _feature_cols_override = list(cfg.feature_cols_override) if cfg.feature_cols_override else None
     train_ds = TAMDataset(
         pixel_df, train_labels,
         scl_purity_min=cfg.scl_purity_min,
@@ -353,6 +389,7 @@ def train_tam(
         use_s1=cfg.use_s1,
         pixel_zscore=cfg.pixel_zscore,
         s1_despeckle_window=cfg.s1_despeckle_window,
+        feature_cols_override=_feature_cols_override,
     )
     band_mean, band_std = train_ds.band_stats
     val_ds = TAMDataset(
@@ -367,6 +404,7 @@ def train_tam(
         use_s1=cfg.use_s1,
         pixel_zscore=cfg.pixel_zscore,
         s1_despeckle_window=cfg.s1_despeckle_window,
+        feature_cols_override=_feature_cols_override,
     )
     logger.info("Train windows: %d  |  Val windows: %d", len(train_ds), len(val_ds))
 
@@ -390,6 +428,9 @@ def train_tam(
     pos_weight = torch.tensor([n_neg / n_pos], dtype=torch.float32).to(device) if n_pos > 0 and n_neg > 0 else None
 
     # --- Model + optimiser --------------------------------------------------
+    # Band-summary mode: override n_global_features to match actual summary width.
+    if cfg.use_band_summaries and global_feat_df is not None:
+        cfg.n_global_features = global_feat_df.shape[1]
     model = TAMClassifier.from_config(cfg)
     model._use_s1 = cfg.use_s1          # persisted to tam_config.json for score pipeline
     model._pixel_zscore = cfg.pixel_zscore

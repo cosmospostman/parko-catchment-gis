@@ -299,7 +299,9 @@ class Location:
             if not tile_paths:
                 tile_paths = [
                     p for p in sorted(_out_dir.glob("*.parquet"))
-                    if not p.name.startswith("_") and ".coords." not in p.name
+                    if not p.name.startswith("_")
+                    and ".coords." not in p.name
+                    and ".tmp" not in p.stem
                 ]
 
             # Append S1 rows to each tile parquet in-place

@@ -445,12 +445,12 @@ def _make_multi_rg_s2_parquet(path: Path, pixel_rows: list[dict]) -> None:
     writer.close()
 
 
-def test_append_s1_collects_coords_from_all_row_groups(tmp_path):
+def test_append_s1_collects_coords_from_all_row_groups(tmp_path, monkeypatch):
     """S1 rows must be generated for every unique pixel, not just those in rg0.
 
     Setup: a parquet with 3 pixels spread across 3 row groups (one per group).
-    The mock collect_s1 records which point_ids it was asked about.
-    After _append_s1_to_tile_parquet, all 3 pixels must appear in the call.
+    Mock _collect_s1_shards to capture which point_ids were passed.
+    After append_s1_to_tile_parquet, all 3 pixels must appear.
     """
     import pyarrow.parquet as pq
 
@@ -470,22 +470,28 @@ def test_append_s1_collects_coords_from_all_row_groups(tmp_path):
 
     captured_points: list[list[str]] = []
 
-    def mock_collect_s1(bbox_wgs84, start, end, points, cache_dir=None):
-        import pandas as pd
+    def mock_resolve_items(bbox_wgs84, start, end, resolved_cache):
+        return ["fake_item"]  # non-empty so _collect_s1_shards is called
+
+    def mock_collect_shards(out_dir, items, bbox_wgs84, points, resolved_cache, **kwargs):
         captured_points.append([pid for pid, _, _ in points])
-        return pd.DataFrame()   # no actual S1 data needed for this test
+        return []  # no shard files — no S1 rows appended
+
+    import utils.s1_collector as _s1c
+    monkeypatch.setattr(_s1c, "_resolve_s1_items", mock_resolve_items)
+    monkeypatch.setattr(_s1c, "_collect_s1_shards", mock_collect_shards)
 
     append_s1_to_tile_parquet(
         tile_path=tile_path,
         bbox_wgs84=[145.40, -22.82, 145.44, -22.78],
         start="2022-01-01",
         end="2022-12-31",
-        collect_s1_fn=mock_collect_s1,
+        collect_s1_fn=None,
     )
 
-    assert len(captured_points) == 1, "collect_s1 should be called exactly once"
+    assert len(captured_points) == 1, "_collect_s1_shards should be called exactly once"
     called_pids = set(captured_points[0])
     assert called_pids == {"px_0000_0000", "px_0001_0000", "px_0002_0000"}, (
-        f"collect_s1 was only given coords for: {called_pids} — "
+        f"_collect_s1_shards was only given coords for: {called_pids} — "
         "pixels in row groups > 0 were missed (first-row-group-only bug)"
     )
