@@ -176,7 +176,7 @@ def main() -> None:
     pixel_df = pixel_df[pixel_df["point_id"].isin(all_labels.index)]
 
     # --- Load checkpoint ------------------------------------------------------
-    model, band_mean, band_std = load_tam(ckpt_dir)
+    model, band_mean, band_std, *_ = load_tam(ckpt_dir)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device).eval()
 

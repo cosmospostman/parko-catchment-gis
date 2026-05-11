@@ -452,6 +452,9 @@ def train_tam(
 
     # Save config + band stats immediately so inference can run even if training is interrupted
     np.savez(out_dir / "tam_band_stats.npz", mean=band_mean, std=band_std)
+    if train_ds.global_feat_mean is not None and len(train_ds.global_feat_mean) > 0:
+        np.savez(out_dir / "tam_global_feat_stats.npz",
+                 mean=train_ds.global_feat_mean, std=train_ds.global_feat_std)
     with open(out_dir / "tam_config.json", "w") as fh:
         json.dump(model.config(), fh, indent=2)
 
@@ -586,6 +589,9 @@ def train_tam(
 
     # Save final band stats + config (may differ from mid-training save if interrupted)
     np.savez(out_dir / "tam_band_stats.npz", mean=band_mean, std=band_std)
+    if train_ds.global_feat_mean is not None and len(train_ds.global_feat_mean) > 0:
+        np.savez(out_dir / "tam_global_feat_stats.npz",
+                 mean=train_ds.global_feat_mean, std=train_ds.global_feat_std)
     cfg_dict = model.config()
     cfg_dict["best_val_auc"] = round(best_val_auc, 6)
     with open(out_dir / "tam_config.json", "w") as fh:
@@ -606,12 +612,13 @@ def train_tam(
 # Checkpoint loading
 # ---------------------------------------------------------------------------
 
-def load_tam(out_dir: Path, device: str | None = None) -> tuple[TAMClassifier, np.ndarray, np.ndarray]:
+def load_tam(out_dir: Path, device: str | None = None) -> tuple[TAMClassifier, np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
     """Load a saved TAMClassifier checkpoint.
 
     Returns
     -------
-    (model, band_mean, band_std)
+    (model, band_mean, band_std, global_feat_mean, global_feat_std)
+    global_feat_mean/std are None when the model has no global features.
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -643,4 +650,12 @@ def load_tam(out_dir: Path, device: str | None = None) -> tuple[TAMClassifier, n
     model.eval()
 
     stats = np.load(out_dir / "tam_band_stats.npz")
-    return model, stats["mean"], stats["std"]
+    gf_stats_path = out_dir / "tam_global_feat_stats.npz"
+    if gf_stats_path.exists():
+        gf = np.load(gf_stats_path)
+        global_feat_mean: np.ndarray | None = gf["mean"]
+        global_feat_std:  np.ndarray | None = gf["std"]
+    else:
+        global_feat_mean = None
+        global_feat_std  = None
+    return model, stats["mean"], stats["std"], global_feat_mean, global_feat_std

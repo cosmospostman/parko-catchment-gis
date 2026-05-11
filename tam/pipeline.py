@@ -247,7 +247,7 @@ def _cmd_score(args: argparse.Namespace) -> None:
     ]
 
     logger.info("Loading checkpoint from %s ...", checkpoint_dir)
-    model, band_mean, band_std = load_tam(checkpoint_dir, device=args.device)
+    model, band_mean, band_std, global_feat_mean, global_feat_std = load_tam(checkpoint_dir, device=args.device)
 
     with open(checkpoint_dir / "tam_config.json") as _fh:
         _cfg_dict = json.load(_fh)
@@ -306,6 +306,8 @@ def _cmd_score(args: argparse.Namespace) -> None:
         pixel_zscore=pixel_zscore,
         s1_despeckle_window=s1_despeckle_window,
         feature_cols=feature_cols,
+        global_feat_mean=global_feat_mean,
+        global_feat_std=global_feat_std,
     )
 
     scored = pixel_coords.merge(scores, on="point_id", how="left")

@@ -236,8 +236,30 @@ class CachedNpzChipStore:
                 self._transformers[crs_key] = t
             xs, ys = t.transform(self._lons, self._lats)
             cols_f, rows_f = ~transform * (xs, ys)
-            rows = np.clip(np.floor(rows_f).astype(np.intp), 0, h - 1)
-            cols = np.clip(np.floor(cols_f).astype(np.intp), 0, w - 1)
+            rows_raw = np.floor(rows_f).astype(np.intp)
+            cols_raw = np.floor(cols_f).astype(np.intp)
+            # Allow 1-pixel overhang at each edge: rasterio sometimes fetches a
+            # window that is 1 pixel short of the bbox due to floating-point rounding,
+            # particularly for coarser-resolution bands (SCL at 20 m, AOT at 60 m).
+            # Beyond 1 pixel the patch was almost certainly fetched for a different bbox.
+            _EDGE_SLOP = 1
+            far_oob = (
+                (rows_raw < -_EDGE_SLOP).any() or (rows_raw >= h + _EDGE_SLOP).any() or
+                (cols_raw < -_EDGE_SLOP).any() or (cols_raw >= w + _EDGE_SLOP).any()
+            )
+            if far_oob:
+                n_oob = int(
+                    ((rows_raw < -_EDGE_SLOP) | (rows_raw >= h + _EDGE_SLOP) |
+                     (cols_raw < -_EDGE_SLOP) | (cols_raw >= w + _EDGE_SLOP)).sum()
+                )
+                raise ValueError(
+                    f"CachedNpzChipStore: {n_oob}/{len(rows_raw)} points fall outside the "
+                    f"cached patch ({h}×{w}) for item '{self._live_item}' band '{band}'. "
+                    "The cached patch was likely built for a different bbox. "
+                    "Delete the chip cache for this item and re-fetch."
+                )
+            rows = np.clip(rows_raw, 0, h - 1)
+            cols = np.clip(cols_raw, 0, w - 1)
             self._proj_cache[proj_key] = (rows, cols)
         return self._proj_cache[proj_key]
 

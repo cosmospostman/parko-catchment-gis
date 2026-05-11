@@ -410,6 +410,51 @@ def collect(
             return False
         return "__done__" in dp.read_text()
 
+    # Pre-check: verify that cached spectral patches cover the current bbox.
+    # Patches written for a different bbox (e.g. a training region on the same tile)
+    # silently corrupt the output — CachedNpzChipStore clips out-of-bounds coordinates
+    # to the patch edge, making every pixel return the same value.
+    # If stale patches are found, invalidate shard .done files so shards are rebuilt.
+    from utils.fetch import _cache_path as _fc_path, _load_patch_cache as _lpc, _patch_covers_bbox as _pcb
+    _proxy_band = "B08"
+    _stale_ids: set[str] = set()
+    for _item in items:
+        _proxy_path = _fc_path(cache_dir, _item.id, _proxy_band)
+        if not _proxy_path.exists():
+            continue
+        _data = _lpc(_proxy_path)
+        if _data is None or not _pcb(_data, bbox_wgs84):
+            _stale_ids.add(_item.id)
+    if _stale_ids:
+        logger.warning(
+            "Stale chip cache: %d items have patches that don't cover bbox %s "
+            "— deleting stale .npz files, shard .done files, and tile parquets",
+            len(_stale_ids), bbox_wgs84,
+        )
+        # Delete the stale .npz files so uncached_items picks them up for re-fetch.
+        # fetch_patches would re-fetch if called, but it only gets called for items
+        # missing from cache — files that exist but cover the wrong bbox are never
+        # passed to fetch_patches without this deletion.
+        _n_npz_deleted = 0
+        for _sid in _stale_ids:
+            _item_dir = cache_dir / _sid
+            if _item_dir.is_dir():
+                for _npz in _item_dir.glob("*.npz"):
+                    _npz.unlink()
+                    _n_npz_deleted += 1
+        if _n_npz_deleted:
+            logger.info("  Deleted %d stale .npz patch files", _n_npz_deleted)
+        for _i in range(n_shards):
+            _dp = _shard_path(_i).with_suffix(".done")
+            if _dp.exists():
+                _dp.unlink()
+                logger.info("  Deleted stale done file: %s", _dp.name)
+        # Also delete any tile parquets built from the stale data
+        for _tp in out_dir.iterdir():
+            if _tp.suffix == ".parquet" and not _tp.stem.startswith("_"):
+                _tp.unlink()
+                logger.info("  Deleted stale tile parquet: %s", _tp.name)
+
     all_shards_done = all(_shard_complete(i) for i in range(n_shards))
 
     if all_shards_done:
@@ -421,7 +466,7 @@ def collect(
             len(sorted_rcs) // n_shards if n_shards else 0,
             shard_row_budget // 1_000_000,
         )
-        # Check how many items are already fully cached on disk
+        # Check how many items are already fully cached on disk.
         from utils.fetch import _cache_path
         import os as _os
         cached_keys: set[tuple[str, str]] = set()

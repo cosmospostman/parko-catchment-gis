@@ -357,15 +357,15 @@ def _compute_band_summaries_from_parquets(
     year_parquets: list[tuple[int, Path]],
     feature_cols: list[str],
     scl_purity_min: float,
-    band_mean: np.ndarray,
-    band_std: np.ndarray,
+    global_feat_mean: np.ndarray,
+    global_feat_std: np.ndarray,
     pixel_zscore_stats: tuple[dict, dict] | None = None,
 ) -> dict[str, np.ndarray]:
     """Pre-pass: compute per-pixel normalised [p5, p95, std] for each feature col.
 
     Reads all year parquets, concatenates S2 rows, computes summary stats per pixel,
-    normalises using band_mean/band_std, and returns a dict {point_id: float32 array}.
-    The summary vector order matches _compute_band_summaries in train.py:
+    normalises using global_feat_mean/std (saved from training), and returns a dict
+    {point_id: float32 array}.  Vector order matches _compute_band_summaries in train.py:
     [col0_p5, col0_p95, col0_std, col1_p5, ...] (3 stats × n_feature_cols).
     """
     import pyarrow.parquet as pq
@@ -405,25 +405,27 @@ def _compute_band_summaries_from_parquets(
             ps = df["point_id"].map({pid: v[i] for pid, v in pid_std_lk.items()})
             df[col] = (df[col] - pm) / ps.clip(lower=1e-6)
 
-    # Compute p5/p95/std per pixel for each feature col, normalised by global band stats
+    # Compute raw p5/p95/std per pixel for each feature col (no normalisation yet)
     grp = df.groupby("point_id")
     pids = grp[feature_cols[0]].mean().index.values  # stable key order
     summary_cols: list[np.ndarray] = []
-    for i, col in enumerate(feature_cols):
+    for col in feature_cols:
         if col not in df.columns:
             z = np.zeros(len(pids), dtype=np.float32)
             summary_cols += [z, z, z]
             continue
-        mu, sigma = float(band_mean[i]), float(band_std[i])
         vals = grp[col]
-        p5  = ((vals.quantile(0.05) - mu) / sigma).reindex(pids).fillna(0).values.astype(np.float32)
-        p95 = ((vals.quantile(0.95) - mu) / sigma).reindex(pids).fillna(0).values.astype(np.float32)
-        std = (vals.std().fillna(0)        / sigma).reindex(pids).fillna(0).values.astype(np.float32)
+        p5  = vals.quantile(0.05).reindex(pids).fillna(0).values.astype(np.float32)
+        p95 = vals.quantile(0.95).reindex(pids).fillna(0).values.astype(np.float32)
+        std = vals.std().fillna(0).reindex(pids).fillna(0).values.astype(np.float32)
         summary_cols += [p5, p95, std]
 
     summary_matrix = np.column_stack(summary_cols)  # (n_pixels, n_cols*3)
 
-    return {pid: summary_matrix[i] for i, pid in enumerate(pids)}
+    # Normalise with training global_feat_mean/std, matching TAMDataset normalisation
+    summary_matrix = (summary_matrix - global_feat_mean) / np.where(global_feat_std < 1e-6, 1.0, global_feat_std)
+
+    return {pid: summary_matrix[i].astype(np.float32) for i, pid in enumerate(pids)}
 
 
 def _gpu_score(
@@ -700,6 +702,8 @@ def score_location_years(
     pixel_zscore: bool = False,
     s1_despeckle_window: int = 0,
     feature_cols: list[str] | None = None,
+    global_feat_mean: np.ndarray | None = None,
+    global_feat_std: np.ndarray | None = None,
 ) -> pd.DataFrame:
     """Score a location across multiple annual parquets and aggregate.
 
@@ -722,13 +726,18 @@ def score_location_years(
         # of its actual phenology. The global band_mean/band_std from training
         # (which are ~0/1 since training data was pixel-z-scored) is sufficient.
         if model.n_global_features > 0:
+            if global_feat_mean is None or global_feat_std is None:
+                raise ValueError(
+                    "Model has global features but tam_global_feat_stats.npz was not found. "
+                    "Re-train to generate it, or pass global_feat_mean/std explicitly."
+                )
             logger.info("Pre-pass: computing per-pixel band summaries (%d feature cols) ...", len(feature_cols))
             band_summaries = _compute_band_summaries_from_parquets(
                 year_parquets=year_parquets,
                 feature_cols=feature_cols,
                 scl_purity_min=scl_purity_min,
-                band_mean=band_mean,
-                band_std=band_std,
+                global_feat_mean=global_feat_mean,
+                global_feat_std=global_feat_std,
                 pixel_zscore_stats=pixel_zscore_stats,
             )
             logger.info("Band summaries computed for %d pixels", len(band_summaries))

@@ -78,7 +78,7 @@ def main() -> None:
     all_labels    = labelled.set_index("point_id")["is_presence"].map({True: 1.0, False: 0.0})
 
     # --- Load checkpoint ------------------------------------------------------
-    model, band_mean, band_std = load_tam(out_dir)
+    model, band_mean, band_std, *_ = load_tam(out_dir)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device).eval()
 

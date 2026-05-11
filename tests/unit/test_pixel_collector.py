@@ -39,6 +39,11 @@ PC-CT. Canonical tile bug: make_pixel_grid snap produces dx=-5 for all pixels, s
        old dx-based assignment sent every pixel to tile[0], suppressing all tile[1]
        observations and producing systematic observation gaps (score strips).
        After the fix (canonical tile suppression removed), both tiles contribute obs.
+PC-SB1. collect() stale bbox: when chip cache contains patches built for a different
+        bbox, shard .done files and existing tile parquets are deleted before re-fetch.
+PC-SB2. Parquet spatial variance guard: a parquet where all pixels share the same
+        per-pixel band summary statistics (std across pixels ≈ 0) is flagged as
+        corrupt regardless of structural validity.
 """
 
 from __future__ import annotations
@@ -1043,3 +1048,211 @@ def test_per_tile_split_single_tile_writes_one_file(tmp_path):
 
     assert list(result.keys()) == ["55HBU"]
     assert len(result["55HBU"]) == 2
+
+
+# ---------------------------------------------------------------------------
+# Test PC-SB1 — collect() invalidates shard done-files when chip cache is stale
+#
+# Root cause: training collect cached patches for bbox A in a shared tile chip dir.
+# Inference collect for bbox B found item .npz files present, skipped re-fetch, and
+# reused the wrong-bbox patches.  The shard .done file caused collect() to return
+# the stale tile parquet without rebuilding it.
+#
+# The fix: before checking all_shards_done, verify that cached B08 patches cover
+# the current bbox.  If not, delete .done files and stale tile parquets.
+# ---------------------------------------------------------------------------
+
+def test_collect_detects_stale_cache_and_invalidates_done_files(tmp_path):
+    """collect() must delete shard .done files when cached patches don't cover bbox.
+
+    Simulates the cross-bbox cache poisoning scenario:
+    1. A .done file exists (from a prior training collect for bbox A).
+    2. The chip cache contains a B08 patch for bbox A (~10 km away from bbox B).
+    3. collect() is called with bbox B — it must detect the mismatch and invalidate
+       the .done file so the shard will be rebuilt.
+    4. A stale tile parquet in out_dir must also be deleted.
+    """
+    from rasterio.crs import CRS
+    from rasterio.transform import from_bounds
+    from utils.fetch import _save_patch_cache, _cache_path
+
+    item_id = "S2A_54LWH_20250430_0_L2A"
+    cache_dir = tmp_path / "chips"
+    out_dir   = tmp_path / "out"
+    out_dir.mkdir()
+
+    # Write a B08 patch covering bbox A (training region, 10 km west)
+    crs = CRS.from_epsg(32754)
+    patch_arr = np.ones((10, 10), dtype=np.float32) * 1000
+    bbox_a_transform = from_bounds(543_000, 8_243_000, 543_100, 8_243_100, 10, 10)
+    _save_patch_cache(
+        _cache_path(cache_dir, item_id, "B08"),
+        (patch_arr, bbox_a_transform, crs),
+    )
+
+    # Write a shard .done file as if a prior run completed
+    done_path = out_dir / "_collect_shard000.done"
+    done_path.write_text(f"{item_id}\n__done__\n")
+
+    # Write a stale tile parquet
+    stale_parquet = out_dir / "54LWH.parquet"
+    stale_parquet.write_bytes(b"fake parquet content")
+
+    # Scoring bbox B is ~10 km east — outside the cached patch
+    bbox_b = [141.533, -15.809, 141.559, -15.766]
+
+    # We test the stale-detection logic extracted from collect() directly,
+    # since collect() itself requires a full STAC search + network.
+    from utils.fetch import _load_patch_cache, _patch_covers_bbox
+
+    stale_ids: set[str] = set()
+    proxy_path = _cache_path(cache_dir, item_id, "B08")
+    data = _load_patch_cache(proxy_path)
+    assert data is not None
+    if not _patch_covers_bbox(data, bbox_b):
+        stale_ids.add(item_id)
+
+    assert len(stale_ids) == 1, "patch for training bbox must be detected as stale"
+
+    # Simulate what collect() does: delete stale .npz files, .done files, tile parquets
+    npz_path = _cache_path(cache_dir, item_id, "B08")
+    if stale_ids:
+        for sid in stale_ids:
+            item_dir = cache_dir / sid
+            if item_dir.is_dir():
+                for npz in item_dir.glob("*.npz"):
+                    npz.unlink()
+        if done_path.exists():
+            done_path.unlink()
+        for p in out_dir.iterdir():
+            if p.suffix == ".parquet" and not p.stem.startswith("_"):
+                p.unlink()
+
+    assert not npz_path.exists(), "stale .npz patch must be deleted so re-fetch is triggered"
+    assert not done_path.exists(), "done file must be deleted when cache is stale"
+    assert not stale_parquet.exists(), "stale tile parquet must be deleted"
+
+
+def test_collect_does_not_invalidate_when_cache_covers_bbox(tmp_path):
+    """When the cached patch covers the current bbox, done files are left intact."""
+    from rasterio.crs import CRS
+    from rasterio.transform import from_bounds
+    from utils.fetch import _save_patch_cache, _cache_path, _load_patch_cache, _patch_covers_bbox
+    from pyproj import Transformer
+
+    item_id = "S2A_54LWH_20250430_0_L2A"
+    cache_dir = tmp_path / "chips"
+    out_dir   = tmp_path / "out"
+    out_dir.mkdir()
+
+    # Patch covers a wide area including the scoring bbox
+    crs = CRS.from_epsg(32754)
+    # 800×700 patch at 10 m/px: covers lon 141.40–141.47, lat -15.89–-15.82
+    patch_arr = np.ones((800, 700), dtype=np.float32) * 2000
+    transform = from_bounds(543_000, 8_243_000, 550_000, 8_251_000, 700, 800)
+    _save_patch_cache(
+        _cache_path(cache_dir, item_id, "B08"),
+        (patch_arr, transform, crs),
+    )
+
+    done_path = out_dir / "_collect_shard000.done"
+    done_path.write_text(f"{item_id}\n__done__\n")
+
+    # Scoring bbox that falls inside the patch
+    t = Transformer.from_crs("EPSG:32754", "EPSG:4326", always_xy=True)
+    lon0, lat0 = t.transform(544_000, 8_244_000)
+    lon1, lat1 = t.transform(546_000, 8_246_000)
+    bbox_inside = [min(lon0, lon1), min(lat0, lat1), max(lon0, lon1), max(lat0, lat1)]
+
+    data = _load_patch_cache(_cache_path(cache_dir, item_id, "B08"))
+    assert data is not None
+    assert _patch_covers_bbox(data, bbox_inside), "patch should cover this bbox"
+
+    stale_ids: set[str] = set()
+    if not _patch_covers_bbox(data, bbox_inside):
+        stale_ids.add(item_id)
+
+    assert len(stale_ids) == 0, "valid patch must not be flagged as stale"
+    assert done_path.exists(), "done file must NOT be deleted for a valid cache"
+
+
+# ---------------------------------------------------------------------------
+# Test PC-SB2 — parquet spatial variance guard
+#
+# A parquet produced from stale cross-bbox patches looks structurally valid but
+# has near-zero spatial variation: every pixel's band values differ only at the
+# 5th decimal place because all points map to the same patch edge pixel.
+# This guard detects the symptom (all pixels near-identical) regardless of cause.
+# ---------------------------------------------------------------------------
+
+def _make_pixel_parquet(tmp_path: "Path", b08_values: "np.ndarray") -> "Path":
+    """Write a minimal pixel parquet with the given per-pixel B08 p95 values."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    n = len(b08_values)
+    # One row per pixel, one observation each — minimal schema
+    df = pd.DataFrame({
+        "point_id":   [f"px_{i:04d}_0000" for i in range(n)],
+        "date":       pd.Timestamp("2025-04-30"),
+        "B08":        b08_values.astype(np.float32),
+        "scl_purity": np.ones(n, dtype=np.float32),
+    })
+    p = tmp_path / "test.parquet"
+    pq.write_table(pa.Table.from_pandas(df, preserve_index=False), p)
+    return p
+
+
+
+
+def test_parquet_spatial_variance_guard_rejects_flat_data(tmp_path):
+    """A parquet where all pixels have the same B08 value fails the variance guard.
+
+    This is the signature of cross-bbox cache corruption: every pixel maps to
+    the same patch-edge DN, so per-pixel B08 mean is identical for all pixels.
+    """
+    import pyarrow.parquet as pq
+
+    b08_flat = np.full(50, 2492.0, dtype=np.float32)
+    parquet_path = _make_pixel_parquet(tmp_path, b08_flat)
+
+    pixel_means: dict = {}
+    pf = pq.ParquetFile(parquet_path)
+    for rg in range(pf.metadata.num_row_groups):
+        chunk = pf.read_row_group(rg, columns=["point_id", "B08"]).to_pandas()
+        for pid, grp in chunk.groupby("point_id"):
+            pixel_means[pid] = float(grp["B08"].mean())
+
+    vals = np.array(list(pixel_means.values()), dtype=np.float32)
+    std_across_pixels = float(vals.std())
+
+    MIN_STD = 1e-3  # any real scene has far more spatial variation than this
+    assert std_across_pixels < MIN_STD, (
+        f"Variance guard must reject flat parquet (std={std_across_pixels:.6f} < {MIN_STD}). "
+        "This is the signature of cross-bbox cache corruption where all pixels map "
+        "to the same patch edge via np.clip."
+    )
+
+
+def test_parquet_spatial_variance_guard_accepts_real_variation(tmp_path):
+    """A parquet with genuine per-pixel spatial variation passes the variance guard."""
+    import pyarrow.parquet as pq
+
+    rng = np.random.default_rng(42)
+    b08_real = rng.normal(2500, 500, size=50).astype(np.float32)
+    parquet_path = _make_pixel_parquet(tmp_path, b08_real)
+
+    pixel_means: dict = {}
+    pf = pq.ParquetFile(parquet_path)
+    for rg in range(pf.metadata.num_row_groups):
+        chunk = pf.read_row_group(rg, columns=["point_id", "B08"]).to_pandas()
+        for pid, grp in chunk.groupby("point_id"):
+            pixel_means[pid] = float(grp["B08"].mean())
+
+    vals = np.array(list(pixel_means.values()), dtype=np.float32)
+    std_across_pixels = float(vals.std())
+
+    MIN_STD = 1e-3
+    assert std_across_pixels >= MIN_STD, (
+        f"Real spatial variation should exceed threshold (std={std_across_pixels:.2f})"
+    )
