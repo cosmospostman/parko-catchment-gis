@@ -61,9 +61,11 @@ def _cmd_train(args: argparse.Namespace) -> None:
             continue
         pf = pq.ParquetFile(path)
         available = set(pf.schema_arrow.names)
-        # Always load source/vh/vv when present — needed for S1 global features
-        # even when use_s1=False (time series S1 disabled but globals still wanted).
-        s1_cols = [c for c in ("source", "vh", "vv", "scl") if c in available]
+        _use_s1 = exp.train_kwargs.get("use_s1", True)
+        _want_s1_data = _use_s1 is not False
+        s1_cols = [c for c in (
+            ("source", "vh", "vv", "scl") if _want_s1_data else ("source", "scl")
+        ) if c in available]
         # B08/B04 needed by compute_global_features (noise filter + S2 globals)
         # even in S1-only experiments where they are not model input features.
         s2_global_cols = [c for c in ("B08", "B04") if c in available and c not in exp.feature_cols]
@@ -253,6 +255,7 @@ def _cmd_score(args: argparse.Namespace) -> None:
     s1_only = _n_bands == 4
     pixel_zscore = _cfg_dict.get("pixel_zscore", False)
     s1_despeckle_window = _cfg_dict.get("s1_despeckle_window", 0)
+    feature_cols = _cfg_dict.get("feature_cols", None)
 
     if getattr(args, "out_parquet", False):
         # Build {tile_id: [(year, pixel-sorted-path), ...]} for score_tiles_chunked
@@ -302,6 +305,7 @@ def _cmd_score(args: argparse.Namespace) -> None:
         s1_only=s1_only,
         pixel_zscore=pixel_zscore,
         s1_despeckle_window=s1_despeckle_window,
+        feature_cols=feature_cols,
     )
 
     scored = pixel_coords.merge(scores, on="point_id", how="left")

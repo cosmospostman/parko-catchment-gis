@@ -174,6 +174,8 @@ def _preprocess(
     vv_mean: dict | None = None,
     vv_std:  dict | None = None,
     despeckle_lookup: pd.DataFrame | None = None,
+    feature_cols: list[str] | None = None,
+    pixel_zscore_stats: tuple[dict, dict] | None = None,
 ) -> _PreparedBatch | None:
     """CPU-side preprocessing using numba kernels for maximum throughput.
 
@@ -202,16 +204,26 @@ def _preprocess(
                                     despeckle_lookup=despeckle_lookup)
         n_feat = _N_FEATURES_S1
     else:
-        # Step 1: extract feature matrix — bands are already float32, zero-copy .values
-        n_feat = _N_FEATURES
-        feat = np.empty((N, n_feat), dtype=np.float32)
-        extract_features(
-            chunk["B02"].values, chunk["B03"].values, chunk["B04"].values,
-            chunk["B05"].values, chunk["B06"].values, chunk["B07"].values,
-            chunk["B08"].values, chunk["B8A"].values, chunk["B11"].values,
-            chunk["B12"].values,
-            feat,
-        )
+        _use_default_cols = feature_cols is None or feature_cols == list(ALL_FEATURE_COLS)
+        if _use_default_cols:
+            # Fast path: numba kernel for the standard 13-feature layout
+            n_feat = _N_FEATURES
+            feat = np.empty((N, n_feat), dtype=np.float32)
+            extract_features(
+                chunk["B02"].values, chunk["B03"].values, chunk["B04"].values,
+                chunk["B05"].values, chunk["B06"].values, chunk["B07"].values,
+                chunk["B08"].values, chunk["B8A"].values, chunk["B11"].values,
+                chunk["B12"].values,
+                feat,
+            )
+        else:
+            # Pandas path for non-default feature sets (e.g. V9: no B06, no EVI)
+            from analysis.constants import add_spectral_indices
+            _cols_needed = set(feature_cols) - set(chunk.columns)
+            if _cols_needed:
+                chunk = add_spectral_indices(chunk)
+            n_feat = len(feature_cols)
+            feat = chunk[feature_cols].values.astype(np.float32)
 
     # Step 2: find group boundaries (pixel-year windows)
     pid_arr  = chunk["point_id"].values
@@ -241,8 +253,30 @@ def _preprocess(
     doy_np   = np.zeros((W, MAX_SEQ_LEN), dtype=np.int64)
     mask_np  = np.ones( (W, MAX_SEQ_LEN), dtype=np.bool_)
 
-    fill_windows(feat, doy_arr, valid_starts, capped, band_mean, band_std,
-                 bands_np, doy_np, mask_np)
+    if pixel_zscore_stats is not None and not s1_only:
+        # Per-pixel z-score: normalise each pixel's observations by its own
+        # temporal mean/std, then apply global band_mean/band_std (which are
+        # ~0/1 after pixel z-score so effectively a no-op).
+        pid_mean_lookup, pid_std_lookup = pixel_zscore_stats
+        _zero = np.zeros(n_feat, dtype=np.float32)
+        _one  = np.ones(n_feat,  dtype=np.float32)
+        pids_at_starts = pid_arr[valid_starts]
+        for k in range(W):
+            s = valid_starts[k]
+            c = capped[k]
+            pm = pid_mean_lookup.get(pids_at_starts[k], _zero)
+            ps = pid_std_lookup.get(pids_at_starts[k],  _one)
+            window = (feat[s:s+c] - pm) / ps  # pixel z-score
+            # then global normalisation (band_mean/band_std ~ 0/1 after zscore)
+            normed = (window - band_mean) / band_std
+            normed = np.where(np.isnan(normed), 0.0, normed).astype(np.float32)
+            n = min(c, MAX_SEQ_LEN)
+            bands_np[k, :n] = normed[:n]
+            doy_np[k,  :n]  = doy_arr[s:s+n]
+            mask_np[k, :n]  = False
+    else:
+        fill_windows(feat, doy_arr, valid_starts, capped, band_mean, band_std,
+                     bands_np, doy_np, mask_np)
 
     pids  = pid_arr[valid_starts]
     years = year_arr[valid_starts]
@@ -262,6 +296,136 @@ def _preprocess(
     return _PreparedBatch(bands_th, doy_th, mask_th, n_obs_th, pids, years)
 
 
+def _compute_s2_pixel_zscore_stats(
+    year_parquets: list[tuple[int, Path]],
+    feature_cols: list[str],
+    scl_purity_min: float,
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    """Pre-pass: compute per-pixel mean and std for each feature col across all years.
+
+    Returns (pid_mean, pid_std) dicts mapping point_id → float32 array of length n_feat.
+    Used to apply pixel z-scoring at inference time, matching the training normalisation.
+    """
+    import pyarrow.parquet as pq
+    from analysis.constants import add_spectral_indices
+
+    raw_band_cols = [c for c in feature_cols if c not in ("NDVI", "NDWI", "EVI")]
+    read_cols = ["point_id", "scl_purity"] + raw_band_cols
+
+    chunks: list[pd.DataFrame] = []
+    for _, path in sorted(year_parquets):
+        pf = pq.ParquetFile(path)
+        available = set(pf.schema_arrow.names)
+        cols = [c for c in read_cols if c in available]
+        for rg in range(pf.metadata.num_row_groups):
+            chunk = pf.read_row_group(rg, columns=cols).to_pandas()
+            if "scl_purity" in chunk.columns:
+                chunk = chunk[chunk["scl_purity"] >= scl_purity_min]
+            chunks.append(chunk)
+
+    if not chunks:
+        return {}, {}
+
+    df = pd.concat(chunks, ignore_index=True)
+    index_cols = [c for c in feature_cols if c in ("NDVI", "NDWI", "EVI")]
+    if index_cols:
+        df = add_spectral_indices(df)
+
+    grp = df.groupby("point_id")
+    pids = grp[feature_cols[0]].mean().index.values
+
+    means: list[np.ndarray] = []
+    stds:  list[np.ndarray] = []
+    for col in feature_cols:
+        if col not in df.columns:
+            means.append(np.zeros(len(pids), dtype=np.float32))
+            stds.append(np.ones(len(pids),  dtype=np.float32))
+            continue
+        vals = grp[col]
+        means.append(vals.mean().reindex(pids).fillna(0).values.astype(np.float32))
+        stds.append( vals.std().reindex(pids).fillna(1).clip(lower=1e-6).values.astype(np.float32))
+
+    mean_matrix = np.column_stack(means)  # (n_pixels, n_feat)
+    std_matrix  = np.column_stack(stds)
+
+    pid_mean = {pid: mean_matrix[i] for i, pid in enumerate(pids)}
+    pid_std  = {pid: std_matrix[i]  for i, pid in enumerate(pids)}
+    return pid_mean, pid_std
+
+
+def _compute_band_summaries_from_parquets(
+    year_parquets: list[tuple[int, Path]],
+    feature_cols: list[str],
+    scl_purity_min: float,
+    band_mean: np.ndarray,
+    band_std: np.ndarray,
+    pixel_zscore_stats: tuple[dict, dict] | None = None,
+) -> dict[str, np.ndarray]:
+    """Pre-pass: compute per-pixel normalised [p5, p95, std] for each feature col.
+
+    Reads all year parquets, concatenates S2 rows, computes summary stats per pixel,
+    normalises using band_mean/band_std, and returns a dict {point_id: float32 array}.
+    The summary vector order matches _compute_band_summaries in train.py:
+    [col0_p5, col0_p95, col0_std, col1_p5, ...] (3 stats × n_feature_cols).
+    """
+    import pyarrow.parquet as pq
+    from analysis.constants import add_spectral_indices
+
+    raw_band_cols = [c for c in feature_cols if c not in ("NDVI", "NDWI", "EVI")]
+    read_cols = ["point_id", "scl_purity"] + raw_band_cols
+
+    chunks: list[pd.DataFrame] = []
+    for _, path in sorted(year_parquets):
+        pf = pq.ParquetFile(path)
+        available = set(pf.schema_arrow.names)
+        cols = [c for c in read_cols if c in available]
+        for rg in range(pf.metadata.num_row_groups):
+            chunk = pf.read_row_group(rg, columns=cols).to_pandas()
+            if "scl_purity" in chunk.columns:
+                chunk = chunk[chunk["scl_purity"] >= scl_purity_min]
+            chunks.append(chunk)
+
+    if not chunks:
+        return {}
+
+    df = pd.concat(chunks, ignore_index=True)
+
+    # Compute spectral indices if needed
+    index_cols = [c for c in feature_cols if c in ("NDVI", "NDWI", "EVI")]
+    if index_cols:
+        df = add_spectral_indices(df)
+
+    # Apply pixel z-score first if stats provided, matching training normalisation.
+    if pixel_zscore_stats is not None:
+        pid_mean_lk, pid_std_lk = pixel_zscore_stats
+        for i, col in enumerate(feature_cols):
+            if col not in df.columns:
+                continue
+            pm = df["point_id"].map({pid: v[i] for pid, v in pid_mean_lk.items()})
+            ps = df["point_id"].map({pid: v[i] for pid, v in pid_std_lk.items()})
+            df[col] = (df[col] - pm) / ps.clip(lower=1e-6)
+
+    # Compute p5/p95/std per pixel for each feature col, normalised by global band stats
+    grp = df.groupby("point_id")
+    pids = grp[feature_cols[0]].mean().index.values  # stable key order
+    summary_cols: list[np.ndarray] = []
+    for i, col in enumerate(feature_cols):
+        if col not in df.columns:
+            z = np.zeros(len(pids), dtype=np.float32)
+            summary_cols += [z, z, z]
+            continue
+        mu, sigma = float(band_mean[i]), float(band_std[i])
+        vals = grp[col]
+        p5  = ((vals.quantile(0.05) - mu) / sigma).reindex(pids).fillna(0).values.astype(np.float32)
+        p95 = ((vals.quantile(0.95) - mu) / sigma).reindex(pids).fillna(0).values.astype(np.float32)
+        std = (vals.std().fillna(0)        / sigma).reindex(pids).fillna(0).values.astype(np.float32)
+        summary_cols += [p5, p95, std]
+
+    summary_matrix = np.column_stack(summary_cols)  # (n_pixels, n_cols*3)
+
+    return {pid: summary_matrix[i] for i, pid in enumerate(pids)}
+
+
 def _gpu_score(
     prepared: _PreparedBatch,
     model: TAMClassifier,
@@ -270,19 +434,31 @@ def _gpu_score(
     all_probs: list,
     batch_size: int,
     device: str,
+    band_summaries: dict | None = None,
 ) -> None:
     """GPU-side: transfer tensors, run inference, append (pid, year, prob) to lists."""
     bands_th, doy_th, mask_th, n_obs_th, pids, years = prepared
     W = len(pids)
+
+    global_feats_th: torch.Tensor | None = None
+    if band_summaries and model.n_global_features > 0:
+        n_g = model.n_global_features
+        gf_np = np.stack([
+            band_summaries.get(pid, np.zeros(n_g, dtype=np.float32))
+            for pid in pids
+        ])
+        global_feats_th = torch.from_numpy(gf_np)
+
     with torch.inference_mode():
         for start in range(0, W, batch_size):
             end = min(start + batch_size, W)
+            gf_batch = global_feats_th[start:end].to(device, non_blocking=True) if global_feats_th is not None else None
             prob, _ = model(
                 bands_th[start:end].to(device, non_blocking=True),
                 doy_th[start:end].to(device, non_blocking=True),
                 mask_th[start:end].to(device, non_blocking=True),
                 n_obs_th[start:end].to(device, non_blocking=True),
-                global_feats=None,  # global features not yet supported in chunked scoring
+                global_feats=gf_batch,
             )
             prob_np = prob.cpu().numpy()
             all_pids.append(pids[start:end])
@@ -336,6 +512,9 @@ def score_pixels_chunked(
     s1_only: bool = False,
     pixel_zscore: bool = False,
     s1_despeckle_window: int = 0,
+    feature_cols: list[str] | None = None,
+    band_summaries: dict | None = None,
+    pixel_zscore_stats: tuple[dict, dict] | None = None,
     # accumulators — pass across years to merge results before final aggregation
     _all_pids:  list | None = None,
     _all_years: list | None = None,
@@ -383,6 +562,7 @@ def score_pixels_chunked(
     n_rg = pf.metadata.num_row_groups
     tile_prefix = f"_{tile_id}_" if tile_id else None
 
+    _s2_band_cols = [c for c in (feature_cols or BAND_COLS) if c not in ("NDVI", "NDWI", "EVI")]
     if s1_only:
         read_cols = (
             ["point_id", "date", "source"]
@@ -393,7 +573,7 @@ def score_pixels_chunked(
         read_cols = (
             ["point_id", "date", "scl_purity"]
             + (["item_id"] if tile_id else [])
-            + BAND_COLS
+            + _s2_band_cols
         )
     # Only read columns that exist in this parquet
     available = set(pf.schema_arrow.names)
@@ -459,7 +639,9 @@ def score_pixels_chunked(
             prepared = _preprocess(item, band_mean, band_std, scl_purity_min, min_obs_per_year, pin=pin, s1_only=s1_only,
                                    pixel_zscore=pixel_zscore, vh_mean=_vh_mean, vh_std=_vh_std,
                                    vv_mean=_vv_mean, vv_std=_vv_std,
-                                   despeckle_lookup=_despeckle_lookup)
+                                   despeckle_lookup=_despeckle_lookup,
+                                   feature_cols=feature_cols,
+                                   pixel_zscore_stats=pixel_zscore_stats)
             if prepared is not None:
                 prep_q.put(prepared)
         prep_q.put(_SENTINEL)
@@ -481,7 +663,8 @@ def score_pixels_chunked(
         if item is _SENTINEL:
             sentinels_seen += 1
             continue
-        _gpu_score(item, model, all_pids, all_years, all_probs, batch_size, device)
+        _gpu_score(item, model, all_pids, all_years, all_probs, batch_size, device,
+                   band_summaries=band_summaries)
         n_scored += len(np.unique(item.pids))
         if n_total_pixels:
             logger.info("Scored %.1f%% (%d / %d pixels)", 100 * n_scored / n_total_pixels, n_scored, n_total_pixels)
@@ -516,6 +699,7 @@ def score_location_years(
     s1_only: bool = False,
     pixel_zscore: bool = False,
     s1_despeckle_window: int = 0,
+    feature_cols: list[str] | None = None,
 ) -> pd.DataFrame:
     """Score a location across multiple annual parquets and aggregate.
 
@@ -527,6 +711,27 @@ def score_location_years(
     all_pids:  list[np.ndarray] = []
     all_years: list[np.ndarray] = []
     all_probs: list[np.ndarray] = []
+
+    # Pre-pass: compute per-pixel stats needed for pixel z-scoring and band summaries.
+    pixel_zscore_stats: tuple[dict, dict] | None = None
+    band_summaries: dict | None = None
+    if feature_cols is not None and not s1_only:
+        # S2 pixel z-score is not applied at inference: with a single season of data
+        # per-pixel z-scoring collapses all between-pixel variation to zero, because
+        # every pixel's z-scored sequence has the same mean (0) and std (1) regardless
+        # of its actual phenology. The global band_mean/band_std from training
+        # (which are ~0/1 since training data was pixel-z-scored) is sufficient.
+        if model.n_global_features > 0:
+            logger.info("Pre-pass: computing per-pixel band summaries (%d feature cols) ...", len(feature_cols))
+            band_summaries = _compute_band_summaries_from_parquets(
+                year_parquets=year_parquets,
+                feature_cols=feature_cols,
+                scl_purity_min=scl_purity_min,
+                band_mean=band_mean,
+                band_std=band_std,
+                pixel_zscore_stats=pixel_zscore_stats,
+            )
+            logger.info("Band summaries computed for %d pixels", len(band_summaries))
 
     _eff_end_year = end_year or max(y for y, _ in year_parquets)
 
@@ -552,6 +757,9 @@ def score_location_years(
             s1_only=s1_only,
             pixel_zscore=pixel_zscore,
             s1_despeckle_window=s1_despeckle_window,
+            feature_cols=feature_cols,
+            band_summaries=band_summaries,
+            pixel_zscore_stats=pixel_zscore_stats,
             _all_pids=all_pids,
             _all_years=all_years,
             _all_probs=all_probs,

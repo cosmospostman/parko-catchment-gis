@@ -274,6 +274,9 @@ class TAMDataset(Dataset):
                 df = pixel_df.copy()
             feature_cols = feature_cols_override if feature_cols_override is not None else ALL_FEATURE_COLS
 
+            if any(c not in df.columns for c in feature_cols if c in ("NDVI", "NDWI", "EVI")):
+                df = add_spectral_indices(df)
+
             if pixel_zscore:
                 # Per-pixel z-score for S2 bands: removes between-tile and between-site
                 # absolute reflectance offsets; preserves phenological curve shape.
@@ -284,16 +287,17 @@ class TAMDataset(Dataset):
                         df[col]  = (df[col] - pix_mean) / pix_std
 
         if use_s1 != "s1_only":
-            if any(c not in df.columns for c in INDEX_COLS):
+            if any(c not in df.columns for c in feature_cols if c in ("NDVI", "NDWI", "EVI")):
                 df = add_spectral_indices(df)
 
             # SCL filter
             if "scl_purity" in df.columns:
                 df = df[df["scl_purity"] >= scl_purity_min]
 
-            # Drop rows with NaN in any S2 band
-            if df[BAND_COLS].isna().any().any():
-                df = df.dropna(subset=BAND_COLS)
+            # Drop rows with NaN in any feature band
+            _band_check = [c for c in feature_cols if c in df.columns]
+            if df[_band_check].isna().any().any():
+                df = df.dropna(subset=_band_check)
 
         # Restrict to labeled pixels when labels provided
         if labels is not None:
@@ -401,9 +405,9 @@ class TAMDataset(Dataset):
             n        = keep
 
         if self._band_noise_std > 0.0:
-            # Add noise only to S2 columns — S1 columns are NaN-imputed to 0
-            # for unsnapped observations and must not be perturbed away from 0.
-            n_s2 = len(ALL_FEATURE_COLS)
+            # Noise applied to S2 columns only — S1 columns (appended after S2)
+            # are NaN-imputed to 0 for unsnapped obs and must not be perturbed.
+            n_s2 = min(len(ALL_FEATURE_COLS), self._n_features)
             offset = np.zeros(self._n_features, dtype=np.float32)
             offset[:n_s2] = np.random.randn(n_s2).astype(np.float32) * self._band_noise_std
             bands_np = bands_np + offset

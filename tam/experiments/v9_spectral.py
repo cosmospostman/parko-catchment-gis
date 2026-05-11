@@ -52,7 +52,7 @@ EXPERIMENT = Experiment(
         "n_layers": 2,
         "dropout":  0.5,
         "n_bands":  len(V9_FEATURE_COLS),  # 11
-        "n_global_features": 0,            # overridden at runtime when use_band_summaries=True
+        "n_global_features": 0,            # overridden at runtime by use_band_summaries
     },
     train_kwargs={
         "lr":                    5e-5,
@@ -65,6 +65,7 @@ EXPERIMENT = Experiment(
         "doy_phase_shift":       True,
         "pixel_zscore":          True,
         "use_s1":                False,
+        "use_band_summaries":    True,
         "val_sites":             ("etna",),
         "feature_cols_override": tuple(V9_FEATURE_COLS),
     },

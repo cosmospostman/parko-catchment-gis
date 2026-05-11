@@ -434,6 +434,7 @@ def train_tam(
     model = TAMClassifier.from_config(cfg)
     model._use_s1 = cfg.use_s1          # persisted to tam_config.json for score pipeline
     model._pixel_zscore = cfg.pixel_zscore
+    model._feature_cols = _feature_cols_override  # None = default ALL_FEATURE_COLS
     model.to(device)
     logger.info(
         "Model: d_model=%d n_heads=%d n_layers=%d d_ff=%d  params=%d",

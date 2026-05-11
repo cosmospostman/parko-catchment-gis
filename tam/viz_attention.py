@@ -181,7 +181,9 @@ def main() -> None:
     model.to(device).eval()
 
     with open(ckpt_dir / "tam_config.json") as fh:
-        cfg = TAMConfig.from_dict(json.load(fh))
+        cfg_dict = json.load(fh)
+    cfg = TAMConfig.from_dict(cfg_dict)
+    saved_feature_cols = cfg_dict.get("feature_cols") or (list(cfg.feature_cols_override) if cfg.feature_cols_override else None)
 
     global_feat_df: pd.DataFrame | None = None
     cache_path = ckpt_dir / "global_features_cache.parquet"
@@ -198,6 +200,7 @@ def main() -> None:
         doy_jitter=0,
         global_features_df=global_feat_df,
         use_s1={4: "s1_only", 17: True}.get(cfg.n_bands, False),
+        feature_cols_override=saved_feature_cols,
     )
 
     pid_to_indices: dict[str, list[int]] = {}

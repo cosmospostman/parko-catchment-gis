@@ -227,6 +227,7 @@ class TAMClassifier(nn.Module):
             # Data/inference config — needed by score pipeline
             "use_s1":             getattr(self, "_use_s1", None),
             "pixel_zscore":       getattr(self, "_pixel_zscore", None),
+            "feature_cols":       getattr(self, "_feature_cols", None),
         }
 
     @classmethod
