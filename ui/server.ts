@@ -84,8 +84,8 @@ function bboxToPolygon(bbox: [number, number, number, number]): GeoJSON.Polygon 
   };
 }
 
-function loadTrainingRegions(features: GeoJSON.Feature[]): void {
-  const path = join(LOCATIONS_DIR, "training.yaml");
+function loadRegionsYaml(features: GeoJSON.Feature[], filename: string, parentId: string): void {
+  const path = join(LOCATIONS_DIR, filename);
   try {
     const raw = Deno.readTextFileSync(path);
     const data = parseYaml(raw) as TrainingYaml;
@@ -96,11 +96,11 @@ function loadTrainingRegions(features: GeoJSON.Feature[]): void {
         geometry: bboxToPolygon(region.bbox),
         properties: {
           id: region.id,
-          name: region.name,
-          label: region.name,
+          name: region.name ?? region.id,
+          label: region.name ?? region.id,
           role: "sub_bbox",
           sub_role: region.label,   // "presence" | "absence"
-          parent_id: "training",
+          parent_id: parentId,
           year: region.year ?? null,
           notes: region.notes ?? null,
           bbox: region.bbox,
@@ -108,18 +108,20 @@ function loadTrainingRegions(features: GeoJSON.Feature[]): void {
       });
     }
   } catch (_) {
-    // training.yaml absent or unreadable — skip silently
+    // file absent or unreadable — skip silently
   }
 }
 
 function loadLocations(): GeoJSON.FeatureCollection {
   const features: GeoJSON.Feature[] = [];
 
-  loadTrainingRegions(features);
+  loadRegionsYaml(features, "training.yaml", "training");
+  loadRegionsYaml(features, "woody-classifier.yaml", "woody-classifier");
 
   for (const entry of Deno.readDirSync(LOCATIONS_DIR)) {
     if (!entry.name.endsWith(".yaml")) continue;
-    if (entry.name === "training.yaml") continue;  // handled above
+    if (entry.name === "training.yaml") continue;
+    if (entry.name === "woody-classifier.yaml") continue;
     const slug = entry.name.replace(/\.yaml$/, "");
     const raw = Deno.readTextFileSync(join(LOCATIONS_DIR, entry.name));
     const loc = parseYaml(raw) as LocationYaml;

@@ -116,6 +116,7 @@ const SCORE_BBOX_COLOR = '#a855f7';
 let geojsonData = null;
 
 const TRAINING_LAYERS = ['training-fill', 'training-line'];
+const WOODY_LAYERS    = ['woody-fill', 'woody-line'];
 
 function loadLocations() {
   Promise.all([
@@ -124,14 +125,19 @@ function loadLocations() {
   ]).then(([geojson, rankings]) => {
       geojsonData = geojson;
 
-      // Split training regions into their own source so they can be toggled.
+      // Split training and woody-classifier regions into their own sources so they can be toggled.
       const trainingFeatures = geojson.features.filter(f => f.properties.parent_id === 'training');
-      const locationFeatures = geojson.features.filter(f => f.properties.parent_id !== 'training');
+      const woodyFeatures    = geojson.features.filter(f => f.properties.parent_id === 'woody-classifier');
+      const locationFeatures = geojson.features.filter(f =>
+        f.properties.parent_id !== 'training' && f.properties.parent_id !== 'woody-classifier'
+      );
       const locationGeojson = { type: 'FeatureCollection', features: locationFeatures };
       const trainingGeojson = { type: 'FeatureCollection', features: trainingFeatures };
+      const woodyGeojson    = { type: 'FeatureCollection', features: woodyFeatures };
 
       map.addSource('locations', { type: 'geojson', data: locationGeojson });
       map.addSource('training-regions', { type: 'geojson', data: trainingGeojson });
+      map.addSource('woody-regions', { type: 'geojson', data: woodyGeojson });
 
       map.addLayer({
         id: 'loc-fill-location',
@@ -200,6 +206,24 @@ function loadLocations() {
         source: 'training-regions',
         layout: { visibility: trainingVisibility },
         paint: { 'line-color': COLOR_EXPR, 'line-width': 2 },
+      });
+
+      // Woody-classifier region layers (toggleable)
+      const woodyVisibility = document.getElementById('woody-toggle').checked ? 'visible' : 'none';
+      map.addLayer({
+        id: 'woody-fill',
+        type: 'fill',
+        source: 'woody-regions',
+        layout: { visibility: woodyVisibility },
+        paint: { 'fill-color': COLOR_EXPR, 'fill-opacity': 0.30 },
+      });
+
+      map.addLayer({
+        id: 'woody-line',
+        type: 'line',
+        source: 'woody-regions',
+        layout: { visibility: woodyVisibility },
+        paint: { 'line-color': COLOR_EXPR, 'line-width': 2, 'line-dasharray': [4, 3] },
       });
 
       buildSidebar(geojson, rankings);
@@ -463,6 +487,35 @@ function buildSidebar(geojson, rankings) {
     body.classList.toggle('open');
   });
 
+  // Woody-classifier accordion
+  const woodyFeatures = geojson.features.filter(f => f.properties.parent_id === 'woody-classifier');
+  document.querySelector('#woody-accordion-header .accordion-label').textContent =
+    `Woody classifier (${woodyFeatures.length})`;
+  const woodyBody = document.getElementById('woody-accordion-body');
+  for (const feat of woodyFeatures) {
+    const { name, sub_role } = feat.properties;
+    let bbox = feat.properties.bbox;
+    if (typeof bbox === 'string') bbox = JSON.parse(bbox);
+
+    const item = document.createElement('div');
+    item.className = 'training-region-item';
+    item.innerHTML = `
+      <span class="training-role-dot ${sub_role}"></span>
+      <span>${name}</span>
+    `;
+    item.addEventListener('click', () => {
+      map.fitBounds([[bbox[0], bbox[1]], [bbox[2], bbox[3]]], { padding: 80, maxZoom: 16 });
+    });
+    woodyBody.appendChild(item);
+  }
+
+  const woodyHeader = document.getElementById('woody-accordion-header');
+  woodyHeader.addEventListener('click', (e) => {
+    if (e.target.id === 'woody-toggle') return;
+    woodyHeader.classList.toggle('open');
+    woodyBody.classList.toggle('open');
+  });
+
   // Location list
   const list = document.getElementById('location-list');
   const locations = geojson.features.filter(f => f.properties.role === 'location');
@@ -560,7 +613,7 @@ function buildPopupHtml(props) {
 }
 
 function attachPopups() {
-  const clickableLayers = ['loc-fill-location', 'loc-fill-sub', 'loc-fill-score', 'training-fill'];
+  const clickableLayers = ['loc-fill-location', 'loc-fill-sub', 'loc-fill-score', 'training-fill', 'woody-fill'];
   for (const layer of clickableLayers) {
     map.on('click', layer, (e) => {
       if (currentMode !== 'locations') return;
@@ -601,6 +654,13 @@ bboxAccordionHeader.addEventListener('click', () => {
 document.getElementById('training-toggle').addEventListener('change', (e) => {
   const vis = e.target.checked ? 'visible' : 'none';
   for (const id of TRAINING_LAYERS) {
+    if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', vis);
+  }
+});
+
+document.getElementById('woody-toggle').addEventListener('change', (e) => {
+  const vis = e.target.checked ? 'visible' : 'none';
+  for (const id of WOODY_LAYERS) {
     if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', vis);
   }
 });
@@ -649,7 +709,7 @@ function clearBboxDraw() {
   document.getElementById('bbox-coords').style.display = 'none';
 }
 
-function commitBbox(a, b) {
+function updateBboxSummary(a, b) {
   const lon_min = Math.min(a.lng, b.lng);
   const lon_max = Math.max(a.lng, b.lng);
   const lat_min = Math.min(a.lat, b.lat);
@@ -658,7 +718,6 @@ function commitBbox(a, b) {
   const coords = [lon_min, lat_min, lon_max, lat_max];
   const yaml = `bbox: [${coords.map(v => v.toFixed(6)).join(', ')}]`;
 
-  // Estimate S2 10m pixel count via haversine area
   const R = 6371000;
   const dLat = (lat_max - lat_min) * Math.PI / 180;
   const dLon = (lon_max - lon_min) * Math.PI / 180;
@@ -666,17 +725,18 @@ function commitBbox(a, b) {
   const heightM = R * dLat;
   const widthM = R * Math.cos(midLat) * dLon;
   const pixelCount = Math.round(heightM * widthM / 100);
-  const pixelLabel = pixelCount >= 1e6
-    ? (pixelCount / 1e6).toFixed(1) + 'M'
-    : pixelCount >= 1e3
-      ? (pixelCount / 1e3).toFixed(0) + 'k'
-      : pixelCount.toString();
 
   document.getElementById('bbox-yaml').textContent = yaml;
-  document.getElementById('bbox-pixel-estimate').textContent = `~${pixelLabel} S2 pixels (10 m)`;
+  document.getElementById('bbox-pixel-estimate').textContent =
+    `${pixelCount.toLocaleString()} S2 pixels (10 m)`;
 
-  const box = document.getElementById('bbox-coords');
-  box.style.display = 'flex';
+  document.getElementById('bbox-coords').style.display = 'flex';
+
+  return yaml;
+}
+
+function commitBbox(a, b) {
+  const yaml = updateBboxSummary(a, b);
 
   const btn = document.getElementById('btn-copy');
   btn.onclick = () => {
@@ -716,6 +776,7 @@ map.on('mousedown', (e) => {
 map.on('mousemove', (e) => {
   if (!isDrawing || currentMode !== 'bbox') return;
   updateDrawnBbox(drawStart, e.lngLat);
+  updateBboxSummary(drawStart, e.lngLat);
 });
 
 map.on('mouseup', (e) => {

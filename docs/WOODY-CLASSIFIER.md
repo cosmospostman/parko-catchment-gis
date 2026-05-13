@@ -20,14 +20,15 @@ Used as a pre-filter before TAM inference: pixels classified as non-woody are su
 woody-classifier/
 ├── __init__.py
 ├── features.py      # compute_woody_features() — band summaries + S1 stats
-├── regions.py       # WOODY_REGIONS — region IDs used for training
 ├── train.py         # load data → fit XGBoost → save model
 ├── score.py         # load model → score pixel parquets → write prob parquet
 └── evaluate.py      # AUC, precision/recall curve, feature importances
 ```
 
+Region IDs are read directly from `data/locations/woody-classifier.yaml` (no separate `regions.py`).
+
 Outputs: `outputs/woody-classifier/`
-New training bboxes: `data/locations/training.yaml` under `# woody-classifier` block
+Training bboxes: `data/locations/woody-classifier.yaml` (same schema as `training.yaml`; displayed in UI as a separate sub-accordion)
 
 ---
 
@@ -111,7 +112,7 @@ Target ~20–28 presence bboxes and ~28–36 absence bboxes across all zones. Bb
 
 ### Validation set
 
-**Target: ~1,600 val pixels** (40% woody / 60% non-woody), drawn from one complete holdout site per climate zone. Never a random pixel split or spatial fraction of training regions — adjacent pixels share soil colour, atmospheric correction, and phenology, so within-site splits overestimate generalisation (V5: spatial split gave AUC 0.88; site holdout gave 0.58 on same model).
+**Target: ≥800 presence + ≥800 absence val pixels**, balanced for directly comparable per-class metrics. Add more patches wherever cover-type diversity demands it — diversity of woody types within val is more important than hitting a pixel ceiling. Drawn from one complete holdout site per climate zone — never a random pixel split or spatial fraction of training regions (V5: spatial split gave AUC 0.88; site holdout gave 0.58 on same model).
 
 | Zone | Holdout site | Why hard |
 |---|---|---|
@@ -120,7 +121,9 @@ Target ~20–28 presence bboxes and ~28–36 absence bboxes across all zones. Bb
 | Arid | Longreach bare-soil + sparse woody patch | The known V9 failure case |
 | Sub-tropical | Barcoorah or new brigalow site | Tests new vegetation type |
 
-Each holdout site contributes both presence and absence pixels. Aim for 250–500 px per site (2–3 patches of ~300 × 300 m each). Patches must include ambiguous cases (sparse woody, dry grass with shrubs) — not just the clearest examples.
+Each holdout site contributes both presence and absence pixels. Use as many patches as needed to cover the full woody-type diversity at that site (dense riparian, sparse scattered trees, mangrove fringe, etc.) — don't stop at the first clear patch.
+
+Geographic diversity across holdout sites matters as much as cover-type diversity within them. The four zones above span different soil colours, atmospheric paths, and rainfall seasonality — if the model has a regional bias it will only show up if val sites are geographically spread. Prefer holdout sites that are far from any training site in the same zone.
 
 ### XGBoost config
 

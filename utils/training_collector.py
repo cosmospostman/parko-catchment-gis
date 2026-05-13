@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import pandas as pd
@@ -185,23 +187,173 @@ def _tile_date_window(tile_regions: list[TrainingRegion]) -> tuple[str, str]:
 # Core
 # ---------------------------------------------------------------------------
 
+_index_lock = threading.Lock()
+
+
+def _collect_one_region(
+    region: TrainingRegion,
+    tile_id: str,
+    tile_items: list,
+    start: str,
+    end: str,
+    cloud_max: int,
+    apply_nbar: bool,
+    max_concurrent: int,
+) -> bool:
+    """Fetch S2 and S1 concurrently for one region, write region parquet.
+
+    S2 and S1 COG fetches are launched in parallel threads since they hit
+    independent endpoints (AWS us-west-2 for S2, Azure West Europe for S1)
+    and share no mutable state.  S1 only needs the pixel grid, which is
+    derived from the bbox without waiting for S2 data.
+
+    Returns True if the region parquet was written, False if skipped.
+    """
+    from utils.pixel_collector import make_pixel_grid
+
+    out_path    = _region_parquet_path(region.id)
+    collect_dir = _TILES_DIR / "regions" / f"{region.id}.collect"
+    cache_dir   = tile_chips_path(tile_id)
+    bbox        = list(region.bbox)
+
+    logger.info("Region %s: S2+S1 fetch start  bbox=%s  %s→%s", region.id, bbox, start, end)
+
+    # Derive the pixel grid immediately — needed by both S2 (point_id_prefix)
+    # and S1 (points list), and costs nothing to compute.
+    points = make_pixel_grid(bbox_wgs84=bbox, point_id_prefix=region.id)
+
+    s2_tile_paths: list[Path] = []
+    s2_exc: BaseException | None = None
+    s1_exc: BaseException | None = None
+
+    def _fetch_s2() -> None:
+        nonlocal s2_tile_paths, s2_exc
+        try:
+            tile_paths = collect(
+                bbox_wgs84=bbox,
+                start=start,
+                end=end,
+                out_dir=collect_dir,
+                cloud_max=cloud_max,
+                cache_dir=cache_dir,
+                apply_nbar=apply_nbar,
+                max_concurrent=max_concurrent,
+                items=tile_items,
+                point_id_prefix=region.id,
+            )
+            if not tile_paths:
+                tile_paths = sorted(collect_dir.glob("*.parquet"))
+                if tile_paths:
+                    logger.info(
+                        "Region %s: collect() returned no paths but found %d existing "
+                        "parquet(s) in collect dir — using those",
+                        region.id, len(tile_paths),
+                    )
+            s2_tile_paths = tile_paths
+        except Exception as exc:
+            s2_exc = exc
+
+    def _fetch_s1() -> None:
+        nonlocal s1_exc
+        try:
+            # S1 fetch runs inside append_s1_to_tile_parquet after S2 writes
+            # out_path, so we only pre-warm the S1 STAC cache here.  The actual
+            # band reads happen after S2 completes (they need the parquet schema).
+            # Warming the cache now means the STAC search round-trip to Planetary
+            # Computer overlaps with the S2 COG fetch rather than following it.
+            from utils.s1_collector import _resolve_s1_items
+            _resolve_s1_items(bbox, start, end, _S1_CHIP_CACHE_DIR)
+        except Exception as exc:
+            s1_exc = exc
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        s2_future = pool.submit(_fetch_s2)
+        s1_future = pool.submit(_fetch_s1)
+        s2_future.result()  # propagates exception if _fetch_s2 raised
+        s1_future.result()  # propagates exception if _fetch_s1 raised
+
+    if s2_exc:
+        raise s2_exc
+    if s1_exc:
+        logger.warning("Region %s: S1 STAC pre-warm failed: %s", region.id, s1_exc)
+
+    if not s2_tile_paths:
+        logger.warning("Region %s: no S2 data — skipping", region.id)
+        return False
+
+    # Merge S2 shards into region parquet, then append S1 (STAC already cached).
+    writer = pq.ParquetWriter(out_path, pq.ParquetFile(s2_tile_paths[0]).schema_arrow)
+    for tp in s2_tile_paths:
+        pf = pq.ParquetFile(tp)
+        for rg_idx in range(pf.metadata.num_row_groups):
+            writer.write_table(pf.read_row_group(rg_idx))
+    writer.close()
+
+    append_s1_to_tile_parquet(
+        tile_path=out_path,
+        bbox_wgs84=bbox,
+        start=start,
+        end=end,
+        collect_s1_fn=collect_s1,
+        s1_cache_dir=_S1_CHIP_CACHE_DIR,
+    )
+
+    logger.info("Region %s: done", region.id)
+    return True
+
+
+def _rebuild_tile_parquet(tile_id: str) -> None:
+    """Concatenate all collected region parquets for tile_id into the tile parquet."""
+    with _index_lock:
+        all_indexed = _load_index()
+        all_indexed_ids = set(
+            all_indexed.loc[all_indexed["tile_id"] == tile_id, "region_id"]
+        )
+
+    region_paths = [
+        _region_parquet_path(rid)
+        for rid in sorted(all_indexed_ids)
+        if _region_parquet_path(rid).exists()
+    ]
+    tile_path = tile_parquet_path(tile_id)
+    logger.info(
+        "Building tile %s from %d region parquets → %s",
+        tile_id, len(region_paths), tile_path.name,
+    )
+    writer = None
+    total_rows = 0
+    for rp in region_paths:
+        pf = pq.ParquetFile(rp)
+        for rg_idx in range(pf.metadata.num_row_groups):
+            tbl = pf.read_row_group(rg_idx)
+            if writer is None:
+                writer = pq.ParquetWriter(tile_path, tbl.schema)
+            writer.write_table(tbl)
+            total_rows += len(tbl)
+    if writer is not None:
+        writer.close()
+    logger.info("Tile %s: %d rows", tile_id, total_rows)
+
+
 def ensure_training_pixels(
     regions: list[TrainingRegion],
     cloud_max: int = 80,
     apply_nbar: bool = True,
     max_concurrent: int = 32,
+    max_region_workers: int = 4,
 ) -> None:
     """Ensure pixel parquets exist for all tiles covered by the given regions.
 
     For each region:
-      1. Calls pixel_collector.collect() with the region's own bbox →
-         data/training/tiles/regions/{region_id}.parquet
-      2. Concatenates all per-region parquets for a tile into
-         data/training/tiles/{tile_id}.parquet
-      3. Updates the sidecar index.
+      1. Fetches S2 COGs and pre-warms the S1 STAC cache concurrently.
+      2. Writes data/training/tiles/regions/{region_id}.parquet (S2 + S1).
+      3. After all regions on a tile finish, rebuilds the tile parquet and
+         updates the sidecar index.
+
+    Regions on different tiles are fetched in parallel (up to max_region_workers
+    at a time).  Within each region, S2 and S1 STAC searches overlap.
 
     Skips regions whose parquet already exists (idempotent).
-    Rebuilds tile parquets whenever any constituent region parquet is new.
     """
     # Group regions by tile
     tile_to_regions: dict[str, list[TrainingRegion]] = {}
@@ -221,103 +373,76 @@ def ensure_training_pixels(
     _TILES_DIR.mkdir(parents=True, exist_ok=True)
     (_TILES_DIR / "regions").mkdir(parents=True, exist_ok=True)
 
+    # Track which tiles have new regions so we know what to rebuild afterwards.
+    tiles_with_new: set[str] = set()
+    tiles_with_new_lock = threading.Lock()
+    submitted_region_ids: set[str] = set()
+
+    # One lock per tile guards the shared STAC cache file so concurrent workers
+    # on the same tile don't race to write it.
+    tile_stac_locks: dict[str, threading.Lock] = {
+        tile_id: threading.Lock() for tile_id in tile_to_regions
+    }
+
+    def _do_region(tile_id, region, tile_regions) -> None:
+        start, end = _tile_date_window(tile_regions)
+        # STAC search is per-tile and cached; the lock ensures only one worker
+        # per tile does the live search — the rest load from the pickle.
+        with tile_stac_locks[tile_id]:
+            tile_items = _fetch_tile_items(tile_id, tile_regions, cloud_max)
+        written = _collect_one_region(
+            region=region,
+            tile_id=tile_id,
+            tile_items=tile_items,
+            start=start,
+            end=end,
+            cloud_max=cloud_max,
+            apply_nbar=apply_nbar,
+            max_concurrent=max_concurrent,
+        )
+        if written:
+            with tiles_with_new_lock:
+                tiles_with_new.add(tile_id)
+            # Update the index as soon as this region is done so a crash
+            # mid-run doesn't lose track of already-completed regions.
+            with _index_lock:
+                _update_index(region.id, [tile_id])
+
+    with ThreadPoolExecutor(max_workers=max_region_workers) as pool:
+        futures: dict = {}
+        for tile_id, tile_regions in sorted(tile_to_regions.items()):
+            pending = [r for r in tile_regions if not _region_parquet_path(r.id).exists()]
+            for r in tile_regions:
+                if r not in pending:
+                    logger.info("Region %s already collected — skipping", r.id)
+            for region in pending:
+                submitted_region_ids.add(region.id)
+                futures[pool.submit(_do_region, tile_id, region, tile_regions)] = region.id
+
+        if not futures:
+            logger.info("All regions already collected.")
+        else:
+            logger.info(
+                "Fetching %d region(s) with up to %d parallel workers",
+                len(futures), max_region_workers,
+            )
+
+        for future in as_completed(futures):
+            region_id = futures[future]
+            exc = future.exception()
+            if exc:
+                logger.error("Region %s failed: %s", region_id, exc, exc_info=exc)
+
+    # Rebuild tile parquets for any tile that got new regions, and update the
+    # index for already-complete regions that weren't in the work list.
     for tile_id, tile_regions in sorted(tile_to_regions.items()):
-        new_regions = []
-
-        tile_path = tile_parquet_path(tile_id)
-        tile_missing = not tile_path.exists()
-        pending = [r for r in tile_regions if not _region_parquet_path(r.id).exists()]
-        for r in tile_regions:
-            if r not in pending:
-                logger.info("Region %s already collected — skipping", r.id)
-
-        if pending or tile_missing:
-            tile_items = _fetch_tile_items(tile_id, tile_regions, cloud_max) if pending else None
-            start, end = _tile_date_window(tile_regions)
-
-        for region in pending:
-            out_path = _region_parquet_path(region.id)
-            collect_dir = _TILES_DIR / "regions" / f"{region.id}.collect"
-            logger.info(
-                "Collecting region %s: bbox=%s  window=%s→%s",
-                region.id, region.bbox, start, end,
-            )
-            cache_dir = tile_chips_path(tile_id)
-            tile_paths = collect(
-                bbox_wgs84=list(region.bbox),
-                start=start,
-                end=end,
-                out_dir=collect_dir,
-                cloud_max=cloud_max,
-                cache_dir=cache_dir,
-                apply_nbar=apply_nbar,
-                max_concurrent=max_concurrent,
-                items=tile_items,
-                point_id_prefix=region.id,
-            )
-            # collect() returns [] when all shards were already marked done but no
-            # sorted intermediate exists (happens when a previous run completed the
-            # shard and wrote the tile parquet but crashed before writing the region
-            # parquet).  Recover by scanning the collect dir for existing outputs.
-            if not tile_paths:
-                tile_paths = sorted(collect_dir.glob("*.parquet"))
-                if tile_paths:
-                    logger.info(
-                        "Region %s: collect() returned no paths but found %d existing "
-                        "parquet(s) in collect dir — using those",
-                        region.id, len(tile_paths),
-                    )
-            # Merge per-tile S2 parquets into a single region parquet,
-            # then fetch and append S1 rows using the same pixel grid.
-            if tile_paths:
-                writer = pq.ParquetWriter(out_path, pq.ParquetFile(tile_paths[0]).schema_arrow)
-                for tp in tile_paths:
-                    pf = pq.ParquetFile(tp)
-                    for rg_idx in range(pf.metadata.num_row_groups):
-                        writer.write_table(pf.read_row_group(rg_idx))
-                writer.close()
-                append_s1_to_tile_parquet(
-                    tile_path=out_path,
-                    bbox_wgs84=list(region.bbox),
-                    start=start,
-                    end=end,
-                    collect_s1_fn=collect_s1,
-                    s1_cache_dir=_S1_CHIP_CACHE_DIR,
-                )
-            new_regions.append(region.id)
-
-        # Rebuild tile parquet if any region is new or the tile parquet was missing.
-        # Include ALL regions indexed for this tile (not just the ones being fetched
-        # now) so that a partial fetch never overwrites previously collected data.
-        if new_regions or tile_missing:
-            all_indexed = _load_index()
-            all_indexed_ids = set(
-                all_indexed.loc[all_indexed["tile_id"] == tile_id, "region_id"]
-            )
-            region_paths = [
-                _region_parquet_path(rid)
-                for rid in sorted(all_indexed_ids)
-                if _region_parquet_path(rid).exists()
-            ]
-            logger.info(
-                "Building tile %s from %d region parquets → %s",
-                tile_id, len(region_paths), tile_path.name,
-            )
-            writer = None
-            total_rows = 0
-            for rp in region_paths:
-                pf = pq.ParquetFile(rp)
-                for rg_idx in range(pf.metadata.num_row_groups):
-                    tbl = pf.read_row_group(rg_idx)
-                    if writer is None:
-                        writer = pq.ParquetWriter(tile_path, tbl.schema)
-                    writer.write_table(tbl)
-                    total_rows += len(tbl)
-            if writer is not None:
-                writer.close()
-            logger.info("Tile %s: %d rows", tile_id, total_rows)
-
+        tile_missing = not tile_parquet_path(tile_id).exists()
+        if tile_id in tiles_with_new or tile_missing:
+            _rebuild_tile_parquet(tile_id)
+        # Ensure already-complete regions are indexed (idempotent).
         for region in tile_regions:
-            _update_index(region.id, [tile_id])
+            if region.id not in submitted_region_ids:
+                with _index_lock:
+                    _update_index(region.id, [tile_id])
 
     logger.info("Done. Index: %s", _INDEX_PATH)

@@ -167,7 +167,8 @@ def cmd_training_list(args: argparse.Namespace) -> None:
     from utils.regions import load_regions
     from utils.location import _bbox_pixel_count
 
-    regions = load_regions()
+    yaml_path = Path(args.yaml) if args.yaml else None
+    regions = load_regions(yaml_path) if yaml_path else load_regions()
     totals: dict[str, int] = {}
 
     print(f"  {'ID':<40} {'LABEL':<10} {'YEAR':<6} {'PIXELS':>8}")
@@ -191,12 +192,17 @@ def cmd_training_fetch(args: argparse.Namespace) -> None:
     from utils.regions import load_regions, select_regions
     from utils.training_collector import ensure_training_pixels
 
-    regions = load_regions() if args.all else select_regions(args.regions)
+    yaml_path = Path(args.yaml) if args.yaml else None
+    if args.all:
+        regions = load_regions(yaml_path) if yaml_path else load_regions()
+    else:
+        regions = select_regions(args.regions, yaml_path) if yaml_path else select_regions(args.regions)
     ensure_training_pixels(
         regions=regions,
         cloud_max=args.cloud_max,
         apply_nbar=not args.no_nbar,
         max_concurrent=args.max_concurrent,
+        max_region_workers=args.max_region_workers,
     )
 
 
@@ -208,7 +214,8 @@ def cmd_training_verify(args: argparse.Namespace) -> None:
 
     BAND_COLS = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12"]
 
-    regions = load_regions()
+    yaml_path = Path(args.yaml) if args.yaml else None
+    regions = load_regions(yaml_path) if yaml_path else load_regions()
     if args.prefix:
         regions = [r for r in regions if r.id.startswith(args.prefix)]
         if not regions:
@@ -402,22 +409,30 @@ def main() -> None:
     pt = sub.add_parser("training", help="Manage training regions and pixel collection")
     tsub = pt.add_subparsers(dest="training_cmd", required=True)
 
-    tsub.add_parser("list", help="List all training regions with estimated pixel counts")
+    tls = tsub.add_parser("list", help="List all training regions with estimated pixel counts")
+    tls.add_argument("--yaml", metavar="PATH", default=None,
+                     help="Path to regions YAML (default: data/locations/training.yaml)")
 
     tvfy = tsub.add_parser("verify", help="Verify training data quality and flag issues")
+    tvfy.add_argument("--yaml", metavar="PATH", default=None,
+                      help="Path to regions YAML (default: data/locations/training.yaml)")
     tvfy.add_argument("--prefix", metavar="STR",
                       help="Only verify regions whose id starts with this prefix")
 
     tf = tsub.add_parser("fetch", help="Fetch pixels for training regions")
+    tf.add_argument("--yaml", metavar="PATH", default=None,
+                    help="Path to regions YAML (default: data/locations/training.yaml)")
     grp = tf.add_mutually_exclusive_group(required=True)
     grp.add_argument("--regions", nargs="+", metavar="ID",
                      help="Region IDs to fetch")
     grp.add_argument("--all", action="store_true",
-                     help="Fetch all regions in training.yaml")
+                     help="Fetch all regions in the YAML")
     tf.add_argument("--cloud-max", type=int, default=80, metavar="N")
     tf.add_argument("--no-nbar", action="store_true")
     tf.add_argument("--max-concurrent", type=int, default=32, metavar="N",
                     help="Max concurrent HTTP patch fetches per tile (default: 32)")
+    tf.add_argument("--max-region-workers", type=int, default=4, metavar="N",
+                    help="Max regions fetched in parallel (default: 4)")
 
     args = p.parse_args()
     {

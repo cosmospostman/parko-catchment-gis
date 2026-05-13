@@ -138,6 +138,56 @@
     .training-role-dot.presence { background: #22c55e; }
     .training-role-dot.absence  { background: #ef4444; }
 
+    /* ---- Woody classifier accordion ---- */
+
+    #woody-accordion {
+      border-bottom: 1px solid #333;
+      flex-shrink: 0;
+    }
+
+    #woody-accordion-header {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      padding: 10px 16px;
+      cursor: pointer;
+      user-select: none;
+      font-size: 12px;
+      color: #aaa;
+    }
+
+    #woody-accordion-header:hover { background: #2e2e2e; }
+
+    #woody-accordion-header input[type="checkbox"] {
+      accent-color: #a78bfa;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+
+    #woody-accordion-header .accordion-label {
+      flex: 1;
+      font-weight: 500;
+      color: #c0c0c0;
+    }
+
+    #woody-accordion-header .accordion-chevron {
+      font-size: 10px;
+      color: #555;
+      transition: transform 0.15s;
+    }
+
+    #woody-accordion-header.open .accordion-chevron { transform: rotate(90deg); }
+
+    #woody-accordion-body {
+      display: none;
+      flex-direction: column;
+      background: #1e1e1e;
+      max-height: 220px;
+      overflow-y: auto;
+    }
+
+    #woody-accordion-body.open { display: flex; }
+
     /* ---- Catchments accordion ---- */
 
     #catchments-accordion {
@@ -815,6 +865,14 @@
           <span class="accordion-chevron">&#9658;</span>
         </div>
         <div id="training-accordion-body"></div>
+      </div>
+      <div id="woody-accordion">
+        <div id="woody-accordion-header">
+          <input type="checkbox" id="woody-toggle">
+          <span class="accordion-label">Woody classifier</span>
+          <span class="accordion-chevron">&#9658;</span>
+        </div>
+        <div id="woody-accordion-body"></div>
       </div>
       <div id="catchments-accordion">
         <div id="catchments-accordion-header">
