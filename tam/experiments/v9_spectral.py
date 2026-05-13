@@ -1,8 +1,9 @@
-"""v9_spectral — S2-only TAM, same site set as v8_roper.
+"""v9_spectral — S2-only TAM, v8_roper site set + Frenchs.
 
 S2-only leg of the three-way comparison (S2-only / S1-only / joint S1+S2).
 Feature set: B02 B03 B04 B05 B07 B08 B8A B11 B12 + NDVI + NDWI (11 bands).
 B06 and EVI excluded. Pixel z-score normalisation identical to V8.
+Frenchs added to address bare-soil confusion and restore monsoonal site diversity.
 """
 
 from tam.core.dataset import V9_FEATURE_COLS
@@ -45,6 +46,18 @@ EXPERIMENT = Experiment(
         "roper_presence_1", "roper_presence_2", "roper_presence_3",
         "roper_presence_4",
         "roper_absence_1", "roper_absence_2", "roper_absence_3",
+        # Barcoorah
+        "barcoorah_presence", "barcoorah_presence_2", "barcoorah_presence_3",
+        "barcoorah_absence_lake", "barcoorah_absence_woodland",
+        "barcoorah_absence_2", "barcoorah_absence_3",
+        # Frenchs — Cape York Peninsula (monsoonal savanna-riparian)
+        "frenchs_presence_1", "frenchs_presence_2", "frenchs_presence_3",
+        "frenchs_presence_4", "frenchs_presence_5", "frenchs_presence_6",
+        "frenchs_absence_bare_soil_2", "frenchs_absence_bare_soil_3",
+        "frenchs_absence_mangrove", "frenchs_absence_ocean",
+        "frenchs_absence_riparian_woodland", "frenchs_absence_riparian", "frenchs_absence_savanna",
+        "frenchs_absence_4", "frenchs_absence_5", "frenchs_absence_6",
+        "frenchs_absence_water_1", "frenchs_absence_water_2", "frenchs_absence_water_3",
     ],
     feature_cols=V9_FEATURE_COLS,
     model_kwargs={

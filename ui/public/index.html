@@ -442,9 +442,100 @@
     }
 
     #sightings-accordion,
-    #s1-accordion {
+    #s1-accordion,
+    #noise-accordion {
       border-bottom: 1px solid #333;
       flex-shrink: 0;
+    }
+
+    #noise-accordion-header {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      padding: 10px 16px;
+      cursor: pointer;
+      user-select: none;
+      font-size: 12px;
+      color: #aaa;
+    }
+
+    #noise-accordion-header:hover { background: #2e2e2e; }
+
+    #noise-accordion-header input[type="checkbox"] {
+      accent-color: #facc15;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+
+    #noise-accordion-header .accordion-label {
+      flex: 1;
+      font-weight: 500;
+      color: #c0c0c0;
+    }
+
+    #noise-accordion-header .accordion-chevron {
+      font-size: 10px;
+      color: #555;
+      transition: transform 0.15s;
+    }
+
+    #noise-accordion-header.open .accordion-chevron { transform: rotate(90deg); }
+
+    #noise-accordion-body {
+      display: none;
+      flex-direction: column;
+      background: #1e1e1e;
+      padding: 8px 16px 10px 16px;
+      gap: 4px;
+    }
+
+    #noise-accordion-body.open { display: flex; }
+
+    #noise-accordion-body .irow {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      color: #b0b0b0;
+      padding: 2px 0;
+    }
+
+    #noise-accordion-body .ikey {
+      font-size: 11px;
+      color: #555;
+      min-width: 60px;
+      flex-shrink: 0;
+    }
+
+    #noise-accordion-body select {
+      flex: 1;
+      background: #1a1a1a;
+      color: #d0d0d0;
+      border: 1px solid #444;
+      border-radius: 4px;
+      padding: 3px 4px;
+      font-size: 11px;
+      cursor: pointer;
+      min-width: 0;
+    }
+
+    #noise-accordion-body input[type="range"] {
+      flex: 1;
+      accent-color: #facc15;
+    }
+
+    .noise-val {
+      font-size: 11px;
+      color: #888;
+      min-width: 28px;
+      text-align: right;
+    }
+
+    #noise-status {
+      font-size: 11px;
+      color: #555;
+      padding: 2px 0;
+      min-height: 16px;
     }
 
     #sightings-accordion-header,
@@ -788,6 +879,40 @@
           <div id="s1-status"></div>
         </div>
       </div>
+      <div id="noise-accordion">
+        <div id="noise-accordion-header">
+          <input type="checkbox" id="noise-toggle">
+          <span class="accordion-label">Noise filter pixels</span>
+          <span class="accordion-chevron">&#9658;</span>
+        </div>
+        <div id="noise-accordion-body">
+          <div class="irow">
+            <span class="ikey">region</span>
+            <select id="noise-region"><option value="">— select —</option></select>
+          </div>
+          <div class="irow">
+            <span class="ikey">dry_ndvi ≥</span>
+            <input type="range" id="noise-dry-ndvi" min="0" max="0.5" step="0.01" value="0.10">
+            <span class="noise-val" id="noise-dry-ndvi-val">0.10</span>
+          </div>
+          <div class="irow">
+            <span class="ikey">rec_p ≥</span>
+            <input type="range" id="noise-rec-p" min="0" max="0.5" step="0.01" value="0.20">
+            <span class="noise-val" id="noise-rec-p-val">0.20</span>
+          </div>
+          <div class="irow">
+            <span class="ikey">nir_cv ≤</span>
+            <input type="range" id="noise-nir-cv" min="0" max="0.5" step="0.01" value="0.20">
+            <span class="noise-val" id="noise-nir-cv-val">0.20</span>
+          </div>
+          <div class="irow">
+            <span class="ikey">s1_vh ≥</span>
+            <input type="range" id="noise-s1-vh" min="-35" max="-5" step="0.5" value="-35">
+            <span class="noise-val" id="noise-s1-vh-val">off</span>
+          </div>
+          <div id="noise-status"></div>
+        </div>
+      </div>
       <ul id="location-list"></ul>
     </div>
 
@@ -807,7 +932,7 @@
       </div>
       <div class="irow">
         <span class="ikey">color</span>
-        <select id="colormap-select">
+        <select id="colormap-select" autocomplete="off">
           <option value="rdylgn">RdYlGn</option>
           <option value="plasma">Plasma</option>
           <option value="viridis">Viridis</option>

@@ -478,7 +478,7 @@ function buildSidebar(geojson, rankings) {
     li.innerHTML = `<div class="loc-name">${name}</div>`;
 
     li.addEventListener('click', (e) => {
-      if (e.target.classList.contains('loc-ranking-select')) return;
+      if (e.target.closest('.loc-ranking-select')) return;
       document.querySelectorAll('#location-list li').forEach(el => el.classList.remove('active'));
       li.classList.add('active');
       map.fitBounds([[bbox[0], bbox[1]], [bbox[2], bbox[3]]], { padding: 60, maxZoom: 14 });
@@ -488,6 +488,7 @@ function buildSidebar(geojson, rankings) {
     if (runs && runs.length > 0) {
       const sel = document.createElement('select');
       sel.className = 'loc-ranking-select';
+      sel.autocomplete = 'off';
       sel.dataset.location = id;
       sel.innerHTML = '<option value="">— ranking —</option>';
       for (const { stem, label } of runs) {
@@ -496,6 +497,7 @@ function buildSidebar(geojson, rankings) {
         opt.textContent = label;
         sel.appendChild(opt);
       }
+      sel.addEventListener('mousedown', (e) => e.stopPropagation());
       sel.addEventListener('change', (e) => {
         e.stopPropagation();
         setRankingLayer(id, e.target.value);
@@ -505,6 +507,13 @@ function buildSidebar(geojson, rankings) {
 
     list.appendChild(li);
   }
+
+  // Force-clear all selects — browsers can restore prior selected values on reload,
+  // including asynchronously after JS runs, so we reset both now and after a tick.
+  const resetSelects = () => document.querySelectorAll('.loc-ranking-select').forEach(sel => { sel.value = ''; });
+  resetSelects();
+  setTimeout(resetSelects, 0);
+  setTimeout(resetSelects, 200);
 }
 
 // ---------------------------------------------------------------------------
@@ -962,7 +971,7 @@ async function loadS1Dates(location) {
   }
 }
 
-s1LocationSel.addEventListener('change', () => loadS1Dates(s1LocationSel.value));
+s1LocationSel.addEventListener('change', () => { if (s1LocationSel.value) loadS1Dates(s1LocationSel.value); });
 s1BandSel.addEventListener('change', applyS1Layer);
 s1DateSel.addEventListener('change', applyS1Layer);
 
@@ -971,12 +980,264 @@ function loadS1() {
     .then(r => r.json())
     .then(locations => {
       s1LocationSel.innerHTML = locations.length
-        ? locations.map(l => `<option value="${l}">${l}</option>`).join('')
+        ? ['<option value="">— location —</option>', ...locations.map(l => `<option value="${l}">${l}</option>`)].join('')
         : '<option value="">no data</option>';
-      if (locations.length) loadS1Dates(locations[0]);
     })
     .catch(() => { s1LocationSel.innerHTML = '<option value="">error</option>'; });
 }
+
+// ---------------------------------------------------------------------------
+// Noise filter pixel overlay
+// ---------------------------------------------------------------------------
+
+const noiseAccordionHeader = document.getElementById('noise-accordion-header');
+const noiseAccordionBody   = document.getElementById('noise-accordion-body');
+const noiseToggle          = document.getElementById('noise-toggle');
+const noiseRegionSel       = document.getElementById('noise-region');
+const noiseDryNdvi         = document.getElementById('noise-dry-ndvi');
+const noiseRecP            = document.getElementById('noise-rec-p');
+const noiseNirCv           = document.getElementById('noise-nir-cv');
+const noiseStatus          = document.getElementById('noise-status');
+
+noiseAccordionHeader.addEventListener('click', (e) => {
+  if (e.target.closest('input[type="checkbox"]')) return;
+  noiseAccordionHeader.classList.toggle('open');
+  noiseAccordionBody.classList.toggle('open');
+});
+
+noiseToggle.addEventListener('change', (e) => {
+  if (map.getLayer('noise-pixels')) {
+    map.setLayoutProperty('noise-pixels', 'visibility', e.target.checked ? 'visible' : 'none');
+  }
+});
+
+// Slider value displays
+function _updateNoiseVal(sliderId, valId) {
+  const slider = document.getElementById(sliderId);
+  const label  = document.getElementById(valId);
+  label.textContent = parseFloat(slider.value).toFixed(2);
+  slider.addEventListener('input', () => {
+    label.textContent = parseFloat(slider.value).toFixed(2);
+    reclassifyNoisePixels();
+  });
+}
+_updateNoiseVal('noise-dry-ndvi', 'noise-dry-ndvi-val');
+_updateNoiseVal('noise-rec-p',    'noise-rec-p-val');
+_updateNoiseVal('noise-nir-cv',   'noise-nir-cv-val');
+
+// S1 VH slider — special display: show "off" at minimum
+const noiseS1Vh = document.getElementById('noise-s1-vh');
+const noiseS1VhVal = document.getElementById('noise-s1-vh-val');
+const NOISE_S1_VH_MIN = parseFloat(noiseS1Vh.min);
+function _updateS1VhVal() {
+  const v = parseFloat(noiseS1Vh.value);
+  noiseS1VhVal.textContent = v <= NOISE_S1_VH_MIN ? 'off' : v.toFixed(1);
+}
+_updateS1VhVal();
+noiseS1Vh.addEventListener('input', () => { _updateS1VhVal(); reclassifyNoisePixels(); });
+
+let noisePixelData = null;    // raw array from API
+let noisePollTimer = null;
+let noiseActiveRegion = null;
+
+function _noiseThresholds() {
+  const s1vh = parseFloat(noiseS1Vh.value);
+  return {
+    dry_ndvi:       parseFloat(noiseDryNdvi.value),
+    rec_p:          parseFloat(noiseRecP.value),
+    nir_cv:         parseFloat(noiseNirCv.value),
+    s1_mean_vh_dry: s1vh <= NOISE_S1_VH_MIN ? null : s1vh,  // null = disabled
+  };
+}
+
+function _classifyPixel(p, t) {
+  // null means insufficient data — treat as passing (matches fillna(threshold) in train.py)
+  if (p.dry_ndvi !== null && p.dry_ndvi < t.dry_ndvi) return 'dropped';
+  if (p.rec_p    !== null && p.rec_p    < t.rec_p)    return 'dropped';
+  if (p.nir_cv   !== null && p.nir_cv   > t.nir_cv)   return 'dropped';
+  // S1 VH: higher dB = more backscatter = more woody structure; drop if below threshold
+  if (t.s1_mean_vh_dry !== null && p.s1_mean_vh_dry !== null && p.s1_mean_vh_dry < t.s1_mean_vh_dry) return 'dropped';
+  return 'kept';
+}
+
+function _propNum(v) {
+  // MapLibre stringifies properties; "null" → null, numeric strings → number
+  if (v === null || v === undefined || v === 'null') return null;
+  const n = Number(v);
+  return isNaN(n) ? null : n;
+}
+
+function _failedCriteria(p, t) {
+  const dry_ndvi = _propNum(p.dry_ndvi);
+  const rec_p    = _propNum(p.rec_p);
+  const nir_cv   = _propNum(p.nir_cv);
+  const reasons = [];
+  if (dry_ndvi !== null && dry_ndvi < t.dry_ndvi)
+    reasons.push(`dry_ndvi ${dry_ndvi.toFixed(3)} < ${t.dry_ndvi.toFixed(2)}`);
+  if (rec_p !== null && rec_p < t.rec_p)
+    reasons.push(`rec_p ${rec_p.toFixed(3)} < ${t.rec_p.toFixed(2)}`);
+  if (nir_cv !== null && nir_cv > t.nir_cv)
+    reasons.push(`nir_cv ${nir_cv.toFixed(3)} > ${t.nir_cv.toFixed(2)}`);
+  const s1vh = _propNum(p.s1_mean_vh_dry);
+  if (t.s1_mean_vh_dry !== null && s1vh !== null && s1vh < t.s1_mean_vh_dry)
+    reasons.push(`s1_vh ${s1vh.toFixed(2)} dB < ${t.s1_mean_vh_dry.toFixed(1)} dB`);
+  return reasons;
+}
+
+function _buildNoiseGeoJSON(pixels, thresholds) {
+  let kept = 0, dropped = 0;
+  const features = pixels.map(p => {
+    const status = _classifyPixel(p, thresholds);
+    if (status === 'kept') kept++; else dropped++;
+    return {
+      type: 'Feature',
+      geometry: { type: 'Point', coordinates: [p.lon, p.lat] },
+      properties: {
+        id:       p.id,
+        status,
+        dry_ndvi: p.dry_ndvi,
+        rec_p:    p.rec_p,
+        nir_cv:   p.nir_cv,
+      },
+    };
+  });
+  return { geojson: { type: 'FeatureCollection', features }, kept, dropped };
+}
+
+function reclassifyNoisePixels() {
+  if (!noisePixelData || !map.getSource('noise-pixels')) return;
+  const t = _noiseThresholds();
+  const { geojson, kept, dropped } = _buildNoiseGeoJSON(noisePixelData, t);
+  map.getSource('noise-pixels').setData(geojson);
+  noiseStatus.textContent = `${kept} kept · ${dropped} dropped`;
+  noiseStatus.style.color = '';
+}
+
+function _ensureNoiseLayer() {
+  if (!map.getSource('noise-pixels')) {
+    map.addSource('noise-pixels', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+    map.addLayer({
+      id: 'noise-pixels',
+      type: 'circle',
+      source: 'noise-pixels',
+      layout: { visibility: noiseToggle.checked ? 'visible' : 'none' },
+      paint: {
+        'circle-radius': 3,
+        'circle-opacity': 0.75,
+        'circle-color': ['match', ['get', 'status'], 'dropped', '#ef4444', '#22c55e'],
+      },
+    });
+
+    map.on('click', 'noise-pixels', (e) => {
+      const feat = e.features[0];
+      if (!feat) return;
+      const p = feat.properties;
+      const t = _noiseThresholds();
+      const reasons = _failedCriteria(p, t);
+      // MapLibre serialises properties to strings; null becomes the string "null"
+      const fmtVal = v => (v === null || v === undefined || v === 'null') ? '<span style="color:#555">null</span>' : Number(v).toFixed(4);
+      const row = (label, val) =>
+        `<div class="popup-row"><span class="popup-label">${label}</span><span>${fmtVal(val)}</span></div>`;
+      const statusBadge = p.status === 'dropped'
+        ? `<span class="role-badge role-absence">dropped</span>`
+        : `<span class="role-badge role-presence">kept</span>`;
+      const whyHtml = reasons.length
+        ? `<div class="popup-notes" style="color:#f87171;">✗ ${reasons.join('<br>✗ ')}</div>`
+        : '';
+      popup.setLngLat(e.lngLat).setHTML(`
+        <div class="popup-title">${p.id}</div>
+        <div class="popup-row"><span class="popup-label">status</span>${statusBadge}</div>
+        ${row('dry_ndvi', p.dry_ndvi)}
+        ${row('rec_p', p.rec_p)}
+        ${row('nir_cv', p.nir_cv)}
+        ${row('s1_vh_dry', p.s1_mean_vh_dry)}
+        ${whyHtml}
+      `).addTo(map);
+    });
+    map.on('mouseenter', 'noise-pixels', () => { map.getCanvas().style.cursor = 'pointer'; });
+    map.on('mouseleave', 'noise-pixels', () => { if (currentMode === 'locations') map.getCanvas().style.cursor = ''; });
+  }
+}
+
+function loadNoisePixels(regionId) {
+  clearInterval(noisePollTimer);
+  noiseActiveRegion = regionId;
+  noisePixelData = null;
+
+  if (!regionId) {
+    if (map.getSource('noise-pixels')) {
+      map.getSource('noise-pixels').setData({ type: 'FeatureCollection', features: [] });
+    }
+    noiseStatus.textContent = '';
+    return;
+  }
+
+  noiseStatus.textContent = 'loading…';
+  noiseStatus.style.color = '#facc15';
+
+  async function poll() {
+    if (noiseActiveRegion !== regionId) return;
+    let resp;
+    try {
+      resp = await fetch(`/api/noise-pixels?region=${encodeURIComponent(regionId)}`);
+    } catch {
+      noiseStatus.textContent = 'network error';
+      noiseStatus.style.color = '#f87171';
+      clearInterval(noisePollTimer);
+      return;
+    }
+
+    if (noiseActiveRegion !== regionId) return;
+
+    if (resp.status === 202) {
+      // still building — keep polling
+      noiseStatus.textContent = 'building…';
+      noiseStatus.style.color = '#facc15';
+      return;
+    }
+
+    if (!resp.ok) {
+      noiseStatus.textContent = `error ${resp.status}`;
+      noiseStatus.style.color = '#f87171';
+      clearInterval(noisePollTimer);
+      return;
+    }
+
+    clearInterval(noisePollTimer);
+    const data = await resp.json();
+    if (noiseActiveRegion !== regionId) return;
+
+    if (data.missing_data) {
+      noiseStatus.textContent = 'no pixel data ingested for this region';
+      noiseStatus.style.color = '#f87171';
+      return;
+    }
+
+    noisePixelData = data.pixels;
+    _ensureNoiseLayer();
+
+    if (noiseToggle.checked) {
+      map.setLayoutProperty('noise-pixels', 'visibility', 'visible');
+    }
+
+    reclassifyNoisePixels();
+  }
+
+  poll();
+  noisePollTimer = setInterval(poll, 3000);
+}
+
+noiseRegionSel.addEventListener('change', () => loadNoisePixels(noiseRegionSel.value));
+
+// Populate region dropdown
+fetch('/api/noise-pixel-regions')
+  .then(r => r.json())
+  .then(regions => {
+    const presenceRegions = regions.filter(r => r.label === 'presence');
+    noiseRegionSel.innerHTML = '<option value="">— select —</option>' +
+      presenceRegions.map(r => `<option value="${r.id}">${r.id}</option>`).join('');
+  })
+  .catch(() => {});
 
 // ---------------------------------------------------------------------------
 // Imagery info sidebar section

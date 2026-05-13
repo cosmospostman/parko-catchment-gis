@@ -117,7 +117,66 @@ S2-only is expected somewhat lower than V8 due to wet-season cloud gaps. If S2-o
 
 ## Implementation checklist
 
-- [ ] `tam/core/config.py` — add `use_band_summaries: bool = False`
-- [ ] `tam/core/dataset.py` — compute p5/p95/std per band and assemble global feature vector when `use_band_summaries=True`
-- [ ] `tam/experiments/v9_spectral.py` — experiment definition
-- [ ] `sweeps/sweep_v9_spectral.py` — sweep script
+- [x] `tam/core/config.py` — add `use_band_summaries: bool = False`
+- [x] `tam/core/dataset.py` — compute p5/p95/std per band and assemble global feature vector when `use_band_summaries=True`
+- [x] `tam/experiments/v9_spectral.py` — experiment definition
+- [x] `sweeps/sweep_v9_spectral.py` — sweep script
+
+---
+
+## Smoke-test findings and improvement strategies
+
+### Observed failure mode
+
+Smoke-testing on Longreach shows V9 assigning its highest probability scores to patches of bare or sparsely vegetated ground — the opposite of the intended signal. The model is not discriminating between Parkinsonia and bare soil.
+
+### Root causes (confirmed by parquet analysis)
+
+**1. Train/inference obs-count mismatch**
+
+Training tiles are multi-year stacks (2020–2025); the Longreach inference parquet is a single year (2021). Obs counts per pixel:
+
+| Data | Clean obs/pixel | Wet-season obs/pixel |
+|---|---|---|
+| norman_road training tile (54KWC) | ~339 | ~112 |
+| etna training tile (54KWA) | ~649 | ~226 |
+| corfield pixel dir (2025 only) | ~39 | ~11 |
+| landsend pixel dir (2025 only) | ~26 | ~6 |
+| roper pixel dir (2025 only) | ~18 | ~5 |
+| Longreach inference (2021) | ~52 | ~15 |
+
+The model learned z-scored temporal sequences from 330–650 observations but classifies pixels with ~52. Sparse wet-season curves (15 obs) look nothing like the training distribution; the model has no exposure to them.
+
+**2. S1-optimised site selection is wrong for S2**
+
+The `v8_roper` site set was chosen for S1 signal diversity (Roper's value was its distinct SAR `vh_contrast` and `peak_doy`). S2 discrimination depends on optical phenological curve shape, not backscatter. Roper (5 wet-season S2 obs/pixel) and Landsend (6 wet-season S2 obs/pixel) are cloud-compromised — their S2 training curves may express little phenological signal. Earlier S2 models (V1, V2) used different sites specifically chosen for S2 contrast.
+
+**3. No bare-soil absence examples in the training set**
+
+V2 added `frenchs_absence_bare_soil_1/2/3` explicitly to fix bare-soil confusion, and it worked — NDVI contribution jumped from −0.001 to +0.028 between V1 and V2. V9's region list contains no bare-soil absence regions. In Longreach's arid semi-arid environment, this is the most important confounding class.
+
+### Improvement strategies (priority order)
+
+**Priority 1 — Add bare-soil absence regions**
+
+The fastest fix with the clearest precedent. Longreach itself is the ideal source: sample confirmed bare/sparse ground patches from within the Longreach tile and register them as absence regions. `frenchs_absence_bare_soil_2` and `frenchs_absence_bare_soil_3` from the V2 training set are already in `data/training/index.parquet` and can be re-added immediately.
+
+**Priority 2 — Match obs-count at train and inference time**
+
+Two options:
+- Retrain V9 on single-year pixel parquets (matching the inference window), reducing `obs_dropout_min` to 10–15 so the model learns to handle sparse curves.
+- Or re-run inference using multi-year tiles so the obs-count matches training (preferred if the multi-year tiles are available for inference regions).
+
+The current mismatch is ~10× on wet-season observations — this alone is sufficient to explain garbage outputs on inference.
+
+**Priority 3 — Audit S2 quality at Roper and Landsend before relying on them**
+
+With 5–6 wet-season obs/pixel, these training pixels may contribute mostly noise. Roper's large AUC jump in V8 (0.964 → 0.989) was due to its distinct SAR signature, not S2 contrast. Consider dropping Roper from V9 and replacing it with a site that has clean S2 wet-season coverage and good presence/absence contrast.
+
+**Priority 4 — Bring back Frenchs (or equivalent monsoonal site)**
+
+V1 and V2 found Frenchs (Cape York monsoonal savanna) highly informative for S2 — strong, well-defined wet-season green-up, clear bare-soil and water absence classes. It was dropped when focus shifted to S1 site selection. Frenchs presence and absence regions (including bare-soil) are already in `data/training/index.parquet`.
+
+**Priority 5 — Consider SWIR structural signal over phenological timing for Longreach**
+
+V1 showed B11 SWIR was the single dominant discriminant (permutation AUC drop +0.047) — a structural, not phenological, signal. The OVERVIEW notes that arid-zone Parkinsonia responds opportunistically to rainfall with no fixed seasonal window. For the Longreach region, a SWIR-structure approach may be more robust than phenological curve shape, and is less sensitive to the obs-count and cloud-gap problems above.
