@@ -13,11 +13,14 @@ Usage
 
 from __future__ import annotations
 
-import sys
+import logging
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _REGIONS_YAML = PROJECT_ROOT / "data" / "locations" / "training.yaml"
@@ -29,7 +32,7 @@ class TrainingRegion:
     name: str
     label: str          # "presence" | "absence"
     bbox: list[float]   # [lon_min, lat_min, lon_max, lat_max]
-    year: int | None    # if set, pin observations to [year-5, year]
+    years: list[int]    # calendar years to fetch and train on (explicit, non-empty)
     tags: list[str]
     notes: str | None
 
@@ -40,6 +43,37 @@ class TrainingRegion:
     @property
     def bbox_tuple(self) -> tuple[float, float, float, float]:
         return tuple(self.bbox)  # type: ignore[return-value]
+
+
+def _parse_years(entry: dict) -> list[int]:
+    """Return the years list for a region entry.
+
+    Accepts the new ``years: [...]`` form.  If the entry has the old singular
+    ``year: YYYY`` field instead, expands it to ``[year-5, ..., year]`` and
+    emits a deprecation warning so YAML authors know to migrate.
+    """
+    if "years" in entry:
+        years = list(entry["years"])
+        if not years:
+            raise ValueError(
+                f"Region {entry.get('id', '?')!r}: 'years' must be a non-empty list"
+            )
+        return years
+
+    if "year" in entry and entry["year"] is not None:
+        year = int(entry["year"])
+        expanded = list(range(year - 5, year + 1))
+        warnings.warn(
+            f"Region {entry.get('id', '?')!r}: 'year: {year}' is deprecated — "
+            f"replace with 'years: {expanded}'",
+            DeprecationWarning,
+            stacklevel=4,
+        )
+        return expanded
+
+    raise ValueError(
+        f"Region {entry.get('id', '?')!r}: must have a 'years' field"
+    )
 
 
 def load_regions(yaml_path: Path = _REGIONS_YAML) -> list[TrainingRegion]:
@@ -54,7 +88,7 @@ def load_regions(yaml_path: Path = _REGIONS_YAML) -> list[TrainingRegion]:
             name=entry["name"],
             label=entry["label"],
             bbox=entry["bbox"],
-            year=entry.get("year"),
+            years=_parse_years(entry),
             tags=entry.get("tags", []),
             notes=entry.get("notes"),
         ))

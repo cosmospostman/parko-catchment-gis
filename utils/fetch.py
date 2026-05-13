@@ -50,6 +50,16 @@ def _read_bbox_patch(
                     min(xs), min(ys), max(xs), max(ys),
                     transform=src.transform,
                 )
+                # Expand by 4 pixels on each side.  make_pixel_grid snaps to
+                # the UTM grid, so points can extend up to ~3 pixels beyond
+                # the bbox edge after reprojection (measured empirically across
+                # all training regions).  1 extra pixel gives headroom for
+                # floating-point rounding in CachedNpzChipStore._pixel_coords.
+                _EXPAND = 4
+                win = Window(
+                    win.col_off - _EXPAND, win.row_off - _EXPAND,
+                    win.width + 2 * _EXPAND, win.height + 2 * _EXPAND,
+                )
                 win = win.intersection(Window(0, 0, src.width, src.height))
                 if win.width <= 0 or win.height <= 0:
                     return None
@@ -109,8 +119,15 @@ def _patch_covers_bbox(
     a = transform
     cols_f = (np.array(xs) - float(a.c)) / float(a.a)
     rows_f = (np.array(ys) - float(a.f)) / float(a.e)
-    return bool(cols_f.min() >= 0 and cols_f.max() < w and
-                rows_f.min() >= 0 and rows_f.max() < h)
+    # Use floor() to match CachedNpzChipStore._pixel_coords, which floors
+    # continuous pixel coordinates before checking bounds.  Checking raw
+    # floats here was too permissive: a corner at rows_f=28.45 passed the
+    # < h+1 test even though floor(28.45+epsilon)=29 could exceed the patch.
+    _SLOP = 1
+    rows_i = np.floor(rows_f).astype(int)
+    cols_i = np.floor(cols_f).astype(int)
+    return bool(cols_i.min() >= -_SLOP and cols_i.max() < w + _SLOP and
+                rows_i.min() >= -_SLOP and rows_i.max() < h + _SLOP)
 
 
 def _save_patch_cache(path: Path, data: tuple[np.ndarray, object, object]) -> None:

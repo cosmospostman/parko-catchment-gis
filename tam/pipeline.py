@@ -86,25 +86,21 @@ def _cmd_train(args: argparse.Namespace) -> None:
     pixel_df["year"] = dates.dt.year
     pixel_df["doy"]  = dates.dt.day_of_year
 
-    # Per-region year pinning: drop observations outside [year-5, year] for
-    # regions that carry a `year` field (guards against post-clearance imagery).
-    pinned_regions = [r for r in regions if r.year is not None]
-    if pinned_regions:
-        # For each pixel_id, find which pinned region it falls in and derive
-        # the allowed year window; pixels in no pinned region are kept as-is.
-        keep_mask = pd.Series(True, index=pixel_df.index)
-        for region in pinned_regions:
-            lon_min, lat_min, lon_max, lat_max = region.bbox
-            in_region = (
-                pixel_df["lon"].between(lon_min, lon_max) &
-                pixel_df["lat"].between(lat_min, lat_max)
-            )
-            out_of_window = in_region & (
-                (pixel_df["year"] < region.year - 5) |
-                (pixel_df["year"] > region.year)
-            )
-            keep_mask &= ~out_of_window
-        pixel_df = pixel_df[keep_mask].reset_index(drop=True)
+    # Per-region year pinning: drop observations outside [min(years), max(years)]
+    # (guards against post-clearance imagery; window is now explicit in the YAML).
+    keep_mask = pd.Series(True, index=pixel_df.index)
+    for region in regions:
+        lon_min, lat_min, lon_max, lat_max = region.bbox
+        in_region = (
+            pixel_df["lon"].between(lon_min, lon_max) &
+            pixel_df["lat"].between(lat_min, lat_max)
+        )
+        out_of_window = in_region & (
+            (pixel_df["year"] < min(region.years)) |
+            (pixel_df["year"] > max(region.years))
+        )
+        keep_mask &= ~out_of_window
+    pixel_df = pixel_df[keep_mask].reset_index(drop=True)
 
     # Build labels from regions
     pixel_coords = (

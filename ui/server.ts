@@ -13,14 +13,14 @@ const PORT = Number(Deno.env.get("PORT") ?? 3000);
 ensureDirSync(WMS_CACHE_DIR);
 
 // ---------------------------------------------------------------------------
-// Noise-pixel build state
+// Woody-score build state
 // ---------------------------------------------------------------------------
 
-const noisePixelBuilding = new Set<string>();
+const woodyScoreBuilding = new Set<string>();
 
-async function buildNoisePixels(regionId: string, outPath: string): Promise<void> {
-  console.log(`Building noise pixels for ${regionId} ...`);
-  const scriptPath = join(__dirname, "..", "tam", "tools", "export_noise_pixels.py");
+async function buildWoodyScores(regionId: string, outPath: string): Promise<void> {
+  console.log(`Building woody scores for ${regionId} ...`);
+  const scriptPath = join(__dirname, "..", "tam", "tools", "export_woody_scores.py");
   const repoDirForPy = join(__dirname, "..");
   const venvPython = join(repoDirForPy, ".venv", "bin", "python3");
   const cmd = new Deno.Command(venvPython, {
@@ -30,9 +30,32 @@ async function buildNoisePixels(regionId: string, outPath: string): Promise<void
     stderr: "inherit",
   });
   const { success } = await cmd.output();
-  noisePixelBuilding.delete(regionId);
-  if (!success) throw new Error(`export_noise_pixels.py failed for ${regionId}`);
-  console.log(`Noise pixels ready: ${outPath}`);
+  woodyScoreBuilding.delete(regionId);
+  if (!success) throw new Error(`export_woody_scores.py failed for ${regionId}`);
+  console.log(`Woody scores ready: ${outPath}`);
+}
+
+// ---------------------------------------------------------------------------
+// Heuristic-score build state (VH dry-season threshold, no model required)
+// ---------------------------------------------------------------------------
+
+const heuristicScoreBuilding = new Set<string>();
+
+async function buildHeuristicScores(regionId: string, outPath: string): Promise<void> {
+  console.log(`Building heuristic scores for ${regionId} ...`);
+  const scriptPath = join(__dirname, "..", "tam", "tools", "export_heuristic_scores.py");
+  const repoDirForPy = join(__dirname, "..");
+  const venvPython = join(repoDirForPy, ".venv", "bin", "python3");
+  const cmd = new Deno.Command(venvPython, {
+    args: [scriptPath, regionId],
+    cwd: repoDirForPy,
+    stdout: "inherit",
+    stderr: "inherit",
+  });
+  const { success } = await cmd.output();
+  heuristicScoreBuilding.delete(regionId);
+  if (!success) throw new Error(`export_heuristic_scores.py failed for ${regionId}`);
+  console.log(`Heuristic scores ready: ${outPath}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -652,8 +675,7 @@ async function handler(req: Request): Promise<Response> {
   // Noise-pixel routes
   // ---------------------------------------------------------------------------
 
-  if (url.pathname === "/api/noise-pixel-regions") {
-    // Return all region_ids from training.yaml
+  if (url.pathname === "/api/woody-score-regions") {
     try {
       const raw = Deno.readTextFileSync(join(LOCATIONS_DIR, "training.yaml"));
       const data = parseYaml(raw) as { regions?: Array<{ id: string; label: string }> };
@@ -662,31 +684,31 @@ async function handler(req: Request): Promise<Response> {
         headers: { "content-type": "application/json", "cache-control": "public, max-age=300" },
       });
     } catch (err) {
-      console.error("Failed to load noise-pixel regions:", err);
+      console.error("Failed to load woody-score regions:", err);
       return new Response(JSON.stringify([]), { headers: { "content-type": "application/json" } });
     }
   }
 
-  if (url.pathname === "/api/noise-pixels-status") {
+  if (url.pathname === "/api/woody-scores-status") {
     const regionId = url.searchParams.get("region");
     if (!regionId) return new Response("Missing region param", { status: 400 });
-    const jsonPath = join(__dirname, "..", "outputs", "noise_pixels", `${regionId}.json`);
+    const jsonPath = join(__dirname, "..", "outputs", "woody_scores", `${regionId}.json`);
     let state: string;
     try {
       Deno.statSync(jsonPath);
       state = "ready";
     } catch {
-      state = noisePixelBuilding.has(regionId) ? "building" : "missing";
+      state = woodyScoreBuilding.has(regionId) ? "building" : "missing";
     }
     return new Response(JSON.stringify({ state }), {
       headers: { "content-type": "application/json", "cache-control": "no-store" },
     });
   }
 
-  if (url.pathname === "/api/noise-pixels") {
+  if (url.pathname === "/api/woody-scores") {
     const regionId = url.searchParams.get("region");
     if (!regionId) return new Response("Missing region param", { status: 400 });
-    const jsonPath = join(__dirname, "..", "outputs", "noise_pixels", `${regionId}.json`);
+    const jsonPath = join(__dirname, "..", "outputs", "woody_scores", `${regionId}.json`);
     try {
       Deno.statSync(jsonPath);
       const data = await Deno.readFile(jsonPath);
@@ -694,12 +716,70 @@ async function handler(req: Request): Promise<Response> {
         headers: { "content-type": "application/json", "cache-control": "no-store" },
       });
     } catch {
-      // Build in background if not already running
-      if (!noisePixelBuilding.has(regionId)) {
-        noisePixelBuilding.add(regionId);
-        buildNoisePixels(regionId, jsonPath).catch(err => {
-          console.error("noise-pixels build error:", err);
-          noisePixelBuilding.delete(regionId);
+      if (!woodyScoreBuilding.has(regionId)) {
+        woodyScoreBuilding.add(regionId);
+        buildWoodyScores(regionId, jsonPath).catch(err => {
+          console.error("woody-scores build error:", err);
+          woodyScoreBuilding.delete(regionId);
+        });
+      }
+      return new Response(JSON.stringify({ state: "building" }), {
+        status: 202,
+        headers: { "content-type": "application/json", "cache-control": "no-store" },
+      });
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Heuristic-score routes (VH dry-season threshold, no model required)
+  // ---------------------------------------------------------------------------
+
+  if (url.pathname === "/api/heuristic-score-regions") {
+    try {
+      const raw = Deno.readTextFileSync(join(LOCATIONS_DIR, "training.yaml"));
+      const data = parseYaml(raw) as { regions?: Array<{ id: string; label: string }> };
+      const regions = (data.regions ?? []).map(r => ({ id: r.id, label: r.label }));
+      return new Response(JSON.stringify(regions), {
+        headers: { "content-type": "application/json", "cache-control": "public, max-age=300" },
+      });
+    } catch (err) {
+      console.error("Failed to load heuristic-score regions:", err);
+      return new Response(JSON.stringify([]), { headers: { "content-type": "application/json" } });
+    }
+  }
+
+  if (url.pathname === "/api/heuristic-scores-status") {
+    const regionId = url.searchParams.get("region");
+    if (!regionId) return new Response("Missing region param", { status: 400 });
+    const jsonPath = join(__dirname, "..", "outputs", "heuristic_scores", `${regionId}.json`);
+    let state: string;
+    try {
+      Deno.statSync(jsonPath);
+      state = "ready";
+    } catch {
+      state = heuristicScoreBuilding.has(regionId) ? "building" : "missing";
+    }
+    return new Response(JSON.stringify({ state }), {
+      headers: { "content-type": "application/json", "cache-control": "no-store" },
+    });
+  }
+
+  if (url.pathname === "/api/heuristic-scores") {
+    const regionId = url.searchParams.get("region");
+    if (!regionId) return new Response("Missing region param", { status: 400 });
+    const jsonPath = join(__dirname, "..", "outputs", "heuristic_scores", `${regionId}.json`);
+    try {
+      Deno.statSync(jsonPath);
+      const data = await Deno.readFile(jsonPath);
+      return new Response(data, {
+        headers: { "content-type": "application/json", "cache-control": "no-store" },
+      });
+    } catch {
+      if (!heuristicScoreBuilding.has(regionId)) {
+        heuristicScoreBuilding.add(regionId);
+        buildHeuristicScores(regionId, jsonPath).catch(err => {
+          console.error("heuristic-scores build error:", err);
+          heuristicScoreBuilding.delete(regionId);
         });
       }
       return new Response(JSON.stringify({ state: "building" }), {

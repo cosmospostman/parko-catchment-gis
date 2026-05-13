@@ -6,10 +6,10 @@ and the tile-grouping behaviour in ensure_training_pixels().
 
 Tests
 -----
- 1. _tile_date_window: start = min(year)-5-01-01, end = max(year)-12-31.
- 2. _tile_date_window: single-region list produces correct window.
- 3. _tile_date_window: all year=None raises ValueError.
- 4. _tile_date_window: mix of year=None and int ignores None values.
+ 1. _tile_date_window: start = min(years), end = max(years) across regions.
+ 2. _tile_date_window: single-region single-year list produces correct window.
+ 3. _tile_date_window: empty years list raises ValueError.
+ 4. _tile_date_window: multi-year list spans correctly.
  5. _union_bbox: single region returns its own bbox.
  6. _union_bbox: two non-overlapping regions return the enclosing bbox.
  7. _union_bbox: empty list raises (Bug TC5 — ungarded crash from min()).
@@ -24,6 +24,7 @@ Tests
 16. Per-tile dedup does not remove cross-tile items with matching ids (Bug TC6 — documents).
 17. Cross-tile boundary pixel produces only one row after (point_id, date) dedup.
 18. Tile rebuild includes all indexed regions, not just those in the current fetch.
+19. _parse_years compat shim: old year: YYYY field expands to [year-5..year] with warning.
 """
 
 from __future__ import annotations
@@ -55,7 +56,7 @@ _GRANULE_RE = re.compile(r"_\d+_L2A$")
 def _make_region(
     region_id: str,
     bbox: list[float] | None = None,
-    year: int | None = 2022,
+    years: list[int] | None = None,
     label: str = "presence",
 ) -> TrainingRegion:
     return TrainingRegion(
@@ -63,7 +64,7 @@ def _make_region(
         name=region_id.replace("_", " ").title(),
         label=label,
         bbox=bbox or [145.0, -23.0, 145.1, -22.9],
-        year=year,
+        years=years if years is not None else [2022],
         tags=[],
         notes=None,
     )
@@ -94,30 +95,42 @@ def training_dirs(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_tile_date_window_start_and_end():
-    regions = [_make_region("r1", year=2021), _make_region("r2", year=2023)]
+    # Two regions with different year ranges — window spans both
+    regions = [
+        _make_region("r1", years=[2019, 2020, 2021]),
+        _make_region("r2", years=[2021, 2022, 2023]),
+    ]
     start, end = _tile_date_window(regions)
-    assert start == "2016-01-01"   # min(2021, 2023) - 5
-    assert end == "2023-12-31"     # max(2021, 2023)
+    assert start == "2019-01-01"
+    assert end == "2023-12-31"
 
 
 def test_tile_date_window_single_region():
-    regions = [_make_region("r1", year=2020)]
+    # Single year in list
+    regions = [_make_region("r1", years=[2024])]
     start, end = _tile_date_window(regions)
-    assert start == "2015-01-01"
-    assert end == "2020-12-31"
+    assert start == "2024-01-01"
+    assert end == "2024-12-31"
 
 
-def test_tile_date_window_all_none_raises():
-    regions = [_make_region("r1", year=None), _make_region("r2", year=None)]
-    with pytest.raises(ValueError, match="no year set"):
-        _tile_date_window(regions)
+def test_tile_date_window_empty_years_raises():
+    # Empty years list should raise — caught at load time normally, but guard here too
+    r = TrainingRegion(
+        id="bad", name="bad", label="presence",
+        bbox=[145.0, -23.0, 145.1, -22.9],
+        years=[],
+        tags=[], notes=None,
+    )
+    with pytest.raises((ValueError, Exception)):
+        _tile_date_window([r])
 
 
-def test_tile_date_window_ignores_none_years():
-    regions = [_make_region("r1", year=None), _make_region("r2", year=2022)]
+def test_tile_date_window_multi_year_list():
+    # Explicit multi-year list: window is exact min..max, no implicit -5
+    regions = [_make_region("r1", years=[2020, 2021, 2022, 2023, 2024, 2025])]
     start, end = _tile_date_window(regions)
-    assert start == "2017-01-01"
-    assert end == "2022-12-31"
+    assert start == "2020-01-01"
+    assert end == "2025-12-31"
 
 
 # ---------------------------------------------------------------------------
@@ -380,3 +393,43 @@ def test_tile_rebuild_includes_all_indexed_regions(training_dirs, monkeypatch):
     point_ids = set(result["point_id"])
     assert "region_a_0000" in point_ids, "region_a missing from rebuilt tile — pre-fix bug"
     assert "region_b_0000" in point_ids, "region_b missing from rebuilt tile"
+
+
+# ---------------------------------------------------------------------------
+# Test 19 — _parse_years compat shim for old year: YYYY field
+# ---------------------------------------------------------------------------
+
+def test_parse_years_compat_shim_expands_old_year_field():
+    """Old 'year: YYYY' entries must expand to [YYYY-5 .. YYYY] with a DeprecationWarning."""
+    import warnings
+    from utils.regions import _parse_years
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = _parse_years({"id": "test_region", "year": 2023})
+
+    assert result == [2018, 2019, 2020, 2021, 2022, 2023]
+    assert any(issubclass(w.category, DeprecationWarning) for w in caught), (
+        "Expected a DeprecationWarning for old 'year:' field"
+    )
+
+
+def test_parse_years_new_field_no_warning():
+    """New 'years: [...]' entries must not emit any DeprecationWarning."""
+    import warnings
+    from utils.regions import _parse_years
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = _parse_years({"id": "test_region", "years": [2024]})
+
+    assert result == [2024]
+    assert not any(issubclass(w.category, DeprecationWarning) for w in caught)
+
+
+def test_parse_years_empty_list_raises():
+    """Empty years list must raise ValueError."""
+    from utils.regions import _parse_years
+
+    with pytest.raises(ValueError, match="non-empty"):
+        _parse_years({"id": "test_region", "years": []})

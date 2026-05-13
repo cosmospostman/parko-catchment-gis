@@ -171,13 +171,13 @@ def cmd_training_list(args: argparse.Namespace) -> None:
     regions = load_regions(yaml_path) if yaml_path else load_regions()
     totals: dict[str, int] = {}
 
-    print(f"  {'ID':<40} {'LABEL':<10} {'YEAR':<6} {'PIXELS':>8}")
-    print("  " + "-" * 68)
+    print(f"  {'ID':<40} {'LABEL':<10} {'YEARS':<12} {'PIXELS':>8}")
+    print("  " + "-" * 74)
     for r in regions:
         n = _bbox_pixel_count(r.bbox)
         totals[r.label] = totals.get(r.label, 0) + n
-        year_str = str(r.year) if r.year else "—"
-        print(f"  {r.id:<40} {r.label:<10} {year_str:<6} {n:>8,}")
+        year_str = f"{min(r.years)}–{max(r.years)}" if r.years else "—"
+        print(f"  {r.id:<40} {r.label:<10} {year_str:<12} {n:>8,}")
 
     print("  " + "-" * 68)
     for label, total in sorted(totals.items()):

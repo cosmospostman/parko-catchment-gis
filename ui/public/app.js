@@ -1048,17 +1048,16 @@ function loadS1() {
 }
 
 // ---------------------------------------------------------------------------
-// Noise filter pixel overlay
+// Noise filter pixel overlay (woody classifier scores)
 // ---------------------------------------------------------------------------
 
 const noiseAccordionHeader = document.getElementById('noise-accordion-header');
 const noiseAccordionBody   = document.getElementById('noise-accordion-body');
 const noiseToggle          = document.getElementById('noise-toggle');
 const noiseRegionSel       = document.getElementById('noise-region');
-const noiseDryNdvi         = document.getElementById('noise-dry-ndvi');
-const noiseRecP            = document.getElementById('noise-rec-p');
-const noiseNirCv           = document.getElementById('noise-nir-cv');
 const noiseStatus          = document.getElementById('noise-status');
+const woodyThresholdSlider = document.getElementById('woody-threshold');
+const woodyThresholdVal    = document.getElementById('woody-threshold-val');
 
 noiseAccordionHeader.addEventListener('click', (e) => {
   if (e.target.closest('input[type="checkbox"]')) return;
@@ -1072,53 +1071,23 @@ noiseToggle.addEventListener('change', (e) => {
   }
 });
 
-// Slider value displays
-function _updateNoiseVal(sliderId, valId) {
-  const slider = document.getElementById(sliderId);
-  const label  = document.getElementById(valId);
-  label.textContent = parseFloat(slider.value).toFixed(2);
-  slider.addEventListener('input', () => {
-    label.textContent = parseFloat(slider.value).toFixed(2);
-    reclassifyNoisePixels();
-  });
-}
-_updateNoiseVal('noise-dry-ndvi', 'noise-dry-ndvi-val');
-_updateNoiseVal('noise-rec-p',    'noise-rec-p-val');
-_updateNoiseVal('noise-nir-cv',   'noise-nir-cv-val');
+woodyThresholdSlider.addEventListener('input', () => {
+  woodyThresholdVal.textContent = parseFloat(woodyThresholdSlider.value).toFixed(2);
+  reclassifyNoisePixels();
+});
 
-// S1 VH slider — special display: show "off" at minimum
-const noiseS1Vh = document.getElementById('noise-s1-vh');
-const noiseS1VhVal = document.getElementById('noise-s1-vh-val');
-const NOISE_S1_VH_MIN = parseFloat(noiseS1Vh.min);
-function _updateS1VhVal() {
-  const v = parseFloat(noiseS1Vh.value);
-  noiseS1VhVal.textContent = v <= NOISE_S1_VH_MIN ? 'off' : v.toFixed(1);
-}
-_updateS1VhVal();
-noiseS1Vh.addEventListener('input', () => { _updateS1VhVal(); reclassifyNoisePixels(); });
-
-let noisePixelData = null;    // raw array from API
+let noisePixelData = null;
 let noisePollTimer = null;
 let noiseActiveRegion = null;
 
-function _noiseThresholds() {
-  const s1vh = parseFloat(noiseS1Vh.value);
-  return {
-    dry_ndvi:       parseFloat(noiseDryNdvi.value),
-    rec_p:          parseFloat(noiseRecP.value),
-    nir_cv:         parseFloat(noiseNirCv.value),
-    s1_mean_vh_dry: s1vh <= NOISE_S1_VH_MIN ? null : s1vh,  // null = disabled
-  };
+function _woodyThreshold() {
+  return parseFloat(woodyThresholdSlider.value);
 }
 
-function _classifyPixel(p, t) {
-  // null means insufficient data — treat as passing (matches fillna(threshold) in train.py)
-  if (p.dry_ndvi !== null && p.dry_ndvi < t.dry_ndvi) return 'dropped';
-  if (p.rec_p    !== null && p.rec_p    < t.rec_p)    return 'dropped';
-  if (p.nir_cv   !== null && p.nir_cv   > t.nir_cv)   return 'dropped';
-  // S1 VH: higher dB = more backscatter = more woody structure; drop if below threshold
-  if (t.s1_mean_vh_dry !== null && p.s1_mean_vh_dry !== null && p.s1_mean_vh_dry < t.s1_mean_vh_dry) return 'dropped';
-  return 'kept';
+function _classifyPixel(p, threshold) {
+  const prob = p.prob_woody;
+  if (prob === null || prob === undefined || prob === 'null') return 'kept';
+  return Number(prob) >= threshold ? 'kept' : 'dropped';
 }
 
 function _propNum(v) {
@@ -1128,37 +1097,18 @@ function _propNum(v) {
   return isNaN(n) ? null : n;
 }
 
-function _failedCriteria(p, t) {
-  const dry_ndvi = _propNum(p.dry_ndvi);
-  const rec_p    = _propNum(p.rec_p);
-  const nir_cv   = _propNum(p.nir_cv);
-  const reasons = [];
-  if (dry_ndvi !== null && dry_ndvi < t.dry_ndvi)
-    reasons.push(`dry_ndvi ${dry_ndvi.toFixed(3)} < ${t.dry_ndvi.toFixed(2)}`);
-  if (rec_p !== null && rec_p < t.rec_p)
-    reasons.push(`rec_p ${rec_p.toFixed(3)} < ${t.rec_p.toFixed(2)}`);
-  if (nir_cv !== null && nir_cv > t.nir_cv)
-    reasons.push(`nir_cv ${nir_cv.toFixed(3)} > ${t.nir_cv.toFixed(2)}`);
-  const s1vh = _propNum(p.s1_mean_vh_dry);
-  if (t.s1_mean_vh_dry !== null && s1vh !== null && s1vh < t.s1_mean_vh_dry)
-    reasons.push(`s1_vh ${s1vh.toFixed(2)} dB < ${t.s1_mean_vh_dry.toFixed(1)} dB`);
-  return reasons;
-}
-
-function _buildNoiseGeoJSON(pixels, thresholds) {
+function _buildNoiseGeoJSON(pixels, threshold) {
   let kept = 0, dropped = 0;
   const features = pixels.map(p => {
-    const status = _classifyPixel(p, thresholds);
+    const status = _classifyPixel(p, threshold);
     if (status === 'kept') kept++; else dropped++;
     return {
       type: 'Feature',
       geometry: { type: 'Point', coordinates: [p.lon, p.lat] },
       properties: {
-        id:       p.id,
+        id:         p.id,
         status,
-        dry_ndvi: p.dry_ndvi,
-        rec_p:    p.rec_p,
-        nir_cv:   p.nir_cv,
+        prob_woody: p.prob_woody,
       },
     };
   });
@@ -1167,8 +1117,8 @@ function _buildNoiseGeoJSON(pixels, thresholds) {
 
 function reclassifyNoisePixels() {
   if (!noisePixelData || !map.getSource('noise-pixels')) return;
-  const t = _noiseThresholds();
-  const { geojson, kept, dropped } = _buildNoiseGeoJSON(noisePixelData, t);
+  const threshold = _woodyThreshold();
+  const { geojson, kept, dropped } = _buildNoiseGeoJSON(noisePixelData, threshold);
   map.getSource('noise-pixels').setData(geojson);
   noiseStatus.textContent = `${kept} kept · ${dropped} dropped`;
   noiseStatus.style.color = '';
@@ -1181,7 +1131,7 @@ function _ensureNoiseLayer() {
       id: 'noise-pixels',
       type: 'circle',
       source: 'noise-pixels',
-      layout: { visibility: noiseToggle.checked ? 'visible' : 'none' },
+      layout: { visibility: 'visible' },
       paint: {
         'circle-radius': 3,
         'circle-opacity': 0.75,
@@ -1193,26 +1143,17 @@ function _ensureNoiseLayer() {
       const feat = e.features[0];
       if (!feat) return;
       const p = feat.properties;
-      const t = _noiseThresholds();
-      const reasons = _failedCriteria(p, t);
-      // MapLibre serialises properties to strings; null becomes the string "null"
-      const fmtVal = v => (v === null || v === undefined || v === 'null') ? '<span style="color:#555">null</span>' : Number(v).toFixed(4);
-      const row = (label, val) =>
-        `<div class="popup-row"><span class="popup-label">${label}</span><span>${fmtVal(val)}</span></div>`;
+      const prob = _propNum(p.prob_woody);
+      const heuristicLabel = prob === null ? '<span style="color:#555">no S1 data</span>'
+        : prob >= 1.0 ? 'woody'
+        : 'non-woody';
       const statusBadge = p.status === 'dropped'
         ? `<span class="role-badge role-absence">dropped</span>`
         : `<span class="role-badge role-presence">kept</span>`;
-      const whyHtml = reasons.length
-        ? `<div class="popup-notes" style="color:#f87171;">✗ ${reasons.join('<br>✗ ')}</div>`
-        : '';
       popup.setLngLat(e.lngLat).setHTML(`
         <div class="popup-title">${p.id}</div>
         <div class="popup-row"><span class="popup-label">status</span>${statusBadge}</div>
-        ${row('dry_ndvi', p.dry_ndvi)}
-        ${row('rec_p', p.rec_p)}
-        ${row('nir_cv', p.nir_cv)}
-        ${row('s1_vh_dry', p.s1_mean_vh_dry)}
-        ${whyHtml}
+        <div class="popup-row"><span class="popup-label">heuristic score</span><span>${heuristicLabel}</span></div>
       `).addTo(map);
     });
     map.on('mouseenter', 'noise-pixels', () => { map.getCanvas().style.cursor = 'pointer'; });
@@ -1240,7 +1181,7 @@ function loadNoisePixels(regionId) {
     if (noiseActiveRegion !== regionId) return;
     let resp;
     try {
-      resp = await fetch(`/api/noise-pixels?region=${encodeURIComponent(regionId)}`);
+      resp = await fetch(`/api/heuristic-scores?region=${encodeURIComponent(regionId)}`);
     } catch {
       noiseStatus.textContent = 'network error';
       noiseStatus.style.color = '#f87171';
@@ -1251,8 +1192,7 @@ function loadNoisePixels(regionId) {
     if (noiseActiveRegion !== regionId) return;
 
     if (resp.status === 202) {
-      // still building — keep polling
-      noiseStatus.textContent = 'building…';
+      noiseStatus.textContent = 'scoring…';
       noiseStatus.style.color = '#facc15';
       return;
     }
@@ -1276,11 +1216,8 @@ function loadNoisePixels(regionId) {
 
     noisePixelData = data.pixels;
     _ensureNoiseLayer();
-
-    if (noiseToggle.checked) {
-      map.setLayoutProperty('noise-pixels', 'visibility', 'visible');
-    }
-
+    map.setLayoutProperty('noise-pixels', 'visibility', 'visible');
+    noiseToggle.checked = true;
     reclassifyNoisePixels();
   }
 
@@ -1291,12 +1228,17 @@ function loadNoisePixels(regionId) {
 noiseRegionSel.addEventListener('change', () => loadNoisePixels(noiseRegionSel.value));
 
 // Populate region dropdown
-fetch('/api/noise-pixel-regions')
+fetch('/api/heuristic-score-regions')
   .then(r => r.json())
   .then(regions => {
-    const presenceRegions = regions.filter(r => r.label === 'presence');
-    noiseRegionSel.innerHTML = '<option value="">— select —</option>' +
-      presenceRegions.map(r => `<option value="${r.id}">${r.id}</option>`).join('');
+    const sort = arr => arr.slice().sort((a, b) => a.id.localeCompare(b.id));
+    const presence = sort(regions.filter(r => r.label === 'presence'));
+    const absence  = sort(regions.filter(r => r.label === 'absence'));
+    const opts = (arr) => arr.map(r => `<option value="${r.id}">${r.id}</option>`).join('');
+    noiseRegionSel.innerHTML =
+      '<option value="">— select —</option>' +
+      `<optgroup label="Presence">${opts(presence)}</optgroup>` +
+      `<optgroup label="Absence">${opts(absence)}</optgroup>`;
   })
   .catch(() => {});
 

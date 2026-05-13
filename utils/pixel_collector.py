@@ -416,15 +416,20 @@ def collect(
     # to the patch edge, making every pixel return the same value.
     # If stale patches are found, invalidate shard .done files so shards are rebuilt.
     from utils.fetch import _cache_path as _fc_path, _load_patch_cache as _lpc, _patch_covers_bbox as _pcb
-    _proxy_band = "B08"
+    # Scan ALL item dirs in the cache, not just those matching current STAC item IDs.
+    # Stale dirs may have been written by a previous fetch with a different date window
+    # or a different region's bbox — their item IDs won't appear in the current STAC
+    # list, so checking only current items silently misses them.
     _stale_ids: set[str] = set()
-    for _item in items:
-        _proxy_path = _fc_path(cache_dir, _item.id, _proxy_band)
-        if not _proxy_path.exists():
-            continue
-        _data = _lpc(_proxy_path)
-        if _data is None or not _pcb(_data, bbox_wgs84):
-            _stale_ids.add(_item.id)
+    if cache_dir.is_dir():
+        for _item_dir in cache_dir.iterdir():
+            if not _item_dir.is_dir():
+                continue
+            for _npz in _item_dir.glob("*.npz"):
+                _data = _lpc(_npz)
+                if _data is None or not _pcb(_data, bbox_wgs84):
+                    _stale_ids.add(_item_dir.name)
+                    break
     if _stale_ids:
         logger.warning(
             "Stale chip cache: %d items have patches that don't cover bbox %s "

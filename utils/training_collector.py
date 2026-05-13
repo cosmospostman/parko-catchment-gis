@@ -173,14 +173,13 @@ def _fetch_tile_items(
 
 
 def _tile_date_window(tile_regions: list[TrainingRegion]) -> tuple[str, str]:
-    """Derive fetch window as [min(year)-5, max(year)] across regions."""
-    years = [r.year for r in tile_regions if r.year is not None]
-    if not years:
+    """Derive fetch window from the explicit years lists across all regions on this tile."""
+    all_years = [yr for r in tile_regions for yr in r.years]
+    if not all_years:
         raise ValueError(
-            f"Regions {[r.id for r in tile_regions]} have no year set — "
-            "all training regions must specify a year"
+            f"Regions {[r.id for r in tile_regions]} have empty years lists"
         )
-    return f"{min(years) - 5}-01-01", f"{max(years)}-12-31"
+    return f"{min(all_years)}-01-01", f"{max(all_years)}-12-31"
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +212,10 @@ def _collect_one_region(
 
     out_path    = _region_parquet_path(region.id)
     collect_dir = _TILES_DIR / "regions" / f"{region.id}.collect"
-    cache_dir   = tile_chips_path(tile_id)
+    # Use a per-region chip cache, not the shared per-tile one. Parallel workers
+    # on the same tile would otherwise race — each writing patches for its own
+    # small bbox, then the stale-check deleting the other worker's patches.
+    cache_dir   = tile_chips_path(tile_id) / region.id
     bbox        = list(region.bbox)
 
     logger.info("Region %s: S2+S1 fetch start  bbox=%s  %s→%s", region.id, bbox, start, end)
@@ -229,6 +231,13 @@ def _collect_one_region(
     def _fetch_s2() -> None:
         nonlocal s2_tile_paths, s2_exc
         try:
+            # Filter to items from this tile only. tile_items comes from a STAC
+            # search over the union bbox, which may include adjacent tiles when a
+            # region straddles a tile boundary. Mixing items from different MGRS
+            # tiles into one cache_dir breaks CachedNpzChipStore: each tile has
+            # its own CRS/transform, so point projections from one tile are
+            # invalid for patches fetched for another.
+            this_tile_items = [it for it in tile_items if tile_id in it.id]
             tile_paths = collect(
                 bbox_wgs84=bbox,
                 start=start,
@@ -238,7 +247,7 @@ def _collect_one_region(
                 cache_dir=cache_dir,
                 apply_nbar=apply_nbar,
                 max_concurrent=max_concurrent,
-                items=tile_items,
+                items=this_tile_items,
                 point_id_prefix=region.id,
             )
             if not tile_paths:
@@ -416,6 +425,11 @@ def ensure_training_pixels(
                 if r not in pending:
                     logger.info("Region %s already collected — skipping", r.id)
             for region in pending:
+                if region.id in submitted_region_ids:
+                    # Region spans multiple tiles — already submitted under the
+                    # first tile encountered (sorted order). Skip duplicates so
+                    # concurrent workers don't race on the same chip cache.
+                    continue
                 submitted_region_ids.add(region.id)
                 futures[pool.submit(_do_region, tile_id, region, tile_regions)] = region.id
 

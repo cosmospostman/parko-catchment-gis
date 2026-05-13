@@ -940,7 +940,7 @@
       <div id="noise-accordion">
         <div id="noise-accordion-header">
           <input type="checkbox" id="noise-toggle">
-          <span class="accordion-label">Noise filter pixels</span>
+          <span class="accordion-label">Noise filter pixels (heuristic)</span>
           <span class="accordion-chevron">&#9658;</span>
         </div>
         <div id="noise-accordion-body">
@@ -949,24 +949,9 @@
             <select id="noise-region"><option value="">— select —</option></select>
           </div>
           <div class="irow">
-            <span class="ikey">dry_ndvi ≥</span>
-            <input type="range" id="noise-dry-ndvi" min="0" max="0.5" step="0.01" value="0.10">
-            <span class="noise-val" id="noise-dry-ndvi-val">0.10</span>
-          </div>
-          <div class="irow">
-            <span class="ikey">rec_p ≥</span>
-            <input type="range" id="noise-rec-p" min="0" max="0.5" step="0.01" value="0.20">
-            <span class="noise-val" id="noise-rec-p-val">0.20</span>
-          </div>
-          <div class="irow">
-            <span class="ikey">nir_cv ≤</span>
-            <input type="range" id="noise-nir-cv" min="0" max="0.5" step="0.01" value="0.20">
-            <span class="noise-val" id="noise-nir-cv-val">0.20</span>
-          </div>
-          <div class="irow">
-            <span class="ikey">s1_vh ≥</span>
-            <input type="range" id="noise-s1-vh" min="-35" max="-5" step="0.5" value="-35">
-            <span class="noise-val" id="noise-s1-vh-val">off</span>
+            <span class="ikey">min score ≥</span>
+            <input type="range" id="woody-threshold" min="0" max="1" step="0.01" value="0.0">
+            <span class="noise-val" id="woody-threshold-val">0.00</span>
           </div>
           <div id="noise-status"></div>
         </div>
