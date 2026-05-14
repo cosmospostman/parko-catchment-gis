@@ -37,7 +37,7 @@ S1_SNAP_WINDOW_DAYS: int = 7   # max |S1_date - S2_date| to accept a snap
 
 N_BANDS: int = len(ALL_FEATURE_COLS)          # 13: S2 only (no S1 in time series yet)
 N_BANDS_S1: int = len(ALL_FEATURE_COLS) + len(S1_FEATURE_COLS)  # 17: S2 + S1
-MAX_SEQ_LEN: int = 128       # canonical value lives in TAMConfig; kept here for model.py import
+MAX_SEQ_LEN: int = 128       # hard upper bound on stored window length; model seq len set via TAMConfig.max_seq_len
 MIN_OBS_PER_YEAR: int = 8
 
 
@@ -224,6 +224,7 @@ class TAMDataset(Dataset):
         pixel_zscore: bool = False,  # if True, z-score each pixel's S1 bands by its own multi-year mean/std
         s1_despeckle_window: int = 0,
         feature_cols_override: list[str] | None = None,  # if set, replaces default feature cols for S2-only mode
+        max_seq_len: int = MAX_SEQ_LEN,  # model sequence length; windows longer than this are randomly subsampled
     ) -> None:
         # doy_jitter: max ±days to shift all observations in a window (training only).
         # A single offset is drawn per __getitem__ call and applied uniformly so
@@ -404,6 +405,7 @@ class TAMDataset(Dataset):
         self._doy_phase_shift = doy_phase_shift
         self._band_noise_std = band_noise_std
         self._obs_dropout_min = obs_dropout_min
+        self._max_seq_len = max_seq_len
 
         # Global features: per-pixel scalars z-scored and stored as float32 arrays
         if global_features_df is not None and len(global_features_df) > 0:
@@ -444,8 +446,14 @@ class TAMDataset(Dataset):
         pid, yr, bands_np, doy_np = self._windows[idx]
         n = len(bands_np)
 
-        if self._obs_dropout_min > 0 and n > self._obs_dropout_min:
-            keep = np.random.randint(self._obs_dropout_min, n + 1)
+        # Subsample to max_seq_len if needed, incorporating obs_dropout.
+        # Upper bound is min(n, max_seq_len); lower bound is obs_dropout_min if set.
+        seq_cap = self._max_seq_len
+        if n > seq_cap or (self._obs_dropout_min > 0 and n > self._obs_dropout_min):
+            lo = self._obs_dropout_min if self._obs_dropout_min > 0 else seq_cap
+            lo = min(lo, seq_cap)
+            hi = min(n, seq_cap)
+            keep = np.random.randint(lo, hi + 1) if lo < hi else hi
             idx_keep = np.sort(np.random.choice(n, keep, replace=False))
             bands_np = bands_np[idx_keep]
             doy_np   = doy_np[idx_keep]
@@ -475,14 +483,14 @@ class TAMDataset(Dataset):
             # that straddle the year boundary, misaligning the band and DOY sequences.
             doy_vals = np.clip(doy_vals + offset, 1, 365)
 
-        bands = np.zeros((MAX_SEQ_LEN, self._n_features), dtype=np.float32)
+        bands = np.zeros((seq_cap, self._n_features), dtype=np.float32)
         bands[:n] = bands_np
 
-        doy = np.zeros(MAX_SEQ_LEN, dtype=np.int64)
+        doy = np.zeros(seq_cap, dtype=np.int64)
         doy[:n] = doy_vals
 
         # Padding mask: True = padding position (PyTorch convention)
-        mask = np.ones(MAX_SEQ_LEN, dtype=bool)
+        mask = np.ones(seq_cap, dtype=bool)
         mask[:n] = False
 
         if self._labels is None:
@@ -499,7 +507,7 @@ class TAMDataset(Dataset):
             bands        = torch.from_numpy(bands),
             doy          = torch.from_numpy(doy),
             mask         = torch.from_numpy(mask),
-            n_obs        = torch.tensor(n / MAX_SEQ_LEN, dtype=torch.float32),
+            n_obs        = torch.tensor(n / seq_cap, dtype=torch.float32),
             global_feats = torch.from_numpy(gf),
             label        = torch.tensor(label,  dtype=torch.float32),
             weight       = torch.tensor(weight, dtype=torch.float32),

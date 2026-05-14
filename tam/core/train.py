@@ -17,7 +17,7 @@ from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader
 
 from tam.core.config import TAMConfig
-from tam.core.dataset import TAMDataset, collate_fn
+from tam.core.dataset import MAX_SEQ_LEN, TAMDataset, collate_fn
 from tam.core.model import TAMClassifier
 
 logger = logging.getLogger(__name__)
@@ -502,6 +502,7 @@ def train_tam(
         pixel_zscore=cfg.pixel_zscore,
         s1_despeckle_window=cfg.s1_despeckle_window,
         feature_cols_override=_feature_cols_override,
+        max_seq_len=cfg.max_seq_len,
     )
     band_mean, band_std = train_ds.band_stats
     _log_rss("after train_ds, before val_ds")
@@ -518,6 +519,7 @@ def train_tam(
         pixel_zscore=cfg.pixel_zscore,
         s1_despeckle_window=cfg.s1_despeckle_window,
         feature_cols_override=_feature_cols_override,
+        max_seq_len=cfg.max_seq_len,
     )
     logger.info("Train windows: %d  |  Val windows: %d", len(train_ds), len(val_ds))
     _log_rss("after val_ds")
@@ -552,6 +554,7 @@ def train_tam(
     model = TAMClassifier.from_config(cfg)
     model._use_s1 = cfg.use_s1          # persisted to tam_config.json for score pipeline
     model._pixel_zscore = cfg.pixel_zscore
+    model._max_seq_len = cfg.max_seq_len
     model._feature_cols = _feature_cols_override  # None = default ALL_FEATURE_COLS
     model.to(device)
     logger.info(
@@ -769,6 +772,7 @@ def load_tam(out_dir: Path, device: str | None = None) -> tuple[TAMClassifier, n
     model.load_state_dict(state, strict=False)
     model._use_s1 = cfg_dict.get("use_s1", None)
     model._pixel_zscore = cfg_dict.get("pixel_zscore", None)
+    model._max_seq_len = cfg_dict.get("max_seq_len", MAX_SEQ_LEN)
     model.to(device)
     model.eval()
 

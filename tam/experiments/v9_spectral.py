@@ -86,6 +86,7 @@ EXPERIMENT = Experiment(
         "pixel_zscore":          True,
         "use_s1":                False,
         "use_band_summaries":    True,
+        "max_seq_len":           64,
         "val_sites":             ("etna",),
         "feature_cols_override": tuple(V9_FEATURE_COLS),
     },

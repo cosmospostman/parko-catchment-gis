@@ -224,7 +224,7 @@ class TAMClassifier(nn.Module):
             "use_n_obs":          self.use_n_obs,
             "n_global_features":  self.n_global_features,
             "doy_density_norm":   self.doy_density_norm,
-            "max_seq_len":        MAX_SEQ_LEN,
+            "max_seq_len":        getattr(self, "_max_seq_len", MAX_SEQ_LEN),
             # Data/inference config — needed by score pipeline
             "use_s1":             getattr(self, "_use_s1", None),
             "pixel_zscore":       getattr(self, "_pixel_zscore", None),

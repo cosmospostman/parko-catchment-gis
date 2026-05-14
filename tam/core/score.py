@@ -176,6 +176,7 @@ def _preprocess(
     despeckle_lookup: pd.DataFrame | None = None,
     feature_cols: list[str] | None = None,
     pixel_zscore_stats: tuple[dict, dict] | None = None,
+    max_seq_len: int = MAX_SEQ_LEN,
 ) -> _PreparedBatch | None:
     """CPU-side preprocessing using numba kernels for maximum throughput.
 
@@ -245,13 +246,13 @@ def _preprocess(
         return None
 
     valid_starts = boundaries[valid].astype(np.int64)
-    capped = np.minimum(lengths[valid], MAX_SEQ_LEN).astype(np.int32)
+    capped = np.minimum(lengths[valid], max_seq_len).astype(np.int32)
     W = int(valid.sum())
 
     # Step 3: fill padded tensors with normalisation via numba parallel kernel
-    bands_np = np.zeros((W, MAX_SEQ_LEN, n_feat), dtype=np.float32)
-    doy_np   = np.zeros((W, MAX_SEQ_LEN), dtype=np.int64)
-    mask_np  = np.ones( (W, MAX_SEQ_LEN), dtype=np.bool_)
+    bands_np = np.zeros((W, max_seq_len, n_feat), dtype=np.float32)
+    doy_np   = np.zeros((W, max_seq_len), dtype=np.int64)
+    mask_np  = np.ones( (W, max_seq_len), dtype=np.bool_)
 
     if pixel_zscore_stats is not None and not s1_only:
         # Per-pixel z-score: normalise each pixel's observations by its own
@@ -270,7 +271,7 @@ def _preprocess(
             # then global normalisation (band_mean/band_std ~ 0/1 after zscore)
             normed = (window - band_mean) / band_std
             normed = np.where(np.isnan(normed), 0.0, normed).astype(np.float32)
-            n = min(c, MAX_SEQ_LEN)
+            n = min(c, max_seq_len)
             bands_np[k, :n] = normed[:n]
             doy_np[k,  :n]  = doy_arr[s:s+n]
             mask_np[k, :n]  = False
@@ -281,7 +282,7 @@ def _preprocess(
     pids  = pid_arr[valid_starts]
     years = year_arr[valid_starts]
 
-    n_obs_np = (capped / MAX_SEQ_LEN).astype(np.float32)
+    n_obs_np = (capped / max_seq_len).astype(np.float32)
 
     bands_th = torch.from_numpy(bands_np)
     doy_th   = torch.from_numpy(doy_np)
@@ -634,7 +635,8 @@ def score_pixels_chunked(
                                    vv_mean=_vv_mean, vv_std=_vv_std,
                                    despeckle_lookup=_despeckle_lookup,
                                    feature_cols=feature_cols,
-                                   pixel_zscore_stats=pixel_zscore_stats)
+                                   pixel_zscore_stats=pixel_zscore_stats,
+                                   max_seq_len=getattr(model, "_max_seq_len", MAX_SEQ_LEN))
             if prepared is not None:
                 prep_q.put(prepared)
         prep_q.put(_SENTINEL)
