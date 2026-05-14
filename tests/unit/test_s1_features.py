@@ -44,9 +44,10 @@ from tam.core.dataset import (
     snap_s1_to_s2,
     TAMDataset,
     N_BANDS,
-    N_BANDS_S1,
     S1_FEATURE_COLS,
 )
+
+N_S1_ONLY_BANDS: int = len(S1_FEATURE_COLS)  # 4: s1_only mode
 from analysis.constants import BANDS
 
 
@@ -393,7 +394,7 @@ def test_snap_s1_spatial_isolation():
 
 
 # ---------------------------------------------------------------------------
-# S1D-1: TAMDataset with use_s1=True has N_BANDS_S1 features
+# S1D-1: TAMDataset with use_s1="s1_only" has N_S1_ONLY_BANDS features
 # ---------------------------------------------------------------------------
 
 def _make_dataset_df(n_pixels: int = 3, n_s2_per_pixel: int = 20,
@@ -428,10 +429,10 @@ def _make_dataset_df(n_pixels: int = 3, n_s2_per_pixel: int = 20,
 
 def test_tamdataset_use_s1_n_bands():
     df, labels = _make_dataset_df(include_s1=True)
-    ds = TAMDataset(df, labels, use_s1=True)
+    ds = TAMDataset(df, labels, use_s1="s1_only")
     sample = ds[0]
-    assert sample.bands.shape == (128, N_BANDS_S1), (
-        f"Expected (128, {N_BANDS_S1}), got {sample.bands.shape}"
+    assert sample.bands.shape == (128, N_S1_ONLY_BANDS), (
+        f"Expected (128, {N_S1_ONLY_BANDS}), got {sample.bands.shape}"
     )
 
 
@@ -449,30 +450,30 @@ def test_tamdataset_no_s1_n_bands():
 
 
 # ---------------------------------------------------------------------------
-# S1D-3: use_s1=True: S1 features non-NaN for windows with S1 data
+# S1D-3: use_s1="s1_only": all bands are S1 features and are non-zero
 # ---------------------------------------------------------------------------
 
 def test_tamdataset_s1_features_populated():
     df, labels = _make_dataset_df(include_s1=True)
-    ds = TAMDataset(df, labels, use_s1=True)
-    # At least one window must have a finite (non-NaN, non-zero) S1 feature value
+    ds = TAMDataset(df, labels, use_s1="s1_only")
+    # At least one window must have a finite non-zero S1 feature value
     for i in range(len(ds)):
         sample = ds[i]
-        bands = sample.bands  # (128, 17)
+        bands = sample.bands  # (128, 4) — all S1 in s1_only mode
         n_obs = int((sample.doy != 0).sum())
-        s1_cols = bands[:n_obs, N_BANDS:]  # last 4 columns for real observations
-        if torch.isfinite(s1_cols).any() and s1_cols[torch.isfinite(s1_cols)].abs().max() > 0:
+        s1_vals = bands[:n_obs, :]
+        if torch.isfinite(s1_vals).any() and s1_vals[torch.isfinite(s1_vals)].abs().max() > 0:
             return
     pytest.fail("No finite non-zero S1 features found in any window")
 
 
 # ---------------------------------------------------------------------------
-# S1D-4: band_mean/band_std shape matches N_BANDS_S1
+# S1D-4: band_mean/band_std shape matches N_S1_ONLY_BANDS
 # ---------------------------------------------------------------------------
 
 def test_tamdataset_band_stats_shape_with_s1():
     df, labels = _make_dataset_df(include_s1=True)
-    ds = TAMDataset(df, labels, use_s1=True)
+    ds = TAMDataset(df, labels, use_s1="s1_only")
     mean, std = ds.band_stats
-    assert mean.shape == (N_BANDS_S1,)
-    assert std.shape  == (N_BANDS_S1,)
+    assert mean.shape == (N_S1_ONLY_BANDS,)
+    assert std.shape  == (N_S1_ONLY_BANDS,)

@@ -198,7 +198,7 @@ class TestTT7LoadTamReconstructsArchitecture:
             smoke_pixel_df, smoke_labels, smoke_coords,
             out_dir=tmp_path, cfg=smoke_cfg, device="cpu",
         )
-        loaded, _, _ = load_tam(tmp_path, device="cpu")
+        loaded, *_ = load_tam(tmp_path, device="cpu")
         assert loaded.config() == trained.config()
 
 
@@ -212,7 +212,7 @@ class TestTT8LoadTamIdenticalPredictions:
             smoke_pixel_df, smoke_labels, smoke_coords,
             out_dir=tmp_path, cfg=smoke_cfg, device="cpu",
         )
-        loaded, band_mean, band_std = load_tam(tmp_path, device="cpu")
+        loaded, band_mean, band_std, *_ = load_tam(tmp_path, device="cpu")
 
         ds = TAMDataset(
             smoke_pixel_df, smoke_labels,

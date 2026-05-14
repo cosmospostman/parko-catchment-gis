@@ -114,20 +114,21 @@ def test_overlapping_groups_not_sorted(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# PS-4  Overlap at pair (2,3) is missed by default n_check=2
+# PS-4  Overlap in an unsampled middle pair is missed when n_pairs > n_check
 #        (documents the known limitation)
 # ---------------------------------------------------------------------------
 
 def test_is_pixel_sorted_misses_overlap_beyond_n_check(tmp_path):
-    # Groups 0+1 and 1+2 are clean; only 2+3 has overlap.
-    p = _write_parquet(
-        tmp_path / "late_overlap.parquet",
-        [["px1"], ["px2"], ["px3"], ["px3"]],  # overlap at pair (2, 3)
-    )
-    # Default n_check=2 checks pairs (0,1) and (1,2) — misses (2,3).
-    assert is_pixel_sorted(p, n_check=2) is True   # false positive — known gap
-    # With n_check=3 the overlap is detected.
-    assert is_pixel_sorted(p, n_check=3) is False
+    # 20 row groups → 19 pairs. n_check=2 samples pairs {0, 10, 18} — pair 5
+    # is never checked.  Place the overlap exactly at pair 5 (groups[5]/groups[6]).
+    n_groups = 20
+    groups = [[f"px{i}"] for i in range(n_groups)]
+    groups[6] = ["px5"]  # groups[5]=["px5"], groups[6]=["px5"] → overlap at pair 5
+    p = _write_parquet(tmp_path / "mid_overlap.parquet", groups)
+    # n_check=2 misses pair 5 → false positive
+    assert is_pixel_sorted(p, n_check=2) is True   # known gap
+    # n_check=19 checks all pairs → overlap detected
+    assert is_pixel_sorted(p, n_check=19) is False
 
 
 # ---------------------------------------------------------------------------

@@ -523,16 +523,19 @@ def train_tam(
     _log_rss("after val_ds")
 
     n_cpu = os.cpu_count() or 4
-    # Reserve cores for DataLoader workers; give the rest to PyTorch matmuls.
-    n_workers = max(2, n_cpu // 4)
-    torch.set_num_threads(max(1, n_cpu - n_workers))
+    # Model is small and GPU-bound; DataLoader throughput is the bottleneck.
+    # Give most cores to workers, leave 2 for PyTorch matmuls and the main thread.
+    n_workers = max(2, n_cpu - 2)
+    torch.set_num_threads(2)
     train_loader = DataLoader(
         train_ds, batch_size=cfg.batch_size, shuffle=True,
-        collate_fn=collate_fn, num_workers=n_workers, persistent_workers=True, pin_memory=True,
+        collate_fn=collate_fn, num_workers=n_workers, persistent_workers=True,
+        pin_memory=True, prefetch_factor=4,
     )
     val_loader = DataLoader(
         val_ds, batch_size=cfg.batch_size, shuffle=False,
-        collate_fn=collate_fn, num_workers=n_workers, persistent_workers=True, pin_memory=True,
+        collate_fn=collate_fn, num_workers=n_workers, persistent_workers=True,
+        pin_memory=True, prefetch_factor=4,
     )
     _log_rss("after DataLoader creation")
     logger.info("DataLoader workers: %d  PyTorch threads: %d", n_workers, torch.get_num_threads())

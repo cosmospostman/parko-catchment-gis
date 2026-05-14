@@ -991,7 +991,7 @@ def test_s1_df_to_arrow_row_count():
 # ---------------------------------------------------------------------------
 
 def _make_s2_parquet(path: Path, region_id: str, n_pixels: int = 3) -> None:
-    """Write a minimal S2-style parquet (no source/vh/vv columns)."""
+    """Write a minimal S2-style parquet."""
     from analysis.constants import BANDS, SPECTRAL_INDEX_COLS
     rows = []
     for i in range(n_pixels):
@@ -1001,6 +1001,7 @@ def _make_s2_parquet(path: Path, region_id: str, n_pixels: int = 3) -> None:
                 "lon": 145.0 + i * 0.0001,
                 "lat": -22.9 - i * 0.0001,
                 "date": dt,
+                "source": "S2",
                 "item_id": f"S2A_tile_{dt.date()}",
                 "tile_id": "55HBU",
                 **{b: 0.1 + i * 0.01 for b in BANDS},
@@ -1010,6 +1011,8 @@ def _make_s2_parquet(path: Path, region_id: str, n_pixels: int = 3) -> None:
                 "view_zenith": 0.95,
                 "sun_zenith": 0.85,
                 **{c: 0.25 for c in SPECTRAL_INDEX_COLS},
+                "vh": None,
+                "vv": None,
             })
     df = pd.DataFrame(rows)
     df["date"] = pd.to_datetime(df["date"])
@@ -1059,7 +1062,7 @@ def _run_ensure(
         name=region_id,
         label="presence",
         bbox=[145.0, -23.0, 145.1, -22.9],
-        year=2022,
+        years=[2022],
         tags=[],
         notes=None,
     )
@@ -1082,9 +1085,22 @@ def _run_ensure(
 
     monkeypatch.setattr(tc, "collect", _fake_collect)
 
-    # Mock collect_s1 → returns a fake S1 DataFrame
+    # Mock append_s1_to_tile_parquet → appends fake S1 rows directly.
+    # collect_s1 is never called by this code path; append_s1_to_tile_parquet
+    # is the real seam that training_collector uses after S2 is written.
     s1_df = _make_s1_df(region_id=region_id, n_pixels=n_pixels)
-    monkeypatch.setattr(tc, "collect_s1", lambda **kw: s1_df)
+
+    def _fake_append_s1(tile_path, **kw):
+        import pyarrow as pa
+        import pyarrow.parquet as _pq
+        existing = _pq.read_table(tile_path)
+        s1_tbl = pa.Table.from_pandas(s1_df, preserve_index=False)
+        combined = pa.concat_tables([existing, s1_tbl], promote_options="default")
+        # Cast back to the original schema column types where possible
+        combined = combined.select(existing.schema.names)
+        _pq.write_table(combined, tile_path)
+
+    monkeypatch.setattr(tc, "append_s1_to_tile_parquet", _fake_append_s1)
 
     tc.ensure_training_pixels([region])
 

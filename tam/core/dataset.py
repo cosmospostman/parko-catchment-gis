@@ -276,11 +276,27 @@ class TAMDataset(Dataset):
             df = snap_s1_to_s2(pixel_df, despeckle_window=s1_despeckle_window)
             feature_cols = ALL_FEATURE_COLS + S1_FEATURE_COLS
         else:
-            if "source" in pixel_df.columns:
-                df = pixel_df[pixel_df["source"] == "S2"].copy()
-            else:
-                df = pixel_df.copy()
             feature_cols = feature_cols_override if feature_cols_override is not None else ALL_FEATURE_COLS
+
+            # Filter to labeled pixels first — reduces df from all-pixels to labeled-only
+            # before the expensive copy, zscore, and sort operations.
+            self._labels_are_pixel_year = (
+                labels is not None and isinstance(labels.index, pd.MultiIndex)
+            )
+            if labels is not None:
+                if self._labels_are_pixel_year:
+                    _keep_pids = set(labels.index.get_level_values("point_id"))
+                else:
+                    _keep_pids = set(labels.index)
+                if "source" in pixel_df.columns:
+                    df = pixel_df[(pixel_df["source"] == "S2") & pixel_df["point_id"].isin(_keep_pids)].copy()
+                else:
+                    df = pixel_df[pixel_df["point_id"].isin(_keep_pids)].copy()
+            else:
+                if "source" in pixel_df.columns:
+                    df = pixel_df[pixel_df["source"] == "S2"].copy()
+                else:
+                    df = pixel_df.copy()
 
             if any(c not in df.columns for c in feature_cols if c in ("NDVI", "NDWI", "EVI")):
                 df = add_spectral_indices(df)
@@ -288,18 +304,17 @@ class TAMDataset(Dataset):
             if pixel_zscore:
                 # Per-pixel z-score for S2 bands: removes between-tile and between-site
                 # absolute reflectance offsets; preserves phenological curve shape.
-                # Compute per-pixel stats once (small table), merge back — avoids
-                # materialising 2×N_bands full-length transform() Series simultaneously.
+                # Operate on labeled-pixel subset — stats are computed per-pixel so
+                # excluding unlabeled pixels doesn't affect correctness.
+                # Use map() lookup instead of merge to avoid widening the df temporarily.
                 s2_zscore_cols = [c for c in feature_cols if c in df.columns]
                 if s2_zscore_cols:
                     stats = df.groupby("point_id")[s2_zscore_cols].agg(["mean", "std"])
-                    stats.columns = [f"{c}__{s}" for c, s in stats.columns]
-                    df = df.merge(stats, on="point_id", how="left")
+                    pid_arr = df["point_id"].values
                     for col in s2_zscore_cols:
-                        m = df[f"{col}__mean"].values
-                        s = df[f"{col}__std"].fillna(1e-6).clip(lower=1e-6).values
+                        m = stats[col]["mean"].reindex(pid_arr).values
+                        s = stats[col]["std"].reindex(pid_arr).clip(lower=1e-6).fillna(1e-6).values
                         df[col] = (df[col].values - m) / s
-                    df = df.drop(columns=[c for c in df.columns if c.endswith("__mean") or c.endswith("__std")])
 
         if use_s1 != "s1_only":
             if any(c not in df.columns for c in feature_cols if c in ("NDVI", "NDWI", "EVI")):
@@ -316,15 +331,17 @@ class TAMDataset(Dataset):
 
         # Restrict to labeled pixels when labels provided.
         # MultiIndex labels → (point_id, year) granularity; flat index → pixel granularity.
-        self._labels_are_pixel_year = (
-            labels is not None and isinstance(labels.index, pd.MultiIndex)
-        )
-        if labels is not None:
-            if self._labels_are_pixel_year:
-                labeled_pids = labels.index.get_level_values("point_id")
-                df = df[df["point_id"].isin(labeled_pids)]
-            else:
-                df = df[df["point_id"].isin(labels.index)]
+        # (S2-only path already filtered to labeled pixels above; this handles s1_only/snap paths.)
+        if not hasattr(self, "_labels_are_pixel_year"):
+            self._labels_are_pixel_year = (
+                labels is not None and isinstance(labels.index, pd.MultiIndex)
+            )
+            if labels is not None:
+                if self._labels_are_pixel_year:
+                    labeled_pids = labels.index.get_level_values("point_id")
+                    df = df[df["point_id"].isin(labeled_pids)]
+                else:
+                    df = df[df["point_id"].isin(labels.index)]
 
         # Compute band stats from training data if not supplied
         if band_mean is None or band_std is None:
