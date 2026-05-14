@@ -259,11 +259,19 @@ class TAMDataset(Dataset):
                 # VH-VV and RVI are ratios and already self-normalised against geometry;
                 # z-scoring them would destroy the real canopy structure signal in their
                 # absolute values (e.g. Parkinsonia's more negative VH-VV vs open cover).
-                for col, min_std in [("s1_vh", 0.1), ("s1_vv", 0.1)]:
-                    if col in df.columns:
-                        pix_mean = df.groupby("point_id")[col].transform("mean")
-                        pix_std  = df.groupby("point_id")[col].transform("std").clip(lower=min_std)
-                        df[col]  = (df[col] - pix_mean) / pix_std
+                s1_zscore_cols = [c for c, _ in [("s1_vh", 0.1), ("s1_vv", 0.1)] if c in df.columns]
+                if s1_zscore_cols:
+                    # Compute per-pixel stats once (small table), merge back — avoids
+                    # materialising N full-length transform() Series simultaneously.
+                    stats = df.groupby("point_id")[s1_zscore_cols].agg(["mean", "std"])
+                    stats.columns = [f"{c}__{s}" for c, s in stats.columns]
+                    df = df.merge(stats, on="point_id", how="left")
+                    for col, min_std in [("s1_vh", 0.1), ("s1_vv", 0.1)]:
+                        if col in s1_zscore_cols:
+                            m = df[f"{col}__mean"].values
+                            s = df[f"{col}__std"].fillna(min_std).clip(lower=min_std).values
+                            df[col] = (df[col].values - m) / s
+                    df = df.drop(columns=[c for c in df.columns if c.endswith("__mean") or c.endswith("__std")])
         elif use_s1:
             df = snap_s1_to_s2(pixel_df, despeckle_window=s1_despeckle_window)
             feature_cols = ALL_FEATURE_COLS + S1_FEATURE_COLS
@@ -280,11 +288,18 @@ class TAMDataset(Dataset):
             if pixel_zscore:
                 # Per-pixel z-score for S2 bands: removes between-tile and between-site
                 # absolute reflectance offsets; preserves phenological curve shape.
-                for col in feature_cols:
-                    if col in df.columns:
-                        pix_mean = df.groupby("point_id")[col].transform("mean")
-                        pix_std  = df.groupby("point_id")[col].transform("std").clip(lower=1e-6)
-                        df[col]  = (df[col] - pix_mean) / pix_std
+                # Compute per-pixel stats once (small table), merge back — avoids
+                # materialising 2×N_bands full-length transform() Series simultaneously.
+                s2_zscore_cols = [c for c in feature_cols if c in df.columns]
+                if s2_zscore_cols:
+                    stats = df.groupby("point_id")[s2_zscore_cols].agg(["mean", "std"])
+                    stats.columns = [f"{c}__{s}" for c, s in stats.columns]
+                    df = df.merge(stats, on="point_id", how="left")
+                    for col in s2_zscore_cols:
+                        m = df[f"{col}__mean"].values
+                        s = df[f"{col}__std"].fillna(1e-6).clip(lower=1e-6).values
+                        df[col] = (df[col].values - m) / s
+                    df = df.drop(columns=[c for c in df.columns if c.endswith("__mean") or c.endswith("__std")])
 
         if use_s1 != "s1_only":
             if any(c not in df.columns for c in feature_cols if c in ("NDVI", "NDWI", "EVI")):

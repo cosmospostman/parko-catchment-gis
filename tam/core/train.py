@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import logging
@@ -96,35 +97,17 @@ def _compute_band_summaries(pixel_df: pd.DataFrame, feature_cols: list[str]) -> 
     <col>_p5, <col>_p95, <col>_std for each col in feature_cols.
     Used as global features when cfg.use_band_summaries=True.
     """
-    from concurrent.futures import ThreadPoolExecutor
-    s2 = pixel_df[pixel_df["source"] == "S2"] if "source" in pixel_df.columns else pixel_df
-    cols = [c for c in feature_cols if c in s2.columns]
-    n_workers = os.cpu_count() or 4
+    # Work on a minimal S2-only slice — avoid copying the full pixel_df.
+    s2_mask = pixel_df["source"] == "S2" if "source" in pixel_df.columns else pd.Series(True, index=pixel_df.index)
+    cols = [c for c in feature_cols if c in pixel_df.columns]
+    keep_cols = ["point_id"] + cols
+    s2 = pixel_df.loc[s2_mask, keep_cols]  # view, no copy
 
-    # Split by point_id so each thread works on a disjoint set of pixels.
-    # Quantile/std can't be merged from partial results, but per-pixel results can.
-    # Sort once so each pixel's rows are contiguous, then split on pixel boundaries.
-    s2_sorted = s2.sort_values("point_id")
-    all_pids = s2_sorted["point_id"].unique()
-    pid_chunks = np.array_split(all_pids, n_workers)
-    # Build a pid→chunk mapping and use it to tag rows — one isin pass total.
-    pid_to_chunk = {pid: i for i, chunk in enumerate(pid_chunks) for pid in chunk}
-    chunk_ids = s2_sorted["point_id"].map(pid_to_chunk).values
-    sub_dfs = [s2_sorted[chunk_ids == i] for i in range(n_workers)]
-
-    def _chunk_stats(sub: pd.DataFrame) -> pd.DataFrame:
-        if sub.empty:
-            return pd.DataFrame()
-        g = sub.groupby("point_id")[cols]
-        p5  = g.quantile(0.05).rename(columns={c: f"{c}_p5"  for c in cols})
-        p95 = g.quantile(0.95).rename(columns={c: f"{c}_p95" for c in cols})
-        std = g.std().rename(columns={c: f"{c}_std" for c in cols})
-        return pd.concat([p5, p95, std], axis=1)
-
-    with ThreadPoolExecutor(max_workers=n_workers) as pool:
-        parts = list(pool.map(_chunk_stats, sub_dfs))
-
-    result = pd.concat(parts)
+    g = s2.groupby("point_id")[cols]
+    p5  = g.quantile(0.05).rename(columns={c: f"{c}_p5"  for c in cols})
+    p95 = g.quantile(0.95).rename(columns={c: f"{c}_p95" for c in cols})
+    std = g.std().rename(columns={c: f"{c}_std" for c in cols})
+    result = pd.concat([p5, p95, std], axis=1)
     ordered = [f"{c}{s}" for c in cols for s in ("_p5", "_p95", "_std")]
     return result[ordered]
 
@@ -210,12 +193,31 @@ def train_tam(
     else:
         train_labels, val_labels = spatial_split(labels, pixel_coords, cfg.val_frac)
 
+    def _log_rss(tag: str) -> None:
+        try:
+            with open("/proc/self/status") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        rss_gb = int(line.split()[1]) / 1e6
+                        logger.info("RSS %s: %.1f GB", tag, rss_gb)
+                        break
+        except Exception:
+            pass
+
+    _log_rss("after load")
+
     # --- SCL=6 exclusion — strip dark-area misclassifications from S2 rows only ---
-    if "scl" in pixel_df.columns:
+    if "scl" in pixel_df.columns and "source" in pixel_df.columns:
         n_before = len(pixel_df)
-        is_s1 = pixel_df["source"] == "S1" if "source" in pixel_df.columns else pd.Series(False, index=pixel_df.index)
-        pixel_df = pixel_df[is_s1 | (pixel_df["scl"] != 6)]
+        # Identify only the bad S2 rows and drop by index — avoids materialising a
+        # full-length boolean array over all 63M rows while the filtered copy is live.
+        bad_idx = pixel_df.index[(pixel_df["source"] == "S2") & (pixel_df["scl"] == 6)]
+        pixel_df.drop(index=bad_idx, inplace=True)
+        pixel_df.reset_index(drop=True, inplace=True)
+        del bad_idx
+        gc.collect()
         logger.info("SCL=6 exclusion: removed %d observations", n_before - len(pixel_df))
+    _log_rss("after SCL exclusion")
 
     # --- Global features -----------------------------------------------------
     global_feat_df = None
@@ -230,6 +232,29 @@ def train_tam(
     elif cfg.n_global_features > 0:
         from tam.core.global_features import GLOBAL_FEATURE_NAMES
         global_feat_df = _load_or_compute_global_features(pixel_df, out_dir, GLOBAL_FEATURE_NAMES)
+    _log_rss("after band summaries")
+
+    # Pre-extract S1 slim for presence filter, then drop S1 rows to free RAM.
+    # The presence filter only needs the slim slices, not the full S1 rows.
+    _presence_filter_s1_slim: pd.DataFrame | None = None
+    _presence_filter_s2_slim: pd.DataFrame | None = None
+    if (cfg.presence_min_vh_dry_db > -99
+            and "source" in pixel_df.columns
+            and "vh" in pixel_df.columns):
+        _doy_col = "doy" if "doy" in pixel_df.columns else None
+        _date_col = "doy" if _doy_col else "date"
+        _s1_cols = ["point_id", "year", "vh", _date_col]
+        _presence_filter_s1_slim = pixel_df.loc[pixel_df["source"] == "S1", _s1_cols].copy()
+        if "NDVI" in pixel_df.columns:
+            _has_scl = "scl" in pixel_df.columns
+            _s2_cols = ["point_id", "year", _date_col, "NDVI"] + (["scl"] if _has_scl else [])
+            _presence_filter_s2_slim = pixel_df.loc[pixel_df["source"] == "S2", _s2_cols].copy()
+
+    # Drop S1 rows — no longer needed after band summaries and slim extraction.
+    if "source" in pixel_df.columns:
+        pixel_df = pixel_df[pixel_df["source"] == "S2"].reset_index(drop=True)
+        gc.collect()
+    _log_rss("after S1 drop")
 
     # raw_counts populated in pixel-year units after the broadcast step below.
     raw_counts: dict[tuple[str, str], int] = {}
@@ -295,21 +320,12 @@ def train_tam(
     # Drop logic per (point_id, year):
     #   drop if mean_vh_dry < presence_min_vh_dry_db
     #           AND NOT (mean_vh_dry >= presence_ndvi_rescue_vh_db AND mean_ndvi_dry >= presence_ndvi_rescue_min)
-    if (cfg.presence_min_vh_dry_db > -99
-            and "source" in pixel_df.columns
-            and "vh" in pixel_df.columns):
-        _doy_col = "doy" if "doy" in pixel_df.columns else None
+    if _presence_filter_s1_slim is not None:
+        s1_slim = _presence_filter_s1_slim
+        s2_slim = _presence_filter_s2_slim
+        _doy_col = "doy" if "doy" in s1_slim.columns else None
         _date_col = "doy" if _doy_col else "date"
-
-        # S1 — dry-season mean VH
-        _s1_cols = ["point_id", "year", "vh", _date_col]
-        s1_slim = pixel_df.loc[pixel_df["source"] == "S1", _s1_cols]
-
-        # S2 — dry-season mean NDVI (SCL-filtered if available)
-        _has_ndvi = "NDVI" in pixel_df.columns
-        _has_scl  = "scl" in pixel_df.columns
-        _s2_cols  = ["point_id", "year", _date_col] + (["NDVI"] if _has_ndvi else []) + (["scl"] if _has_scl else [])
-        s2_slim = pixel_df.loc[pixel_df["source"] == "S2", _s2_cols] if _has_ndvi else None
+        _has_scl = s2_slim is not None and "scl" in s2_slim.columns
 
         if not s1_slim.empty:
             doy_vals = (s1_slim[_date_col].values if _doy_col
@@ -366,6 +382,9 @@ def train_tam(
                 "Presence filter (mean_vh_dry < %.1f dB%s): removed %d presence pixel-years",
                 cfg.presence_min_vh_dry_db, ndvi_note, sum(noise_removed.values()),
             )
+        del s1_slim, s2_slim, _presence_filter_s1_slim, _presence_filter_s2_slim
+        gc.collect()
+    _log_rss("after presence filter")
 
     # --- Pixel-year summary table --------------------------------------------
     # All counts (Raw, Noise, Total) are in pixel-year units.
@@ -463,6 +482,12 @@ def train_tam(
         global_feat_df = global_feat_df.iloc[:, :cfg.n_global_features]
 
     # --- Datasets -----------------------------------------------------------
+    # Drop source column if present — pixel_df is already S2-only at this point,
+    # so the column only causes TAMDataset to do a redundant boolean scan + copy.
+    if "source" in pixel_df.columns:
+        pixel_df = pixel_df.drop(columns=["source"])
+
+    _log_rss("before train_ds")
     _feature_cols_override = list(cfg.feature_cols_override) if cfg.feature_cols_override else None
     train_ds = TAMDataset(
         pixel_df, train_py_labels,
@@ -479,6 +504,7 @@ def train_tam(
         feature_cols_override=_feature_cols_override,
     )
     band_mean, band_std = train_ds.band_stats
+    _log_rss("after train_ds, before val_ds")
     val_ds = TAMDataset(
         pixel_df, val_py_labels,
         band_mean=band_mean, band_std=band_std,
@@ -494,6 +520,7 @@ def train_tam(
         feature_cols_override=_feature_cols_override,
     )
     logger.info("Train windows: %d  |  Val windows: %d", len(train_ds), len(val_ds))
+    _log_rss("after val_ds")
 
     n_cpu = os.cpu_count() or 4
     # Reserve cores for DataLoader workers; give the rest to PyTorch matmuls.
@@ -507,6 +534,7 @@ def train_tam(
         val_ds, batch_size=cfg.batch_size, shuffle=False,
         collate_fn=collate_fn, num_workers=n_workers, persistent_workers=True, pin_memory=True,
     )
+    _log_rss("after DataLoader creation")
     logger.info("DataLoader workers: %d  PyTorch threads: %d", n_workers, torch.get_num_threads())
 
     # --- Class imbalance weight — computed from pixel-year labels after heuristic filter ---
@@ -536,6 +564,11 @@ def train_tam(
         doy_counts = np.bincount(train_doys.astype(int), minlength=366)
         model.set_doy_frequencies(doy_counts)
         logger.info("DOY density normalisation enabled — inverse-freq weights computed from %d training observations", len(train_doys))
+
+    # pixel_df no longer needed — free before DataLoader workers fork.
+    del pixel_df
+    gc.collect()
+    _log_rss("after pixel_df free")
 
     # Save config + band stats immediately so inference can run even if training is interrupted
     np.savez(out_dir / "tam_band_stats.npz", mean=band_mean, std=band_std)

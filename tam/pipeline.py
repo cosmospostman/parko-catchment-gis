@@ -13,6 +13,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import logging
 import sys
@@ -99,11 +100,14 @@ def _cmd_train(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     pixel_df = pd.concat(chunks, ignore_index=True)
+    del chunks
+    gc.collect()
 
     # Apply date filter
     dates = pd.to_datetime(pixel_df["date"])
     pixel_df["year"] = dates.dt.year
     pixel_df["doy"]  = dates.dt.day_of_year
+    del dates
 
     # Per-region year pinning: drop observations outside [min(years), max(years)]
     # (guards against post-clearance imagery; window is now explicit in the YAML).
@@ -120,6 +124,8 @@ def _cmd_train(args: argparse.Namespace) -> None:
         )
         keep_mask &= ~out_of_window
     pixel_df = pixel_df[keep_mask].reset_index(drop=True)
+    del keep_mask
+    gc.collect()
 
     # Build labels from regions
     pixel_coords = (
@@ -167,8 +173,11 @@ def _cmd_train(args: argparse.Namespace) -> None:
         **overrides,
     )
 
+    pixel_df = pixel_df[pixel_df["point_id"].isin(labels.index)].reset_index(drop=True)
+    gc.collect()
+
     _, best_val_auc = train_tam(
-        pixel_df=pixel_df[pixel_df["point_id"].isin(labels.index)],
+        pixel_df=pixel_df,
         labels=labels,
         pixel_coords=pixel_coords,
         out_dir=out_dir,

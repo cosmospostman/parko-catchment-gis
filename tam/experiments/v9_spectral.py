@@ -31,8 +31,15 @@ EXPERIMENT = Experiment(
         "etna_absence_5",
         # Landsend
         "landsend_presence_1", "landsend_presence_2", "landsend_presence_3",
-        "landsend_presence_4",
+        "landsend_presence_4", "landsend_presence_5", "landsend_presence_6",
+        "landsend_presence_7",
+        "landsend_sparse_presence_1", "landsend_sparse_presence_2",
+        "landsend_sparse_presence_3", "landsend_sparse_presence_4",
+        "landsend_sparse_presence_5",
         "landsend_absence_1", "landsend_absence_2", "landsend_absence_3",
+        "landsend_absence_grass_1", "landsend_absence_grass_2",
+        "landsend_absence_riverbed_1", "landsend_absence_riverbed_2",
+        "landsend_absence_riverbed_3",
         # Lake Mueller
         "lake_mueller_presence", "lake_mueller_presence_2",
         "lake_mueller_presence_3", "lake_mueller_presence_4",
