@@ -52,8 +52,14 @@ def _cmd_train(args: argparse.Namespace) -> None:
     tile_ids = tile_ids_for_regions(exp.region_ids)
     logger.info("Experiment: %s  tiles: %d  regions: %s", exp.name, len(tile_ids), exp.region_ids)
 
-    # Load labeled pixels from training tile parquets
-    chunks: list[pd.DataFrame] = []
+    # Load labeled pixels from training tile parquets — row groups read in parallel.
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    _use_s1 = exp.train_kwargs.get("use_s1", True)
+    _want_s1_data = _use_s1 is not False
+
+    # Build (path, read_cols, n_row_groups) list for tiles that exist.
+    tile_specs: list[tuple[Path, list[str], int]] = []
     for tid in tile_ids:
         path = tile_parquet_path(tid)
         if not path.exists():
@@ -61,19 +67,32 @@ def _cmd_train(args: argparse.Namespace) -> None:
             continue
         pf = pq.ParquetFile(path)
         available = set(pf.schema_arrow.names)
-        _use_s1 = exp.train_kwargs.get("use_s1", True)
-        _want_s1_data = _use_s1 is not False
         s1_cols = [c for c in (
             ("source", "vh", "vv", "scl") if _want_s1_data else ("source", "scl")
         ) if c in available]
-        # B08/B04 needed by compute_global_features (noise filter + S2 globals)
-        # even in S1-only experiments where they are not model input features.
+        # vh/vv always needed for the VH heuristic presence filter, even in S2-only runs.
+        for _c in ("source", "vh", "vv"):
+            if _c in available and _c not in s1_cols:
+                s1_cols.append(_c)
+        # B08/B04 needed by compute_global_features even in S1-only experiments.
         s2_global_cols = [c for c in ("B08", "B04") if c in available and c not in exp.feature_cols]
         base_cols = ["point_id", "lon", "lat", "date", "scl_purity"]
         read_cols = base_cols + [c for c in exp.feature_cols if c in available] + s1_cols + s2_global_cols
-        for rg in range(pf.metadata.num_row_groups):
-            tbl = pf.read_row_group(rg, columns=read_cols)
-            chunks.append(tbl.to_pandas())
+        tile_specs.append((path, read_cols, pf.metadata.num_row_groups))
+
+    def _read_row_group(path: Path, rg: int, cols: list[str]) -> pd.DataFrame:
+        return pq.ParquetFile(path).read_row_group(rg, columns=cols).to_pandas()
+
+    chunks: list[pd.DataFrame] = []
+    n_workers = min(16, sum(n for _, _, n in tile_specs))
+    with ThreadPoolExecutor(max_workers=n_workers) as ex:
+        futures = {
+            ex.submit(_read_row_group, path, rg, cols): (path, rg)
+            for path, cols, n_rg in tile_specs
+            for rg in range(n_rg)
+        }
+        for fut in as_completed(futures):
+            chunks.append(fut.result())
 
     if not chunks:
         logger.error("No training data found for experiment %s", exp.name)
@@ -127,11 +146,12 @@ def _cmd_train(args: argparse.Namespace) -> None:
         "spatial_stride":        args.spatial_stride,
         "band_noise_std":        args.band_noise_std,
         "weight_decay":          args.weight_decay,
-        "presence_min_dry_ndvi": args.presence_min_dry_ndvi,
-        "presence_min_rec_p":    args.presence_min_rec_p,
-        "presence_grass_nir_cv": args.presence_grass_nir_cv,
+        "presence_min_vh_dry_db":     args.presence_min_vh_dry_db,
+        "presence_ndvi_rescue_vh_db": args.presence_ndvi_rescue_vh_db,
+        "presence_ndvi_rescue_min":   args.presence_ndvi_rescue_min,
         "s1_despeckle_window":   args.s1_despeckle_window,
         "batch_size":            args.batch_size,
+        "doy_phase_shift":       args.doy_phase_shift,
     }.items() if v is not None}
     if args.val_sites:
         overrides["val_sites"] = tuple(args.val_sites)
@@ -358,15 +378,18 @@ if __name__ == "__main__":
     p_train.add_argument("--weight-decay",    type=float, default=None)
     p_train.add_argument("--val-sites",       nargs="+",  default=None,
                          help="Hold out these sites entirely for validation (e.g. --val-sites frenchs barcoorah)")
-    p_train.add_argument("--presence-min-dry-ndvi", type=float, default=None,
-                         help="Min dry-season median NDVI for presence pixels (default: 0.10)")
-    p_train.add_argument("--presence-min-rec-p",    type=float, default=None,
-                         help="Min NDVI amplitude for presence pixels (default: 0.20)")
+    p_train.add_argument("--doy-phase-shift", type=lambda x: x.lower() in ("true", "1", "yes"),
+                         default=None, metavar="BOOL",
+                         help="Enable/disable DOY phase shift encoding (true/false)")
+    p_train.add_argument("--presence-min-vh-dry-db", type=float, default=None,
+                         help="Strict VH floor (dB): drop presence pixel-years unconditionally below this (default: -21.0)")
+    p_train.add_argument("--presence-ndvi-rescue-vh-db", type=float, default=None,
+                         help="Looser VH floor (dB) used only when dry-season NDVI passes (default: -23.0)")
+    p_train.add_argument("--presence-ndvi-rescue-min", type=float, default=None,
+                         help="Min dry-season NDVI to rescue a pixel-year between the two VH floors (default: 0.50)")
     p_train.add_argument("--s1-despeckle-window",  type=int,   default=None,
                          help="Temporal despeckle window for S1 (rolling median over N acquisitions). 0=off, default=3. Other reasonable values: 5, 7.")
     p_train.add_argument("--batch-size",           type=int,   default=None)
-    p_train.add_argument("--presence-grass-nir-cv", type=float, default=None,
-                         help="Max NIR CV for presence pixels — filters grass (default: 0.20)")
     p_train.add_argument("--scl-purity", type=float, default=0.5)
     p_train.add_argument("--device", default=None)
 

@@ -96,17 +96,36 @@ def _compute_band_summaries(pixel_df: pd.DataFrame, feature_cols: list[str]) -> 
     <col>_p5, <col>_p95, <col>_std for each col in feature_cols.
     Used as global features when cfg.use_band_summaries=True.
     """
-    s2 = pixel_df[pixel_df["source"] == "S2"].copy() if "source" in pixel_df.columns else pixel_df.copy()
+    from concurrent.futures import ThreadPoolExecutor
+    s2 = pixel_df[pixel_df["source"] == "S2"] if "source" in pixel_df.columns else pixel_df
     cols = [c for c in feature_cols if c in s2.columns]
-    grp = s2.groupby("point_id")[cols]
-    p5  = grp.quantile(0.05).rename(columns={c: f"{c}_p5"  for c in cols})
-    p95 = grp.quantile(0.95).rename(columns={c: f"{c}_p95" for c in cols})
-    std = grp.std().rename(columns={c: f"{c}_std" for c in cols})
-    result = pd.concat([p5, p95, std], axis=1)
-    # interleave columns as p5/p95/std per band rather than all-p5 then all-p95
-    ordered = []
-    for c in cols:
-        ordered += [f"{c}_p5", f"{c}_p95", f"{c}_std"]
+    n_workers = os.cpu_count() or 4
+
+    # Split by point_id so each thread works on a disjoint set of pixels.
+    # Quantile/std can't be merged from partial results, but per-pixel results can.
+    # Sort once so each pixel's rows are contiguous, then split on pixel boundaries.
+    s2_sorted = s2.sort_values("point_id")
+    all_pids = s2_sorted["point_id"].unique()
+    pid_chunks = np.array_split(all_pids, n_workers)
+    # Build a pid→chunk mapping and use it to tag rows — one isin pass total.
+    pid_to_chunk = {pid: i for i, chunk in enumerate(pid_chunks) for pid in chunk}
+    chunk_ids = s2_sorted["point_id"].map(pid_to_chunk).values
+    sub_dfs = [s2_sorted[chunk_ids == i] for i in range(n_workers)]
+
+    def _chunk_stats(sub: pd.DataFrame) -> pd.DataFrame:
+        if sub.empty:
+            return pd.DataFrame()
+        g = sub.groupby("point_id")[cols]
+        p5  = g.quantile(0.05).rename(columns={c: f"{c}_p5"  for c in cols})
+        p95 = g.quantile(0.95).rename(columns={c: f"{c}_p95" for c in cols})
+        std = g.std().rename(columns={c: f"{c}_std" for c in cols})
+        return pd.concat([p5, p95, std], axis=1)
+
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        parts = list(pool.map(_chunk_stats, sub_dfs))
+
+    result = pd.concat(parts)
+    ordered = [f"{c}{s}" for c in cols for s in ("_p5", "_p95", "_std")]
     return result[ordered]
 
 
@@ -199,62 +218,28 @@ def train_tam(
         logger.info("SCL=6 exclusion: removed %d observations", n_before - len(pixel_df))
 
     # --- Global features -----------------------------------------------------
-    # Always compute when the noise filter is active (needs dry_ndvi/rec_p/nir_cv)
-    # even if the model head uses no global features (n_global_features == 0).
-    _noise_filter_active = (
-        cfg.presence_min_dry_ndvi > 0
-        or cfg.presence_min_rec_p > 0
-        or cfg.presence_grass_nir_cv < 1.0
-    )
     global_feat_df = None
-    _named_globals_for_noise: pd.DataFrame | None = None
     if cfg.use_band_summaries:
         from tam.core.dataset import V9_FEATURE_COLS
         from analysis.constants import add_spectral_indices
-        _df_for_summaries = pixel_df.copy()
-        if "NDVI" not in _df_for_summaries.columns or "NDWI" not in _df_for_summaries.columns:
-            _df_for_summaries = add_spectral_indices(_df_for_summaries)
-        global_feat_df = _compute_band_summaries(_df_for_summaries, V9_FEATURE_COLS)
+        logger.info("Computing band summaries (%d rows) ...", len(pixel_df))
+        if "NDVI" not in pixel_df.columns or "NDWI" not in pixel_df.columns:
+            pixel_df = add_spectral_indices(pixel_df)
+        global_feat_df = _compute_band_summaries(pixel_df, V9_FEATURE_COLS)
         logger.info("Band summaries computed: %d pixels, %d features", len(global_feat_df), global_feat_df.shape[1])
-        if _noise_filter_active:
-            from tam.core.global_features import GLOBAL_FEATURE_NAMES
-            _named_globals_for_noise = _load_or_compute_global_features(pixel_df, out_dir, GLOBAL_FEATURE_NAMES)
-    elif cfg.n_global_features > 0 or _noise_filter_active:
+    elif cfg.n_global_features > 0:
         from tam.core.global_features import GLOBAL_FEATURE_NAMES
         global_feat_df = _load_or_compute_global_features(pixel_df, out_dir, GLOBAL_FEATURE_NAMES)
 
-    # Track per-(site, class) pixel counts at each stage for the summary table.
-    # raw_counts: counts from `labels` before any filter; keyed by (site, class).
+    # raw_counts populated in pixel-year units after the broadcast step below.
     raw_counts: dict[tuple[str, str], int] = {}
-    for pid in labels.index:
-        key = _site_class(pid)
-        raw_counts[key] = raw_counts.get(key, 0) + 1
 
     noise_removed: dict[tuple[str, str], int] = {}
 
-    # --- Presence noise filter — remove obvious non-Parkinsonia presence pixels
-    _noise_filter_df = _named_globals_for_noise if _named_globals_for_noise is not None else global_feat_df
-    if _noise_filter_df is not None and _noise_filter_active:
-        def _apply_noise_filter(lbl: pd.Series) -> pd.Series:
-            presence_pids = set(lbl[lbl == 1].index)
-            gf = _noise_filter_df.reindex(list(presence_pids))
-            noise_mask = (
-                (gf["dry_ndvi"].fillna(cfg.presence_min_dry_ndvi) < cfg.presence_min_dry_ndvi) |
-                (gf["rec_p"].fillna(cfg.presence_min_rec_p)       < cfg.presence_min_rec_p) |
-                (gf["nir_cv"].fillna(cfg.presence_grass_nir_cv)   > cfg.presence_grass_nir_cv)
-            )
-            noisy_pids = presence_pids & set(gf[noise_mask].index)
-            for pid in noisy_pids:
-                key = _site_class(pid)
-                noise_removed[key] = noise_removed.get(key, 0) + 1
-            return lbl[~lbl.index.isin(noisy_pids)]
-
-        train_labels = _apply_noise_filter(train_labels)
-        val_labels   = _apply_noise_filter(val_labels)
-
     stride_removed: dict[tuple[str, str], int] = {}
 
-    # --- Spatial stride — thin training pixels to reduce within-site redundancy
+    # --- Spatial stride — thin training pixels to reduce within-site redundancy.
+    # Runs at pixel granularity before broadcasting to pixel-years.
     if cfg.spatial_stride > 1:
         coords = pixel_coords.set_index("point_id")
         candidate = coords.loc[coords.index.intersection(train_labels.index)]
@@ -279,16 +264,118 @@ def train_tam(
 
         train_labels = train_labels[train_labels.index.isin(strided_ids)]
 
-    # --- Pixel summary table -------------------------------------------------
+    # --- Broadcast pixel labels → (point_id, year) labels ------------------
+    # Each surviving pixel contributes one entry per year it has observations in.
+    # Compute the (point_id, year) universe from labeled pixels only — cheaper than
+    # drop_duplicates on the full pixel_df which may have tens of millions of rows.
+    labeled_pids = set(labels.index)
+    pixel_years = (
+        pixel_df.loc[pixel_df["point_id"].isin(labeled_pids), ["point_id", "year"]]
+        .drop_duplicates()
+    )
+
+    def _broadcast_to_pixel_years(lbl: pd.Series) -> pd.Series:
+        """Expand pixel-level labels to a MultiIndex (point_id, year) Series."""
+        py = pixel_years[pixel_years["point_id"].isin(lbl.index)]
+        py = py.merge(lbl.rename("label"), left_on="point_id", right_index=True)
+        return py.set_index(["point_id", "year"])["label"]
+
+    train_py_labels = _broadcast_to_pixel_years(train_labels)
+    val_py_labels   = _broadcast_to_pixel_years(val_labels)
+
+    # Pixel-year counts before heuristic filter — used as "Raw py" in summary table.
+    all_py = pd.concat([train_py_labels, val_py_labels])
+    all_pids = all_py.index.get_level_values("point_id")
+    # Map _site_class once per unique point_id then broadcast — avoids regex per row.
+    unique_pids = pd.Index(np.unique(all_pids))
+    pid_to_sc = pd.Series(list(map(_site_class, unique_pids)), index=unique_pids)
+    raw_counts = pd.Series(all_pids).map(pid_to_sc).value_counts().to_dict()
+
+    # --- Presence filter: drop presence pixel-years with low dry-season VH unless rescued by NDVI.
+    # Drop logic per (point_id, year):
+    #   drop if mean_vh_dry < presence_min_vh_dry_db
+    #           AND NOT (mean_vh_dry >= presence_ndvi_rescue_vh_db AND mean_ndvi_dry >= presence_ndvi_rescue_min)
+    if (cfg.presence_min_vh_dry_db > -99
+            and "source" in pixel_df.columns
+            and "vh" in pixel_df.columns):
+        _doy_col = "doy" if "doy" in pixel_df.columns else None
+        _date_col = "doy" if _doy_col else "date"
+
+        # S1 — dry-season mean VH
+        _s1_cols = ["point_id", "year", "vh", _date_col]
+        s1_slim = pixel_df.loc[pixel_df["source"] == "S1", _s1_cols]
+
+        # S2 — dry-season mean NDVI (SCL-filtered if available)
+        _has_ndvi = "NDVI" in pixel_df.columns
+        _has_scl  = "scl" in pixel_df.columns
+        _s2_cols  = ["point_id", "year", _date_col] + (["NDVI"] if _has_ndvi else []) + (["scl"] if _has_scl else [])
+        s2_slim = pixel_df.loc[pixel_df["source"] == "S2", _s2_cols] if _has_ndvi else None
+
+        if not s1_slim.empty:
+            doy_vals = (s1_slim[_date_col].values if _doy_col
+                        else pd.to_datetime(s1_slim["date"]).dt.day_of_year.values)
+            vh_lin = s1_slim["vh"].values.astype(np.float32)
+            vh_db  = np.where(vh_lin > 0, 10.0 * np.log10(vh_lin), np.nan)
+            dry_mask = (doy_vals >= 121) & (doy_vals <= 304) & np.isfinite(vh_db)
+
+            dry_s1 = pd.DataFrame({
+                "point_id": s1_slim["point_id"].values[dry_mask],
+                "year":     s1_slim["year"].values[dry_mask],
+                "_vh_db":   vh_db[dry_mask].astype(np.float32),
+            })
+            mean_vh_dry_py = dry_s1.groupby(["point_id", "year"])["_vh_db"].mean()
+
+            # S2 NDVI per (point_id, year) — clear observations only
+            mean_ndvi_dry_py: pd.Series | None = None
+            if s2_slim is not None and not s2_slim.empty:
+                s2_doy = (s2_slim[_date_col].values if _doy_col
+                          else pd.to_datetime(s2_slim["date"]).dt.day_of_year.values)
+                s2_dry_mask = (s2_doy >= 121) & (s2_doy <= 304)
+                if _has_scl:
+                    s2_dry_mask &= s2_slim["scl"].isin([4.0, 5.0]).values
+                dry_s2 = s2_slim[s2_dry_mask & s2_slim["NDVI"].notna()]
+                if not dry_s2.empty:
+                    mean_ndvi_dry_py = dry_s2.groupby(["point_id", "year"])["NDVI"].mean()
+
+            def _apply_presence_filter(lbl_py: pd.Series) -> pd.Series:
+                presence_py = lbl_py[lbl_py == 1]
+                vh = mean_vh_dry_py.reindex(presence_py.index)
+                fails_strict = vh < cfg.presence_min_vh_dry_db
+                if mean_ndvi_dry_py is not None:
+                    ndvi = mean_ndvi_dry_py.reindex(presence_py.index)
+                    rescued = (
+                        (vh >= cfg.presence_ndvi_rescue_vh_db)
+                        & (ndvi >= cfg.presence_ndvi_rescue_min)
+                    )
+                    drop_mask = fails_strict & ~rescued
+                else:
+                    drop_mask = fails_strict
+                drop_idx  = presence_py.index[drop_mask.fillna(False)]
+                drop_pids = drop_idx.get_level_values("point_id")
+                sc = pd.Series(drop_pids).map(pid_to_sc).value_counts()
+                for key, cnt in sc.items():
+                    noise_removed[key] = noise_removed.get(key, 0) + cnt
+                return lbl_py[~lbl_py.index.isin(drop_idx)]
+
+            train_py_labels = _apply_presence_filter(train_py_labels)
+            val_py_labels   = _apply_presence_filter(val_py_labels)
+            ndvi_note = (f", NDVI rescue: VH>={cfg.presence_ndvi_rescue_vh_db:.1f} dB"
+                         f" & NDVI>={cfg.presence_ndvi_rescue_min:.2f}"
+                         if mean_ndvi_dry_py is not None else "")
+            logger.info(
+                "Presence filter (mean_vh_dry < %.1f dB%s): removed %d presence pixel-years",
+                cfg.presence_min_vh_dry_db, ndvi_note, sum(noise_removed.values()),
+            )
+
+    # --- Pixel-year summary table --------------------------------------------
+    # All counts (Raw, Noise, Total) are in pixel-year units.
+    # Stride is pixel-level (applied before broadcast) and shown separately.
     val_site_set = set(cfg.val_sites) if cfg.val_sites else set()
 
-    final_counts: dict[tuple[str, str], int] = {}
-    for pid in train_labels.index:
-        key = _site_class(pid)
-        final_counts[key] = final_counts.get(key, 0) + 1
-    for pid in val_labels.index:
-        key = _site_class(pid)
-        final_counts[key] = final_counts.get(key, 0) + 1
+    # final_counts: surviving pixel-years per (site, class) after all filters.
+    final_all_py = pd.concat([train_py_labels, val_py_labels])
+    final_pids = final_all_py.index.get_level_values("point_id")
+    final_counts = pd.Series(final_pids).map(pid_to_sc).value_counts().to_dict()
 
     all_keys = sorted(raw_counts.keys(), key=lambda k: (k[0] in val_site_set, k[0], k[1]))
 
@@ -298,9 +385,9 @@ def train_tam(
         return f"-{n:>{w - 1},}" if n else f"{'':>{w}}"
 
     def row(label: str, raw: int, noise: int, stride: int, final: int) -> str:
-        return f"{label:>{col_w}}  {raw:>8,}  {neg(noise, 7)}  {neg(stride, 7)}  {final:>8,}"
+        return f"{label:>{col_w}}  {raw:>8,}  {neg(noise, 7)}  {neg(stride, 9)}  {final:>8,}"
 
-    header = f"{'':>{col_w}}  {'Raw px':>8}  {'Noise':>7}  {'Stride':>7}  {'Total':>8}"
+    header = f"{'':>{col_w}}  {'Raw py':>8}  {'Noise py':>7}  {'Stride px':>9}  {'Total py':>8}"
     sep    = "-" * len(header)
     thin   = " " * len(header)
 
@@ -378,7 +465,7 @@ def train_tam(
     # --- Datasets -----------------------------------------------------------
     _feature_cols_override = list(cfg.feature_cols_override) if cfg.feature_cols_override else None
     train_ds = TAMDataset(
-        pixel_df, train_labels,
+        pixel_df, train_py_labels,
         scl_purity_min=cfg.scl_purity_min,
         min_obs_per_year=cfg.min_obs_per_year,
         doy_jitter=cfg.doy_jitter,
@@ -393,7 +480,7 @@ def train_tam(
     )
     band_mean, band_std = train_ds.band_stats
     val_ds = TAMDataset(
-        pixel_df, val_labels,
+        pixel_df, val_py_labels,
         band_mean=band_mean, band_std=band_std,
         scl_purity_min=cfg.scl_purity_min,
         min_obs_per_year=cfg.min_obs_per_year,
@@ -422,9 +509,9 @@ def train_tam(
     )
     logger.info("DataLoader workers: %d  PyTorch threads: %d", n_workers, torch.get_num_threads())
 
-    # --- Class imbalance weight -------------------------------------------
-    n_pos = float((train_labels == 1).sum())
-    n_neg = float((train_labels == 0).sum())
+    # --- Class imbalance weight — computed from pixel-year labels after heuristic filter ---
+    n_pos = float((train_py_labels == 1).sum())
+    n_neg = float((train_py_labels == 0).sum())
     pos_weight = torch.tensor([n_neg / n_pos], dtype=torch.float32).to(device) if n_pos > 0 and n_neg > 0 else None
 
     # --- Model + optimiser --------------------------------------------------
@@ -444,7 +531,7 @@ def train_tam(
 
     if cfg.doy_density_norm:
         # Compute DOY observation counts from training pixels and set inverse-freq weights
-        train_pids = set(train_labels.index)
+        train_pids = set(train_py_labels.index.get_level_values("point_id"))
         train_doys = pixel_df.loc[pixel_df["point_id"].isin(train_pids), "doy"].values
         doy_counts = np.bincount(train_doys.astype(int), minlength=366)
         model.set_doy_frequencies(doy_counts)

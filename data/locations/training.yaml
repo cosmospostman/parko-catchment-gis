@@ -1193,6 +1193,97 @@ regions:
     years: [2020, 2021, 2022, 2023, 2024, 2025]
     tags: [semi-arid, riparian]
 
+  - id: landsend_sparse_presence_1
+    name: "Landsend — sparse presence 1"
+    label: presence
+    bbox: [141.422908, -20.425288, 141.431558, -20.420934]
+    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [semi-arid, riparian, sparse]
+
+  - id: landsend_sparse_presence_2
+    name: "Landsend — sparse presence 2"
+    label: presence
+    bbox: [141.420429, -20.419396, 141.424273, -20.416710]
+    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [semi-arid, riparian, sparse]
+
+  - id: landsend_presence_5
+    name: "Landsend — presence 5"
+    label: presence
+    bbox: [141.413873, -20.413197, 141.416883, -20.411782]
+    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [semi-arid, riparian]
+
+  - id: landsend_presence_6
+    name: "Landsend — presence 6"
+    label: presence
+    bbox: [141.364408, -20.448068, 141.371827, -20.444328]
+    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [semi-arid, riparian]
+
+  - id: landsend_presence_7
+    name: "Landsend — presence 7"
+    label: presence
+    bbox: [141.359083, -20.448924, 141.363344, -20.443833]
+    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [semi-arid, riparian]
+
+  - id: landsend_sparse_presence_3
+    name: "Landsend — sparse presence 3"
+    label: presence
+    bbox: [141.326555, -20.454316, 141.329556, -20.450980]
+    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [semi-arid, riparian, sparse]
+
+  - id: landsend_sparse_presence_4
+    name: "Landsend — sparse presence 4"
+    label: presence
+    bbox: [141.299700, -20.447186, 141.303006, -20.444888]
+    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [semi-arid, riparian, sparse]
+
+  - id: landsend_sparse_presence_5
+    name: "Landsend — sparse presence 5"
+    label: presence
+    bbox: [141.311860, -20.432469, 141.314162, -20.429743]
+    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [semi-arid, riparian, sparse]
+
+  - id: landsend_absence_riverbed_1
+    name: "Landsend — absence (riverbed 1)"
+    label: absence
+    bbox: [141.384281, -20.434567, 141.386839, -20.428956]
+    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [semi-arid, riverbed]
+
+  - id: landsend_absence_riverbed_2
+    name: "Landsend — absence (riverbed 2)"
+    label: absence
+    bbox: [141.391123, -20.430345, 141.397827, -20.428569]
+    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [semi-arid, riverbed]
+
+  - id: landsend_absence_riverbed_3
+    name: "Landsend — absence (riverbed 3)"
+    label: absence
+    bbox: [141.389916, -20.439288, 141.394866, -20.438118]
+    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [semi-arid, riverbed]
+
+  - id: landsend_absence_grass_1
+    name: "Landsend — absence (grass 1)"
+    label: absence
+    bbox: [141.446174, -20.464081, 141.454805, -20.459480]
+    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [semi-arid, grass]
+
+  - id: landsend_absence_grass_2
+    name: "Landsend — absence (grass 2)"
+    label: absence
+    bbox: [141.374804, -20.472622, 141.379882, -20.467973]
+    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [semi-arid, grass]
+
   # ---------------------------------------------------------------------------
   # Alexandria — Northern Territory (semi-arid, riparian)
   # ---------------------------------------------------------------------------

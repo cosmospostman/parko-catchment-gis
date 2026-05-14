@@ -359,7 +359,6 @@ def _compute_band_summaries_from_parquets(
     scl_purity_min: float,
     global_feat_mean: np.ndarray,
     global_feat_std: np.ndarray,
-    pixel_zscore_stats: tuple[dict, dict] | None = None,
 ) -> dict[str, np.ndarray]:
     """Pre-pass: compute per-pixel normalised [p5, p95, std] for each feature col.
 
@@ -395,17 +394,9 @@ def _compute_band_summaries_from_parquets(
     if index_cols:
         df = add_spectral_indices(df)
 
-    # Apply pixel z-score first if stats provided, matching training normalisation.
-    if pixel_zscore_stats is not None:
-        pid_mean_lk, pid_std_lk = pixel_zscore_stats
-        for i, col in enumerate(feature_cols):
-            if col not in df.columns:
-                continue
-            pm = df["point_id"].map({pid: v[i] for pid, v in pid_mean_lk.items()})
-            ps = df["point_id"].map({pid: v[i] for pid, v in pid_std_lk.items()})
-            df[col] = (df[col] - pm) / ps.clip(lower=1e-6)
-
     # Compute raw p5/p95/std per pixel for each feature col (no normalisation yet)
+    # NOTE: pixel z-score is intentionally NOT applied here — training computes band
+    # summaries from raw reflectances (before z-scoring), so inference must match.
     grp = df.groupby("point_id")
     pids = grp[feature_cols[0]].mean().index.values  # stable key order
     summary_cols: list[np.ndarray] = []
@@ -720,11 +711,13 @@ def score_location_years(
     pixel_zscore_stats: tuple[dict, dict] | None = None
     band_summaries: dict | None = None
     if feature_cols is not None and not s1_only:
-        # S2 pixel z-score is not applied at inference: with a single season of data
-        # per-pixel z-scoring collapses all between-pixel variation to zero, because
-        # every pixel's z-scored sequence has the same mean (0) and std (1) regardless
-        # of its actual phenology. The global band_mean/band_std from training
-        # (which are ~0/1 since training data was pixel-z-scored) is sufficient.
+        logger.info("Pre-pass: computing per-pixel z-score stats (%d feature cols) ...", len(feature_cols))
+        pixel_zscore_stats = _compute_s2_pixel_zscore_stats(
+            year_parquets=year_parquets,
+            feature_cols=feature_cols,
+            scl_purity_min=scl_purity_min,
+        )
+        logger.info("Z-score stats computed for %d pixels", len(pixel_zscore_stats[0]))
         if model.n_global_features > 0:
             if global_feat_mean is None or global_feat_std is None:
                 raise ValueError(
@@ -738,7 +731,6 @@ def score_location_years(
                 scl_purity_min=scl_purity_min,
                 global_feat_mean=global_feat_mean,
                 global_feat_std=global_feat_std,
-                pixel_zscore_stats=pixel_zscore_stats,
             )
             logger.info("Band summaries computed for %d pixels", len(band_summaries))
 

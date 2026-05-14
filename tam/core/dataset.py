@@ -299,9 +299,17 @@ class TAMDataset(Dataset):
             if df[_band_check].isna().any().any():
                 df = df.dropna(subset=_band_check)
 
-        # Restrict to labeled pixels when labels provided
+        # Restrict to labeled pixels when labels provided.
+        # MultiIndex labels → (point_id, year) granularity; flat index → pixel granularity.
+        self._labels_are_pixel_year = (
+            labels is not None and isinstance(labels.index, pd.MultiIndex)
+        )
         if labels is not None:
-            df = df[df["point_id"].isin(labels.index)]
+            if self._labels_are_pixel_year:
+                labeled_pids = labels.index.get_level_values("point_id")
+                df = df[df["point_id"].isin(labeled_pids)]
+            else:
+                df = df[df["point_id"].isin(labels.index)]
 
         # Compute band stats from training data if not supplied
         if band_mean is None or band_std is None:
@@ -350,6 +358,13 @@ class TAMDataset(Dataset):
                 continue
             n = min(len(b), MAX_SEQ_LEN)
             self._windows.append((p[0], int(y[0]), b[:n], d[:n]))
+
+        # For pixel-year labels, drop windows whose (point_id, year) is not in the label set.
+        if labels is not None and self._labels_are_pixel_year:
+            valid_py = set(labels.index)
+            self._windows = [
+                (p, y, b, d) for p, y, b, d in self._windows if (p, y) in valid_py
+            ]
 
         self._n_features = len(feature_cols)
         self._labels = labels
@@ -438,7 +453,12 @@ class TAMDataset(Dataset):
         mask = np.ones(MAX_SEQ_LEN, dtype=bool)
         mask[:n] = False
 
-        label  = float(self._labels[pid]) if self._labels is not None else 0.0
+        if self._labels is None:
+            label = 0.0
+        elif self._labels_are_pixel_year:
+            label = float(self._labels.get((pid, yr), 0.0))
+        else:
+            label = float(self._labels[pid])
         weight = 1.0
 
         gf = self._global_feats.get(pid, np.zeros(self._n_global, dtype=np.float32))

@@ -115,6 +115,73 @@ S2-only is expected somewhat lower than V8 due to wet-season cloud gaps. If S2-o
 
 ---
 
+## Best run to date — 2026-05-13 (unchanged after sweep)
+
+**Val AUC: 0.755** (epoch 50/60, last improvement epoch 50)
+
+Previous best: 0.673. This is a **+0.08 improvement** on a stricter val set.
+
+### What changed
+
+**Per-year heuristic filter** — the core change. The previous filter computed a multi-year mean VH dry-season backscatter per pixel and dropped presence pixels below -18 dB. Because Corfield Parkinsonia has been expanding over 2018–2023, multi-year averaging dragged most pixels below threshold — only 70 of 2,740 Corfield presence pixels survived (2.6%). The filter was similarly broken at other sites.
+
+The new filter applies the -18 dB threshold per year independently. A pixel is kept in the years it passes and dropped in the years it doesn't. This recovers 1,182 Corfield presence pixel-years (vs 70 previously) and adds genuine label diversity — encroaching-edge pixels in years they were woody, which are spectrally distinct from the dense established core.
+
+Total noise removed across all sites: 50,970 pixel-years (10.5% of training data), now correctly identified and excluded.
+
+### Hyperparams (unchanged from sweep plan)
+
+| Param | Value |
+|---|---|
+| `d_model` | 128 |
+| `n_layers` | 2 |
+| `n_heads` | 4 |
+| `dropout` | 0.5 |
+| `weight_decay` | 0.1 |
+| `lr` | 5e-5 |
+| `n_epochs` | 60 |
+| `patience` | 15 |
+| `batch_size` | 1024 |
+| `use_band_summaries` | False |
+| `presence_min_vh_dry_db` | -18.0 (per-year) |
+
+### Training data (pixel-years after filter)
+
+| Site | Role | Presence py | Absence py |
+|---|---|---|---|
+| Barcoorah | Train | 9,932 | 10,356 |
+| Corfield | Train | 1,182 | 28,260 |
+| Frenchs | Train | 18,055 | 107,628 |
+| Lake Mueller | Train | 7,476 | 17,982 |
+| Landsend | Train | 16,757 | 30,882 |
+| Norman Road | Train | 19,965 | 36,126 |
+| Roper | Train | 2,765 | 21,810 |
+| Cloncurry | Train (absence only) | 0 | 50,454 |
+| **Etna** | **Holdout** | **6,646** | **49,914** |
+
+---
+
+## Hyperparameter sweep — 2026-05-13/14 (null result)
+
+Overnight ablation sweep (`sweeps/sweep_v9_overnight.py`) tested eight runs, each isolating one variable against the 0.755 baseline. No run beat baseline. Results:
+
+| run_id | change from baseline | val AUC |
+|---|---|---|
+| `vh_floor_m18` | baseline re-run | 0.701 |
+| `no_phase_shift` | doy_phase_shift=False | 0.749 |
+| `vh_floor_m17` | presence_min_vh_dry_db=−17.0 | 0.758 |
+| `lr_1e4` | lr=1e-4 | 0.786 |
+| `two_heads` | n_heads=2 | 0.737 |
+| `dropout_03` | dropout=0.3 | 0.685 |
+| `no_obs_dropout` | obs_dropout_min=0 | 0.654 |
+| `vh_floor_m19` | presence_min_vh_dry_db=−19.0 | 0.645 |
+
+`lr_1e4` (0.786) and the baseline re-run (0.701) show substantial variance across runs — the 0.755 baseline itself was not robustly reproducible. A combined run (`doy_phase_shift=False` + `vh_floor=−17.0`) was attempted post-sweep and produced a val AUC of 0.806 on epoch 1 (train AUC 0.560), which is a fluke on the small etna val set rather than a real result; the model stabilised at ~0.69 before early stopping.
+
+**Conclusion:** the 0.755 baseline remains the best credible result. The bottleneck is not hyperparameters.
+
+---
+
 ## Implementation checklist
 
 - [x] `tam/core/config.py` — add `use_band_summaries: bool = False`

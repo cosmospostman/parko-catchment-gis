@@ -49,10 +49,12 @@ class TAMConfig:
     spatial_stride:       int   = 1   # if >1, thin training pixels spatially (every Nth pixel per region)
     stride_exclude_sites: tuple = ()  # site prefixes exempt from spatial stride (e.g. small/sparse sites)
 
-    # Presence pixel noise filters (applied before training, using global features)
-    presence_min_dry_ndvi: float = 0.10  # filter water/bare soil (dry-season median NDVI)
-    presence_min_rec_p:    float = 0.20  # filter low-amplitude pixels (bare soil, water, grass)
-    presence_grass_nir_cv: float = 0.20  # filter high-variability pixels (grass)
+    # Presence pixel filter: drop presence pixel-years with low dry-season VH unless rescued by NDVI.
+    # Logic: drop if mean_vh_dry < presence_min_vh_dry_db
+    #        AND NOT (mean_vh_dry >= presence_ndvi_rescue_vh_db AND mean_ndvi_dry >= presence_ndvi_rescue_min)
+    presence_min_vh_dry_db:      float = -21.0  # strict VH floor — drop unconditionally below this
+    presence_ndvi_rescue_vh_db:  float = -23.0  # looser VH floor used only when NDVI passes
+    presence_ndvi_rescue_min:    float = 0.50   # min dry-season NDVI to trigger rescue
 
     def to_dict(self) -> dict:
         return asdict(self)
