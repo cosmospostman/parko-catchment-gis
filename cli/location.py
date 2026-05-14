@@ -210,7 +210,7 @@ def cmd_training_verify(args: argparse.Namespace) -> None:
     import numpy as np
     import pandas as pd
     from utils.regions import load_regions
-    from utils.training_collector import _region_parquet_path
+    from utils.training_collector import _region_parquet_path, tile_parquet_path, _load_index
 
     BAND_COLS = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12"]
 
@@ -258,6 +258,25 @@ def cmd_training_verify(args: argparse.Namespace) -> None:
             region_issues.append(f"NAN      {r.id} — {nan_counts} NaN band values")
         if band_means.max() > 1.5 or band_means.min() < -0.5:
             region_issues.append(f"RANGE    {r.id} — band means outside expected range [{band_means.min():.2f}, {band_means.max():.2f}]")
+
+        # S1 backscatter sanity checks — VH lives in the tile parquet, not the region parquet
+        index = _load_index()
+        tile_ids = index.loc[index["region_id"] == r.id, "tile_id"].tolist()
+        for tile_id in tile_ids:
+            tp = tile_parquet_path(tile_id)
+            if not tp.exists():
+                region_issues.append(f"S1_MISS  {r.id} — tile parquet {tile_id} not built yet")
+                continue
+            tile_df = pd.read_parquet(tp, columns=["point_id", "vh"])
+            region_prefix = r.id + "_"
+            vh = tile_df.loc[tile_df["point_id"].str.startswith(region_prefix), "vh"].dropna()
+            if len(vh) == 0:
+                region_issues.append(f"S1_MISS  {r.id} — no S1 vh data in tile {tile_id}")
+            elif vh.median() > 1.0:
+                region_issues.append(
+                    f"S1_SCALE {r.id} — vh median={vh.median():.1f} in tile {tile_id} looks like raw GRD DN, not linear power"
+                )
+
         if not region_issues and args.prefix:
             issues.append(f"OK       {r.id}")
         else:
