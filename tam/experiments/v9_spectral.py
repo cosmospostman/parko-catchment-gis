@@ -11,7 +11,7 @@ from tam.core.experiment import Experiment
 
 EXPERIMENT = Experiment(
     name="v9_spectral",
-    region_ids=[
+    train_region_ids=[
         # Norman Road
         "norman_road_presence_1", "norman_road_presence_2",
         "norman_road_presence_3", "norman_road_presence_4",
@@ -25,11 +25,11 @@ EXPERIMENT = Experiment(
         "cloncurry_absence_1", "cloncurry_absence_2", "cloncurry_absence_3",
         "cloncurry_absence_4", "cloncurry_absence_5", "cloncurry_absence_6",
         "cloncurry_absence_7",
-        # Etna Creek (held out at sweep level via val_sites=("etna",))
-        "etna_presence_1", "etna_presence_2", "etna_presence_3", "etna_presence_4",
-        "etna_absence_1", "etna_absence_2", "etna_absence_3", "etna_absence_4",
-        "etna_absence_5",
-        # Landsend
+        # Etna Creek — train-only regions
+        "etna_presence_5", "etna_presence_6", "etna_presence_7",
+        "etna_presence_8", "etna_presence_9",
+        "etna_absence_6", "etna_absence_7",
+        # Landsend — train-only regions
         "landsend_presence_1", "landsend_presence_2", "landsend_presence_3",
         "landsend_presence_4", "landsend_presence_5", "landsend_presence_6",
         "landsend_presence_7",
@@ -47,24 +47,46 @@ EXPERIMENT = Experiment(
         "lake_mueller_absence_3",
         # Corfield
         "corfield_presence_1", "corfield_presence_2", "corfield_presence_3",
-        "corfield_presence_4", "corfield_presence_5",
+        "corfield_presence_4", "corfield_presence_5", "corfield_presence_6",
         "corfield_absence_1", "corfield_absence_2", "corfield_absence_3",
         # Roper River
         "roper_presence_1", "roper_presence_2", "roper_presence_3",
         "roper_presence_4",
         "roper_absence_1", "roper_absence_2", "roper_absence_3",
-        # Barcoorah
+        # Barcoorah — train-only regions
         "barcoorah_presence", "barcoorah_presence_2", "barcoorah_presence_3",
         "barcoorah_absence_lake", "barcoorah_absence_woodland",
         "barcoorah_absence_2", "barcoorah_absence_3",
+        # Hughenden — train-only regions
+        "hughenden_presence_4",
+        "hughenden_absence_3", "hughenden_absence_5",
         # Frenchs — Cape York Peninsula (monsoonal savanna-riparian)
         "frenchs_presence_1", "frenchs_presence_2", "frenchs_presence_3",
-        "frenchs_presence_4", "frenchs_presence_5", "frenchs_presence_6",
+        "frenchs_presence_4",
         "frenchs_absence_bare_soil_2", "frenchs_absence_bare_soil_3",
         "frenchs_absence_mangrove", "frenchs_absence_ocean",
-        "frenchs_absence_riparian_woodland", "frenchs_absence_riparian", "frenchs_absence_savanna",
-        "frenchs_absence_4", "frenchs_absence_5", "frenchs_absence_6",
+        "frenchs_absence_riparian_woodland", "frenchs_absence_riparian",
+        "frenchs_absence_5", "frenchs_absence_6",
         "frenchs_absence_water_1", "frenchs_absence_water_2", "frenchs_absence_water_3",
+    ],
+    val_region_ids=[
+        # Etna Creek
+        "etna_presence_1", "etna_presence_2", "etna_presence_3", "etna_presence_4",
+        "etna_absence_1", "etna_absence_2", "etna_absence_3", "etna_absence_4",
+        "etna_absence_5",
+        # Landsend
+        "landsend_presence_8",
+        "landsend_absence_4", "landsend_absence_5",
+        # Barcoorah
+        "barcoorah_presence_4",
+        "barcoorah_absence_4",
+        # Hughenden
+        "hughenden_presence_1", "hughenden_presence_2", "hughenden_presence_3",
+        "hughenden_absence_1", "hughenden_absence_2",
+        "hughenden_absence_6", "hughenden_absence_7",
+        # Frenchs — held out for monsoonal generalisation check
+        "frenchs_presence_5", "frenchs_presence_6",
+        "frenchs_absence_savanna", "frenchs_absence_4",
     ],
     feature_cols=V9_FEATURE_COLS,
     model_kwargs={
@@ -79,15 +101,14 @@ EXPERIMENT = Experiment(
         "weight_decay":          0.1,
         "n_epochs":              60,
         "patience":              15,
-        "band_noise_std":        0.03,
+        "band_noise_std":        0.05,
         "obs_dropout_min":       4,
         "doy_density_norm":      True,
-        "doy_phase_shift":       True,
+        "doy_phase_shift":       False,
         "pixel_zscore":          True,
         "use_s1":                False,
         "use_band_summaries":    True,
         "max_seq_len":           64,
-        "val_sites":             ("etna",),
         "feature_cols_override": tuple(V9_FEATURE_COLS),
     },
 )

@@ -9,7 +9,7 @@ from tam.core.experiment import Experiment
 
 EXPERIMENT = Experiment(
     name="v8_roper",
-    region_ids=[
+    train_region_ids=[
         # Norman Road
         "norman_road_presence_1", "norman_road_presence_2",
         "norman_road_presence_3", "norman_road_presence_4",

@@ -105,6 +105,21 @@ _S2_COLLECTION  = "sentinel-2-l2a"
 _GRANULE_RE     = _re.compile(r"_\d+_L2A$")
 
 
+def _best_tile_for_region(region: "TrainingRegion", tile_ids: list[str]) -> str:
+    """Return the tile whose footprint contains the region centroid, or the first tile."""
+    from shapely.geometry import Point
+    from utils.s2_tiles import get_au_tile_grid
+    cx = (region.bbox[0] + region.bbox[2]) / 2
+    cy = (region.bbox[1] + region.bbox[3]) / 2
+    centroid = Point(cx, cy)
+    grid = get_au_tile_grid()
+    for tile_id in tile_ids:
+        row = grid[grid["Name"] == tile_id]
+        if not row.empty and row.iloc[0].geometry.contains(centroid):
+            return tile_id
+    return tile_ids[0]
+
+
 def _union_bbox(regions: list[TrainingRegion]) -> list[float]:
     lon_min = min(r.bbox[0] for r in regions)
     lat_min = min(r.bbox[1] for r in regions)
@@ -198,7 +213,7 @@ def _collect_one_region(
     cloud_max: int,
     apply_nbar: bool,
     max_concurrent: int,
-) -> bool:
+) -> str | None:
     """Fetch S2 and S1 concurrently for one region, write region parquet.
 
     S2 and S1 COG fetches are launched in parallel threads since they hit
@@ -206,7 +221,9 @@ def _collect_one_region(
     and share no mutable state.  S1 only needs the pixel grid, which is
     derived from the bbox without waiting for S2 data.
 
-    Returns True if the region parquet was written, False if skipped.
+    Returns the actual S2 tile_id the data was sourced from (which may differ
+    from the ``tile_id`` argument when the region straddles a tile boundary and
+    no items matched the primary tile), or None if no data was written.
     """
     from utils.pixel_collector import make_pixel_grid
 
@@ -216,7 +233,7 @@ def _collect_one_region(
     # on the same tile would otherwise race — each writing patches for its own
     # small bbox, then the stale-check deleting the other worker's patches.
     cache_dir   = tile_chips_path(tile_id) / region.id
-    bbox        = list(region.bbox)
+    bbox = list(region.bbox)
 
     logger.info("Region %s: S2+S1 fetch start  bbox=%s  %s→%s", region.id, bbox, start, end)
 
@@ -288,7 +305,20 @@ def _collect_one_region(
 
     if not s2_tile_paths:
         logger.warning("Region %s: no S2 data — skipping", region.id)
-        return False
+        return None
+
+    # Detect the actual S2 tile from the first shard filename (e.g. "54KZC.parquet").
+    # This may differ from tile_id when the region straddles a boundary and STAC
+    # had no items for the primary tile — the fallback uses a neighbouring tile's
+    # cached shards.  We index under the actual tile so _rebuild_tile_parquet
+    # finds the region parquet.
+    actual_tile_id = s2_tile_paths[0].stem
+    if actual_tile_id != tile_id:
+        logger.warning(
+            "Region %s: S2 data came from tile %s, not primary tile %s — "
+            "indexing under %s",
+            region.id, actual_tile_id, tile_id, actual_tile_id,
+        )
 
     # Merge S2 shards into region parquet, then append S1 (STAC already cached).
     writer = pq.ParquetWriter(out_path, pq.ParquetFile(s2_tile_paths[0]).schema_arrow)
@@ -308,7 +338,7 @@ def _collect_one_region(
     )
 
     logger.info("Region %s: done", region.id)
-    return True
+    return actual_tile_id
 
 
 def _rebuild_tile_parquet(tile_id: str) -> None:
@@ -364,10 +394,15 @@ def ensure_training_pixels(
 
     Skips regions whose parquet already exists (idempotent).
     """
-    # Group regions by tile
+    # Group regions by tile.  For each region, record which tile should own it
+    # (the one containing its centroid) so multi-tile regions aren't submitted
+    # under the wrong tile (e.g. a sliver tile whose patches are too small).
+    region_primary_tile: dict[str, str] = {}
     tile_to_regions: dict[str, list[TrainingRegion]] = {}
     for region in regions:
-        for tile_id in bbox_to_tile_ids(region.bbox_tuple):
+        tile_ids = bbox_to_tile_ids(region.bbox_tuple)
+        region_primary_tile[region.id] = _best_tile_for_region(region, tile_ids)
+        for tile_id in tile_ids:
             tile_to_regions.setdefault(tile_id, []).append(region)
 
     if not tile_to_regions:
@@ -399,7 +434,7 @@ def ensure_training_pixels(
         # per tile does the live search — the rest load from the pickle.
         with tile_stac_locks[tile_id]:
             tile_items = _fetch_tile_items(tile_id, tile_regions, cloud_max)
-        written = _collect_one_region(
+        actual_tile = _collect_one_region(
             region=region,
             tile_id=tile_id,
             tile_items=tile_items,
@@ -409,13 +444,13 @@ def ensure_training_pixels(
             apply_nbar=apply_nbar,
             max_concurrent=max_concurrent,
         )
-        if written:
+        if actual_tile is not None:
             with tiles_with_new_lock:
-                tiles_with_new.add(tile_id)
+                tiles_with_new.add(actual_tile)
             # Update the index as soon as this region is done so a crash
             # mid-run doesn't lose track of already-completed regions.
             with _index_lock:
-                _update_index(region.id, [tile_id])
+                _update_index(region.id, [actual_tile])
 
     with ThreadPoolExecutor(max_workers=max_region_workers) as pool:
         futures: dict = {}
@@ -426,9 +461,12 @@ def ensure_training_pixels(
                     logger.info("Region %s already collected — skipping", r.id)
             for region in pending:
                 if region.id in submitted_region_ids:
-                    # Region spans multiple tiles — already submitted under the
-                    # first tile encountered (sorted order). Skip duplicates so
-                    # concurrent workers don't race on the same chip cache.
+                    # Region spans multiple tiles — already submitted under its
+                    # primary tile (centroid-containing). Skip other tiles.
+                    continue
+                if region_primary_tile[region.id] != tile_id:
+                    # This tile is not the primary for this region — it will be
+                    # submitted when we reach the primary tile in sorted order.
                     continue
                 submitted_region_ids.add(region.id)
                 futures[pool.submit(_do_region, tile_id, region, tile_regions)] = region.id

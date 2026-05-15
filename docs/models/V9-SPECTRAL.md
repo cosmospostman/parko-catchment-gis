@@ -1,135 +1,19 @@
-# V9-SPECTRAL — Model Plan
+# V9-SPECTRAL
 
-## Context
+S2-only TAM. Part of a three-way comparison (S2-only / S1-only / joint S1+S2).
 
-V9-SPECTRAL is the S2-only leg of a three-way comparison planned in `docs/S2-AGAIN.md`:
-
-1. **S2-only (this model)** — confirm phenological signal is discriminating before adding complexity
-2. **S1-only (V8)** — reference point at val AUC 0.989 on Etna holdout
-3. **Joint S1+S2** — interleaved sequence; assess whether combined modality beats either alone
-
-All three use identical label sets on sites with both S1 and S2 coverage. V9 trains on the same `v8_roper` region set so the comparison is unconfounded by site distribution.
+**Current best val AUC: 0.7846** (`no_phase_shift`, sweep 2026-05-14)
 
 ---
 
 ## Feature set
 
-### Time-series bands — n_bands = 11
-
-| Feature | Notes |
-|---|---|
-| B02, B03, B04, B05, B07, B08, B8A, B11, B12 | S2 L2A surface reflectance; B06 and B10 excluded |
-| NDVI | (B08 − B04) / (B08 + B04); z-scored independently |
-| NDWI | (B03 − B08) / (B03 + B08); z-scored independently |
-
-EVI excluded — its additive denominator constant behaves differently under z-score normalisation and adds little over NDVI here.
-
-### Normalisation
-
-**Pixel z-score** (`pixel_zscore=True`): each observation normalised by the pixel's own temporal mean/std across the annual window. Identical to V8. Removes absolute reflectance offsets between tiles and sites; preserves phenological curve shape, which is the discriminating signal for Parkinsonia.
-
-### Global features — sweep axis
-
-The named S2 globals from prior models (`nir_cv`, `rec_p`, `peak_doy`, `peak_doy_cv`, `dry_ndvi`) are substantially redundant with band-level summary statistics: `dry_ndvi` ≈ NDVI p5, `rec_p` ≈ NDVI p95−p5, `peak_doy` is derivable from the z-scored curve shape. Rather than carry partially-redundant named scalars, the sweep uses **band summaries** as the ablation axis against a clean `n_global_features=0` baseline.
-
-**`use_band_summaries=False`** — no global inputs; `n_global_features=0`.
-
-**`use_band_summaries=True`** — appends [p5, p95, std] computed across the annual observation stack for each of the 11 bands (33 scalars total) as additional global inputs alongside the z-scored sequence. Gives the model explicit access to the phenological envelope per S2-AGAIN.md without a separate named-globals layer. Key question: do these add value over the sequence alone?
-
----
-
-## Augmentation
-
-Identical to V8:
-
-| Augmentation | Value |
-|---|---|
-| `doy_phase_shift` | True — full-year circular wraparound; forces shape learning over calendar learning |
-| `band_noise_std` | 0.03 — Gaussian in normalised space, independent per observation |
-| `obs_dropout_min` | 4 — subsample to Uniform(4, n) observations per window |
-| `doy_density_norm` | True — weight mean pool by inverse DOY frequency |
+11 bands: B02 B03 B04 B05 B07 B08 B8A B11 B12 + NDVI + NDWI.  
+B06 and EVI excluded. Pixel z-score normalisation (identical to V8).
 
 ---
 
 ## Architecture
-
-Identical Transformer backbone to V8 settled config:
-
-| Param | Value |
-|---|---|
-| `d_model` | 128 |
-| `n_layers` | 2 |
-| `n_heads` | 4 |
-| `dropout` | 0.5 |
-| `weight_decay` | 0.1 |
-| `n_epochs` | 60 |
-| `patience` | 15 |
-| `batch_size` | 1024 |
-
-`n_bands=11`. `n_global_features=0` (baseline) or `33` (band summaries ablation).
-
----
-
-## Sweep
-
-Etna held out as site holdout throughout — identical protocol to V8. Four runs over two axes:
-
-| run_id | use_band_summaries | lr | expected |
-|---|---|---|---|
-| `s2_nosumm_1e-5` | False | 1e-5 | likely fails to converge (V8 precedent) |
-| `s2_nosumm_5e-5` | False | 5e-5 | **primary baseline** |
-| `s2_summ_1e-5` | True | 1e-5 | likely fails |
-| `s2_summ_5e-5` | True | 5e-5 | band-summaries ablation |
-
-Script: `sweeps/sweep_v9_spectral.py`
-
----
-
-## Training data
-
-Same as `v8_roper`:
-
-| Site | Role | n_presence | n_absence |
-|---|---|---|---|
-| Norman Road | Train | 5,189 | 6,021 |
-| Cloncurry | Train (absence only) | 0 | 2,228 |
-| Landsend | Train | 3,954 | 5,147 |
-| Lake Mueller | Train | 1,019 | 1,835 |
-| Corfield | Train | 2,109 | 4,710 |
-| Roper | Train | 937 | 3,635 |
-| **Etna** | **Holdout** | **3,193** | **8,319** |
-
-`use_s1="none"` — S1 columns ignored; no snapping step. All other filters (SCL, scl_purity ≥ 0.5, noise filter) unchanged.
-
----
-
-## Key comparison
-
-| Model | Modality | Val AUC (Etna) |
-|---|---|---|
-| V8 `v8_roper` | S1-only | 0.989 |
-| V9-SPECTRAL `s2_nosumm_5e-5` | S2-only | TBD |
-| V9-SPECTRAL `s2_summ_5e-5` | S2-only + band summaries | TBD |
-
-S2-only is expected somewhat lower than V8 due to wet-season cloud gaps. If S2-only exceeds or matches S1-only, the case for the joint model weakens; if it underperforms, joint fusion is well-motivated.
-
----
-
-## Best run to date — 2026-05-13 (unchanged after sweep)
-
-**Val AUC: 0.755** (epoch 50/60, last improvement epoch 50)
-
-Previous best: 0.673. This is a **+0.08 improvement** on a stricter val set.
-
-### What changed
-
-**Per-year heuristic filter** — the core change. The previous filter computed a multi-year mean VH dry-season backscatter per pixel and dropped presence pixels below -18 dB. Because Corfield Parkinsonia has been expanding over 2018–2023, multi-year averaging dragged most pixels below threshold — only 70 of 2,740 Corfield presence pixels survived (2.6%). The filter was similarly broken at other sites.
-
-The new filter applies the -18 dB threshold per year independently. A pixel is kept in the years it passes and dropped in the years it doesn't. This recovers 1,182 Corfield presence pixel-years (vs 70 previously) and adds genuine label diversity — encroaching-edge pixels in years they were woody, which are spectrally distinct from the dense established core.
-
-Total noise removed across all sites: 50,970 pixel-years (10.5% of training data), now correctly identified and excluded.
-
-### Hyperparams (unchanged from sweep plan)
 
 | Param | Value |
 |---|---|
@@ -142,30 +26,50 @@ Total noise removed across all sites: 50,970 pixel-years (10.5% of training data
 | `n_epochs` | 60 |
 | `patience` | 15 |
 | `batch_size` | 1024 |
-| `use_band_summaries` | False |
-| `presence_min_vh_dry_db` | -18.0 (per-year) |
-
-### Training data (pixel-years after filter)
-
-| Site | Role | Presence py | Absence py |
-|---|---|---|---|
-| Barcoorah | Train | 9,932 | 10,356 |
-| Corfield | Train | 1,182 | 28,260 |
-| Frenchs | Train | 18,055 | 107,628 |
-| Lake Mueller | Train | 7,476 | 17,982 |
-| Landsend | Train | 16,757 | 30,882 |
-| Norman Road | Train | 19,965 | 36,126 |
-| Roper | Train | 2,765 | 21,810 |
-| Cloncurry | Train (absence only) | 0 | 50,454 |
-| **Etna** | **Holdout** | **6,646** | **49,914** |
+| `max_seq_len` | 64 |
 
 ---
 
-## Hyperparameter sweep — 2026-05-13/14 (null result)
+## Training sites
 
-Overnight ablation sweep (`sweeps/sweep_v9_overnight.py`) tested eight runs, each isolating one variable against the 0.755 baseline. No run beat baseline. Results:
+Sites: Norman Road, Cloncurry (absence only), Etna Creek (train split), Landsend, Lake Mueller, Corfield, Roper River, Barcoorah, Hughenden, Frenchs.  
+Val holdout: Etna Creek (presence + absence), Landsend, Barcoorah, Hughenden, Frenchs.
 
-| run_id | change from baseline | val AUC |
+Frenchs added to address bare-soil confusion and restore monsoonal site diversity. Bare-soil absence regions (`frenchs_absence_bare_soil_2/3`) included after smoke-testing revealed bare/sparse ground was the primary false-positive class.
+
+---
+
+## Training history
+
+### Initial — V9 created as S2-only experiment (`1c7bfe5`)
+
+V9 launched as the S2-only leg of a planned three-way comparison (S2-only / S1-only / joint). Starting point: same `v8_roper` site set, same Transformer backbone, S1 columns disabled (`use_s1=False`). Feature set fixed at 11 bands (B06 and EVI dropped vs V8). `use_band_summaries` added as an ablation axis — appends [p5, p95, std] across the annual stack for each band as additional global inputs.
+
+Scoring path refactored to support non-default feature column sets: V9's layout (no B06, no EVI) bypassed the Numba fast path used for V8, now routed through a Pandas fallback with per-pixel z-score applied in the score loop.
+
+### Site expansion — Frenchs + Barcoorah added; val set restructured
+
+Frenchs Creek (Cape York monsoonal savanna-riparian) added to training and val sets to address bare-soil confusion and restore monsoonal diversity. Bare-soil absence regions (`frenchs_absence_bare_soil_2/3`) included explicitly — same fix that improved V2. Barcoorah and Hughenden added to both train and val splits. Frenchs presence/absence regions split between train and val so monsoonal generalisation is assessed independently of the Etna holdout.
+
+### OOM fix — band-summary computation refactored (`1f7d448`)
+
+Training was OOM at startup on the expanded site set. Root cause: band-summary computation copied the full `pixel_df` into a thread pool (one copy per worker). Replaced with a single-pass groupby on a minimal S2-only column slice (`point_id` + feature columns only, view not copy). Also added per-step RSS logging to catch future memory regressions.
+
+### `max_seq_len` reduced 128 → 64 (`afb4ee9`)
+
+Sequence length cap reduced from 128 to 64 for better throughput on the M4000. Multi-year training stacks have ~330–650 obs/pixel; obs-dropout already subsamples these heavily, so reducing the hard cap from 128 to 64 costs little in sequence diversity but halves the memory footprint per batch.
+
+### 2026-05-13 — per-year VH filter (+0.08 AUC)
+
+**Val AUC: 0.755**
+
+Previous filter computed a multi-year mean VH dry-season backscatter and dropped presence pixels below −18 dB. Multi-year averaging dragged expanding-front pixels below threshold (e.g. Corfield: 70/2,740 presence pixels survived). New filter applies the −18 dB threshold per-year independently, recovering those pixels in years they were woody. Total noise removed: ~51k pixel-years (10.5% of training data).
+
+### 2026-05-13/14 — ablation sweep (null result on most axes)
+
+Eight runs isolating one variable against the 0.755 baseline. Substantial run-to-run variance meant the baseline itself was not robustly reproducible at 0.755.
+
+| run_id | change | val AUC |
 |---|---|---|
 | `vh_floor_m18` | baseline re-run | 0.701 |
 | `no_phase_shift` | doy_phase_shift=False | 0.749 |
@@ -176,74 +80,24 @@ Overnight ablation sweep (`sweeps/sweep_v9_overnight.py`) tested eight runs, eac
 | `no_obs_dropout` | obs_dropout_min=0 | 0.654 |
 | `vh_floor_m19` | presence_min_vh_dry_db=−19.0 | 0.645 |
 
-`lr_1e4` (0.786) and the baseline re-run (0.701) show substantial variance across runs — the 0.755 baseline itself was not robustly reproducible. A combined run (`doy_phase_shift=False` + `vh_floor=−17.0`) was attempted post-sweep and produced a val AUC of 0.806 on epoch 1 (train AUC 0.560), which is a fluke on the small etna val set rather than a real result; the model stabilised at ~0.69 before early stopping.
+### 2026-05-14 — phase-shift sweep (standout winner)
 
-**Conclusion:** the 0.755 baseline remains the best credible result. The bottleneck is not hyperparameters.
+Sweep varying `doy_phase_shift`, `lr`, and `band_noise_std` against the expanded training set (Frenchs added, relaxed noise filter).
+
+| run_id | doy_phase_shift | lr | band_noise_std | val AUC |
+|---|---|---|---|---|
+| baseline | True | 5e-05 | 0.05 | 0.6749 |
+| **no_phase_shift** | **False** | 5e-05 | 0.05 | **0.7846** |
+| lr_1e4 | True | 1e-04 | 0.05 | 0.6633 |
+| lr_2e4 | True | 2e-04 | 0.05 | 0.6795 |
+
+`doy_phase_shift=False` was the clear winner (+0.110 AUC over baseline). The DOY circular wraparound augmentation actively hurts S2 discrimination — likely because it destroys the absolute seasonal timing that is part of the Parkinsonia phenological signal. **`doy_phase_shift=False` is now the default in `v9_spectral.py`.**
 
 ---
 
-## Implementation checklist
+## Known failure modes
 
-- [x] `tam/core/config.py` — add `use_band_summaries: bool = False`
-- [x] `tam/core/dataset.py` — compute p5/p95/std per band and assemble global feature vector when `use_band_summaries=True`
-- [x] `tam/experiments/v9_spectral.py` — experiment definition
-- [x] `sweeps/sweep_v9_spectral.py` — sweep script
+Smoke-testing on Longreach showed the model assigning highest scores to bare/sparse ground. Two confirmed root causes:
 
----
-
-## Smoke-test findings and improvement strategies
-
-### Observed failure mode
-
-Smoke-testing on Longreach shows V9 assigning its highest probability scores to patches of bare or sparsely vegetated ground — the opposite of the intended signal. The model is not discriminating between Parkinsonia and bare soil.
-
-### Root causes (confirmed by parquet analysis)
-
-**1. Train/inference obs-count mismatch**
-
-Training tiles are multi-year stacks (2020–2025); the Longreach inference parquet is a single year (2021). Obs counts per pixel:
-
-| Data | Clean obs/pixel | Wet-season obs/pixel |
-|---|---|---|
-| norman_road training tile (54KWC) | ~339 | ~112 |
-| etna training tile (54KWA) | ~649 | ~226 |
-| corfield pixel dir (2025 only) | ~39 | ~11 |
-| landsend pixel dir (2025 only) | ~26 | ~6 |
-| roper pixel dir (2025 only) | ~18 | ~5 |
-| Longreach inference (2021) | ~52 | ~15 |
-
-The model learned z-scored temporal sequences from 330–650 observations but classifies pixels with ~52. Sparse wet-season curves (15 obs) look nothing like the training distribution; the model has no exposure to them.
-
-**2. S1-optimised site selection is wrong for S2**
-
-The `v8_roper` site set was chosen for S1 signal diversity (Roper's value was its distinct SAR `vh_contrast` and `peak_doy`). S2 discrimination depends on optical phenological curve shape, not backscatter. Roper (5 wet-season S2 obs/pixel) and Landsend (6 wet-season S2 obs/pixel) are cloud-compromised — their S2 training curves may express little phenological signal. Earlier S2 models (V1, V2) used different sites specifically chosen for S2 contrast.
-
-**3. No bare-soil absence examples in the training set**
-
-V2 added `frenchs_absence_bare_soil_1/2/3` explicitly to fix bare-soil confusion, and it worked — NDVI contribution jumped from −0.001 to +0.028 between V1 and V2. V9's region list contains no bare-soil absence regions. In Longreach's arid semi-arid environment, this is the most important confounding class.
-
-### Improvement strategies (priority order)
-
-**Priority 1 — Add bare-soil absence regions**
-
-The fastest fix with the clearest precedent. Longreach itself is the ideal source: sample confirmed bare/sparse ground patches from within the Longreach tile and register them as absence regions. `frenchs_absence_bare_soil_2` and `frenchs_absence_bare_soil_3` from the V2 training set are already in `data/training/index.parquet` and can be re-added immediately.
-
-**Priority 2 — Match obs-count at train and inference time**
-
-Two options:
-- Retrain V9 on single-year pixel parquets (matching the inference window), reducing `obs_dropout_min` to 10–15 so the model learns to handle sparse curves.
-- Or re-run inference using multi-year tiles so the obs-count matches training (preferred if the multi-year tiles are available for inference regions).
-
-The current mismatch is ~10× on wet-season observations — this alone is sufficient to explain garbage outputs on inference.
-
-**Priority 3 — Audit S2 quality at Roper and Landsend before relying on them**
-
-With 5–6 wet-season obs/pixel, these training pixels may contribute mostly noise. Roper's large AUC jump in V8 (0.964 → 0.989) was due to its distinct SAR signature, not S2 contrast. Consider dropping Roper from V9 and replacing it with a site that has clean S2 wet-season coverage and good presence/absence contrast.
-
-**Priority 4 — Bring back Frenchs (or equivalent monsoonal site)**
-
-V1 and V2 found Frenchs (Cape York monsoonal savanna) highly informative for S2 — strong, well-defined wet-season green-up, clear bare-soil and water absence classes. It was dropped when focus shifted to S1 site selection. Frenchs presence and absence regions (including bare-soil) are already in `data/training/index.parquet`.
-
-**Priority 5 — Consider SWIR structural signal over phenological timing for Longreach**
-
-V1 showed B11 SWIR was the single dominant discriminant (permutation AUC drop +0.047) — a structural, not phenological, signal. The OVERVIEW notes that arid-zone Parkinsonia responds opportunistically to rainfall with no fixed seasonal window. For the Longreach region, a SWIR-structure approach may be more robust than phenological curve shape, and is less sensitive to the obs-count and cloud-gap problems above.
+1. **Obs-count mismatch** — training used multi-year stacks (~330–650 obs/pixel); inference parquets are single-year (~52 obs/pixel). Sparse wet-season curves look nothing like the training distribution.
+2. **No bare-soil absence training examples** — fixed by adding `frenchs_absence_bare_soil_2/3`. V2 precedent: NDVI contribution jumped from −0.001 to +0.028 after this fix.

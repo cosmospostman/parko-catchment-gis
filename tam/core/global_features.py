@@ -32,13 +32,12 @@ import os
 import numpy as np
 import pandas as pd
 
+from tam.core.constants import DRY_DOY_MIN as _DRY_DOY_MIN, DRY_DOY_MAX as _DRY_DOY_MAX
+
 GLOBAL_FEATURE_NAMES: list[str] = [
     "s1_mean_vh_dry", "s1_vh_contrast", "s1_vh_std", "s1_mean_rvi",
     "nir_cv", "rec_p", "peak_doy", "peak_doy_cv", "dry_ndvi",
 ]
-
-_DRY_DOY_MIN = 121   # May 1
-_DRY_DOY_MAX = 304   # October 31
 _MIN_DRY_OBS = 5
 _MIN_OBS     = 10
 _SMOOTH_DAYS = 30

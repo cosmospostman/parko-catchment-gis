@@ -76,6 +76,20 @@ regions:
     years: [2016, 2017, 2018, 2019, 2020, 2021]
     tags: [arid]
 
+  - id: barcoorah_presence_4
+    name: "Barcoorah — presence 4"
+    label: presence
+    bbox: [145.343474, -22.510558, 145.345133, -22.508158]
+    years: [2024]
+    tags: [arid]
+
+  - id: barcoorah_absence_4
+    name: "Barcoorah — absence 4"
+    label: absence
+    bbox: [145.317074, -22.458019, 145.320232, -22.455206]
+    years: [2024]
+    tags: [arid]
+
   # ---------------------------------------------------------------------------
   # Frenchs — Cape York Peninsula (monsoonal, savanna-riparian)
   # ---------------------------------------------------------------------------
@@ -1141,6 +1155,55 @@ regions:
     years: [2020, 2021, 2022, 2023, 2024, 2025]
     tags: [semi-arid]
 
+  - id: etna_presence_5
+    name: "Etna Creek — presence 5"
+    label: presence
+    bbox: [142.251447, -21.716763, 142.260631, -21.706943]
+    years: [2024]
+    tags: [semi-arid]
+
+  - id: etna_presence_6
+    name: "Etna Creek — presence 6"
+    label: presence
+    bbox: [142.245951, -21.698666, 142.250815, -21.693360]
+    years: [2024]
+    tags: [semi-arid]
+
+  - id: etna_presence_7
+    name: "Etna Creek — presence 7"
+    label: presence
+    bbox: [142.245106, -21.660234, 142.252309, -21.654738]
+    years: [2024]
+    tags: [semi-arid]
+
+  - id: etna_presence_8
+    name: "Etna Creek — presence 8"
+    label: presence
+    bbox: [142.164599, -21.686079, 142.167703, -21.679420]
+    years: [2024]
+    tags: [semi-arid]
+
+  - id: etna_presence_9
+    name: "Etna Creek — presence 9"
+    label: presence
+    bbox: [142.143401, -21.681782, 142.145517, -21.679462]
+    years: [2024]
+    tags: [semi-arid]
+
+  - id: etna_absence_6
+    name: "Etna Creek — absence 6"
+    label: absence
+    bbox: [142.238169, -21.643139, 142.242889, -21.639018]
+    years: [2024]
+    tags: [semi-arid]
+
+  - id: etna_absence_7
+    name: "Etna Creek — absence 7"
+    label: absence
+    bbox: [142.112021, -21.672097, 142.122038, -21.669575]
+    years: [2024]
+    tags: [semi-arid]
+
   # ---------------------------------------------------------------------------
   # Landsend — northwest Queensland (semi-arid, riparian)
   # ---------------------------------------------------------------------------
@@ -1284,6 +1347,27 @@ regions:
     years: [2020, 2021, 2022, 2023, 2024, 2025]
     tags: [semi-arid, grass]
 
+  - id: landsend_presence_8
+    name: "Landsend — presence 8"
+    label: presence
+    bbox: [141.393939, -20.461065, 141.399497, -20.456670]
+    years: [2024]
+    tags: [semi-arid, riparian]
+
+  - id: landsend_absence_4
+    name: "Landsend — absence 4"
+    label: absence
+    bbox: [141.400515, -20.451299, 141.404781, -20.448351]
+    years: [2024]
+    tags: [semi-arid, riparian]
+
+  - id: landsend_absence_5
+    name: "Landsend — absence 5"
+    label: absence
+    bbox: [141.435625, -20.467801, 141.445901, -20.466041]
+    years: [2024]
+    tags: [semi-arid, riparian]
+
   # ---------------------------------------------------------------------------
   # Alexandria — Northern Territory (semi-arid, riparian)
   # ---------------------------------------------------------------------------
@@ -1381,3 +1465,76 @@ regions:
   #   bbox: [143.198975, -21.503427, 143.200475, -21.502821]
   #   year: 2025
   #   tags: [semi-arid]
+
+  # ---------------------------------------------------------------------------
+  # Hughenden — northwest Queensland (semi-arid)
+  # ---------------------------------------------------------------------------
+  - id: hughenden_presence_1
+    name: "Hughenden — presence 1"
+    label: presence
+    bbox: [144.165157, -20.890948, 144.167122, -20.886420]
+    years: [2024]
+    tags: [semi-arid]
+
+  - id: hughenden_presence_2
+    name: "Hughenden — presence 2"
+    label: presence
+    bbox: [144.170576, -20.886840, 144.173595, -20.884114]
+    years: [2024]
+    tags: [semi-arid]
+
+  - id: hughenden_presence_3
+    name: "Hughenden — presence 3"
+    label: presence
+    bbox: [144.111057, -20.877895, 144.113551, -20.874213]
+    years: [2024]
+    tags: [semi-arid]
+
+  - id: hughenden_presence_4
+    name: "Hughenden — presence 4"
+    label: presence
+    bbox: [144.083798, -20.843978, 144.090036, -20.841629]
+    years: [2024]
+    tags: [semi-arid]
+
+  - id: hughenden_absence_1
+    name: "Hughenden — absence 1"
+    label: absence
+    bbox: [144.111722, -20.861073, 144.114405, -20.857756]
+    years: [2024]
+    tags: [semi-arid]
+
+  - id: hughenden_absence_2
+    name: "Hughenden — absence 2"
+    label: absence
+    bbox: [144.201459, -20.847580, 144.208270, -20.844293]
+    years: [2024]
+    tags: [semi-arid]
+
+  - id: hughenden_absence_3
+    name: "Hughenden — absence 3"
+    label: absence
+    bbox: [144.198966, -20.844312, 144.202763, -20.839214]
+    years: [2024]
+    tags: [semi-arid]
+
+  - id: hughenden_absence_5
+    name: "Hughenden — absence 5"
+    label: absence
+    bbox: [144.292665, -20.827444, 144.295551, -20.821943]
+    years: [2024]
+    tags: [semi-arid]
+
+  - id: hughenden_absence_6
+    name: "Hughenden — absence 6"
+    label: absence
+    bbox: [144.296341, -20.830262, 144.298824, -20.821145]
+    years: [2024]
+    tags: [semi-arid]
+
+  - id: hughenden_absence_7
+    name: "Hughenden — absence 7"
+    label: absence
+    bbox: [144.230982, -20.771074, 144.234622, -20.765838]
+    years: [2024]
+    tags: [semi-arid]

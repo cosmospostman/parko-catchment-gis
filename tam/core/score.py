@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from tam.core.dataset import ALL_FEATURE_COLS, BAND_COLS, MAX_SEQ_LEN, S1_FEATURE_COLS, despeckle_s1
+from tam.core.dataset import ALL_FEATURE_COLS, BAND_COLS, MAX_SEQ_LEN, S1_FEATURE_COLS, despeckle_s1, lin_to_db
 from tam.core.model import TAMClassifier
 
 logger = logging.getLogger(__name__)
@@ -51,8 +51,8 @@ def _compute_pixel_s1_stats(parquet: Path) -> tuple[dict, dict, dict, dict]:
     if not chunks:
         return {}, {}, {}, {}
     all_s1 = pd.concat(chunks, ignore_index=True)
-    all_s1["vh_db"] = np.where(all_s1["vh"] > 0, 10 * np.log10(all_s1["vh"]), np.nan)
-    all_s1["vv_db"] = np.where(all_s1["vv"] > 0, 10 * np.log10(all_s1["vv"]), np.nan)
+    all_s1["vh_db"] = lin_to_db(all_s1["vh"].values.astype(np.float32))
+    all_s1["vv_db"] = lin_to_db(all_s1["vv"].values.astype(np.float32))
     grp = all_s1.groupby("point_id")
     vh_mean = grp["vh_db"].mean()
     vh_std  = grp["vh_db"].std().clip(lower=0.1)
@@ -121,8 +121,8 @@ def _extract_s1_features(
         chunk.index = idx
     vh_lin = chunk["vh"].values.astype(np.float32)
     vv_lin = chunk["vv"].values.astype(np.float32)
-    vh_db  = np.where(vh_lin > 0, 10 * np.log10(vh_lin), np.nan)
-    vv_db  = np.where(vv_lin > 0, 10 * np.log10(vv_lin), np.nan)
+    vh_db  = lin_to_db(vh_lin)
+    vv_db  = lin_to_db(vv_lin)
     vh_vv  = vh_db - vv_db
     denom  = vh_lin + vv_lin
     rvi    = np.where(denom > 0, 4 * vh_lin / denom, np.nan)

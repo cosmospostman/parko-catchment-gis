@@ -106,7 +106,7 @@ def main() -> None:
         doy_phase_shift=True,
         pixel_zscore=True,
         use_s1=False,
-        val_sites=("etna",),
+        val_region_ids=tuple(exp.val_region_ids),
         feature_cols_override=tuple(V9_FEATURE_COLS),
         lr=args.lr,
         d_model=args.d_model,

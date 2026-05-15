@@ -41,6 +41,11 @@ MAX_SEQ_LEN: int = 128       # hard upper bound on stored window length; model s
 MIN_OBS_PER_YEAR: int = 8
 
 
+def lin_to_db(linear: np.ndarray) -> np.ndarray:
+    """Convert linear-power SAR backscatter to dB; returns nan where linear <= 0."""
+    return np.where(linear > 0, 10.0 * np.log10(linear), np.nan)
+
+
 class TAMSample(NamedTuple):
     bands:        torch.Tensor   # (MAX_SEQ_LEN, N_BANDS)  float32, normalised, zero-padded
     doy:          torch.Tensor   # (MAX_SEQ_LEN,)           int64, 1–365, 0=padding
@@ -113,8 +118,8 @@ def snap_s1_to_s2(pixel_df: pd.DataFrame, window_days: int = S1_SNAP_WINDOW_DAYS
     s1 = s1.copy()
     vh_lin = s1["vh"].values.astype(np.float32) if "vh" in s1.columns else np.full(len(s1), np.nan, dtype=np.float32)
     vv_lin = s1["vv"].values.astype(np.float32) if "vv" in s1.columns else np.full(len(s1), np.nan, dtype=np.float32)
-    s1["s1_vh"]    = np.where(vh_lin > 0, 10 * np.log10(vh_lin), np.nan).astype(np.float32)
-    s1["s1_vv"]    = np.where(vv_lin > 0, 10 * np.log10(vv_lin), np.nan).astype(np.float32)
+    s1["s1_vh"]    = lin_to_db(vh_lin).astype(np.float32)
+    s1["s1_vv"]    = lin_to_db(vv_lin).astype(np.float32)
     s1["s1_vh_vv"] = s1["s1_vh"] - s1["s1_vv"]
     denom = vh_lin + vv_lin
     s1["s1_rvi"]   = np.where(denom > 0, 4 * vh_lin / denom, np.nan).astype(np.float32)
@@ -243,8 +248,8 @@ class TAMDataset(Dataset):
             s1_rows = despeckle_s1(s1_rows, s1_despeckle_window)
             vh_lin = s1_rows["vh"].values.astype(np.float32)
             vv_lin = s1_rows["vv"].values.astype(np.float32)
-            s1_rows["s1_vh"]    = np.where(vh_lin > 0, 10 * np.log10(vh_lin), np.nan).astype(np.float32)
-            s1_rows["s1_vv"]    = np.where(vv_lin > 0, 10 * np.log10(vv_lin), np.nan).astype(np.float32)
+            s1_rows["s1_vh"]    = lin_to_db(vh_lin).astype(np.float32)
+            s1_rows["s1_vv"]    = lin_to_db(vv_lin).astype(np.float32)
             s1_rows["s1_vh_vv"] = s1_rows["s1_vh"] - s1_rows["s1_vv"]
             denom = vh_lin + vv_lin
             s1_rows["s1_rvi"]   = np.where(denom > 0, 4 * vh_lin / denom, np.nan).astype(np.float32)

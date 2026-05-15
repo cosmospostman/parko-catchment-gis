@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from pathlib import Path
 
 import numpy as np
@@ -17,8 +18,11 @@ from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader
 
 from tam.core.config import TAMConfig
-from tam.core.dataset import MAX_SEQ_LEN, TAMDataset, collate_fn
+from tam.core.constants import DRY_DOY_MIN as _DRY_DOY_MIN, DRY_DOY_MAX as _DRY_DOY_MAX
+from tam.core.dataset import MAX_SEQ_LEN, TAMDataset, V9_FEATURE_COLS, collate_fn, lin_to_db
+from tam.core.global_features import GLOBAL_FEATURE_NAMES, compute_global_features
 from tam.core.model import TAMClassifier
+from analysis.constants import add_spectral_indices
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +71,21 @@ def spatial_split(
     return train_labels, val_labels
 
 
+def region_holdout_split(
+    labels: pd.Series,
+    val_region_ids: tuple[str, ...],
+) -> tuple[pd.Series, pd.Series]:
+    """Hold out pixels whose region ID is in val_region_ids.
+
+    Point IDs have the form <region_id>_<row>_<col>. The region is recovered
+    by stripping the trailing _<row>_<col> numeric suffix.
+    """
+    _suffix = re.compile(r"_\d+_\d+$")
+    val_set = set(val_region_ids)
+    is_val = labels.index.map(lambda pid: _suffix.sub("", pid) in val_set)
+    return labels[~is_val], labels[is_val]
+
+
 def site_holdout_split(
     labels: pd.Series,
     val_sites: tuple[str, ...],
@@ -77,7 +96,6 @@ def site_holdout_split(
     form <site>_presence_N or <site>_absence_N, so the site is the prefix
     before the first '_presence' or '_absence'.
     """
-    import re
     def point_site(pid: str) -> str:
         m = re.match(r"^(.+?)_(presence|absence)", pid)
         return m.group(1) if m else pid
@@ -103,11 +121,16 @@ def _compute_band_summaries(pixel_df: pd.DataFrame, feature_cols: list[str]) -> 
     keep_cols = ["point_id"] + cols
     s2 = pixel_df.loc[s2_mask, keep_cols]  # view, no copy
 
+    # Compute all three stats sequentially, deleting each intermediate after concat,
+    # to avoid three full (n_pixels × n_cols) result tables live simultaneously.
     g = s2.groupby("point_id")[cols]
     p5  = g.quantile(0.05).rename(columns={c: f"{c}_p5"  for c in cols})
     p95 = g.quantile(0.95).rename(columns={c: f"{c}_p95" for c in cols})
+    result = pd.concat([p5, p95], axis=1)
+    del p5, p95
     std = g.std().rename(columns={c: f"{c}_std" for c in cols})
-    result = pd.concat([p5, p95, std], axis=1)
+    result = pd.concat([result, std], axis=1)
+    del std
     ordered = [f"{c}{s}" for c in cols for s in ("_p5", "_p95", "_std")]
     return result[ordered]
 
@@ -125,7 +148,6 @@ def _load_or_compute_global_features(
     out_dir: Path,
     feature_names: list[str],
 ) -> pd.DataFrame:
-    from tam.core.global_features import compute_global_features
     cache_path = out_dir / "global_features_cache.parquet"
     key_path   = out_dir / "global_features_cache.key"
     cache_key  = _global_features_cache_key(pixel_df)
@@ -146,6 +168,39 @@ def _load_or_compute_global_features(
     return global_feat_df
 
 
+def _site_class(pid: str) -> tuple[str, str]:
+    m = re.match(r"^(.+?)_(presence|absence)", pid)
+    return (m.group(1), m.group(2)) if m else (pid, "unknown")
+
+
+def _apply_presence_filter(
+    lbl_py: pd.Series,
+    mean_vh_dry_py: pd.Series,
+    cfg: TAMConfig,
+    pid_to_sc: pd.Series,
+    noise_removed: dict,
+    mean_ndvi_dry_py: pd.Series | None = None,
+) -> pd.Series:
+    presence_py = lbl_py[lbl_py == 1]
+    vh = mean_vh_dry_py.reindex(presence_py.index)
+    fails_strict = vh < cfg.presence_min_vh_dry_db
+    if mean_ndvi_dry_py is not None:
+        ndvi = mean_ndvi_dry_py.reindex(presence_py.index)
+        rescued = (
+            (vh >= cfg.presence_ndvi_rescue_vh_db)
+            & (ndvi >= cfg.presence_ndvi_rescue_min)
+        )
+        drop_mask = fails_strict & ~rescued
+    else:
+        drop_mask = fails_strict
+    drop_idx  = presence_py.index[drop_mask.fillna(False)]
+    drop_pids = drop_idx.get_level_values("point_id")
+    sc = pd.Series(drop_pids).map(pid_to_sc).value_counts()
+    for key, cnt in sc.items():
+        noise_removed[key] = noise_removed.get(key, 0) + cnt
+    return lbl_py[~lbl_py.index.isin(drop_idx)]
+
+
 def train_tam(
     pixel_df: pd.DataFrame,
     labels: pd.Series,
@@ -153,7 +208,7 @@ def train_tam(
     out_dir: Path,
     cfg: TAMConfig | None = None,
     device: str | None = None,
-) -> TAMClassifier:
+) -> tuple[TAMClassifier, float]:
     """Train a TAMClassifier and save checkpoint to out_dir.
 
     Parameters
@@ -172,7 +227,7 @@ def train_tam(
 
     Returns
     -------
-    The best-val-AUC TAMClassifier (weights loaded from checkpoint).
+    Tuple of (best-val-AUC TAMClassifier with weights loaded from checkpoint, best_val_auc float).
     """
     if cfg is None:
         cfg = TAMConfig()
@@ -181,14 +236,10 @@ def train_tam(
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Training on device: %s", device)
 
-    import re as _re
-
-    def _site_class(pid: str) -> tuple[str, str]:
-        m = _re.match(r"^(.+?)_(presence|absence)", pid)
-        return (m.group(1), m.group(2)) if m else (pid, "unknown")
-
     # --- Split labels ---------------------------------------------------------
-    if cfg.val_sites:
+    if cfg.val_region_ids:
+        train_labels, val_labels = region_holdout_split(labels, cfg.val_region_ids)
+    elif cfg.val_sites:
         train_labels, val_labels = site_holdout_split(labels, cfg.val_sites)
     else:
         train_labels, val_labels = spatial_split(labels, pixel_coords, cfg.val_frac)
@@ -222,15 +273,12 @@ def train_tam(
     # --- Global features -----------------------------------------------------
     global_feat_df = None
     if cfg.use_band_summaries:
-        from tam.core.dataset import V9_FEATURE_COLS
-        from analysis.constants import add_spectral_indices
         logger.info("Computing band summaries (%d rows) ...", len(pixel_df))
         if "NDVI" not in pixel_df.columns or "NDWI" not in pixel_df.columns:
             pixel_df = add_spectral_indices(pixel_df)
         global_feat_df = _compute_band_summaries(pixel_df, V9_FEATURE_COLS)
         logger.info("Band summaries computed: %d pixels, %d features", len(global_feat_df), global_feat_df.shape[1])
     elif cfg.n_global_features > 0:
-        from tam.core.global_features import GLOBAL_FEATURE_NAMES
         global_feat_df = _load_or_compute_global_features(pixel_df, out_dir, GLOBAL_FEATURE_NAMES)
     _log_rss("after band summaries")
 
@@ -255,6 +303,11 @@ def train_tam(
         pixel_df = pixel_df[pixel_df["source"] == "S2"].reset_index(drop=True)
         gc.collect()
     _log_rss("after S1 drop")
+
+    # px_counts: unique pixel count per (site, class) — area indicator, computed once before broadcast.
+    px_counts: dict[tuple[str, str], int] = pd.Series(
+        list(map(_site_class, labels.index)), index=labels.index
+    ).value_counts().to_dict()
 
     # raw_counts populated in pixel-year units after the broadcast step below.
     raw_counts: dict[tuple[str, str], int] = {}
@@ -331,8 +384,8 @@ def train_tam(
             doy_vals = (s1_slim[_date_col].values if _doy_col
                         else pd.to_datetime(s1_slim["date"]).dt.day_of_year.values)
             vh_lin = s1_slim["vh"].values.astype(np.float32)
-            vh_db  = np.where(vh_lin > 0, 10.0 * np.log10(vh_lin), np.nan)
-            dry_mask = (doy_vals >= 121) & (doy_vals <= 304) & np.isfinite(vh_db)
+            vh_db  = lin_to_db(vh_lin)
+            dry_mask = (doy_vals >= _DRY_DOY_MIN) & (doy_vals <= _DRY_DOY_MAX) & np.isfinite(vh_db)
 
             dry_s1 = pd.DataFrame({
                 "point_id": s1_slim["point_id"].values[dry_mask],
@@ -346,35 +399,15 @@ def train_tam(
             if s2_slim is not None and not s2_slim.empty:
                 s2_doy = (s2_slim[_date_col].values if _doy_col
                           else pd.to_datetime(s2_slim["date"]).dt.day_of_year.values)
-                s2_dry_mask = (s2_doy >= 121) & (s2_doy <= 304)
+                s2_dry_mask = (s2_doy >= _DRY_DOY_MIN) & (s2_doy <= _DRY_DOY_MAX)
                 if _has_scl:
                     s2_dry_mask &= s2_slim["scl"].isin([4.0, 5.0]).values
                 dry_s2 = s2_slim[s2_dry_mask & s2_slim["NDVI"].notna()]
                 if not dry_s2.empty:
                     mean_ndvi_dry_py = dry_s2.groupby(["point_id", "year"])["NDVI"].mean()
 
-            def _apply_presence_filter(lbl_py: pd.Series) -> pd.Series:
-                presence_py = lbl_py[lbl_py == 1]
-                vh = mean_vh_dry_py.reindex(presence_py.index)
-                fails_strict = vh < cfg.presence_min_vh_dry_db
-                if mean_ndvi_dry_py is not None:
-                    ndvi = mean_ndvi_dry_py.reindex(presence_py.index)
-                    rescued = (
-                        (vh >= cfg.presence_ndvi_rescue_vh_db)
-                        & (ndvi >= cfg.presence_ndvi_rescue_min)
-                    )
-                    drop_mask = fails_strict & ~rescued
-                else:
-                    drop_mask = fails_strict
-                drop_idx  = presence_py.index[drop_mask.fillna(False)]
-                drop_pids = drop_idx.get_level_values("point_id")
-                sc = pd.Series(drop_pids).map(pid_to_sc).value_counts()
-                for key, cnt in sc.items():
-                    noise_removed[key] = noise_removed.get(key, 0) + cnt
-                return lbl_py[~lbl_py.index.isin(drop_idx)]
-
-            train_py_labels = _apply_presence_filter(train_py_labels)
-            val_py_labels   = _apply_presence_filter(val_py_labels)
+            train_py_labels = _apply_presence_filter(train_py_labels, mean_vh_dry_py, cfg, pid_to_sc, noise_removed, mean_ndvi_dry_py)
+            val_py_labels   = _apply_presence_filter(val_py_labels,   mean_vh_dry_py, cfg, pid_to_sc, noise_removed, mean_ndvi_dry_py)
             ndvi_note = (f", NDVI rescue: VH>={cfg.presence_ndvi_rescue_vh_db:.1f} dB"
                          f" & NDVI>={cfg.presence_ndvi_rescue_min:.2f}"
                          if mean_ndvi_dry_py is not None else "")
@@ -390,6 +423,8 @@ def train_tam(
     # All counts (Raw, Noise, Total) are in pixel-year units.
     # Stride is pixel-level (applied before broadcast) and shown separately.
     val_site_set = set(cfg.val_sites) if cfg.val_sites else set()
+    if cfg.val_region_ids:
+        val_site_set |= {_site_class(rid)[0] for rid in cfg.val_region_ids}
 
     # final_counts: surviving pixel-years per (site, class) after all filters.
     final_all_py = pd.concat([train_py_labels, val_py_labels])
@@ -403,75 +438,81 @@ def train_tam(
     def neg(n: int, w: int) -> str:
         return f"-{n:>{w - 1},}" if n else f"{'':>{w}}"
 
-    def row(label: str, raw: int, noise: int, stride: int, final: int) -> str:
-        return f"{label:>{col_w}}  {raw:>8,}  {neg(noise, 7)}  {neg(stride, 9)}  {final:>8,}"
+    def row(label: str, px: int, raw: int, noise: int, stride: int, final: int) -> str:
+        return f"{label:>{col_w}}  {px:>8,}  {raw:>8,}  {neg(noise, 7)}  {neg(stride, 9)}  {final:>8,}"
 
-    header = f"{'':>{col_w}}  {'Raw py':>8}  {'Noise py':>7}  {'Stride px':>9}  {'Total py':>8}"
+    header = f"{'':>{col_w}}  {'Raw px':>8}  {'Raw py':>8}  {'Noise py':>7}  {'Stride px':>9}  {'Total py':>8}"
     sep    = "-" * len(header)
     thin   = " " * len(header)
 
     train_sites = sorted({s for s, _ in all_keys if s not in val_site_set})
     val_sites_sorted = sorted({s for s, _ in all_keys if s in val_site_set})
 
-    def site_rows(sites: list[str], prefix: str = "") -> tuple[list[str], int, int, int, int]:
+    def site_rows(sites: list[str], prefix: str = "") -> tuple[list[str], int, int, int, int, int]:
         block_lines = []
-        b_raw = b_noise = b_stride = b_final = 0
+        b_px = b_raw = b_noise = b_stride = b_final = 0
         for site in sites:
             for cls in ("presence", "absence"):
                 key = (site, cls)
                 if key not in raw_counts:
                     continue
+                px     = px_counts.get(key, 0)
                 raw    = raw_counts.get(key, 0)
                 noise  = noise_removed.get(key, 0)
                 stride = stride_removed.get(key, 0)
                 final  = final_counts.get(key, 0)
-                block_lines.append(row(f"{prefix}{site} {cls}", raw, noise, stride, final))
-                b_raw += raw; b_noise += noise; b_stride += stride; b_final += final
-        return block_lines, b_raw, b_noise, b_stride, b_final
+                block_lines.append(row(f"{prefix}{site} {cls}", px, raw, noise, stride, final))
+                b_px += px; b_raw += raw; b_noise += noise; b_stride += stride; b_final += final
+        return block_lines, b_px, b_raw, b_noise, b_stride, b_final
 
     lines = [sep, header, sep]
 
-    train_rows, train_raw, train_noise, train_stride, train_final = site_rows(train_sites)
+    train_rows, train_px, train_raw, train_noise, train_stride, train_final = site_rows(train_sites)
     lines.extend(train_rows)
     lines.append(thin)
-    lines.append(row("PRESENCE", *[
+    lines.append(row("PRESENCE",
+        sum(px_counts.get((s, "presence"), 0) for s in train_sites),
         sum(raw_counts.get((s, "presence"), 0) for s in train_sites),
         sum(noise_removed.get((s, "presence"), 0) for s in train_sites),
         sum(stride_removed.get((s, "presence"), 0) for s in train_sites),
         sum(final_counts.get((s, "presence"), 0) for s in train_sites),
-    ]))
-    lines.append(row("ABSENCE", *[
+    ))
+    lines.append(row("ABSENCE",
+        sum(px_counts.get((s, "absence"), 0) for s in train_sites),
         sum(raw_counts.get((s, "absence"), 0) for s in train_sites),
         sum(noise_removed.get((s, "absence"), 0) for s in train_sites),
         sum(stride_removed.get((s, "absence"), 0) for s in train_sites),
         sum(final_counts.get((s, "absence"), 0) for s in train_sites),
-    ]))
-    lines.append(row("TRAIN TOTAL", train_raw, train_noise, train_stride, train_final))
+    ))
+    lines.append(row("TRAIN TOTAL", train_px, train_raw, train_noise, train_stride, train_final))
     lines.append(sep)
 
-    val_rows, val_raw, val_noise, val_stride, val_final = site_rows(val_sites_sorted, prefix="HOLDOUT: ")
+    val_rows, val_px, val_raw, val_noise, val_stride, val_final = site_rows(val_sites_sorted, prefix="HOLDOUT: ")
     lines.extend(val_rows)
     lines.append(thin)
-    lines.append(row("PRESENCE", *[
+    lines.append(row("PRESENCE",
+        sum(px_counts.get((s, "presence"), 0) for s in val_sites_sorted),
         sum(raw_counts.get((s, "presence"), 0) for s in val_sites_sorted),
         sum(noise_removed.get((s, "presence"), 0) for s in val_sites_sorted),
         0,
         sum(final_counts.get((s, "presence"), 0) for s in val_sites_sorted),
-    ]))
-    lines.append(row("ABSENCE", *[
+    ))
+    lines.append(row("ABSENCE",
+        sum(px_counts.get((s, "absence"), 0) for s in val_sites_sorted),
         sum(raw_counts.get((s, "absence"), 0) for s in val_sites_sorted),
         sum(noise_removed.get((s, "absence"), 0) for s in val_sites_sorted),
         0,
         sum(final_counts.get((s, "absence"), 0) for s in val_sites_sorted),
-    ]))
-    lines.append(row("VAL TOTAL", val_raw, val_noise, val_stride, val_final))
+    ))
+    lines.append(row("VAL TOTAL", val_px, val_raw, val_noise, val_stride, val_final))
     lines.append(sep)
 
+    total_px    = train_px    + val_px
     total_stride_n = train_stride + val_stride
     total_raw   = train_raw   + val_raw
     total_noise = train_noise + val_noise
     total_final = train_final + val_final
-    lines.append(row("TOTAL", total_raw, total_noise, total_stride_n, total_final))
+    lines.append(row("TOTAL", total_px, total_raw, total_noise, total_stride_n, total_final))
     lines.append(sep)
 
     logger.info("Pixel summary (stride=%d):\n%s", cfg.spatial_stride, "\n".join(lines))
@@ -668,7 +709,7 @@ def train_tam(
 
         # --- Validation -------------------------------------------------------
         model.eval()
-        val_probs, val_labels_list = [], []
+        val_probs, val_labels_list, val_pids = [], [], []
         with torch.no_grad():
             for batch in val_loader:
                 prob, _ = model(
@@ -680,6 +721,7 @@ def train_tam(
                 )
                 val_probs.extend(prob.cpu().numpy())
                 val_labels_list.extend(batch["label"].numpy())
+                val_pids.extend(batch["point_id"])
 
         val_probs_arr = np.array(val_probs)
         val_labels_arr = np.array(val_labels_list)
@@ -692,12 +734,22 @@ def train_tam(
         else:
             val_auc = float("nan")
 
+        # Macro-site AUC: average AUC across val sites weighted equally.
+        site_aucs = []
+        val_sites_arr = np.array([_site_class(pid)[0] for pid in val_pids])
+        for site in np.unique(val_sites_arr):
+            mask = finite & (val_sites_arr == site)
+            if mask.sum() > 0 and len(set(val_labels_arr[mask])) > 1:
+                site_aucs.append(roc_auc_score(val_labels_arr[mask], val_probs_arr[mask]))
+        val_auc_macro = float(np.mean(site_aucs)) if site_aucs else float("nan")
+
         logger.info(
-            "epoch %3d/%d  loss=%.4f  train_auc=%.3f  val_auc=%.3f%s",
+            "epoch %3d/%d  loss=%.4f  train_auc=%.3f  val_auc=%.3f  val_auc_macro=%.3f%s",
             epoch, cfg.n_epochs,
             epoch_loss / max(len(train_loader), 1),
             train_auc,
             val_auc,
+            val_auc_macro,
             "  *" if (not np.isnan(val_auc) and val_auc >= best_val_auc) else "",
         )
 

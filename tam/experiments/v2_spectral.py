@@ -9,7 +9,7 @@ from tam.core.experiment import Experiment
 
 EXPERIMENT = Experiment(
     name="v2_spectral",
-    region_ids=[
+    train_region_ids=[
         "lake_mueller_presence", "lake_mueller_presence_2", "lake_mueller_presence_3",
         # "lake_mueller_presence_mixed",  # removed — noisy labels (Parkinsonia mixed with native canopy)
         "lake_mueller_absence",

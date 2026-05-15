@@ -3,7 +3,6 @@
 Outputs all files into a single subdirectory alongside the checkpoint:
   <checkpoint>/attention/
     summary.txt          — text summary of peak attention by site/class/head
-    mean_<site>.png      — mean attention across all heads and layers
     perhead_<site>_<cls>.png — per-head attention for last layer
 
 Usage:
@@ -145,37 +144,18 @@ def main() -> None:
 
     exp = importlib.import_module(f"tam.experiments.{args.experiment}").EXPERIMENT
 
-    # --- Load pixels ----------------------------------------------------------
-    regions  = select_regions(exp.region_ids)
-    tile_ids = tile_ids_for_regions(exp.region_ids)
+    # --- Setup ----------------------------------------------------------------
+    all_regions = select_regions(exp.region_ids)
 
-    chunks: list[pd.DataFrame] = []
-    for tid in tile_ids:
-        path = tile_parquet_path(tid)
-        if not path.exists():
-            continue
-        pf = pq.ParquetFile(path)
-        available = set(pf.schema_arrow.names)
-        s1_cols = [c for c in ("source", "vh", "vv") if c in available]
-        base_cols = ["point_id", "lon", "lat", "date", "scl_purity"]
-        read_cols = base_cols + [c for c in exp.feature_cols if c in available] + s1_cols
-        for rg in range(pf.metadata.num_row_groups):
-            tbl = pf.read_row_group(rg, columns=read_cols)
-            chunks.append(tbl.to_pandas())
+    # Determine site list from experiment region_ids before any data load.
+    all_site_region_ids: dict[str, list[str]] = {}
+    for rid in exp.region_ids:
+        site = point_site(rid)
+        all_site_region_ids.setdefault(site, []).append(rid)
 
-    pixel_df = pd.concat(chunks, ignore_index=True)
-    pixel_df["year"] = pd.to_datetime(pixel_df["date"]).dt.year
-    pixel_df["doy"]  = pd.to_datetime(pixel_df["date"]).dt.day_of_year
+    sites = args.sites or sorted(all_site_region_ids.keys())
 
-    pixel_coords = pixel_df[["point_id","lon","lat"]].drop_duplicates("point_id").reset_index(drop=True)
-    labelled     = label_pixels(pixel_coords, regions).dropna(subset=["is_presence"])
-    all_labels   = labelled.set_index("point_id")["is_presence"].map({True: 1.0, False: 0.0})
-
-    # Filter pixel_df to labelled pixels before snap_s1_to_s2 — snap is O(n²)
-    # over rows so running it on the full tile parquet is very slow.
-    pixel_df = pixel_df[pixel_df["point_id"].isin(all_labels.index)]
-
-    # --- Load checkpoint ------------------------------------------------------
+    # --- Load checkpoint (small, keep in memory throughout) -------------------
     model, band_mean, band_std, *_ = load_tam(ckpt_dir)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device).eval()
@@ -190,36 +170,68 @@ def main() -> None:
     if cache_path.exists():
         global_feat_df = pd.read_parquet(cache_path)
 
-    sites = args.sites or sorted({point_site(p) for p in all_labels.index})
-
-    ds = TAMDataset(
-        pixel_df, all_labels,
-        band_mean=band_mean, band_std=band_std,
-        scl_purity_min=cfg.scl_purity_min,
-        min_obs_per_year=cfg.min_obs_per_year,
-        doy_jitter=0,
-        global_features_df=global_feat_df,
-        use_s1={4: "s1_only", 17: True}.get(cfg.n_bands, False),
-        feature_cols_override=saved_feature_cols,
-    )
-
-    pid_to_indices: dict[str, list[int]] = {}
-    for i, (pid, *_) in enumerate(ds._windows):
-        pid_to_indices.setdefault(pid, []).append(i)
-
-    rng     = np.random.default_rng(42)
     n_heads = model.n_heads
+    rng     = np.random.default_rng(42)
     summary_lines: list[str] = [
         f"Attention summary — {args.experiment}",
         f"Checkpoint: {ckpt_dir}",
         f"n_heads={n_heads}  n_layers={model.n_layers}",
         "",
-        f"{'site':<20} {'class':<10} {'n_px':>6}  {'peak_months (mean)':30}  {'peak_months per head (last layer)'}",
+        f"{'site':<20} {'class':<10} {'n_px':>6}  {'peak_months per head (last layer)'}",
         "-" * 110,
     ]
 
     for site in sites:
-        site_labels = all_labels[all_labels.index.map(point_site) == site]
+        site_region_ids = all_site_region_ids.get(site)
+        if not site_region_ids:
+            print(f"  skipping {site} — no regions found in experiment")
+            continue
+
+        print(f"  processing {site} ...")
+
+        # Load only tiles needed for this site, free after.
+        site_regions = select_regions(site_region_ids)
+        tile_ids     = tile_ids_for_regions(site_region_ids)
+
+        chunks: list[pd.DataFrame] = []
+        for tid in tile_ids:
+            path = tile_parquet_path(tid)
+            if not path.exists():
+                continue
+            pf        = pq.ParquetFile(path)
+            available = set(pf.schema_arrow.names)
+            s1_cols   = [c for c in ("source", "vh", "vv") if c in available]
+            base_cols = ["point_id", "lon", "lat", "date", "scl_purity"]
+            read_cols = base_cols + [c for c in exp.feature_cols if c in available] + s1_cols
+            for rg in range(pf.metadata.num_row_groups):
+                chunks.append(pf.read_row_group(rg, columns=read_cols).to_pandas())
+
+        pixel_df = pd.concat(chunks, ignore_index=True)
+        del chunks
+        pixel_df["year"] = pd.to_datetime(pixel_df["date"]).dt.year
+        pixel_df["doy"]  = pd.to_datetime(pixel_df["date"]).dt.day_of_year
+
+        pixel_coords = pixel_df[["point_id", "lon", "lat"]].drop_duplicates("point_id").reset_index(drop=True)
+        labelled     = label_pixels(pixel_coords, site_regions).dropna(subset=["is_presence"])
+        site_labels  = labelled.set_index("point_id")["is_presence"].map({True: 1.0, False: 0.0})
+
+        pixel_df = pixel_df[pixel_df["point_id"].isin(site_labels.index)]
+
+        ds = TAMDataset(
+            pixel_df, site_labels,
+            band_mean=band_mean, band_std=band_std,
+            scl_purity_min=cfg.scl_purity_min,
+            min_obs_per_year=cfg.min_obs_per_year,
+            doy_jitter=0,
+            global_features_df=global_feat_df,
+            use_s1={4: "s1_only", 17: True}.get(cfg.n_bands, False),
+            feature_cols_override=saved_feature_cols,
+        )
+        del pixel_df
+
+        pid_to_indices: dict[str, list[int]] = {}
+        for i, (pid, *_) in enumerate(ds._windows):
+            pid_to_indices.setdefault(pid, []).append(i)
 
         for cls in [1.0, 0.0]:
             cls_name = "presence" if cls == 1.0 else "absence"
@@ -233,33 +245,23 @@ def main() -> None:
             if not indices:
                 continue
 
-            # --- Mean plot ----------------------------------------------------
-            mean_profile = attention_by_doy(model, ds, indices, device, per_head=False)
-            fig, ax = plt.subplots(figsize=(10, 3))
-            bar_axes(ax, mean_profile, color, f"{site} — {cls_name} — mean attention (all heads/layers)  n={len(indices)}")
-            plt.tight_layout()
-            plt.savefig(out_dir / f"mean_{site}_{cls_name}.png", dpi=150, bbox_inches="tight")
-            plt.close(fig)
-
-            # --- Per-head plot ------------------------------------------------
             head_profiles = attention_by_doy(model, ds, indices, device, per_head=True)
-            fig2, axs = plt.subplots(1, n_heads, figsize=(5 * n_heads, 3.5), sharey=True)
+            fig, axs = plt.subplots(1, n_heads, figsize=(5 * n_heads, 3.5), sharey=True)
             if n_heads == 1:
                 axs = [axs]
-            fig2.suptitle(f"{site} — {cls_name} — per-head attention (last layer)  n={len(indices)}", fontsize=10)
+            fig.suptitle(f"{site} — {cls_name} — per-head attention (last layer)  n={len(indices)}", fontsize=10)
             for h, ax in enumerate(axs):
                 bar_axes(ax, head_profiles[h], color, f"head {h}")
             plt.tight_layout()
             plt.savefig(out_dir / f"perhead_{site}_{cls_name}.png", dpi=150, bbox_inches="tight")
-            plt.close(fig2)
+            plt.close(fig)
 
-            # --- Text summary -------------------------------------------------
-            mean_peaks = peak_months(mean_profile)
             head_peaks = "  |  ".join(f"h{h}: {peak_months(head_profiles[h])}" for h in range(n_heads))
             summary_lines.append(
-                f"{site:<20} {cls_name:<10} {len(cls_pids):>6}  {mean_peaks:<30}  {head_peaks}"
+                f"{site:<20} {cls_name:<10} {len(cls_pids):>6}  {head_peaks}"
             )
 
+        del ds, pid_to_indices
         summary_lines.append("")  # blank line between sites
 
     summary_text = "\n".join(summary_lines)

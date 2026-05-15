@@ -33,9 +33,7 @@ _OUT_DIR  = _REPO / "outputs" / "heuristic_scores"
 # Physical threshold (dB) — pixels at or above this are woody, below are rejected
 _VH_WOODY_FLOOR_DB = -18.0
 
-# Dry season: May 1 – Oct 31 (DOY 121–304)
-_DRY_DOY_MIN = 121
-_DRY_DOY_MAX = 304
+from tam.core.constants import DRY_DOY_MIN as _DRY_DOY_MIN, DRY_DOY_MAX as _DRY_DOY_MAX
 
 
 def _region_label(region_id: str) -> str:

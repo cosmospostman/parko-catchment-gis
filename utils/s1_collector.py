@@ -310,23 +310,19 @@ def _resolve_s1_items(
             stac_cache.unlink(missing_ok=True)
 
     if items is None:
-        try:
-            import planetary_computer as _pc
-            _modifier = _pc.sign_inplace
-        except ImportError:
-            _modifier = None
-
         logger.info(
             "S1 STAC search: endpoint=%s collection=%s bbox=%s start=%s end=%s",
             _STAC_ENDPOINT, _S1_COLLECTION, bbox_wgs84, start, end,
         )
+        # Fetch unsigned so cached items don't carry expired SAS tokens.
+        # Per-item signing happens in _fetch_item at read time.
         items = search_sentinel1(
             bbox=bbox_wgs84,
             start=start,
             end=end,
             endpoint=_STAC_ENDPOINT,
             collection=_S1_COLLECTION,
-            modifier=_modifier,
+            modifier=None,
         )
         try:
             with stac_cache.open("wb") as fh:

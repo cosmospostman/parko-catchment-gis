@@ -43,7 +43,15 @@ def _cmd_train(args: argparse.Namespace) -> None:
     import importlib
     import pyarrow.parquet as pq
 
-    exp_module = importlib.import_module(f"tam.experiments.{args.experiment}")
+    try:
+        exp_module = importlib.import_module(f"tam.experiments.{args.experiment}")
+    except ModuleNotFoundError:
+        available = sorted(
+            p.stem for p in Path("tam/experiments").glob("*.py") if not p.stem.startswith("_")
+        )
+        raise SystemExit(
+            f"Unknown experiment '{args.experiment}'. Available: {', '.join(available)}"
+        )
     exp = exp_module.EXPERIMENT
 
     from utils.regions import select_regions
@@ -81,27 +89,49 @@ def _cmd_train(args: argparse.Namespace) -> None:
         read_cols = base_cols + [c for c in exp.feature_cols if c in available] + s1_cols + s2_global_cols
         tile_specs.append((path, read_cols, pf.metadata.num_row_groups))
 
-    def _read_row_group(path: Path, rg: int, cols: list[str]) -> pd.DataFrame:
-        return pq.ParquetFile(path).read_row_group(rg, columns=cols).to_pandas()
+    def _read_tile(path: Path, cols: list[str], n_rg: int) -> pd.DataFrame:
+        """Read all row groups of one tile with bounded parallelism."""
+        pf = pq.ParquetFile(path)
+        rg_chunks: list[pd.DataFrame] = []
+        # 4 threads per tile overlaps I/O without blowing memory across tiles.
+        n_workers = min(4, n_rg)
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            futures = {ex.submit(pf.read_row_group, rg, columns=cols): rg for rg in range(n_rg)}
+            for fut in as_completed(futures):
+                rg_chunks.append(fut.result().to_pandas())
+        return pd.concat(rg_chunks, ignore_index=True)
 
-    chunks: list[pd.DataFrame] = []
-    n_workers = min(16, sum(n for _, _, n in tile_specs))
-    with ThreadPoolExecutor(max_workers=n_workers) as ex:
-        futures = {
-            ex.submit(_read_row_group, path, rg, cols): (path, rg)
-            for path, cols, n_rg in tile_specs
-            for rg in range(n_rg)
-        }
-        for fut in as_completed(futures):
-            chunks.append(fut.result())
+    # Filter to known training region point_ids before accumulating tiles.
+    # point_id format is <region_id>_<row>_<col>; strip the trailing two numeric
+    # segments to recover the region prefix and match against the experiment set.
+    # Applying this per-tile keeps each tile's footprint small before concat.
+    import re as _re
+    _suffix_re = _re.compile(r"_\d+_\d+$")
+    known_region_ids = set(exp.region_ids)
 
-    if not chunks:
+    def _filter_to_regions(df: pd.DataFrame) -> pd.DataFrame:
+        pid_region = df["point_id"].str.replace(_suffix_re, "", regex=True)
+        return df[pid_region.isin(known_region_ids)]
+
+    # Read tiles one at a time and filter immediately — peak memory per iteration
+    # is one raw tile + the filtered tile, not all tiles simultaneously.
+    tile_dfs: list[pd.DataFrame] = []
+    for path, cols, n_rg in tile_specs:
+        logger.info("Loading tile %s (%d row groups) ...", path.name, n_rg)
+        tile_df = _filter_to_regions(_read_tile(path, cols, n_rg))
+        if not tile_df.empty:
+            tile_dfs.append(tile_df)
+        del tile_df
+        gc.collect()
+
+    if not tile_dfs:
         logger.error("No training data found for experiment %s", exp.name)
         sys.exit(1)
 
-    pixel_df = pd.concat(chunks, ignore_index=True)
-    del chunks
+    pixel_df = pd.concat(tile_dfs, ignore_index=True)
+    del tile_dfs
     gc.collect()
+    logger.info("After region filter: %d rows", len(pixel_df))
 
     # Apply date filter
     dates = pd.to_datetime(pixel_df["date"])
@@ -161,6 +191,8 @@ def _cmd_train(args: argparse.Namespace) -> None:
     }.items() if v is not None}
     if args.val_sites:
         overrides["val_sites"] = tuple(args.val_sites)
+    if exp.val_region_ids:
+        overrides["val_region_ids"] = tuple(exp.val_region_ids)
     if args.stride_exclude_sites:
         overrides["stride_exclude_sites"] = tuple(args.stride_exclude_sites)
     positional = {"n_epochs", "patience", "scl_purity_min"}

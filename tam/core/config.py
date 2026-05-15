@@ -41,6 +41,7 @@ class TAMConfig:
     weight_decay:    float = 1e-3
     val_frac:        float = 0.2
     val_sites:       tuple = ()   # if non-empty, hold out these sites entirely instead of using val_frac
+    val_region_ids:  tuple = ()   # if non-empty, hold out exactly these regions (takes precedence over val_sites)
     patience:        int   = 5
     min_delta:       float = 1e-4
     obs_dropout_min: int   = 0   # if >0, subsample each window to Uniform(obs_dropout_min, n) during training

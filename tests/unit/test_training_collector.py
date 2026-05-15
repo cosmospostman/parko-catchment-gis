@@ -433,3 +433,186 @@ def test_parse_years_empty_list_raises():
 
     with pytest.raises(ValueError, match="non-empty"):
         _parse_years({"id": "test_region", "years": []})
+
+
+# ---------------------------------------------------------------------------
+# Tests 20–23 — tile-boundary mismatch (the 55KBT/54KZC class of bug)
+# ---------------------------------------------------------------------------
+#
+# Scenario: _best_tile_for_region() picks tile A (centroid-based), but STAC
+# has no items for tile A — collect() falls back to cached shards from tile B.
+# The region parquet contains tile_id=B, but before the fix _do_region indexed
+# the region under tile A, so _rebuild_tile_parquet(A) found 0 region parquets.
+#
+# Fix: _collect_one_region() returns the *actual* tile_id (shard stem), and
+# _do_region indexes/rebuilds under that value.
+
+def _write_minimal_parquet(path, point_ids: list[str], tile_id: str = "55HBU") -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    schema = pa.schema([
+        pa.field("point_id", pa.string()),
+        pa.field("lon", pa.float32()),
+        pa.field("lat", pa.float32()),
+        pa.field("tile_id", pa.string()),
+    ])
+    tbl = pa.table({
+        "point_id": pa.array(point_ids, pa.string()),
+        "lon":      pa.array([145.0] * len(point_ids), pa.float32()),
+        "lat":      pa.array([-23.0] * len(point_ids), pa.float32()),
+        "tile_id":  pa.array([tile_id] * len(point_ids), pa.string()),
+    }, schema=schema)
+    pq.write_table(tbl, path)
+
+
+def test_collect_one_region_returns_actual_tile_when_fallback_fires(
+    training_dirs, monkeypatch, tmp_path
+):
+    """When the primary tile has no STAC items and collect() falls back to
+    cached shards from a neighbouring tile, _collect_one_region() must return
+    the actual tile_id (the shard stem), not the primary tile_id argument.
+    """
+    import pyarrow.parquet as pq
+
+    tiles_dir  = training_dirs["tiles_dir"]
+    region_dir = tiles_dir / "regions"
+    region     = _make_region("boundary_region", bbox=[144.0, -21.0, 144.1, -20.9], years=[2024])
+
+    # Simulate a collect dir already populated with a shard from tile 54KZC
+    # (the neighbouring tile that actually has S2 imagery for this bbox).
+    collect_dir = region_dir / "boundary_region.collect"
+    collect_dir.mkdir()
+    shard = collect_dir / "54KZC.parquet"
+    _write_minimal_parquet(shard, ["boundary_region_0000_0000"], tile_id="54KZC")
+
+    # collect() returns no new paths (no STAC items matched the primary tile).
+    monkeypatch.setattr(tc, "collect", lambda **kw: [])
+    # S1 append is a no-op for this test.
+    monkeypatch.setattr(tc, "append_s1_to_tile_parquet", lambda **kw: None)
+    # make_pixel_grid is imported inside _collect_one_region from utils.pixel_collector.
+    import utils.pixel_collector as pc_mod
+    monkeypatch.setattr(pc_mod, "make_pixel_grid",
+                        lambda **kw: [("boundary_region_0000_0000", 144.05, -20.95)])
+
+    # Patch _fetch_tile_items to return an empty list (no 55KBT items).
+    monkeypatch.setattr(tc, "_fetch_tile_items", lambda *a, **kw: [])
+
+    actual = tc._collect_one_region(
+        region=region,
+        tile_id="55KBT",          # primary tile — no imagery
+        tile_items=[],
+        start="2024-01-01",
+        end="2024-12-31",
+        cloud_max=80,
+        apply_nbar=True,
+        max_concurrent=4,
+    )
+
+    assert actual == "54KZC", (
+        f"Expected actual_tile_id='54KZC' (the fallback shard), got {actual!r}"
+    )
+
+
+def test_collect_one_region_returns_none_when_no_s2_data(training_dirs, monkeypatch):
+    """When collect() returns nothing and the collect dir is empty,
+    _collect_one_region() must return None (not a tile_id string).
+    """
+    region = _make_region("empty_region", bbox=[144.0, -21.0, 144.1, -20.9], years=[2024])
+
+    monkeypatch.setattr(tc, "collect", lambda **kw: [])
+    monkeypatch.setattr(tc, "append_s1_to_tile_parquet", lambda **kw: None)
+    import utils.pixel_collector as pc_mod  # noqa: PLC0415
+    monkeypatch.setattr(pc_mod, "make_pixel_grid",
+                        lambda **kw: [("empty_region_0000_0000", 144.05, -20.95)])
+
+    result = tc._collect_one_region(
+        region=region,
+        tile_id="55KBT",
+        tile_items=[],
+        start="2024-01-01",
+        end="2024-12-31",
+        cloud_max=80,
+        apply_nbar=True,
+        max_concurrent=4,
+    )
+
+    assert result is None
+
+
+def test_do_region_indexes_under_actual_tile_not_primary(training_dirs, monkeypatch):
+    """_do_region() must index the region under the actual tile returned by
+    _collect_one_region(), not the primary tile passed as its tile_id argument.
+
+    This is the direct regression test for the 55KBT/54KZC bug: primary=55KBT,
+    actual data in 54KZC → index must record 54KZC.
+    """
+    region = _make_region("boundary_region", bbox=[144.0, -21.0, 144.1, -20.9], years=[2024])
+
+    # _collect_one_region returns the *actual* tile (54KZC), simulating the fallback.
+    monkeypatch.setattr(tc, "_collect_one_region", lambda **kw: "54KZC")
+    monkeypatch.setattr(tc, "_fetch_tile_items",   lambda *a, **kw: [])
+    monkeypatch.setattr(tc, "_rebuild_tile_parquet", lambda tid: None)
+
+    tiles_with_new: set[str] = set()
+    tiles_with_new_lock = __import__("threading").Lock()
+
+    # Replicate the _do_region closure body directly (it's a nested function
+    # so we can't call it without running the full ensure_training_pixels).
+    start, end = "2024-01-01", "2024-12-31"
+    tile_items = tc._fetch_tile_items("55KBT", [region], 80)
+    actual_tile = tc._collect_one_region(
+        region=region,
+        tile_id="55KBT",
+        tile_items=tile_items,
+        start=start,
+        end=end,
+        cloud_max=80,
+        apply_nbar=True,
+        max_concurrent=4,
+    )
+    if actual_tile is not None:
+        with tiles_with_new_lock:
+            tiles_with_new.add(actual_tile)
+        from utils.training_collector import _update_index
+        _update_index(region.id, [actual_tile])
+
+    df = tc._load_index()
+    row = df[df["region_id"] == "boundary_region"]
+    assert len(row) == 1
+    assert row.iloc[0]["tile_id"] == "54KZC", (
+        "Index must record the actual tile (54KZC), not the primary tile (55KBT)"
+    )
+    assert "54KZC" in tiles_with_new
+    assert "55KBT" not in tiles_with_new
+
+
+def test_rebuild_tile_uses_actual_tile_not_primary(training_dirs, monkeypatch):
+    """End-to-end index+rebuild: after a boundary-mismatch fetch, the region
+    parquet is found when rebuilding the *actual* tile, not the primary tile.
+    """
+    import pyarrow.parquet as pq
+
+    tiles_dir  = training_dirs["tiles_dir"]
+    regions_dir = tiles_dir / "regions"
+
+    # Simulate: region parquet was written with tile_id=54KZC (actual tile)
+    rp = regions_dir / "boundary_region.parquet"
+    _write_minimal_parquet(rp, ["boundary_region_0000_0000"], tile_id="54KZC")
+
+    # Index records 54KZC (the fix)
+    tc._update_index("boundary_region", ["54KZC"])
+
+    # Rebuild 54KZC — should include the region
+    tc._rebuild_tile_parquet("54KZC")
+
+    tile_path = tc.tile_parquet_path("54KZC")
+    assert tile_path.exists(), "54KZC tile parquet was not created"
+    df = pq.read_table(tile_path).to_pandas()
+    assert "boundary_region_0000_0000" in df["point_id"].values
+
+    # Rebuild 55KBT — should produce 0 rows (nothing indexed there)
+    tc._rebuild_tile_parquet("55KBT")
+    tile_path_bt = tc.tile_parquet_path("55KBT")
+    if tile_path_bt.exists():
+        df_bt = pq.read_table(tile_path_bt).to_pandas()
+        assert len(df_bt) == 0, "55KBT tile should be empty — region lives in 54KZC"

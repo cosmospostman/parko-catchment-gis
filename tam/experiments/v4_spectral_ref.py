@@ -10,7 +10,7 @@ from tam.core.experiment import Experiment
 
 EXPERIMENT = Experiment(
     name="v4_spectral_ref",
-    region_ids=[
+    train_region_ids=[
         "lake_mueller_presence", "lake_mueller_presence_2", "lake_mueller_presence_3",
         "lake_mueller_absence",
         "barcoorah_presence",

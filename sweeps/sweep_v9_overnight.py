@@ -1,17 +1,19 @@
 """sweep_v9_overnight.py — Overnight ablation sweep on V9-SPECTRAL.
 
-Baseline: doy_phase_shift=True, n_heads=4, dropout=0.5, obs_dropout_min=4,
-          lr=5e-5, presence_min_vh_dry_db=-18.0  (val_auc=0.755)
+Context: baseline val_auc=0.755 was on a tighter dataset. This sweep reflects
+the expanded training set (new regions, Frenchs val sites, relaxed noise filter
+admitting more sparse/juvenile presence pixels). Expected baseline is lower.
+
+Baseline: doy_phase_shift=True, dropout=0.5, obs_dropout_min=4,
+          lr=5e-5, band_noise_std=0.05
 
 Runs (each isolates one variable against the baseline):
-  1. no_phase_shift      — doy_phase_shift=False
-  2. two_heads           — n_heads=2
-  3. dropout_03          — dropout=0.3
-  4. no_obs_dropout      — obs_dropout_min=0
-  5. lr_1e4              — lr=1e-4
-  6. vh_floor_m19        — presence_min_vh_dry_db=-19.0
-  7. vh_floor_m18        — presence_min_vh_dry_db=-18.0  (baseline, re-run for direct comparison)
-  8. vh_floor_m17        — presence_min_vh_dry_db=-17.0
+  1. baseline            — all base values
+  2. no_phase_shift      — doy_phase_shift=False
+  3. lr_1e4              — lr=1e-4
+  4. lr_2e4              — lr=2e-4
+  5. noise_03            — band_noise_std=0.03
+  6. noise_05            — band_noise_std=0.05  (== baseline, explicit reference point)
 
 Usage
 -----
@@ -33,22 +35,19 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # Baseline values
 _BASE = dict(
     doy_phase_shift=True,
-    n_heads=4,
     dropout=0.5,
     obs_dropout_min=4,
     lr=5e-5,
-    presence_min_vh_dry_db=-18.0,
+    band_noise_std=0.05,
 )
 
 RUNS = [
+    {**_BASE, "run_id": "baseline"},
     {**_BASE, "run_id": "no_phase_shift",  "doy_phase_shift": False},
-    {**_BASE, "run_id": "two_heads",        "n_heads": 2},
-    {**_BASE, "run_id": "dropout_03",       "dropout": 0.3},
-    {**_BASE, "run_id": "no_obs_dropout",   "obs_dropout_min": 0},
-    {**_BASE, "run_id": "lr_1e4",           "lr": 1e-4},
-    {**_BASE, "run_id": "vh_floor_m19",     "presence_min_vh_dry_db": -19.0},
-    {**_BASE, "run_id": "vh_floor_m18",     "presence_min_vh_dry_db": -18.0},
-    {**_BASE, "run_id": "vh_floor_m17",     "presence_min_vh_dry_db": -17.0},
+    {**_BASE, "run_id": "lr_1e4",          "lr": 1e-4},
+    {**_BASE, "run_id": "lr_2e4",          "lr": 2e-4},
+    {**_BASE, "run_id": "noise_03",        "band_noise_std": 0.03},
+    {**_BASE, "run_id": "noise_05",        "band_noise_std": 0.05},
 ]
 
 
@@ -91,8 +90,7 @@ def _load_pixels(base_out: Path):
         s1_cols   = [c for c in ("source", "vh", "vv", "scl") if c in available]
         s2_extra  = [c for c in ("B08", "B04") if c in available and c not in exp.feature_cols]
         read_cols = base_cols + [c for c in exp.feature_cols if c in available] + s1_cols + s2_extra
-        seen: set[str] = set()
-        read_cols = [c for c in read_cols if not (c in seen or seen.add(c))]  # type: ignore[func-returns-value]
+        read_cols = list(dict.fromkeys(read_cols))
         for rg in range(pf.metadata.num_row_groups):
             chunks.append(pf.read_row_group(rg, columns=read_cols).to_pandas())
 
@@ -114,6 +112,7 @@ def _load_pixels(base_out: Path):
 
 
 def run_one(run: dict, out_dir: Path, pixel_df, pixel_coords, labels, device) -> float | None:
+    import importlib
     from tam.core.config import TAMConfig
     from tam.core.dataset import V9_FEATURE_COLS
     from tam.core.train import train_tam
@@ -128,16 +127,16 @@ def run_one(run: dict, out_dir: Path, pixel_df, pixel_coords, labels, device) ->
 
     logger.info("=" * 60)
     logger.info(
-        "START %s  phase_shift=%s  n_heads=%d  dropout=%.2f  obs_dropout_min=%d  lr=%g  vh_floor=%.1f",
-        run_id, run["doy_phase_shift"], run["n_heads"], run["dropout"],
-        run["obs_dropout_min"], run["lr"], run["presence_min_vh_dry_db"],
+        "START %s  phase_shift=%s  dropout=%.2f  obs_dropout_min=%d  lr=%g  band_noise_std=%.2f",
+        run_id, run["doy_phase_shift"], run["dropout"],
+        run["obs_dropout_min"], run["lr"], run["band_noise_std"],
     )
     logger.info("=" * 60)
 
     cfg = TAMConfig(
         d_model=128,
         n_layers=2,
-        n_heads=run["n_heads"],
+        n_heads=4,
         dropout=run["dropout"],
         n_bands=len(V9_FEATURE_COLS),
         n_global_features=0,
@@ -145,16 +144,17 @@ def run_one(run: dict, out_dir: Path, pixel_df, pixel_coords, labels, device) ->
         weight_decay=0.1,
         n_epochs=60,
         patience=15,
-        band_noise_std=0.03,
+        band_noise_std=run["band_noise_std"],
         obs_dropout_min=run["obs_dropout_min"],
         doy_density_norm=True,
         doy_phase_shift=run["doy_phase_shift"],
         pixel_zscore=True,
         use_s1=False,
-        val_sites=("etna",),
-        use_band_summaries=False,
+        val_region_ids=tuple(
+            importlib.import_module("tam.experiments.v9_spectral").EXPERIMENT.val_region_ids
+        ),
+        use_band_summaries=True,
         feature_cols_override=tuple(V9_FEATURE_COLS),
-        presence_min_vh_dry_db=run["presence_min_vh_dry_db"],
     )
 
     try:
@@ -190,7 +190,7 @@ def main() -> None:
 
     _setup_logging(base_out / "sweep.log")
 
-    header = "run_id\tdoy_phase_shift\tn_heads\tdropout\tobs_dropout_min\tlr\tvh_floor\tbest_val_auc"
+    header = "run_id\tdoy_phase_shift\tdropout\tobs_dropout_min\tlr\tband_noise_std\tbest_val_auc"
     logger.info(header.replace("\t", "  "))
 
     summary_path = base_out / "summary.tsv"
@@ -201,10 +201,9 @@ def main() -> None:
     if args.dry_run:
         for run in RUNS:
             logger.info(
-                "DRY RUN — %s  phase_shift=%s  n_heads=%d  dropout=%.2f  "
-                "obs_dropout_min=%d  lr=%g  vh_floor=%.1f",
-                run["run_id"], run["doy_phase_shift"], run["n_heads"], run["dropout"],
-                run["obs_dropout_min"], run["lr"], run["presence_min_vh_dry_db"],
+                "DRY RUN — %s  phase_shift=%s  dropout=%.2f  obs_dropout_min=%d  lr=%g  band_noise_std=%.2f",
+                run["run_id"], run["doy_phase_shift"], run["dropout"],
+                run["obs_dropout_min"], run["lr"], run["band_noise_std"],
             )
         return
 
@@ -218,8 +217,8 @@ def main() -> None:
 
         val_str = f"{val_auc:.4f}" if val_auc is not None else "FAILED"
         row = (
-            f"{run_id}\t{run['doy_phase_shift']}\t{run['n_heads']}\t{run['dropout']:.2f}\t"
-            f"{run['obs_dropout_min']}\t{run['lr']}\t{run['presence_min_vh_dry_db']:.1f}\t{val_str}"
+            f"{run_id}\t{run['doy_phase_shift']}\t{run['dropout']:.2f}\t"
+            f"{run['obs_dropout_min']}\t{run['lr']}\t{run['band_noise_std']:.2f}\t{val_str}"
         )
         logger.info(row.replace("\t", "  "))
         with open(summary_path, "a") as fh:
