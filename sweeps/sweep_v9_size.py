@@ -1,0 +1,248 @@
+"""sweep_v9_size.py — Model size / depth ablation on V9-SPECTRAL.
+
+Context: best known result is val_auc=0.785 (no_phase_shift, d_model=128, n_layers=2,
+d_ff=64). The current d_ff=64 is 0.5× d_model — inverted from the usual transformer
+convention. This sweep explores whether more depth or width helps, scaling d_ff with
+d_model (d_ff = d_model) and n_heads with d_model (head_dim fixed at 32).
+
+Runs:
+  baseline    d_model=128  n_heads=4  n_layers=2  d_ff=128   (same arch, d_ff corrected)
+  layers_3    d_model=128  n_heads=4  n_layers=3  d_ff=128
+  layers_4    d_model=128  n_heads=4  n_layers=4  d_ff=128
+  wide        d_model=256  n_heads=8  n_layers=2  d_ff=256
+  wide_deep   d_model=256  n_heads=8  n_layers=3  d_ff=256
+
+All other hyperparameters match the best v9 config (no_phase_shift, lr=5e-5, etc.).
+
+Usage
+-----
+    python sweeps/sweep_v9_size.py
+    python sweeps/sweep_v9_size.py --dry-run
+    python sweeps/sweep_v9_size.py --out outputs/my-sweep-dir
+    python sweeps/sweep_v9_size.py --runs baseline wide
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+_BASE = dict(
+    doy_phase_shift=False,
+    dropout=0.5,
+    obs_dropout_min=4,
+    lr=5e-5,
+    band_noise_std=0.05,
+)
+
+RUNS = [
+    {**_BASE, "run_id": "baseline",   "d_model": 128, "n_heads": 4, "n_layers": 2, "d_ff": 128},
+    {**_BASE, "run_id": "layers_3",   "d_model": 128, "n_heads": 4, "n_layers": 3, "d_ff": 128},
+    {**_BASE, "run_id": "layers_4",   "d_model": 128, "n_heads": 4, "n_layers": 4, "d_ff": 128},
+    {**_BASE, "run_id": "wide",       "d_model": 256, "n_heads": 8, "n_layers": 2, "d_ff": 256},
+    {**_BASE, "run_id": "wide_deep",  "d_model": 256, "n_heads": 8, "n_layers": 3, "d_ff": 256},
+]
+
+RUN_IDS = [r["run_id"] for r in RUNS]
+
+
+def _setup_logging(sweep_log: Path) -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(sweep_log),
+        ],
+        force=True,
+    )
+
+
+logger = logging.getLogger("sweep_v9_size")
+
+
+def _load_pixels(base_out: Path):
+    import importlib
+    import pyarrow.parquet as pq
+    import pandas as pd
+    from tam.utils import label_pixels
+    from utils.regions import select_regions
+    from utils.training_collector import tile_ids_for_regions, tile_parquet_path
+
+    exp = importlib.import_module("tam.experiments.v9_spectral").EXPERIMENT
+    regions = select_regions(exp.region_ids)
+    tile_ids = tile_ids_for_regions(exp.region_ids)
+
+    chunks = []
+    for tid in tile_ids:
+        path = tile_parquet_path(tid)
+        if not path.exists():
+            logger.error("Missing tile parquet: %s — run training_collector first", path)
+            sys.exit(1)
+        pf = pq.ParquetFile(path)
+        available = set(pf.schema_arrow.names)
+        base_cols = ["point_id", "lon", "lat", "date", "scl_purity"]
+        s1_cols   = [c for c in ("source", "vh", "vv", "scl") if c in available]
+        s2_extra  = [c for c in ("B08", "B04") if c in available and c not in exp.feature_cols]
+        read_cols = base_cols + [c for c in exp.feature_cols if c in available] + s1_cols + s2_extra
+        read_cols = list(dict.fromkeys(read_cols))
+        for rg in range(pf.metadata.num_row_groups):
+            chunks.append(pf.read_row_group(rg, columns=read_cols).to_pandas())
+
+    pixel_df = pd.concat(chunks, ignore_index=True)
+    dates = pd.to_datetime(pixel_df["date"])
+    pixel_df["year"] = dates.dt.year
+    pixel_df["doy"]  = dates.dt.day_of_year
+
+    pixel_coords = (
+        pixel_df[["point_id", "lon", "lat"]]
+        .drop_duplicates("point_id")
+        .reset_index(drop=True)
+    )
+    labelled = label_pixels(pixel_coords, regions).dropna(subset=["is_presence"])
+    labels = labelled.set_index("point_id")["is_presence"].map({True: 1.0, False: 0.0})
+
+    logger.info("Pixels loaded: %d unique points", len(pixel_coords))
+    return pixel_df, pixel_coords, labels
+
+
+def run_one(run: dict, out_dir: Path, pixel_df, pixel_coords, labels, device) -> float | None:
+    import importlib
+    from tam.core.config import TAMConfig
+    from tam.core.dataset import V9_FEATURE_COLS
+    from tam.core.train import train_tam
+
+    run_id = run["run_id"]
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    run_handler = logging.FileHandler(out_dir / "train.log")
+    run_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    root = logging.getLogger()
+    root.addHandler(run_handler)
+
+    n_params_est = (
+        run["d_model"] * len(V9_FEATURE_COLS)           # band_proj
+        + run["n_layers"] * (
+            4 * run["d_model"] ** 2                      # self-attn QKV+out
+            + 2 * run["d_model"] * run["d_ff"]           # FFN
+        )
+    )
+    logger.info("=" * 60)
+    logger.info(
+        "START %s  d_model=%d  n_heads=%d  n_layers=%d  d_ff=%d  (~%dk params)",
+        run_id, run["d_model"], run["n_heads"], run["n_layers"], run["d_ff"],
+        n_params_est // 1000,
+    )
+    logger.info("=" * 60)
+
+    cfg = TAMConfig(
+        d_model=run["d_model"],
+        n_heads=run["n_heads"],
+        n_layers=run["n_layers"],
+        d_ff=run["d_ff"],
+        dropout=run["dropout"],
+        n_bands=len(V9_FEATURE_COLS),
+        n_global_features=0,
+        lr=run["lr"],
+        weight_decay=0.1,
+        n_epochs=60,
+        patience=15,
+        band_noise_std=run["band_noise_std"],
+        obs_dropout_min=run["obs_dropout_min"],
+        doy_density_norm=True,
+        doy_phase_shift=run["doy_phase_shift"],
+        pixel_zscore=True,
+        use_s1=False,
+        val_region_ids=tuple(
+            importlib.import_module("tam.experiments.v9_spectral").EXPERIMENT.val_region_ids
+        ),
+        use_band_summaries=True,
+        feature_cols_override=tuple(V9_FEATURE_COLS),
+        max_seq_len=64,
+    )
+
+    try:
+        _, best_val_auc = train_tam(
+            pixel_df=pixel_df[pixel_df["point_id"].isin(labels.index)],
+            labels=labels,
+            pixel_coords=pixel_coords,
+            out_dir=out_dir,
+            cfg=cfg,
+            device=device,
+        )
+    except Exception as exc:
+        logger.error("Run %s failed: %s", run_id, exc, exc_info=True)
+        return None
+    finally:
+        root.removeHandler(run_handler)
+        run_handler.close()
+
+    logger.info("END %s  best_val_auc=%.4f", run_id, best_val_auc)
+    return best_val_auc
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="V9-SPECTRAL model size ablation sweep")
+    parser.add_argument("--out", default="outputs/sweep-v9-size",
+                        help="Base output directory (default: outputs/sweep-v9-size)")
+    parser.add_argument("--device", default=None, help="cpu / cuda (auto-detect if omitted)")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--runs", nargs="+", choices=RUN_IDS, default=None,
+                        metavar="RUN_ID",
+                        help=f"Subset of runs to execute (default: all). Choices: {RUN_IDS}")
+    args = parser.parse_args()
+
+    base_out = PROJECT_ROOT / args.out
+    base_out.mkdir(parents=True, exist_ok=True)
+
+    _setup_logging(base_out / "sweep.log")
+
+    runs = [r for r in RUNS if args.runs is None or r["run_id"] in args.runs]
+
+    header = "run_id\td_model\tn_heads\tn_layers\td_ff\tbest_val_auc"
+    logger.info(header.replace("\t", "  "))
+
+    summary_path = base_out / "summary.tsv"
+    if not summary_path.exists():
+        with open(summary_path, "w") as fh:
+            fh.write(header + "\n")
+
+    if args.dry_run:
+        for run in runs:
+            logger.info(
+                "DRY RUN — %s  d_model=%d  n_heads=%d  n_layers=%d  d_ff=%d",
+                run["run_id"], run["d_model"], run["n_heads"], run["n_layers"], run["d_ff"],
+            )
+        return
+
+    pixel_df, pixel_coords, labels = _load_pixels(base_out)
+
+    for run in runs:
+        run_id = run["run_id"]
+        out_dir = base_out / run_id
+
+        val_auc = run_one(run, out_dir, pixel_df, pixel_coords, labels, args.device)
+
+        val_str = f"{val_auc:.4f}" if val_auc is not None else "FAILED"
+        row = (
+            f"{run_id}\t{run['d_model']}\t{run['n_heads']}\t"
+            f"{run['n_layers']}\t{run['d_ff']}\t{val_str}"
+        )
+        logger.info(row.replace("\t", "  "))
+        with open(summary_path, "a") as fh:
+            fh.write(row + "\n")
+
+    logger.info("Done. Results: %s", summary_path)
+    print("\n" + "=" * 60)
+    print("SWEEP RESULTS")
+    print("=" * 60)
+    print(summary_path.read_text())
+
+
+if __name__ == "__main__":
+    main()
