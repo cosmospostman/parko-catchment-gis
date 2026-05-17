@@ -44,6 +44,8 @@ class TAMConfig:
     val_region_ids:  tuple = ()   # if non-empty, hold out exactly these regions (takes precedence over val_sites)
     patience:        int   = 5
     min_delta:       float = 1e-4
+    cvar_alpha:      float = 0.25  # tail fraction for CVaR val metric (site-weighted pair AUC)
+    min_pair_pixels: int   = 50    # min pixels per bbox to include a pair in CVaR computation
     obs_dropout_min: int   = 0   # if >0, subsample each window to Uniform(obs_dropout_min, n) during training
     warmup_freeze_epochs: int = 0  # if >0, freeze temporal stream for first N epochs (head-only warmup)
     doy_density_norm: bool = False  # if True, weight mean pool by inverse DOY observation frequency

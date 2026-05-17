@@ -173,6 +173,87 @@ def _site_class(pid: str) -> tuple[str, str]:
     return (m.group(1), m.group(2)) if m else (pid, "unknown")
 
 
+def _region_from_pid(pid: str) -> str:
+    """Return the region ID from a point_id of the form <region_id>_<row>_<col>."""
+    return "_".join(pid.split("_")[:-2])
+
+
+def _cvar_auc(
+    probs: np.ndarray,
+    labels: np.ndarray,
+    pids: list[str],
+    finite: np.ndarray,
+    alpha: float,
+    min_pair_pixels: int,
+) -> float:
+    """Site-weighted CVaR AUC across all presence/absence bbox pairs.
+
+    Each site contributes equal weight regardless of how many pairs it contains.
+    Sites with no valid pairs are excluded and the remaining weights renormalise
+    to 1.0.  Returns nan if no valid pairs exist.
+    """
+    # Group pixel indices by region, then split regions into presence/absence per site.
+    region_ids = np.array([_region_from_pid(p) for p in pids])
+    site_ids = np.array([_site_class(p)[0] for p in pids])
+
+    # Build per-site lists of presence and absence region names.
+    sites = np.unique(site_ids)
+    site_pairs: dict[str, list[tuple[str, str]]] = {}
+    for site in sites:
+        site_mask = site_ids == site
+        regions_in_site = np.unique(region_ids[site_mask])
+        presence_regions = [r for r in regions_in_site if "_presence" in r]
+        absence_regions = [r for r in regions_in_site if "_absence" in r]
+        pairs = [(p, a) for p in presence_regions for a in absence_regions]
+        if pairs:
+            site_pairs[site] = pairs
+
+    if not site_pairs:
+        return float("nan")
+
+    # Compute AUC for each pair; filter pairs below min_pair_pixels.
+    pair_aucs: list[float] = []
+    pair_site: list[str] = []
+    for site, pairs in site_pairs.items():
+        for pres_r, abs_r in pairs:
+            pres_mask = finite & (region_ids == pres_r)
+            abs_mask = finite & (region_ids == abs_r)
+            if pres_mask.sum() < min_pair_pixels or abs_mask.sum() < min_pair_pixels:
+                continue
+            pair_probs = np.concatenate([probs[pres_mask], probs[abs_mask]])
+            pair_labels = np.concatenate([labels[pres_mask], labels[abs_mask]])
+            if len(set(pair_labels)) < 2:
+                continue
+            try:
+                auc = roc_auc_score(pair_labels, pair_probs)
+            except ValueError:
+                continue
+            pair_aucs.append(auc)
+            pair_site.append(site)
+
+    if not pair_aucs:
+        return float("nan")
+
+    # Site-weighted: each active site's pairs share a budget of 1/n_active_sites.
+    active_sites = list(dict.fromkeys(pair_site))  # preserves order, dedups
+    n_active = len(active_sites)
+    site_budget = 1.0 / n_active
+    site_pair_counts = {s: pair_site.count(s) for s in active_sites}
+    weights = np.array([site_budget / site_pair_counts[s] for s in pair_site])
+    # Weights already sum to 1.0 by construction.
+
+    # Weighted CVaR: sort pairs ascending by AUC, accumulate weight until alpha.
+    order = np.argsort(pair_aucs)
+    sorted_aucs = np.array(pair_aucs)[order]
+    sorted_weights = weights[order]
+    cumulative = np.cumsum(sorted_weights)
+    tail_mask = cumulative <= alpha
+    # Always include at least the bottom pair.
+    if not tail_mask.any():
+        tail_mask[0] = True
+    return float(np.average(sorted_aucs[tail_mask], weights=sorted_weights[tail_mask]))
+
+
 def _apply_presence_filter(
     lbl_py: pd.Series,
     mean_vh_dry_py: pd.Series,
@@ -729,12 +810,8 @@ def train_tam(
         n_nan = (~finite).sum()
         if n_nan:
             logger.warning("epoch %d: %d NaN predictions in validation set", epoch, n_nan)
-        if finite.any() and len(set(val_labels_arr[finite])) > 1:
-            val_auc = roc_auc_score(val_labels_arr[finite], val_probs_arr[finite])
-        else:
-            val_auc = float("nan")
 
-        # Macro-site AUC: average AUC across val sites weighted equally.
+        # Macro-site AUC: unweighted mean of per-site AUCs (summary only).
         site_aucs = []
         val_sites_arr = np.array([_site_class(pid)[0] for pid in val_pids])
         for site in np.unique(val_sites_arr):
@@ -743,18 +820,23 @@ def train_tam(
                 site_aucs.append(roc_auc_score(val_labels_arr[mask], val_probs_arr[mask]))
         val_auc_macro = float(np.mean(site_aucs)) if site_aucs else float("nan")
 
+        # Primary checkpoint metric: site-weighted CVaR AUC across bbox pairs.
+        val_cvar = _cvar_auc(
+            val_probs_arr, val_labels_arr, val_pids, finite,
+            alpha=cfg.cvar_alpha, min_pair_pixels=cfg.min_pair_pixels,
+        )
+
         logger.info(
-            "epoch %3d/%d  loss=%.4f  train_auc=%.3f  val_auc=%.3f  val_auc_macro=%.3f%s",
+            "epoch %3d/%d  loss=%.4f  train_auc=%.3f  val_cvar%.0f=%.3f%s",
             epoch, cfg.n_epochs,
             epoch_loss / max(len(train_loader), 1),
             train_auc,
-            val_auc,
-            val_auc_macro,
-            "  *" if (not np.isnan(val_auc) and val_auc >= best_val_auc) else "",
+            cfg.cvar_alpha * 100, val_cvar,
+            "  *" if (not np.isnan(val_cvar) and val_cvar >= best_val_auc) else "",
         )
 
-        if not np.isnan(val_auc) and val_auc > best_val_auc + cfg.min_delta:
-            best_val_auc = val_auc
+        if not np.isnan(val_cvar) and val_cvar > best_val_auc + cfg.min_delta:
+            best_val_auc = val_cvar
             epochs_without_improvement = 0
             torch.save(model.state_dict(), checkpoint_path)
         else:
@@ -763,7 +845,10 @@ def train_tam(
                 logger.info("Early stopping at epoch %d (no improvement for %d epochs)", epoch, cfg.patience)
                 break
 
-    logger.info("Best val AUC: %.3f — checkpoint: %s", best_val_auc, checkpoint_path)
+    logger.info(
+        "Best val CVaR%.0f AUC: %.3f  macro: %.3f — checkpoint: %s",
+        cfg.cvar_alpha * 100, best_val_auc, val_auc_macro, checkpoint_path,
+    )
 
     # Save final band stats + config (may differ from mid-training save if interrupted)
     np.savez(out_dir / "tam_band_stats.npz", mean=band_mean, std=band_std)
