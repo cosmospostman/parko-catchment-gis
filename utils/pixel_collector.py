@@ -678,6 +678,7 @@ def collect(
             existing = sorted(
                 p for p in out_dir.iterdir()
                 if p.suffix == ".parquet"
+                and p.stem
                 and not p.stem.startswith("_")
                 and ".tmp" not in p.stem
             )
@@ -802,6 +803,10 @@ def collect(
                 tile_col = rg.column("tile_id").combine_chunks()
                 unique_tiles = pc.unique(tile_col).to_pylist()
                 for tid in unique_tiles:
+                    if not tid:
+                        n_bad = pc.sum(pc.equal(tile_col, tid)).as_py()
+                        logger.warning("Skipping %d rows with empty tile_id in shard", n_bad)
+                        continue
                     mask = pc.equal(tile_col, tid)
                     subset = rg.filter(mask)
                     write_bufs.setdefault(tid, []).append(subset)

@@ -173,10 +173,6 @@ def _site_class(pid: str) -> tuple[str, str]:
     return (m.group(1), m.group(2)) if m else (pid, "unknown")
 
 
-def _region_from_pid(pid: str) -> str:
-    """Return the region ID from a point_id of the form <region_id>_<row>_<col>."""
-    return "_".join(pid.split("_")[:-2])
-
 
 def _cvar_auc(
     probs: np.ndarray,
@@ -184,74 +180,42 @@ def _cvar_auc(
     pids: list[str],
     finite: np.ndarray,
     alpha: float,
-    min_pair_pixels: int,
-) -> float:
-    """Site-weighted CVaR AUC across all presence/absence bbox pairs.
+) -> tuple[float, list[dict]]:
+    """CVaR AUC over per-site scores.
 
-    Each site contributes equal weight regardless of how many pairs it contains.
-    Sites with no valid pairs are excluded and the remaining weights renormalise
-    to 1.0.  Returns nan if no valid pairs exist.
+    Pools all pixels within each site, computes one AUC per site, then takes
+    the CVaR (mean of the bottom alpha fraction) over those site scores.
+    Sites without both classes present after NaN filtering are excluded.
+
+    Returns
+    -------
+    (cvar_score, site_records) where site_records is a list of dicts with keys:
+        site, n_pixels, auc, in_tail
     """
-    # Group pixel indices by region, then split regions into presence/absence per site.
-    region_ids = np.array([_region_from_pid(p) for p in pids])
     site_ids = np.array([_site_class(p)[0] for p in pids])
+    site_records: list[dict] = []
+    for site in np.unique(site_ids):
+        mask = finite & (site_ids == site)
+        n = int(mask.sum())
+        if n == 0 or len(set(labels[mask])) < 2:
+            continue
+        try:
+            auc = roc_auc_score(labels[mask], probs[mask])
+        except ValueError:
+            continue
+        site_records.append({"site": site, "n_pixels": n, "auc": auc, "in_tail": False})
 
-    # Build per-site lists of presence and absence region names.
-    sites = np.unique(site_ids)
-    site_pairs: dict[str, list[tuple[str, str]]] = {}
-    for site in sites:
-        site_mask = site_ids == site
-        regions_in_site = np.unique(region_ids[site_mask])
-        presence_regions = [r for r in regions_in_site if "_presence" in r]
-        absence_regions = [r for r in regions_in_site if "_absence" in r]
-        pairs = [(p, a) for p in presence_regions for a in absence_regions]
-        if pairs:
-            site_pairs[site] = pairs
+    if not site_records:
+        return float("nan"), site_records
 
-    if not site_pairs:
-        return float("nan")
+    site_aucs = np.array([r["auc"] for r in site_records])
+    order = np.argsort(site_aucs)
+    n_tail = max(1, int(np.ceil(alpha * len(site_aucs))))
+    for i, idx in enumerate(order):
+        site_records[idx]["in_tail"] = i < n_tail
 
-    # Compute AUC for each pair; filter pairs below min_pair_pixels.
-    pair_aucs: list[float] = []
-    pair_site: list[str] = []
-    for site, pairs in site_pairs.items():
-        for pres_r, abs_r in pairs:
-            pres_mask = finite & (region_ids == pres_r)
-            abs_mask = finite & (region_ids == abs_r)
-            if pres_mask.sum() < min_pair_pixels or abs_mask.sum() < min_pair_pixels:
-                continue
-            pair_probs = np.concatenate([probs[pres_mask], probs[abs_mask]])
-            pair_labels = np.concatenate([labels[pres_mask], labels[abs_mask]])
-            if len(set(pair_labels)) < 2:
-                continue
-            try:
-                auc = roc_auc_score(pair_labels, pair_probs)
-            except ValueError:
-                continue
-            pair_aucs.append(auc)
-            pair_site.append(site)
-
-    if not pair_aucs:
-        return float("nan")
-
-    # Site-weighted: each active site's pairs share a budget of 1/n_active_sites.
-    active_sites = list(dict.fromkeys(pair_site))  # preserves order, dedups
-    n_active = len(active_sites)
-    site_budget = 1.0 / n_active
-    site_pair_counts = {s: pair_site.count(s) for s in active_sites}
-    weights = np.array([site_budget / site_pair_counts[s] for s in pair_site])
-    # Weights already sum to 1.0 by construction.
-
-    # Weighted CVaR: sort pairs ascending by AUC, accumulate weight until alpha.
-    order = np.argsort(pair_aucs)
-    sorted_aucs = np.array(pair_aucs)[order]
-    sorted_weights = weights[order]
-    cumulative = np.cumsum(sorted_weights)
-    tail_mask = cumulative <= alpha
-    # Always include at least the bottom pair.
-    if not tail_mask.any():
-        tail_mask[0] = True
-    return float(np.average(sorted_aucs[tail_mask], weights=sorted_weights[tail_mask]))
+    tail_aucs = np.sort(site_aucs)[:n_tail]
+    return float(tail_aucs.mean()), site_records
 
 
 def _apply_presence_filter(
@@ -517,14 +481,13 @@ def train_tam(
     col_w = max((len(f"{s} {c}") for s, c in all_keys), default=20) + 2
 
     def neg(n: int, w: int) -> str:
-        return f"-{n:>{w - 1},}" if n else f"{'':>{w}}"
+        return f"-{n:>{w - 2},}" if n else f"{'':>{w}}"
 
     def row(label: str, px: int, raw: int, noise: int, stride: int, final: int) -> str:
-        return f"{label:>{col_w}}  {px:>8,}  {raw:>8,}  {neg(noise, 7)}  {neg(stride, 9)}  {final:>8,}"
+        return f"{label:>{col_w}}  {px:>8,}  {raw:>8,}  {neg(noise, 8)}  {neg(stride, 10)}  {final:>8,}"
 
-    header = f"{'':>{col_w}}  {'Raw px':>8}  {'Raw py':>8}  {'Noise py':>7}  {'Stride px':>9}  {'Total py':>8}"
+    header = f"{'':>{col_w}}  {'Raw px':>8}  {'Raw py':>8}  {'Noise py':>8}  {'Stride px':>10}  {'Total py':>8}"
     sep    = "-" * len(header)
-    thin   = " " * len(header)
 
     train_sites = sorted({s for s, _ in all_keys if s not in val_site_set})
     val_sites_sorted = sorted({s for s, _ in all_keys if s in val_site_set})
@@ -550,7 +513,7 @@ def train_tam(
 
     train_rows, train_px, train_raw, train_noise, train_stride, train_final = site_rows(train_sites)
     lines.extend(train_rows)
-    lines.append(thin)
+    lines.append("")
     lines.append(row("PRESENCE",
         sum(px_counts.get((s, "presence"), 0) for s in train_sites),
         sum(raw_counts.get((s, "presence"), 0) for s in train_sites),
@@ -570,7 +533,7 @@ def train_tam(
 
     val_rows, val_px, val_raw, val_noise, val_stride, val_final = site_rows(val_sites_sorted, prefix="HOLDOUT: ")
     lines.extend(val_rows)
-    lines.append(thin)
+    lines.append("")
     lines.append(row("PRESENCE",
         sum(px_counts.get((s, "presence"), 0) for s in val_sites_sorted),
         sum(raw_counts.get((s, "presence"), 0) for s in val_sites_sorted),
@@ -811,20 +774,12 @@ def train_tam(
         if n_nan:
             logger.warning("epoch %d: %d NaN predictions in validation set", epoch, n_nan)
 
-        # Macro-site AUC: unweighted mean of per-site AUCs (summary only).
-        site_aucs = []
-        val_sites_arr = np.array([_site_class(pid)[0] for pid in val_pids])
-        for site in np.unique(val_sites_arr):
-            mask = finite & (val_sites_arr == site)
-            if mask.sum() > 0 and len(set(val_labels_arr[mask])) > 1:
-                site_aucs.append(roc_auc_score(val_labels_arr[mask], val_probs_arr[mask]))
-        val_auc_macro = float(np.mean(site_aucs)) if site_aucs else float("nan")
-
-        # Primary checkpoint metric: site-weighted CVaR AUC across bbox pairs.
-        val_cvar = _cvar_auc(
+        # Primary checkpoint metric: CVaR over per-site AUCs.
+        val_cvar, site_records = _cvar_auc(
             val_probs_arr, val_labels_arr, val_pids, finite,
-            alpha=cfg.cvar_alpha, min_pair_pixels=cfg.min_pair_pixels,
+            alpha=cfg.cvar_alpha,
         )
+        val_auc_macro = float(np.mean([r["auc"] for r in site_records])) if site_records else float("nan")
 
         logger.info(
             "epoch %3d/%d  loss=%.4f  train_auc=%.3f  val_cvar%.0f=%.3f%s",
@@ -834,6 +789,14 @@ def train_tam(
             cfg.cvar_alpha * 100, val_cvar,
             "  *" if (not np.isnan(val_cvar) and val_cvar >= best_val_auc) else "",
         )
+
+        if logger.isEnabledFor(logging.DEBUG) and site_records:
+            for r in sorted(site_records, key=lambda r: r["auc"]):
+                logger.debug(
+                    "  %s  n=%6d  auc=%.3f%s",
+                    r["site"], r["n_pixels"], r["auc"],
+                    "  <-- tail" if r["in_tail"] else "",
+                )
 
         if not np.isnan(val_cvar) and val_cvar > best_val_auc + cfg.min_delta:
             best_val_auc = val_cvar

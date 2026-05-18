@@ -95,6 +95,12 @@ Sweep varying `doy_phase_shift`, `lr`, and `band_noise_std` against the expanded
 
 ---
 
+## Excluded sites
+
+**Barcoorah** — removed from both train and val (2026-05-17). Google Earth inspection showed no detectable change in vegetation between 2020–2023. Parkinsonia would be expected to spread visibly over a 3-year window; the absence of change suggests either mislabelled regions or an atypically static stand. The site was actively degrading val CVaR (AUC falling from 0.70 → 0.17 across epochs) while all other sites improved, confirming it was providing no useful signal.
+
+---
+
 ## Known failure modes
 
 Smoke-testing on Longreach showed the model assigning highest scores to bare/sparse ground. Two confirmed root causes:

@@ -232,6 +232,21 @@ regions:
     years: [2018, 2019, 2020, 2021, 2022, 2023]
     tags: [monsoonal, water]
 
+  - id: frenchs_absence_7
+    name: "Frenchs — absence 7"
+    label: absence
+    bbox: [141.546730, -15.794994, 141.555167, -15.792794]
+    years: [2018, 2019, 2020, 2021, 2022, 2023]
+    tags: [monsoonal]
+
+  - id: frenchs_absence_8
+    name: "Frenchs — absence 8"
+    label: absence
+    bbox: [141.548369, -15.791752, 141.552216, -15.790617]
+    years: [2018, 2019, 2020, 2021, 2022, 2023]
+    tags: [monsoonal]
+    notes: Use for validation only.
+
   # ---------------------------------------------------------------------------
   # Lake Mueller — Thomson River riparian corridor (GPS-logged field survey)
   # ---------------------------------------------------------------------------
@@ -289,6 +304,27 @@ regions:
     years: [2016, 2017, 2018, 2019, 2020, 2021]
     tags: [arid, riparian]
 
+  - id: lake_mueller_absence_4
+    name: "Lake Mueller — absence 4"
+    label: absence
+    bbox: [145.469649, -22.718342, 145.472365, -22.714838]
+    years: [2016, 2017, 2018, 2019, 2020, 2021]
+    tags: [arid, riparian]
+
+  - id: lake_mueller_absence_5
+    name: "Lake Mueller — absence 5"
+    label: absence
+    bbox: [145.409083, -22.759358, 145.411511, -22.754805]
+    years: [2016, 2017, 2018, 2019, 2020, 2021]
+    tags: [arid, riparian]
+
+  - id: lake_mueller_absence_6
+    name: "Lake Mueller — absence 6"
+    label: absence
+    bbox: [145.492444, -22.761309, 145.495476, -22.757149]
+    years: [2016, 2017, 2018, 2019, 2020, 2021]
+    tags: [arid, riparian]
+
   - id: lake_mueller_presence_4
     name: "Lake Mueller — presence 4"
     label: presence
@@ -332,6 +368,36 @@ regions:
     bbox: [141.820453, -20.354505, 141.831232, -20.349521]
     years: [2020, 2021, 2022, 2023, 2024, 2025]
     tags: [monsoonal]
+
+  - id: maria_downs_absence_2
+    name: "Maria Downs — absence 2"
+    label: absence
+    bbox: [141.907969, -20.261290, 141.914937, -20.257351]
+    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [monsoonal]
+
+  - id: maria_downs_presence_2
+    name: "Maria Downs — presence 2"
+    label: presence
+    bbox: [141.855480, -20.354122, 141.860340, -20.351956]
+    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [monsoonal]
+
+  - id: maria_downs_val_absence_1
+    name: "Maria Downs — val absence 1"
+    label: absence
+    bbox: [141.914679, -20.270752, 141.921761, -20.268755]
+    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [monsoonal]
+    notes: Use for validation only.
+
+  - id: maria_downs_val_presence_1
+    name: "Maria Downs — val presence 1"
+    label: presence
+    bbox: [141.834677, -20.349791, 141.838489, -20.347463]
+    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [monsoonal]
+    notes: Use for validation only.
 
   # ---------------------------------------------------------------------------
   # Norman Road — Gulf savanna (monsoonal)
@@ -1159,50 +1225,85 @@ regions:
     name: "Etna Creek — presence 5"
     label: presence
     bbox: [142.251447, -21.716763, 142.260631, -21.706943]
-    years: [2024]
+    years: [2020, 2021, 2022, 2023, 2024, 2025]
     tags: [semi-arid]
 
   - id: etna_presence_6
     name: "Etna Creek — presence 6"
     label: presence
     bbox: [142.245951, -21.698666, 142.250815, -21.693360]
-    years: [2024]
+    years: [2020, 2021, 2022, 2023, 2024, 2025]
     tags: [semi-arid]
 
   - id: etna_presence_7
     name: "Etna Creek — presence 7"
     label: presence
     bbox: [142.245106, -21.660234, 142.252309, -21.654738]
-    years: [2024]
+    years: [2020, 2021, 2022, 2023, 2024, 2025]
     tags: [semi-arid]
 
   - id: etna_presence_8
     name: "Etna Creek — presence 8"
     label: presence
     bbox: [142.164599, -21.686079, 142.167703, -21.679420]
-    years: [2024]
+    years: [2020, 2021, 2022, 2023, 2024, 2025]
     tags: [semi-arid]
 
   - id: etna_presence_9
     name: "Etna Creek — presence 9"
     label: presence
     bbox: [142.143401, -21.681782, 142.145517, -21.679462]
-    years: [2024]
+    years: [2020, 2021, 2022, 2023, 2024, 2025]
     tags: [semi-arid]
 
   - id: etna_absence_6
     name: "Etna Creek — absence 6"
     label: absence
     bbox: [142.238169, -21.643139, 142.242889, -21.639018]
-    years: [2024]
+    years: [2020, 2021, 2022, 2023, 2024, 2025]
     tags: [semi-arid]
 
   - id: etna_absence_7
     name: "Etna Creek — absence 7"
     label: absence
     bbox: [142.112021, -21.672097, 142.122038, -21.669575]
-    years: [2024]
+    years: [2020, 2021, 2022, 2023, 2024, 2025]
     tags: [semi-arid]
+
+  - id: etna_absence_8
+    name: "Etna Creek — absence 8"
+    label: absence
+    bbox: [142.106564, -21.894497, 142.111656, -21.890628]
+    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [semi-arid, woody]
+
+  - id: etna_absence_9
+    name: "Etna Creek — absence 9"
+    label: absence
+    bbox: [142.079364, -21.975821, 142.086891, -21.973191]
+    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [semi-arid, woody]
+
+  - id: etna_absence_10
+    name: "Etna Creek — absence 10"
+    label: absence
+    bbox: [141.955468, -21.822958, 141.961984, -21.820362]
+    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [semi-arid, woody]
+
+  - id: etna_absence_11
+    name: "Etna Creek — absence 11"
+    label: absence
+    bbox: [141.897353, -21.850127, 141.902225, -21.845548]
+    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [semi-arid, woody]
+
+  - id: etna_absence_12
+    name: "Etna Creek — absence 12"
+    label: absence
+    bbox: [142.088148, -21.942946, 142.094107, -21.937818]
+    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [semi-arid, woody]
 
   # ---------------------------------------------------------------------------
   # Landsend — northwest Queensland (semi-arid, riparian)
@@ -1351,21 +1452,21 @@ regions:
     name: "Landsend — presence 8"
     label: presence
     bbox: [141.393939, -20.461065, 141.399497, -20.456670]
-    years: [2024]
+    years: [2020, 2021, 2022, 2023, 2024, 2025]
     tags: [semi-arid, riparian]
 
   - id: landsend_absence_4
     name: "Landsend — absence 4"
     label: absence
     bbox: [141.400515, -20.451299, 141.404781, -20.448351]
-    years: [2024]
+    years: [2020, 2021, 2022, 2023, 2024, 2025]
     tags: [semi-arid, riparian]
 
   - id: landsend_absence_5
     name: "Landsend — absence 5"
     label: absence
     bbox: [141.435625, -20.467801, 141.445901, -20.466041]
-    years: [2024]
+    years: [2020, 2021, 2022, 2023, 2024, 2025]
     tags: [semi-arid, riparian]
 
   # ---------------------------------------------------------------------------
@@ -1473,68 +1574,197 @@ regions:
     name: "Hughenden — presence 1"
     label: presence
     bbox: [144.165157, -20.890948, 144.167122, -20.886420]
-    years: [2024]
+    years: [2019, 2020, 2021, 2022, 2023, 2024]
     tags: [semi-arid]
 
   - id: hughenden_presence_2
     name: "Hughenden — presence 2"
     label: presence
     bbox: [144.170576, -20.886840, 144.173595, -20.884114]
-    years: [2024]
+    years: [2019, 2020, 2021, 2022, 2023, 2024]
     tags: [semi-arid]
 
   - id: hughenden_presence_3
     name: "Hughenden — presence 3"
     label: presence
     bbox: [144.111057, -20.877895, 144.113551, -20.874213]
-    years: [2024]
+    years: [2019, 2020, 2021, 2022, 2023, 2024]
     tags: [semi-arid]
 
   - id: hughenden_presence_4
     name: "Hughenden — presence 4"
     label: presence
     bbox: [144.083798, -20.843978, 144.090036, -20.841629]
-    years: [2024]
+    years: [2019, 2020, 2021, 2022, 2023, 2024]
     tags: [semi-arid]
 
   - id: hughenden_absence_1
     name: "Hughenden — absence 1"
     label: absence
     bbox: [144.111722, -20.861073, 144.114405, -20.857756]
-    years: [2024]
+    years: [2019, 2020, 2021, 2022, 2023, 2024]
     tags: [semi-arid]
 
   - id: hughenden_absence_2
     name: "Hughenden — absence 2"
     label: absence
     bbox: [144.201459, -20.847580, 144.208270, -20.844293]
-    years: [2024]
+    years: [2019, 2020, 2021, 2022, 2023, 2024]
     tags: [semi-arid]
 
   - id: hughenden_absence_3
     name: "Hughenden — absence 3"
     label: absence
     bbox: [144.198966, -20.844312, 144.202763, -20.839214]
-    years: [2024]
+    years: [2019, 2020, 2021, 2022, 2023, 2024]
     tags: [semi-arid]
 
   - id: hughenden_absence_5
     name: "Hughenden — absence 5"
     label: absence
     bbox: [144.292665, -20.827444, 144.295551, -20.821943]
-    years: [2024]
+    years: [2019, 2020, 2021, 2022, 2023, 2024]
     tags: [semi-arid]
 
   - id: hughenden_absence_6
     name: "Hughenden — absence 6"
     label: absence
     bbox: [144.296341, -20.830262, 144.298824, -20.821145]
-    years: [2024]
+    years: [2019, 2020, 2021, 2022, 2023, 2024]
     tags: [semi-arid]
 
   - id: hughenden_absence_7
     name: "Hughenden — absence 7"
     label: absence
     bbox: [144.230982, -20.771074, 144.234622, -20.765838]
-    years: [2024]
+    years: [2019, 2020, 2021, 2022, 2023, 2024]
     tags: [semi-arid]
+
+  # ---------------------------------------------------------------------------
+  # Burdekin — north Queensland (semi-arid, riparian)
+  # ---------------------------------------------------------------------------
+  - id: burdekin_presence_1
+    name: "Burdekin — presence 1"
+    label: presence
+    bbox: [147.533350, -19.675780, 147.534810, -19.671319]
+    years: [2022, 2023, 2024]
+    tags: [semi-arid, riparian]
+
+  - id: burdekin_presence_2
+    name: "Burdekin — presence 2"
+    label: presence
+    bbox: [147.530407, -19.673253, 147.532077, -19.671739]
+    years: [2022, 2023, 2024]
+    tags: [semi-arid, riparian]
+
+  - id: burdekin_absence_1
+    name: "Burdekin — absence 1"
+    label: absence
+    bbox: [147.587083, -19.692787, 147.591148, -19.689217]
+    years: [2022, 2023, 2024]
+    tags: [semi-arid, riparian]
+
+  - id: burdekin_absence_2
+    name: "Burdekin — absence 2"
+    label: absence
+    bbox: [147.498476, -19.635693, 147.501435, -19.632711]
+    years: [2022, 2023, 2024]
+    tags: [semi-arid, riparian]
+
+  - id: burdekin_absence_3
+    name: "Burdekin — absence 3"
+    label: absence
+    bbox: [147.479312, -19.713771, 147.482588, -19.710482]
+    years: [2022, 2023, 2024]
+    tags: [semi-arid, riparian]
+
+  - id: burdekin_val_presence_1
+    name: "Burdekin — val presence 1"
+    label: presence
+    bbox: [147.529467, -19.671040, 147.532250, -19.670038]
+    years: [2022, 2023, 2024]
+    tags: [semi-arid, riparian]
+    notes: Use for validation only.
+
+  - id: burdekin_val_absence_1
+    name: "Burdekin — val absence 1"
+    label: absence
+    bbox: [147.587250, -19.706394, 147.589771, -19.704852]
+    years: [2022, 2023, 2024]
+    tags: [semi-arid, riparian]
+    notes: Use for validation only.
+
+  - id: burdekin_val_absence_2
+    name: "Burdekin — val absence 2"
+    label: absence
+    bbox: [147.473447, -19.653469, 147.484004, -19.652706]
+    years: [2022, 2023, 2024]
+    tags: [semi-arid, riparian]
+    notes: Use for validation only.
+
+  # ---------------------------------------------------------------------------
+  # Rupert Creek — northwest Queensland (semi-arid, riparian)
+  # ---------------------------------------------------------------------------
+  - id: rupert_ck_presence_1
+    name: "Rupert Ck — presence 1"
+    label: presence
+    bbox: [142.542424, -21.245974, 142.553180, -21.244081]
+    years: [2016, 2017, 2018, 2019, 2020]
+    tags: [semi-arid, riparian]
+
+  - id: rupert_ck_presence_2
+    name: "Rupert Ck — presence 2"
+    label: presence
+    bbox: [142.544944, -21.247657, 142.557825, -21.246044]
+    years: [2016, 2017, 2018, 2019, 2020]
+    tags: [semi-arid, riparian]
+
+  - id: rupert_ck_presence_3
+    name: "Rupert Ck — presence 3"
+    label: presence
+    bbox: [142.547609, -21.249422, 142.561003, -21.247672]
+    years: [2016, 2017, 2018, 2019, 2020]
+    tags: [semi-arid, riparian]
+
+  - id: rupert_ck_presence_sparse_1
+    name: "Rupert Ck — presence (sparse) 1"
+    label: presence
+    bbox: [142.629268, -21.262838, 142.633548, -21.258828]
+    years: [2016, 2017, 2018, 2019, 2020]
+    tags: [semi-arid, riparian, sparse]
+
+  - id: rupert_ck_absence_1
+    name: "Rupert Ck — absence 1"
+    label: absence
+    bbox: [142.534921, -21.256466, 142.543543, -21.255218]
+    years: [2016, 2017, 2018, 2019, 2020]
+    tags: [semi-arid, riparian]
+
+  - id: rupert_ck_absence_2
+    name: "Rupert Ck — absence 2"
+    label: absence
+    bbox: [142.568529, -21.255017, 142.572587, -21.253197]
+    years: [2016, 2017, 2018, 2019, 2020]
+    tags: [semi-arid, riparian]
+
+  - id: rupert_ck_absence_3
+    name: "Rupert Ck — absence 3"
+    label: absence
+    bbox: [142.562959, -21.250587, 142.566889, -21.248308]
+    years: [2016, 2017, 2018, 2019, 2020]
+    tags: [semi-arid, riparian]
+
+  - id: rupert_ck_val_presence_1
+    name: "Rupert Ck — val presence 1"
+    label: presence
+    bbox: [142.550725, -21.250666, 142.560945, -21.249775]
+    years: [2016, 2017, 2018, 2019, 2020]
+    tags: [semi-arid, riparian]
+    notes: Use for validation only.
+
+  - id: rupert_ck_val_absence_1
+    name: "Rupert Ck — val absence 1"
+    label: absence
+    bbox: [142.539366, -21.236329, 142.541705, -21.233197]
+    years: [2016, 2017, 2018, 2019, 2020]
+    tags: [semi-arid, riparian]

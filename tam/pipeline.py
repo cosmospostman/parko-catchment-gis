@@ -16,6 +16,7 @@ import argparse
 import gc
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -127,6 +128,21 @@ def _cmd_train(args: argparse.Namespace) -> None:
     if not tile_dfs:
         logger.error("No training data found for experiment %s", exp.name)
         sys.exit(1)
+
+    # Build shared CategoricalDtype for high-cardinality string columns before concat.
+    # When all frames share the same dtype, pd.concat allocates int codes (not object
+    # strings) for the output — avoiding a 2× peak from concurrent object arrays.
+    for _col in ("point_id", "source", "date"):
+        if _col not in tile_dfs[0].columns:
+            continue
+        _all_cats = pd.api.types.union_categoricals(
+            [pd.Categorical(df[_col]) for df in tile_dfs]
+        )
+        _shared_dtype = pd.CategoricalDtype(categories=_all_cats.categories, ordered=False)
+        for df in tile_dfs:
+            df[_col] = df[_col].astype(_shared_dtype)
+        del _all_cats, _shared_dtype
+    gc.collect()
 
     pixel_df = pd.concat(tile_dfs, ignore_index=True)
     del tile_dfs
@@ -390,8 +406,9 @@ def _add_common_score_args(p: argparse.ArgumentParser) -> None:
 
 
 if __name__ == "__main__":
+    _log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
     logging.basicConfig(
-        level=logging.INFO,
+        level=getattr(logging, _log_level, logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 
