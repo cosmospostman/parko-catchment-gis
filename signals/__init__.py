@@ -18,7 +18,11 @@ Usage
 """
 
 from signals.base import Signal
+from signals.mavi import MAVISignal
+from signals.ndre import NDRESignal, CIRESignal
+from signals.ndsvi import NDSVISignal
 from signals.ndvi import NDVISignal, NDWISignal, EVISignal
+from signals.s1 import VHSignal, VVSignal, VHVVSignal, RVISignal
 from signals.s2_bands import (
     B02Signal,
     B03Signal,
@@ -32,9 +36,14 @@ from signals.s2_bands import (
     B12B11Signal,
     B11B08Signal,
 )
+from signals.temporal import TemporalVarianceSignal
 
 __all__ = [
     "Signal",
+    "MAVISignal",
+    "NDRESignal",
+    "CIRESignal",
+    "NDSVISignal",
     "NDVISignal",
     "NDWISignal",
     "EVISignal",
@@ -49,4 +58,9 @@ __all__ = [
     "B12Signal",
     "B12B11Signal",
     "B11B08Signal",
+    "TemporalVarianceSignal",
+    "VHSignal",
+    "VVSignal",
+    "VHVVSignal",
+    "RVISignal",
 ]

@@ -7,8 +7,11 @@ training parquets. The harness:
   1. Loads each region's per-observation parquet
   2. Runs signal.compute() to derive the time series
   3. Groups by (point_id, year) and runs signal.summarise() to get scalars
-  4. Compares presence vs absence distributions on a chosen summary key
-  5. Returns per-site EvalResult with IQR overlap, AUROC, and class stats
+  4. Optionally filters presence pixel-years using the same VH dry-season
+     threshold applied during TAM training (presence_min_vh_dry_db), so that
+     eval results reflect the pixel-years the model actually trains on
+  5. Compares presence vs absence distributions on a chosen summary key
+  6. Returns per-site EvalResult with IQR overlap, AUROC, and class stats
 
 Usage
 -----
@@ -31,11 +34,16 @@ Usage
     results = evaluate(NDRESignal(), sites, rank_key="p05")
     for r in results:
         print(r)
+
+    # With presence filter matching TAM training defaults:
+    results = evaluate(NDRESignal(), sites, rank_key="p05",
+                       presence_min_vh_dry_db=-21.0)
 """
 
 from __future__ import annotations
 
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
@@ -48,6 +56,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from signals.base import Signal
+from tam.core.constants import DRY_DOY_MIN as _DRY_DOY_MIN, DRY_DOY_MAX as _DRY_DOY_MAX
 from utils.training_collector import _region_parquet_path
 
 
@@ -107,16 +116,73 @@ class EvalResult:
 
 
 # ---------------------------------------------------------------------------
+# Presence VH filter
+# ---------------------------------------------------------------------------
+
+def _vh_dry_mean(df: pd.DataFrame) -> pd.Series:
+    """Compute mean dry-season VH (dB) per (point_id, year) from S1 rows.
+
+    Returns a Series indexed by (point_id, year). Pixel-years with no S1 dry
+    observations get NaN — they are not dropped by the filter (NaN = no data,
+    not low-VH).
+    """
+    if "vh" not in df.columns or "source" not in df.columns:
+        return pd.Series(dtype="float64")
+
+    s1 = df[df["source"] == "S1"].copy()
+    if s1.empty:
+        return pd.Series(dtype="float64")
+
+    s1["date"] = pd.to_datetime(s1["date"])
+    s1["year"] = s1["date"].dt.year
+    s1["doy"]  = s1["date"].dt.day_of_year
+    dry = s1[(s1["doy"] >= _DRY_DOY_MIN) & (s1["doy"] <= _DRY_DOY_MAX)]
+    if dry.empty:
+        return pd.Series(dtype="float64")
+
+    vh_lin = dry["vh"].values.astype("float32")
+    with np.errstate(divide="ignore", invalid="ignore"):
+        vh_db = 10.0 * np.log10(np.where(vh_lin > 0, vh_lin, np.nan))
+    dry = dry.copy()
+    dry["_vh_db"] = vh_db
+    return dry.groupby(["point_id", "year"])["_vh_db"].mean()
+
+
+def _apply_presence_vh_filter(
+    frame: pd.DataFrame,
+    min_vh_db: float,
+) -> pd.DataFrame:
+    """Drop presence pixel-years whose mean dry-season VH is below min_vh_db.
+
+    Pixel-years with no S1 dry observations (NaN mean VH) are retained — absence
+    of S1 data is not evidence of low backscatter.
+    """
+    if "_mean_vh_dry_db" not in frame.columns:
+        return frame
+    is_presence = frame["label"] == "presence"
+    fails = is_presence & (frame["_mean_vh_dry_db"] < min_vh_db)
+    return frame[~fails]
+
+
+# ---------------------------------------------------------------------------
 # Loading
 # ---------------------------------------------------------------------------
 
-def _load_region(region_id: str, label: str, signal: Signal) -> pd.DataFrame | None:
+def _load_region(
+    region_id: str,
+    label: str,
+    signal: Signal,
+    presence_min_vh_dry_db: float | None = None,
+) -> pd.DataFrame | None:
     """Load one region parquet, compute the signal, return a pixel-year summary frame.
 
     Returns None if the parquet does not exist (region not yet fetched).
 
     Columns in the returned frame:
         point_id, year, label, <signal.name>_<key> for each summarise() key
+
+    If presence_min_vh_dry_db is set and label is "presence", an additional
+    column _mean_vh_dry_db is included so the caller can apply the VH filter.
     """
     path = _region_parquet_path(region_id)
     if not path.exists():
@@ -136,6 +202,13 @@ def _load_region(region_id: str, label: str, signal: Signal) -> pd.DataFrame | N
     df["date"] = pd.to_datetime(df["date"])
     df["year"] = df["date"].dt.year
 
+    # Pre-compute VH dry-season mean per pixel-year for presence filter
+    vh_dry = (
+        _vh_dry_mean(df)
+        if (label == "presence" and presence_min_vh_dry_db is not None)
+        else pd.Series(dtype="float64")
+    )
+
     # Per pixel-year summarise
     records = []
     for (pid, yr), grp in df.groupby(["point_id", "year"], sort=False):
@@ -144,6 +217,8 @@ def _load_region(region_id: str, label: str, signal: Signal) -> pd.DataFrame | N
             continue
         row = {"point_id": pid, "year": yr, "label": label}
         row.update({f"{signal.name}_{k}": v for k, v in stats.items()})
+        if not vh_dry.empty:
+            row["_mean_vh_dry_db"] = vh_dry.get((pid, yr), np.nan)
         records.append(row)
 
     if not records:
@@ -172,7 +247,7 @@ def _iqr_overlap(pres_vals: np.ndarray, abs_vals: np.ndarray) -> float:
 
 
 def _auroc(pres_vals: np.ndarray, abs_vals: np.ndarray) -> float:
-    """AUROC using the Mann-Whitney U statistic (exact, no sklearn dependency).
+    """AUROC via sort-based Mann-Whitney U; O(n log n), no sklearn dependency.
 
     Interprets higher signal value as predicting presence. Returns NaN if
     either class is empty.
@@ -180,10 +255,20 @@ def _auroc(pres_vals: np.ndarray, abs_vals: np.ndarray) -> float:
     n_p, n_a = len(pres_vals), len(abs_vals)
     if n_p == 0 or n_a == 0:
         return np.nan
-    # Count pairs where presence > absence (ties count as 0.5)
-    u = 0.0
-    for pv in pres_vals:
-        u += np.sum(pv > abs_vals) + 0.5 * np.sum(pv == abs_vals)
+    # Rank all values jointly; ties get average rank (standard U-stat approach)
+    combined = np.concatenate([pres_vals, abs_vals])
+    order = np.argsort(combined, kind="stable")
+    ranks = np.empty(len(combined), dtype="float64")
+    # Assign average ranks to ties
+    i = 0
+    while i < len(order):
+        j = i + 1
+        while j < len(order) and combined[order[j]] == combined[order[i]]:
+            j += 1
+        avg_rank = (i + j + 1) / 2.0  # 1-based average rank
+        ranks[order[i:j]] = avg_rank
+        i = j
+    u = ranks[:n_p].sum() - n_p * (n_p + 1) / 2.0
     return float(u / (n_p * n_a))
 
 
@@ -214,6 +299,7 @@ def evaluate(
     sites: Sequence[SiteSpec],
     rank_key: str = "p05",
     min_obs_per_year: int = 6,
+    presence_min_vh_dry_db: float | None = None,
     verbose: bool = True,
 ) -> list[EvalResult]:
     """Evaluate a signal's discriminative power across one or more site comparisons.
@@ -231,6 +317,12 @@ def evaluate(
     min_obs_per_year:
         Minimum n_obs in a pixel-year to include it in the comparison.
         Pixel-years below this threshold are excluded (sparse cloud cover).
+    presence_min_vh_dry_db:
+        If set, drop presence pixel-years whose mean dry-season VH backscatter
+        (dB) is below this threshold, mirroring the TAM training presence filter
+        (default −21.0 dB). Pass None (default) to skip filtering and evaluate
+        all labeled pixel-years. Pixel-years with no S1 dry observations are
+        always retained regardless of this threshold.
     verbose:
         Print progress messages.
 
@@ -247,12 +339,21 @@ def evaluate(
 
         frames: list[pd.DataFrame] = []
         missing: list[str] = []
-        for region_id, label in site.regions:
-            frame = _load_region(region_id, label, signal)
-            if frame is None:
-                missing.append(region_id)
-            else:
-                frames.append(frame)
+        with ThreadPoolExecutor(max_workers=len(site.regions)) as pool:
+            futures = {
+                pool.submit(
+                    _load_region, region_id, label, signal,
+                    presence_min_vh_dry_db=presence_min_vh_dry_db,
+                ): region_id
+                for region_id, label in site.regions
+            }
+            for future in as_completed(futures):
+                region_id = futures[future]
+                frame = future.result()
+                if frame is None:
+                    missing.append(region_id)
+                else:
+                    frames.append(frame)
 
         if missing and verbose:
             print(f"  WARNING: {len(missing)} region(s) not found: {missing}")
@@ -263,6 +364,16 @@ def evaluate(
             continue
 
         combined = pd.concat(frames, ignore_index=True)
+
+        # Apply presence VH filter — mirrors TAM training presence filter
+        if presence_min_vh_dry_db is not None:
+            n_before = (combined["label"] == "presence").sum()
+            combined = _apply_presence_vh_filter(combined, presence_min_vh_dry_db)
+            n_dropped = n_before - (combined["label"] == "presence").sum()
+            if verbose and n_dropped > 0:
+                print(f"  VH filter (<{presence_min_vh_dry_db} dB): dropped {n_dropped} presence pixel-years")
+        if "_mean_vh_dry_db" in combined.columns:
+            combined = combined.drop(columns=["_mean_vh_dry_db"])
 
         # Apply minimum obs filter
         n_obs_col = f"{signal.name}_n_obs"
