@@ -55,3 +55,32 @@ Examining the narrow N-S slice at the western streak terminus (lon ≈ 145.2146)
 ### Fix
 
 Same as for Kowanyama: run `tile_harmonisation.calibrate()` on the Quaids parquet to derive per-(tile, band, year) scale factors from same-pixel same-day overlap observations, then apply them at feature-extraction time. The B11 offset at Quaids (~40%) is substantially larger than the ~1–8% seen at Kowanyama, so the correction is expected to have a proportionally larger impact.
+
+---
+
+## Quaids investigation (v9_spectral, May 2026)
+
+### Observed pattern
+
+Horizontal E-W banding across the full 55KCB-only section of the scene (right/east side). The left/west section (where both 55KBB and 55KCB overlap) scores cleanly.
+
+### Root causes identified
+
+**Bug 1 — S2C not recognized in `_TILE_ID_RE`:**
+
+`utils/pixel_collector.py:69` had `r"^S2[AB]_(\d{2}[A-Z]{3})_"`. Sentinel-2C (operational 2025) item IDs like `S2C_55KBB_20250224_0_L2A` don't match, so `tile_id` was set to `""` for all S2C acquisitions. This caused the entire S2C 2025 fetch for quaids (70.3 M rows, 22 dates) to be written to a hidden file named `.parquet` in the year directory. The regex was fixed to `r"^S2[ABC]_"`.
+
+**Consequence:** `parquet_tile_paths()` (iterdir + suffix check) correctly excluded `.parquet` from scoring, so the scoring run was unaffected by the S2C data. However, the fallback glob in `location.py:301` (`out_dir.glob("*.parquet")`) and `s1_tile_builder.py:45` both match `.parquet` on Linux. The orphaned `.parquet` should be deleted after re-fetching with the fixed regex.
+
+**Bug 2 — Temporal coverage imbalance between 55KBB and 55KCB:**
+
+The current 2025 fetch has no meaningful radiometric bias between tiles (B11 calibration scale_factor ≈ 1.0008; the historical 40% B11 difference was an older-data artifact). The horizontal banding comes instead from **unequal temporal sampling** across the scene:
+
+| Region | 55KBB dates/pixel | 55KCB dates/pixel | Character |
+|---|---|---|---|
+| West edge (lon 145.19) | ~6 dates | ~15 dates | CB-dominant: wet/transitional season |
+| East edge (lon 145.33) | ~11 dates | ~13 dates | More balanced: fuller year coverage |
+
+55KBB contributes primarily dry/late-season acquisitions (Jun, Sep–Dec); 55KCB provides the wet and transitional season (Jan, Mar, Jun–Nov). Because 55KBB orbit tracks are narrower at the western edge of the quaids bbox, the western section gets fewer dry-season observations, giving a different model input distribution → different TAM probability. S2 orbit tracks run NNW→SSE, so the coverage boundaries are roughly E-W, producing horizontal bands at the observation-count transition zones.
+
+The existing `tile_harmonisation` framework corrects radiometric offsets but not temporal coverage imbalances. No immediate fix exists for the temporal issue short of either date-count equalization or accepting the artifact.

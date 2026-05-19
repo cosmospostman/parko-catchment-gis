@@ -66,7 +66,7 @@ logger = logging.getLogger(__name__)
 STAC_ENDPOINT = "https://earth-search.aws.element84.com/v1"
 S2_COLLECTION  = "sentinel-2-l2a"
 
-_TILE_ID_RE = re.compile(r"^S2[AB]_(\d{2}[A-Z]{3})_")
+_TILE_ID_RE = re.compile(r"^S2[ABC]_(\d{2}[A-Z]{3})_")
 
 
 def _utm_crs_for_bbox(bbox_wgs84: list[float]) -> str:

@@ -315,7 +315,7 @@ class TAMDataset(Dataset):
                 # Use map() lookup instead of merge to avoid widening the df temporarily.
                 s2_zscore_cols = [c for c in feature_cols if c in df.columns]
                 if s2_zscore_cols:
-                    stats = df.groupby("point_id")[s2_zscore_cols].agg(["mean", "std"])
+                    stats = df.groupby("point_id", observed=True)[s2_zscore_cols].agg(["mean", "std"])
                     pid_arr = df["point_id"].values
                     for col in s2_zscore_cols:
                         m = stats[col]["mean"].reindex(pid_arr).values
@@ -382,7 +382,7 @@ class TAMDataset(Dataset):
         pid_all   = df["point_id"].values
         yr_all    = df["year"].values
 
-        group_sizes = df.groupby(["point_id", "year"], sort=False).size()
+        group_sizes = df.groupby(["point_id", "year"], sort=False, observed=True).size()
         split_points = np.cumsum(group_sizes.values)[:-1]
 
         bands_split = np.split(bands_all, split_points)

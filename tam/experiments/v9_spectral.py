@@ -64,6 +64,8 @@ EXPERIMENT = Experiment(
         # Burdekin — train-only regions
         "burdekin_presence_1", "burdekin_presence_2",
         "burdekin_absence_1", "burdekin_absence_2", "burdekin_absence_3",
+        "burdekin_absence_4", "burdekin_absence_5",
+        "burdekin_absence_6", "burdekin_absence_7", "burdekin_absence_8",
         # Maria Downs — train-only regions
         "maria_downs_presence", "maria_downs_absence",
         "maria_downs_presence_2", "maria_downs_absence_2",
@@ -93,7 +95,9 @@ EXPERIMENT = Experiment(
         "hughenden_absence_1", "hughenden_absence_2",
         "hughenden_absence_6", "hughenden_absence_7",
         # Burdekin
-        "burdekin_val_presence_1", "burdekin_val_absence_1", "burdekin_val_absence_2",
+        "burdekin_val_presence_1",
+        "burdekin_val_absence_1", "burdekin_val_absence_2",
+        "burdekin_val_absence_3", "burdekin_val_absence_4",
         # Maria Downs
         "maria_downs_val_presence_1", "maria_downs_val_absence_1",
         # Rupert Creek
@@ -104,8 +108,8 @@ EXPERIMENT = Experiment(
     ],
     feature_cols=V9_FEATURE_COLS,
     model_kwargs={
-        "d_model":  128,
-        "n_layers": 2,
+        "d_model":  256,
+        "n_layers": 3,
         "dropout":  0.5,
         "n_bands":  len(V9_FEATURE_COLS),  # 11
         "n_global_features": 0,            # overridden at runtime by use_band_summaries

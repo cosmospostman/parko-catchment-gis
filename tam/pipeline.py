@@ -114,12 +114,27 @@ def _cmd_train(args: argparse.Namespace) -> None:
         pid_region = df["point_id"].str.replace(_suffix_re, "", regex=True)
         return df[pid_region.isin(known_region_ids)]
 
-    # Read tiles one at a time and filter immediately — peak memory per iteration
-    # is one raw tile + the filtered tile, not all tiles simultaneously.
+    # Load-time spatial stride: thin unique point_ids per tile before accumulating.
+    # This mirrors the train_tam spatial_stride logic but runs early enough to keep
+    # tile_dfs small — at 100M+ rows the accumulated object arrays OOM before concat.
+    # stride=1 is a no-op. The same stride is re-applied in train_tam to labels only,
+    # which is harmless (the strided pixels are simply absent from pixel_df).
+    _load_stride = args.spatial_stride or exp.train_kwargs.get("spatial_stride", 1) or 1
+
+    def _stride_tile(df: pd.DataFrame, stride: int) -> pd.DataFrame:
+        if stride <= 1:
+            return df
+        # Sort by lat/lon for a geographically systematic (reproducible) sample.
+        coords = df[["point_id", "lat", "lon"]].drop_duplicates("point_id")
+        keep = set(coords.sort_values(["lat", "lon"])["point_id"].iloc[::stride])
+        return df[df["point_id"].isin(keep)]
+
+    # Read tiles one at a time, filter and thin immediately — peak memory per
+    # iteration is one raw tile, not the accumulation of all tiles.
     tile_dfs: list[pd.DataFrame] = []
     for path, cols, n_rg in tile_specs:
         logger.info("Loading tile %s (%d row groups) ...", path.name, n_rg)
-        tile_df = _filter_to_regions(_read_tile(path, cols, n_rg))
+        tile_df = _stride_tile(_filter_to_regions(_read_tile(path, cols, n_rg)), _load_stride)
         if not tile_df.empty:
             tile_dfs.append(tile_df)
         del tile_df

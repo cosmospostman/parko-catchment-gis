@@ -1702,6 +1702,57 @@ regions:
     tags: [semi-arid, riparian]
     notes: Use for validation only.
 
+  - id: burdekin_absence_4
+    name: "Burdekin — absence 4 (cropland)"
+    label: absence
+    bbox: [147.511708, -19.712255, 147.514297, -19.710587]
+    years: [2022, 2023, 2024]
+    tags: [semi-arid, cropland]
+
+  - id: burdekin_absence_5
+    name: "Burdekin — absence 5 (cropland)"
+    label: absence
+    bbox: [147.491581, -19.623176, 147.493188, -19.619886]
+    years: [2022, 2023, 2024]
+    tags: [semi-arid, cropland]
+
+  - id: burdekin_absence_6
+    name: "Burdekin — absence 6 (riverbed)"
+    label: absence
+    bbox: [147.486066, -19.653267, 147.488627, -19.651441]
+    years: [2022, 2023, 2024]
+    tags: [semi-arid, riverbed]
+
+  - id: burdekin_absence_7
+    name: "Burdekin — absence 7 (ocean)"
+    label: absence
+    bbox: [147.610949, -19.715516, 147.613249, -19.713391]
+    years: [2022, 2023, 2024]
+    tags: [semi-arid, ocean]
+
+  - id: burdekin_absence_8
+    name: "Burdekin — absence 8 (woodland)"
+    label: absence
+    bbox: [147.545176, -19.708725, 147.546840, -19.706136]
+    years: [2022, 2023, 2024]
+    tags: [semi-arid, woody]
+
+  - id: burdekin_val_absence_3
+    name: "Burdekin — val absence 3 (cropland)"
+    label: absence
+    bbox: [147.527463, -19.634943, 147.529575, -19.632898]
+    years: [2022, 2023, 2024]
+    tags: [semi-arid, cropland]
+    notes: Use for validation only.
+
+  - id: burdekin_val_absence_4
+    name: "Burdekin — val absence 4 (woodland)"
+    label: absence
+    bbox: [147.545390, -19.711334, 147.547561, -19.709336]
+    years: [2022, 2023, 2024]
+    tags: [semi-arid, woody]
+    notes: Use for validation only.
+
   # ---------------------------------------------------------------------------
   # Rupert Creek — northwest Queensland (semi-arid, riparian)
   # ---------------------------------------------------------------------------

@@ -1,11 +1,10 @@
 # Candidate Signals for Future Investigation
 
-Signals identified in the literature as biophysically promising for Parkinsonia discrimination but not yet investigated in this project. Each entry has enough context to scope a concrete analysis.
+Signals identified as biophysically promising for Parkinsonia discrimination. Each entry includes enough context to scope a concrete analysis and a `Signal` / `SiteSpec` eval plan using the `signals/` harness.
 
-**Already investigated (not repeated here):**
+**Previously investigated (ad-hoc scripts, not yet in the Signal framework):**
 - Red-edge ratio (B07/B05 → `re_p10`) — `docs/research/LONGREACH-RED-EDGE.md`
 - SWIR moisture index (NDMI/swir_mi) — `docs/research/LONGREACH-SWIR.md`
-- MAVI — `docs/MAVI.md`
 - S1 SAR backscatter — V8 model (`docs/models/V8-TRAINING.md`)
 - Temporal amplitude, peak DOY, recession — `docs/research/recession-and-greenup/`, `docs/research/day-of-year-peak/`
 
@@ -15,14 +14,44 @@ Signals identified in the literature as biophysically promising for Parkinsonia 
 
 | Signal | Formulation | Priority | Key uncertainty |
 |---|---|---|---|
-| NDRE / CI_RE | (B8A−B05)/(B8A+B05); (B07/B05)−1 | Medium | Redundancy with re_p10; B8A availability |
-| SMA — PV/NPV/BS | Linear unmixing, 3 endmembers | High | Endmember selection; NPV fraction novelty |
+| MAVI | (B08−B04)/(B08+B04+B11) | High | Direction reverses with canopy fraction |
+| NDRE / CI_RE | (B8A−B05)/(B8A+B05); (B07/B05)−1 | Medium | Redundancy with re_p10; dry-season window specificity |
+| SMA — PV/NPV/BS | Linear unmixing, 3 endmembers | High | Endmember selection; requires constrained inversion |
 | NDSVI + B11/B12 decoupling | (B11−B04)/(B11+B04); B12/B11 ratio | Medium | Redundancy with swir_mi |
-| Explicit temporal phenometrics | σ_t, IQR, phase delay of NDVI | Medium-high | Phase delay requires rainfall reference |
+| Temporal variance (σ_t) | std(NDVI) per pixel-year | Medium-high | Correlates with nir_cv; no external data needed |
 
 ---
 
-## 1. NDRE / CI_RE — Red-Edge Chlorophyll Indices
+## 1. MAVI — Moisture-Adjusted Vegetation Index
+
+### Hypothesis
+
+Sparse Parkinsonia creates an eco-hydrological footprint larger than its canopy footprint. Deep roots draw down soil moisture in a radial zone beyond the canopy drip line, producing a "drawdown halo" detectable in Sentinel-2 SWIR. MAVI makes this relationship explicit by placing B11 (SWIR-1, soil and canopy water sensitive) in the denominator alongside the standard NDVI bands.
+
+### Formulation
+
+```
+MAVI = (B08 - B04) / (B08 + B04 + B11)
+```
+
+### Key findings from prior investigation (`docs/MAVI.md`)
+
+- At Landsend, mean dry-season MAVI ordering: dense presence (0.193) > sparse presence (0.145) > grass absence (0.099) — consistent and physically interpretable.
+- **Direction reverses at high canopy cover:** dense riparian presence (Corfield) shows MAVI *increasing* into dry season as surrounding matrix senesces. Sparse presence shows the expected *decrease*. The signal is canopy-fraction-weighted, not a universal monotone discriminator.
+- Sparse presence bboxes show **bimodal within-bbox distributions** during Apr–May (wet-to-dry transition): a low-MAVI grass/soil cluster and a high-MAVI canopy cluster. This bimodality is the primary discrimination signal for sparse infestations; it is invisible in bbox-aggregate means.
+- ΔMAVI/Δt (temporal derivative) showed no class separation at the pixel-year aggregate level — not recommended as an explicit feature.
+
+### Connection to what we know
+
+B08 and B11 are already in the feature set; MAVI adds value by making the canopy-fraction-weighted moisture relationship an explicit input the model doesn't have to re-derive. The bimodal within-bbox distributions suggest MAVI provides discrimination at the individual pixel level even when site-level means overlap.
+
+### Priority
+
+**High.** Formulation is simple, all bands present in training parquets, prior investigation provides clear hypotheses about the discrimination window (Apr–May) and expected direction at sparse vs dense sites. Main open question is whether the Signal harness recovers the bimodality finding across a wider site set.
+
+---
+
+## 2. NDRE / CI_RE — Red-Edge Chlorophyll Indices
 
 ### Hypothesis
 
@@ -66,7 +95,7 @@ NDRE/CI_RE likely correlates highly with re_p10 in the wet season. The testable 
 
 ---
 
-## 2. Spectral Mixture Analysis — PV/NPV/BS Fractional Cover
+## 3. Spectral Mixture Analysis — PV/NPV/BS Fractional Cover
 
 ### Hypothesis
 
@@ -114,7 +143,7 @@ This directly addresses the sub-pixel problem identified in OVERVIEW.md (§"Dete
 
 ---
 
-## 3. NDSVI + B11/B12 Structural Decoupling
+## 4. NDSVI + B11/B12 Structural Decoupling
 
 ### Hypothesis
 
@@ -155,51 +184,140 @@ B11/B12 decoupling is not captured by any existing feature and addresses a speci
 
 ---
 
-## 4. Explicit Temporal Phenometrics
+## 5. Temporal Variance (σ_t)
 
 ### Hypothesis
 
-Annual grasses respond to rainfall pulses with large, rapid NDVI spikes followed by rapid decay. Parkinsonia, buffered by its deep root network, exhibits a flatter, delayed, and more stable response curve. Two pixel-level statistics capture this:
-
-- **Temporal variance (σ_t, IQR):** Sparse woody invaders display significantly *lower* temporal NDVI variance than purely grass-dominated zones. The IQR of a rolling 12-month NDVI stack separates the volatile grass phenology from the buffered woody phenology without requiring knowledge of the rainfall calendar.
-- **Phase delay:** Parkinsonia's green-up lags the rainfall peak (roots respond to the deep soil moisture front, not the surface pulse). Grasses respond near-instantly to surface rain. The offset between a pixel's NDVI peak DOY and the site's mean rainfall peak DOY separates deep-rooted woody plants from shallow-rooted grasses.
+Annual grasses respond to rainfall pulses with large, rapid NDVI spikes followed by rapid decay. Parkinsonia, buffered by its deep root network, exhibits a flatter and more stable response curve. σ_t captures this directly without requiring knowledge of the rainfall calendar.
 
 ### Formulation
 
 Per-pixel, per-year:
 ```
-sigma_t    = std(NDVI) across qualifying observations in the year
-ndvi_iqr   = p75(NDVI) - p25(NDVI) across qualifying observations in the year
-phase_delay = DOY_of_peak_NDVI - DOY_of_peak_rainfall  (site-median rainfall from BoM gridded data)
+sigma_t  = std(NDVI) across qualifying S2 observations in the year
+ndvi_iqr = p75(NDVI) - p25(NDVI) across qualifying S2 observations in the year
 ```
 
-Multi-year summaries: mean sigma_t, mean ndvi_iqr, mean phase_delay; std of phase_delay across years (calendar consistency).
+Applied to NDVI by default. Can be applied to any other signal (MAVI, CI_RE) as a secondary check.
 
-These can be computed for any index (NDVI, MAVI, CI_RE) — NDVI is the most interpretable starting point.
+Note: phase delay (peak NDVI DOY vs peak rainfall DOY) is a related hypothesis but requires external rainfall data not currently in the pipeline. It is not included here.
 
 ### Connection to what we know
 
-The TAM attention visualisation for V8 already shows the model attending to phenologically meaningful windows — wet-season at northern sites, Nov/Dec at Lake Mueller. This suggests the transformer is implicitly learning temporal buffering without being given explicit variance or phase features. Explicit phenometrics would:
-
-1. Make the signal testable and interpretable independently of the model
-2. Provide features for simpler classifiers (RF) in the V10 feature ablation
-3. Allow pre-screening of training pixels by temporal variance quality (low obs count years produce artificially low σ_t)
-
-rec_mean (wet-to-dry NDVI amplitude) captures a related but distinct property: the *total swing* rather than the *within-year variance*. A pixel could have high rec_mean (large wet-to-dry drop) but low σ_t if the transition is smooth. σ_t specifically captures the inter-observation volatility — whether the pixel fluctuates rapidly or plateaus.
-
-nir_cv (dry-season NIR coefficient of variation) captures within-dry-season NIR stability. σ_t computed over the full annual window is a different statistic that includes the wet-to-dry transition shape.
-
-### Investigation sketch
-
-1. Compute per-pixel annual σ_t and NDVI IQR at Landsend (sparse presence + grass absence)
-2. Check class ordering and IQR separation — expect presence < absence (lower variance)
-3. Correlation test: σ_t against nir_cv, rec_mean; if r < 0.7 with both, σ_t adds a new axis
-4. Phase delay: requires BoM AWAP monthly gridded rainfall at each pixel location; compute DOY-of-peak per pixel-year; compare to site's mean rainfall peak month
-5. Test whether mean phase_delay differs between presence and absence; test inter-annual std of phase_delay (presence should be more calendar-consistent than grass)
+`rec_mean` captures the *total wet-to-dry swing*; σ_t captures *within-year volatility*. A pixel with a smooth seasonal ramp has high rec_mean but low σ_t. `nir_cv` captures within-dry-season NIR stability; σ_t covers the full annual window including the wet-to-dry transition. Both correlations need to be below r = 0.7 for σ_t to earn its place.
 
 ### Priority
 
-**Medium-high.** σ_t and NDVI IQR are cheap and can be computed immediately from existing parquets. Phase delay is the most biophysically novel but requires rainfall data — this is already flagged in OVERVIEW.md as a proposed feature ("rainfall-normalised anomaly") so the infrastructure question is known. Start with σ_t/IQR; tackle phase delay when rainfall data integration is prioritised.
+**Medium-high.** Cheap — computable directly from NDVI column already in training parquets. Unlike other candidates, σ_t is implemented via a custom `summarise()` override (the discriminative summary is `std`, not `p05`).
+
+Note: the `summarise()` default returns `std` as one of its keys, so no override is needed — the harness just uses `rank_key="std"` instead of `rank_key="p05"`.
+
+---
+
+## Evaluation plan
+
+Signals are evaluated using `signals/eval.py`. Each signal is a `Signal` subclass; discriminability is measured across three named `SiteSpec` tiers that serve different diagnostic purposes.
+
+### Rationale for three tiers
+
+| Tier | Purpose |
+|------|---------|
+| **Arid clean** | Upper-bound discriminability. Dense presence vs simple grassland/open absence with minimal background woody cover. If a signal fails here it has no path forward. |
+| **Sparse stress** | Real-world stress test. Sparse presence pixels are the hardest detection case. A signal that holds here is genuinely useful. |
+| **Woody false-positive panel** | Specificity check. Dense non-Parkinsonia woody vegetation. A signal that fires here as strongly as on presence is not discriminative — it is measuring woody cover generically. |
+
+Note: signals don't need to be universally discriminative across all tiers to be useful. The TAM attention mechanism can learn when a signal is relevant. A signal that separates cleanly only at arid sites still earns its place.
+
+### Site specs
+
+```python
+from signals.eval import SiteSpec
+
+# Tier 1 — Arid clean: dense presence vs open grassland/absence
+ARID_CLEAN = SiteSpec("arid_clean", [
+    ("barcoorah_presence",   "presence"),
+    ("barcoorah_presence_2", "presence"),
+    ("barcoorah_presence_3", "presence"),
+    ("barcoorah_presence_4", "presence"),
+    ("lake_mueller_presence",   "presence"),
+    ("lake_mueller_presence_2", "presence"),
+    ("lake_mueller_presence_3", "presence"),
+    ("lake_mueller_presence_4", "presence"),
+    ("barcoorah_absence_2",    "absence"),
+    ("barcoorah_absence_3",    "absence"),
+    ("barcoorah_absence_4",    "absence"),
+    ("lake_mueller_absence",   "absence"),
+    ("lake_mueller_absence_2", "absence"),
+    ("lake_mueller_absence_3", "absence"),
+])
+
+# Tier 2 — Sparse stress: sparse presence vs grass absence at Landsend
+SPARSE_STRESS = SiteSpec("sparse_stress", [
+    ("landsend_sparse_presence_1", "presence"),
+    ("landsend_sparse_presence_2", "presence"),
+    ("landsend_sparse_presence_3", "presence"),
+    ("landsend_sparse_presence_4", "presence"),
+    ("landsend_sparse_presence_5", "presence"),
+    ("landsend_absence_grass_1",   "absence"),
+    ("landsend_absence_grass_2",   "absence"),
+])
+
+# Tier 3 — Woody false-positive panel: non-Parkinsonia woody cover
+# All regions treated as pseudo-absence (label is informational only here).
+# Run signal on this tier and check whether scores resemble presence or absence.
+WOODY_FP = SiteSpec("woody_fp", [
+    # Cloncurry: monsoonal woodland (dense Eucalyptus/Acacia, no Parkinsonia)
+    ("cloncurry_absence_1", "absence"),
+    ("cloncurry_absence_2", "absence"),
+    ("cloncurry_absence_3", "absence"),
+    ("cloncurry_absence_4", "absence"),
+    ("cloncurry_absence_5", "absence"),
+    ("cloncurry_absence_6", "absence"),
+    ("cloncurry_absence_7", "absence"),
+    # Burdekin: semi-arid woody, added explicitly as a false-positive hard negative
+    ("burdekin_absence_8",      "absence"),
+    ("burdekin_val_absence_4",  "absence"),
+    # Etna Creek: semi-arid woody absence (tags: woody)
+    ("etna_absence_8",  "absence"),
+    ("etna_absence_9",  "absence"),
+    ("etna_absence_10", "absence"),
+    ("etna_absence_11", "absence"),
+    ("etna_absence_12", "absence"),
+])
+```
+
+### Running the evaluation
+
+```python
+from signals.eval import evaluate
+from signals.ndre import NDRESignal, CIRESignal
+
+SITES = [ARID_CLEAN, SPARSE_STRESS, WOODY_FP]
+
+# Index-based signals: rank on p05 (dry-season floor)
+for sig in [NDRESignal(), CIRESignal()]:
+    results = evaluate(sig, SITES, rank_key="p05")
+
+# MAVI: also rank on p05; check p25/amplitude for the bimodal case
+from signals.mavi import MAVISignal
+results = evaluate(MAVISignal(), SITES, rank_key="p05")
+
+# Temporal variance: rank on std (the discriminative summary)
+from signals.temporal import TemporalVarianceSignal
+results = evaluate(TemporalVarianceSignal(), SITES, rank_key="std")
+```
+
+### Verdict criteria
+
+| Criterion | Threshold | Action |
+|-----------|-----------|--------|
+| IQR overlap (Tier 1) | 0.0 | Required for advancement |
+| AUROC (Tier 1) | ≥ 0.75 | Minimum useful separation |
+| AUROC (Tier 2, sparse) | ≥ 0.65 | Earns place in model feature set |
+| Pearson r vs existing signals | < 0.7 | Required for independence |
+| Tier 3 AUROC vs Tier 1 AUROC | Gap > 0.15 | Confirms Parkinsonia-specific rather than generic woody signal |
+
+SMA is excluded from this harness — it requires a constrained least-squares unmixing step that does not fit the `Signal.compute()` interface. It will be evaluated separately.
 
 ---
 

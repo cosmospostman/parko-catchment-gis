@@ -123,7 +123,7 @@ def _compute_band_summaries(pixel_df: pd.DataFrame, feature_cols: list[str]) -> 
 
     # Compute all three stats sequentially, deleting each intermediate after concat,
     # to avoid three full (n_pixels × n_cols) result tables live simultaneously.
-    g = s2.groupby("point_id")[cols]
+    g = s2.groupby("point_id", observed=True)[cols]
     p5  = g.quantile(0.05).rename(columns={c: f"{c}_p5"  for c in cols})
     p95 = g.quantile(0.95).rename(columns={c: f"{c}_p95" for c in cols})
     result = pd.concat([p5, p95], axis=1)
@@ -437,7 +437,7 @@ def train_tam(
                 "year":     s1_slim["year"].values[dry_mask],
                 "_vh_db":   vh_db[dry_mask].astype(np.float32),
             })
-            mean_vh_dry_py = dry_s1.groupby(["point_id", "year"])["_vh_db"].mean()
+            mean_vh_dry_py = dry_s1.groupby(["point_id", "year"], observed=True)["_vh_db"].mean()
 
             # S2 NDVI per (point_id, year) — clear observations only
             mean_ndvi_dry_py: pd.Series | None = None
@@ -449,7 +449,7 @@ def train_tam(
                     s2_dry_mask &= s2_slim["scl"].isin([4.0, 5.0]).values
                 dry_s2 = s2_slim[s2_dry_mask & s2_slim["NDVI"].notna()]
                 if not dry_s2.empty:
-                    mean_ndvi_dry_py = dry_s2.groupby(["point_id", "year"])["NDVI"].mean()
+                    mean_ndvi_dry_py = dry_s2.groupby(["point_id", "year"], observed=True)["NDVI"].mean()
 
             train_py_labels = _apply_presence_filter(train_py_labels, mean_vh_dry_py, cfg, pid_to_sc, noise_removed, mean_ndvi_dry_py)
             val_py_labels   = _apply_presence_filter(val_py_labels,   mean_vh_dry_py, cfg, pid_to_sc, noise_removed, mean_ndvi_dry_py)
