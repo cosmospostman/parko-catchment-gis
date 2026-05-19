@@ -29,9 +29,11 @@ S1_FEATURE_COLS: list[str] = ["s1_vh", "s1_vv", "s1_vh_vv", "s1_rvi"]
 
 # V9-SPECTRAL feature set: B06 excluded (calibration artefacts), EVI excluded
 # (additive denominator behaves poorly under pixel z-score), NDWI retained.
+# MAVI, NDRE, CI_RE added after signal eval (2026-05-19): all cleared AUROC ≥ 0.75
+# at sparse_stress tier (CI_RE=0.816, MAVI=0.794, NDRE=0.780).
 V9_FEATURE_COLS: list[str] = [
     "B02", "B03", "B04", "B05", "B07", "B08", "B8A", "B11", "B12",
-    "NDVI", "NDWI",
+    "NDVI", "NDWI", "MAVI", "NDRE", "CI_RE",
 ]
 S1_SNAP_WINDOW_DAYS: int = 7   # max |S1_date - S2_date| to accept a snap
 
@@ -304,7 +306,7 @@ class TAMDataset(Dataset):
                 else:
                     df = pixel_df.copy()
 
-            if any(c not in df.columns for c in feature_cols if c in ("NDVI", "NDWI", "EVI")):
+            if any(c not in df.columns for c in feature_cols if c in set(INDEX_COLS)):
                 df = add_spectral_indices(df)
 
             if pixel_zscore:
@@ -323,7 +325,7 @@ class TAMDataset(Dataset):
                         df[col] = (df[col].values - m) / s
 
         if use_s1 != "s1_only":
-            if any(c not in df.columns for c in feature_cols if c in ("NDVI", "NDWI", "EVI")):
+            if any(c not in df.columns for c in feature_cols if c in set(INDEX_COLS)):
                 df = add_spectral_indices(df)
 
             # SCL filter

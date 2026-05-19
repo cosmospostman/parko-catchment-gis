@@ -321,6 +321,45 @@ SMA is excluded from this harness — it requires a constrained least-squares un
 
 ---
 
+## Results (2026-05-19)
+
+Evaluated across all three tiers using the harness above. Woody FP tier returned no AUROC (all-absence spec — single-class, undefined). The critical tiers are arid_clean (Tier 1, upper bound) and sparse_stress (Tier 2, real-world bar).
+
+### Raw results
+
+| Signal | rank_key | T1 arid_clean AUROC | T1 IQR overlap | T2 sparse_stress AUROC | T2 IQR overlap |
+|---|---|---|---|---|---|
+| NDRE | p05 | 0.467 | 0.855 | 0.780 | 0.032 |
+| CI_RE | p05 | 0.473 | 0.773 | **0.816** | **CLEAN** |
+| MAVI | p05 | 0.501 | 0.898 | **0.794** | 0.037 |
+| NDSVI | p05 | 0.454 | 0.708 | 0.730 | 0.209 |
+| B12/B11 | std | 0.585 | 0.547 | 0.405 | 0.631 |
+| sigma_t (NDVI std) | std | 0.637 | 0.303 | 0.414 | 0.697 |
+
+### Verdicts
+
+**CI_RE — ACCEPT.** Best Tier 2 result overall: AUROC 0.816, only signal with clean IQR separation (0.0) at sparse sites. Failure at Tier 1 (AUROC 0.473) is expected and physically interpretable — dense presence at arid sites does not rely on the dry-season stem signal.
+
+**MAVI — ACCEPT.** AUROC 0.794, IQR overlap 0.037 at Tier 2. Consistent with prior investigation: MAVI is a sparse-infestation discriminator, not a dense-presence signal. Prior work (bimodal within-bbox distributions in Apr–May) holds across a wider site set.
+
+**NDRE — ACCEPT.** AUROC 0.780 at Tier 2, IQR overlap 0.032. Adds a different spectral axis from MAVI (red-edge vs SWIR moisture). Tier 1 failure same interpretation as CI_RE.
+
+**NDSVI — CLOSE.** AUROC 0.730 (marginal, below 0.75 T1 bar), IQR overlap 0.209 at Tier 2. Follow-up investigation (2026-05-19) found r = −0.692 vs swir_mi_p10 and r = 0.660 vs re_p10 — both near-threshold, and the negative correlation with swir_mi reflects inverted shared variance (same underlying state, opposite sign) rather than independent information. Monthly profile is flat year-round with no new temporal discriminant. Not worth adding a fourth SWIR-derived feature.
+
+**B12/B11 (std) — CLOSE.** AUROC 0.405 at Tier 2 (presence scores *lower* than absence). No discriminative signal in either direction.
+
+**sigma_t (NDVI std) — CLOSE.** AUROC 0.414 at Tier 2 — same direction problem. Presence pixels are actually *more* volatile than absence at this site, opposite to the hypothesis.
+
+### NDSVI follow-up detail
+
+Landsend sparse_stress sites, pixel-year p10 aggregation:
+
+- `ndsvi_p10` vs `swir_mi_p10`: r = −0.692 (inverted — same underlying wet/dry state, opposite sign)
+- `ndsvi_p10` vs `re_p10`: r = 0.660
+- Jul–Sep delta: presence 0.299 vs absence 0.249 (Δ = 0.050); swir_mi collapses to near-zero delta in same window (Δ = 0.004) — NDSVI does maintain dry-season separation where swir_mi does not, but not large enough to justify inclusion alongside MAVI and CI_RE.
+
+---
+
 ## References
 
 - Misra, G., Cawkwell, F., & Wingler, A. (2020). Status of Phenological Research Using Sentinel-2 Data: A Review. *Remote Sensing*, 12(17), 2760.

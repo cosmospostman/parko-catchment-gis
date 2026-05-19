@@ -9,7 +9,7 @@ are defined here and imported by every other module. Edit once, applies everywhe
 # ---------------------------------------------------------------------------
 
 BANDS: list[str] = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12"]
-SPECTRAL_INDEX_COLS: list[str] = ["NDVI", "NDWI", "EVI"]
+SPECTRAL_INDEX_COLS: list[str] = ["NDVI", "NDWI", "EVI", "MAVI", "NDRE", "CI_RE"]
 
 SCL_BAND = "SCL"
 AOT_BAND = "AOT"
@@ -65,17 +65,15 @@ FLOWERING_THRESHOLD: float = 0.15
 # ---------------------------------------------------------------------------
 
 def add_spectral_indices(df: "pd.DataFrame") -> "pd.DataFrame":
-    """Return df with NDVI, NDWI, EVI columns appended, derived from raw bands."""
-    import numpy as np
-    b02 = df["B02"].values.astype("float32")
-    b03 = df["B03"].values.astype("float32")
-    b04 = df["B04"].values.astype("float32")
-    b08 = df["B08"].values.astype("float32")
+    """Return df with NDVI, NDWI, EVI, MAVI, NDRE, CI_RE columns appended."""
+    from signals.ndvi import NDVISignal, NDWISignal, EVISignal
+    from signals.mavi import MAVISignal
+    from signals.ndre import NDRESignal, CIRESignal
     df = df.copy()
-    denom = b08 + b04
-    df["NDVI"] = np.divide(b08 - b04, denom, out=np.zeros_like(denom), where=denom != 0)
-    denom = b03 + b08
-    df["NDWI"] = np.divide(b03 - b08, denom, out=np.zeros_like(denom), where=denom != 0)
-    evi_denom = b08 + 6 * b04 - 7.5 * b02 + 1
-    df["EVI"]  = np.divide(2.5 * (b08 - b04), evi_denom, out=np.zeros_like(evi_denom), where=evi_denom != 0)
+    df["NDVI"]  = NDVISignal().compute(df)
+    df["NDWI"]  = NDWISignal().compute(df)
+    df["EVI"]   = EVISignal().compute(df)
+    df["MAVI"]  = MAVISignal().compute(df)
+    df["NDRE"]  = NDRESignal().compute(df)
+    df["CI_RE"] = CIRESignal().compute(df)
     return df

@@ -18,5 +18,6 @@ Usage
 """
 
 from signals.base import Signal
+from signals.ndvi import NDVISignal, NDWISignal, EVISignal
 
-__all__ = ["Signal"]
+__all__ = ["Signal", "NDVISignal", "NDWISignal", "EVISignal"]
