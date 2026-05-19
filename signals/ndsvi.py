@@ -16,7 +16,7 @@ is similar.
 Formulations
 ------------
     NDSVI   = (B11 - B04) / (B11 + B04)
-    B12_B11 = B12 / B11
+    B12_B11 = B12 / B11  — implemented in s2_bands.py, re-exported here
 
 Bands required: B04, B11, B12 — all present in training tile parquets.
 """
@@ -27,6 +27,7 @@ import numpy as np
 import pandas as pd
 
 from signals.base import Signal
+from signals.s2_bands import B12B11Signal
 
 
 class NDSVISignal(Signal):
@@ -48,25 +49,3 @@ class NDSVISignal(Signal):
         return out
 
 
-class B12B11Signal(Signal):
-    """SWIR structural decoupling ratio: B12 / B11.
-
-    Elevated values indicate dry cellulose/lignin-dominated pixels (woody
-    skeleton). Temporal variance of this ratio separates structurally woody
-    pixels from bare soil and senescing grass even when NDVI is similar.
-    Evaluate using rank_key="std" to target the decoupling effect.
-    """
-
-    name = "b12_b11"
-
-    def compute(self, df: pd.DataFrame) -> pd.Series:
-        good = self.quality_mask(df)
-        out = pd.Series(np.nan, index=df.index, dtype="float32")
-        if good.any():
-            b12 = df.loc[good, "B12"].values.astype("float32")
-            b11 = df.loc[good, "B11"].values.astype("float32")
-            result = np.full(b11.shape, np.nan, dtype="float32")
-            valid = b11 != 0
-            result[valid] = b12[valid] / b11[valid]
-            out[good] = result
-        return out

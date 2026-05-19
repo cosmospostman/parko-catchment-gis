@@ -207,7 +207,7 @@ def _preprocess(
     else:
         _use_default_cols = feature_cols is None or feature_cols == list(ALL_FEATURE_COLS)
         if _use_default_cols:
-            # Fast path: numba kernel for the standard 13-feature layout
+            # Fast path: numba kernel for the standard 16-feature layout (ALL_FEATURE_COLS)
             n_feat = _N_FEATURES
             feat = np.empty((N, n_feat), dtype=np.float32)
             extract_features(

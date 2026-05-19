@@ -106,8 +106,12 @@ class MemoryChipStore:
                     self._crs_transformer.setdefault(crs_key, t)
                     t = self._crs_transformer[crs_key]
 
-            # Vectorised projection — CPU work done outside the lock
-            xs, ys = t.transform(self._lons, self._lats)
+            # Vectorised projection — CPU work done outside the lock.
+            # Pass as Python lists: pyproj dispatches 1-element numpy arrays to
+            # _transform_point (scalar path) which raises a NumPy DeprecationWarning
+            # when it tries to convert a 0-d result back to scalar.
+            _xs, _ys = t.transform(self._lons.tolist(), self._lats.tolist())
+            xs, ys = np.asarray(_xs), np.asarray(_ys)
             cols_f, rows_f = ~transform * (xs, ys)
             rows = np.clip(np.floor(rows_f).astype(np.intp), 0, h - 1)
             cols = np.clip(np.floor(cols_f).astype(np.intp), 0, w - 1)

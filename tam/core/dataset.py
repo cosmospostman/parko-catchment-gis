@@ -142,9 +142,9 @@ def snap_s1_to_s2(pixel_df: pd.DataFrame, window_days: int = S1_SNAP_WINDOW_DAYS
     for pid, grp_s2 in s2.groupby("point_id", sort=False):
         grp_s2 = grp_s2.sort_values("_date_dt")
         if pid not in s1_by_pid:
+            grp_s2 = grp_s2.copy()
             for col in S1_FEATURE_COLS:
-                grp_s2 = grp_s2.copy()
-                grp_s2[col] = np.nan
+                grp_s2[col] = np.full(len(grp_s2), np.nan, dtype=np.float32)
             pieces.append(grp_s2)
             continue
 

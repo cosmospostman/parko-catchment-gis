@@ -19,5 +19,34 @@ Usage
 
 from signals.base import Signal
 from signals.ndvi import NDVISignal, NDWISignal, EVISignal
+from signals.s2_bands import (
+    B02Signal,
+    B03Signal,
+    B04Signal,
+    B05Signal,
+    B07Signal,
+    B08Signal,
+    B8ASignal,
+    B11Signal,
+    B12Signal,
+    B12B11Signal,
+    B11B08Signal,
+)
 
-__all__ = ["Signal", "NDVISignal", "NDWISignal", "EVISignal"]
+__all__ = [
+    "Signal",
+    "NDVISignal",
+    "NDWISignal",
+    "EVISignal",
+    "B02Signal",
+    "B03Signal",
+    "B04Signal",
+    "B05Signal",
+    "B07Signal",
+    "B08Signal",
+    "B8ASignal",
+    "B11Signal",
+    "B12Signal",
+    "B12B11Signal",
+    "B11B08Signal",
+]

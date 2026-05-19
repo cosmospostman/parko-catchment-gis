@@ -18,9 +18,17 @@ def extract_features(
     b8a: np.ndarray,
     b11: np.ndarray,
     b12: np.ndarray,
-    out: np.ndarray,  # (N, 13) float32 C-contiguous, pre-allocated
+    out: np.ndarray,  # (N, 16) float32 C-contiguous, pre-allocated
 ) -> None:
-    """Fill out with [B02..B12, NDVI, NDWI, EVI] in parallel, no intermediate arrays."""
+    """Fill out with [B02..B12, NDVI, NDWI, EVI, MAVI, NDRE, CI_RE] in parallel.
+
+    Column order must match ALL_FEATURE_COLS in tam/core/dataset.py:
+      0-9:   B02 B03 B04 B05 B06 B07 B08 B8A B11 B12
+      10-12: NDVI NDWI EVI
+      13:    MAVI  = (B08 - B04) / (B08 + B04 + B11)
+      14:    NDRE  = (B8A - B05) / (B8A + B05)
+      15:    CI_RE = (B07 / B05) - 1
+    """
     N = len(b02)
     for i in prange(N):
         out[i, 0] = b02[i]; out[i, 1] = b03[i]; out[i, 2] = b04[i]
@@ -32,6 +40,11 @@ def extract_features(
         out[i, 11] = (b03[i] - b08[i]) / denom if denom != 0.0 else 0.0
         denom = b08[i] + 6.0 * b04[i] - 7.5 * b02[i] + 1.0
         out[i, 12] = 2.5 * (b08[i] - b04[i]) / denom if denom != 0.0 else 0.0
+        denom = b08[i] + b04[i] + b11[i]
+        out[i, 13] = (b08[i] - b04[i]) / denom if denom != 0.0 else 0.0
+        denom = b8a[i] + b05[i]
+        out[i, 14] = (b8a[i] - b05[i]) / denom if denom != 0.0 else 0.0
+        out[i, 15] = (b07[i] / b05[i]) - 1.0 if b05[i] != 0.0 else 0.0
 
 
 @njit(parallel=True, cache=True)
@@ -63,17 +76,17 @@ def warmup() -> None:
     """JIT-compile both kernels with tiny dummy data (call once at startup)."""
     n = 10
     dummy_band = np.zeros(n, dtype=np.float32)
-    out = np.zeros((n, 13), dtype=np.float32)
+    out = np.zeros((n, 16), dtype=np.float32)
     extract_features(dummy_band, dummy_band, dummy_band, dummy_band, dummy_band,
                      dummy_band, dummy_band, dummy_band, dummy_band, dummy_band, out)
 
-    feat = np.zeros((n, 13), dtype=np.float32)
+    feat = np.zeros((n, 16), dtype=np.float32)
     doy  = np.zeros(n, dtype=np.int32)
     starts = np.array([0], dtype=np.int64)
     caps   = np.array([5], dtype=np.int32)
-    mean   = np.zeros(13, dtype=np.float32)
-    std    = np.ones(13, dtype=np.float32)
-    bands_out = np.zeros((1, 128, 13), dtype=np.float32)
+    mean   = np.zeros(16, dtype=np.float32)
+    std    = np.ones(16, dtype=np.float32)
+    bands_out = np.zeros((1, 128, 16), dtype=np.float32)
     doy_out   = np.zeros((1, 128), dtype=np.int64)
     mask_out  = np.ones((1, 128), dtype=np.bool_)
     fill_windows(feat, doy, starts, caps, mean, std, bands_out, doy_out, mask_out)
