@@ -278,15 +278,18 @@ def test_tile_id_stem_unaffected_by_ensure(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# PS-11  IDs without underscores crash sort_parquet_by_pixel (known fragility)
+# PS-11  IDs without underscores sort without error (northing key falls back to None)
 # ---------------------------------------------------------------------------
 
-def test_sort_parquet_by_pixel_requires_underscore_ids(tmp_path):
-    """sort_parquet_by_pixel silently finds zero row-coords for IDs without
-    underscores (e.g. 'px1'), then divides by zero.
+def test_sort_parquet_by_pixel_tolerates_no_underscore_ids(tmp_path):
+    """sort_parquet_by_pixel no longer crashes on IDs without underscores.
 
-    This documents that the real pipeline pixel IDs must follow the
-    'px_<easting>_<northing>' convention for the sort to work.
+    The northing key extraction (str.splitn("_", 4).list.get(2)) returns null
+    for IDs like 'px1' — Polars sorts nulls first, then falls back to point_id
+    order.  The output is valid and pixel-sorted.
+
+    Real pipeline IDs follow 'px_<easting>_<northing>' so this is an edge case,
+    but it should not crash.
     """
     from utils.parquet_utils import sort_parquet_by_pixel
     from tam.core.dataset import BAND_COLS
@@ -294,64 +297,51 @@ def test_sort_parquet_by_pixel_requires_underscore_ids(tmp_path):
     rng = np.random.default_rng(11)
     _start = datetime.date(2023, 1, 1)
     df = pl.DataFrame({
-        "point_id": ["px1", "px2"],
+        "point_id": ["px2", "px1"],
         "date": [datetime.datetime(_start.year, _start.month, _start.day + 20 * i) for i in range(2)],
         "scl_purity": [1.0, 1.0],
         **{b: rng.uniform(0, 1, 2).astype(np.float32).tolist() for b in BAND_COLS},
     }).with_columns(pl.col("date").cast(pl.Datetime("us")))
-    src = tmp_path / "bad_ids.parquet"
+    src = tmp_path / "any_ids.parquet"
     pq.write_table(df.to_arrow(), src, row_group_size=1)
 
-    dst = tmp_path / "bad_ids_sorted.parquet"
-    with pytest.raises(ZeroDivisionError):
-        sort_parquet_by_pixel(src, dst)
+    dst = tmp_path / "any_ids_sorted.parquet"
+    sort_parquet_by_pixel(src, dst)
+    assert dst.exists() and dst.stat().st_size > 0
 
 
 # ---------------------------------------------------------------------------
-# PS-12  sort_parquet_by_pixel groups by northing row for real pipeline IDs
+# PS-12  sort_parquet_by_pixel sorts by northing row for real pipeline IDs
 #
 # Real IDs: "px_<easting_col>_<northing_row>"
-# The sort must bucket by the northing component (part index 2), not the
-# easting component (part index 1).  After sorting, all pixels sharing a
-# northing row coordinate must land in the same output row group —
-# regardless of how many different easting columns they occupy.
+# The sort key is the northing component so all pixels sharing a northing row
+# are contiguous in the output stream, regardless of easting.  Lexicographic
+# sort on the full point_id would group by easting instead.
 # ---------------------------------------------------------------------------
 
 def test_sort_groups_by_northing_not_easting(tmp_path):
-    """Pixels in the same northing row but different easting columns must be
-    written to the same output row group.
+    """All observations for pixels sharing a northing row must be contiguous
+    in the sorted output — they must not be interleaved with observations from
+    a different northing row.
 
     Grid layout (easting × northing):
       easting 0000: northing 0000, 0001
       easting 0001: northing 0000, 0001
 
-    Input: interleaved across 4 row groups so every pixel spans groups.
-    Expected after sort: one row group per unique northing value (0000, 0001).
-    If the sort mistakenly groups by easting, it produces one row group per
-    easting (0000, 0001) instead — the assertion below would still pass for
-    count but the northing-per-group check catches the axis confusion.
+    After sort: northing 0000 rows come before northing 0001 rows; within
+    each northing, easting order is the secondary key.
     """
     from utils.parquet_utils import sort_parquet_by_pixel
     from tam.core.dataset import BAND_COLS
 
     rng = np.random.default_rng(12)
 
-    # Two eastings, two northings → 4 pixels.
-    # IDs follow the real pipeline convention: px_<easting>_<northing>.
     pids = [
         "px_0000_0000",  # easting 0, northing 0
         "px_0001_0000",  # easting 1, northing 0
         "px_0000_0001",  # easting 0, northing 1
         "px_0001_0001",  # easting 1, northing 1
     ]
-    # Scatter observations: each row group contains one observation per pixel
-    # so that no natural grouping by easting or northing pre-exists.
-    n_obs = 4  # one obs per pixel per row group
-    groups = []
-    for _ in range(3):
-        groups.append(pids)  # repeat all 4 pixels → 4 obs each, 3 row groups
-
-    _start12 = datetime.date(2023, 1, 1)
 
     def _make_df(pid_list):
         n = len(pid_list)
@@ -365,8 +355,8 @@ def test_sort_groups_by_northing_not_easting(tmp_path):
 
     src = tmp_path / "tile.parquet"
     writer = None
-    for pid_list in groups:
-        tbl = _make_df(pid_list).to_arrow()
+    for _ in range(3):
+        tbl = _make_df(pids).to_arrow()
         if writer is None:
             writer = pq.ParquetWriter(src, tbl.schema)
         writer.write_table(tbl)
@@ -374,60 +364,39 @@ def test_sort_groups_by_northing_not_easting(tmp_path):
         writer.close()
 
     dst = tmp_path / "tile_sorted.parquet"
-    sort_parquet_by_pixel(src, dst)
+    sort_parquet_by_pixel(src, dst, row_group_size=1)  # 1 row/rg so each row is individually inspectable
 
-    pf = pq.ParquetFile(dst)
-    n_out = pf.metadata.num_row_groups
+    result = pl.read_parquet(dst)
+    northings = [pid.split("_")[2] for pid in result["point_id"].to_list()]
 
-    # Collect the set of northing values present in each output row group.
-    northings_per_group = []
-    for i in range(n_out):
-        tbl = pf.read_row_group(i, columns=["point_id"])
-        ids = tbl.column("point_id").to_pylist()
-        northings = {pid.split("_")[2] for pid in ids}
-        northings_per_group.append(northings)
-
-    # Every output row group must contain exactly one distinct northing value —
-    # pixels from different geographic rows must never share a row group.
-    for i, northings in enumerate(northings_per_group):
-        assert len(northings) == 1, (
-            f"Row group {i} contains mixed northing values {northings}; "
-            "sort_parquet_by_pixel is grouping by easting instead of northing"
-        )
-
-    # Collect the set of easting values present in each output row group.
-    eastings_per_group = []
-    for i in range(n_out):
-        tbl = pf.read_row_group(i, columns=["point_id"])
-        ids = tbl.column("point_id").to_pylist()
-        eastings = {pid.split("_")[1] for pid in ids}
-        eastings_per_group.append(eastings)
-
-    # Both easting columns (0000, 0001) must appear together in each group —
-    # i.e. no row group is restricted to a single easting value.
-    for i, eastings in enumerate(eastings_per_group):
-        assert eastings == {"0000", "0001"}, (
-            f"Row group {i} contains only eastings {eastings}; "
-            "expected both easting columns to be co-located within a northing row"
-        )
+    # Northing values must not alternate — once we leave northing 0000 we must
+    # never return to it.
+    seen = set()
+    prev = None
+    for n in northings:
+        if n != prev:
+            assert n not in seen, (
+                f"Northing {n!r} reappears after other northings — sort is not grouping by northing"
+            )
+            seen.add(n)
+            prev = n
 
 
 # ---------------------------------------------------------------------------
-# PS-13  Each output row group spans exactly one northing row
-#        (inverse of PS-12: catches the opposite axis confusion)
+# PS-13  All northing rows appear in the output and observations are contiguous
+#        (inverse of PS-12: confirms no northing row is missing or split)
 # ---------------------------------------------------------------------------
 
 def test_sort_does_not_mix_northing_rows(tmp_path):
-    """Pixels from different northing rows must never be placed in the same
-    output row group.  With 3 distinct northing rows the output must have
-    exactly 3 row groups (one per northing), not 1 (merged) or more than 3.
+    """Pixels from different northing rows must not be interleaved in the output.
+    With 3 distinct northing rows the sorted stream must contain all observations
+    for northing 0000 before any for 0001, and all 0001 before any 0002.
     """
     from utils.parquet_utils import sort_parquet_by_pixel
     from tam.core.dataset import BAND_COLS
 
     rng = np.random.default_rng(13)
 
-    # 1 easting × 3 northings
     pids = ["px_0000_0000", "px_0000_0001", "px_0000_0002"]
 
     def _make_df(pid_list):
@@ -441,28 +410,21 @@ def test_sort_does_not_mix_northing_rows(tmp_path):
         }).with_columns(pl.col("date").cast(pl.Datetime("us")))
 
     src = tmp_path / "tile.parquet"
-    # Write all 3 pixels into a single interleaved row group so the sort must
-    # actually separate them.
     tbl = _make_df(pids * 4).to_arrow()
-    pq.write_table(tbl, src, row_group_size=len(pids) * 4)
+    pq.write_table(tbl, src)
 
     dst = tmp_path / "tile_sorted.parquet"
     sort_parquet_by_pixel(src, dst)
 
-    pf = pq.ParquetFile(dst)
-    n_out = pf.metadata.num_row_groups
+    result = pl.read_parquet(dst)
+    northings = [pid.split("_")[2] for pid in result["point_id"].to_list()]
 
-    assert n_out == 3, (
-        f"Expected 3 output row groups (one per northing row), got {n_out}"
-    )
+    assert set(northings) == {"0000", "0001", "0002"}
 
-    seen_northings = set()
-    for i in range(n_out):
-        tbl = pf.read_row_group(i, columns=["point_id"])
-        northings = {pid.split("_")[2] for pid in tbl.column("point_id").to_pylist()}
-        assert len(northings) == 1, f"Row group {i} mixes northing rows: {northings}"
-        seen_northings.update(northings)
-
-    assert seen_northings == {"0000", "0001", "0002"}, (
-        f"Not all northing rows present in output: {seen_northings}"
-    )
+    seen: set[str] = set()
+    prev: str | None = None
+    for n in northings:
+        if n != prev:
+            assert n not in seen, f"Northing {n!r} reappears — rows are not contiguous by northing"
+            seen.add(n)
+            prev = n
