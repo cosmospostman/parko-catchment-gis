@@ -9,7 +9,7 @@ MAVISignal contracts
   M3.  compute returns NaN for S1 rows
   M4.  compute returns NaN for low-scl_purity rows
   M5.  compute output dtype is float32
-  M6.  compute index matches input df index
+  M6.  compute length matches input df
 
 NDSVISignal contracts
 ---------------------
@@ -38,7 +38,7 @@ TemporalVarianceSignal contracts
 from __future__ import annotations
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import pytest
 
 from signals.mavi import MAVISignal
@@ -59,18 +59,31 @@ def _make_df(
     B11: float = 0.2,
     B12: float = 0.15,
     NDVI: float = 0.6,
-) -> pd.DataFrame:
-    return pd.DataFrame({
+) -> pl.DataFrame:
+    dates = pl.date_range(
+        pl.date(2023, 1, 1), pl.date(2023, 1, 1).dt.offset_by(f"{(n-1)*5}d"),
+        interval="5d", eager=True,
+    )
+    return pl.DataFrame({
         "point_id":   [f"px_{i:04d}" for i in range(n)],
-        "date":       pd.date_range("2023-01-01", periods=n, freq="5D"),
-        "source":     source,
-        "scl_purity": scl_purity,
-        "B04":        float(B04),
-        "B08":        float(B08),
-        "B11":        float(B11),
-        "B12":        float(B12),
-        "NDVI":       float(NDVI),
+        "date":       dates,
+        "source":     [source] * n,
+        "scl_purity": [scl_purity] * n,
+        "B04":        [float(B04)] * n,
+        "B08":        [float(B08)] * n,
+        "B11":        [float(B11)] * n,
+        "B12":        [float(B12)] * n,
+        "NDVI":       [float(NDVI)] * n,
     })
+
+
+def _valid(ts: pl.Series) -> np.ndarray:
+    arr = ts.to_numpy()
+    return arr[~np.isnan(arr)]
+
+
+def _all_nan(ts: pl.Series) -> bool:
+    return np.isnan(ts.to_numpy()).all()
 
 
 # ---------------------------------------------------------------------------
@@ -86,32 +99,31 @@ class TestMAVISignal:
         expected = (b08 - b04) / (b08 + b04 + b11)
         df = _make_df(B08=b08, B04=b04, B11=b11)
         ts = self.sig.compute(df)
-        assert np.allclose(ts.dropna(), expected, atol=1e-5)
+        assert np.allclose(_valid(ts), expected, atol=1e-5)
 
     def test_m2_nan_when_denominator_zero(self):
         df = _make_df(B08=0.0, B04=0.0, B11=0.0)
         ts = self.sig.compute(df)
-        assert ts.isna().all()
+        assert _all_nan(ts)
 
     def test_m3_nan_for_s1_rows(self):
         df = _make_df(source="S1")
         ts = self.sig.compute(df)
-        assert ts.isna().all()
+        assert _all_nan(ts)
 
     def test_m4_nan_for_low_scl_purity(self):
         df = _make_df(source="S2", scl_purity=0.1)
         ts = self.sig.compute(df)
-        assert ts.isna().all()
+        assert _all_nan(ts)
 
     def test_m5_output_dtype_float32(self):
         ts = self.sig.compute(_make_df())
-        assert ts.dtype == np.float32
+        assert ts.dtype == pl.Float32
 
-    def test_m6_index_matches_input(self):
+    def test_m6_length_matches_input(self):
         df = _make_df(n=12)
-        df.index = range(50, 62)
         ts = self.sig.compute(df)
-        assert list(ts.index) == list(df.index)
+        assert len(ts) == len(df)
 
 
 # ---------------------------------------------------------------------------
@@ -127,21 +139,21 @@ class TestNDSVISignal:
         expected = (b11 - b04) / (b11 + b04)
         df = _make_df(B11=b11, B04=b04)
         ts = self.sig.compute(df)
-        assert np.allclose(ts.dropna(), expected, atol=1e-5)
+        assert np.allclose(_valid(ts), expected, atol=1e-5)
 
     def test_d2_nan_when_denominator_zero(self):
         df = _make_df(B11=0.0, B04=0.0)
         ts = self.sig.compute(df)
-        assert ts.isna().all()
+        assert _all_nan(ts)
 
     def test_d3_nan_for_quality_failed(self):
         df = _make_df(source="S2", scl_purity=0.2)
         ts = self.sig.compute(df)
-        assert ts.isna().all()
+        assert _all_nan(ts)
 
     def test_d4_output_dtype_float32(self):
         ts = self.sig.compute(_make_df())
-        assert ts.dtype == np.float32
+        assert ts.dtype == pl.Float32
 
 
 # ---------------------------------------------------------------------------
@@ -157,21 +169,21 @@ class TestB12B11Signal:
         expected = b12 / b11
         df = _make_df(B12=b12, B11=b11)
         ts = self.sig.compute(df)
-        assert np.allclose(ts.dropna(), expected, atol=1e-5)
+        assert np.allclose(_valid(ts), expected, atol=1e-5)
 
     def test_w2_nan_when_b11_zero(self):
         df = _make_df(B11=0.0, B12=0.1)
         ts = self.sig.compute(df)
-        assert ts.isna().all()
+        assert _all_nan(ts)
 
     def test_w3_nan_for_quality_failed(self):
         df = _make_df(source="S1", scl_purity=1.0)
         ts = self.sig.compute(df)
-        assert ts.isna().all()
+        assert _all_nan(ts)
 
     def test_w4_output_dtype_float32(self):
         ts = self.sig.compute(_make_df())
-        assert ts.dtype == np.float32
+        assert ts.dtype == pl.Float32
 
 
 # ---------------------------------------------------------------------------
@@ -186,25 +198,26 @@ class TestTemporalVarianceSignal:
         ndvi_val = 0.72
         df = _make_df(NDVI=ndvi_val)
         ts = self.sig.compute(df)
-        assert np.allclose(ts.dropna(), ndvi_val, atol=1e-5)
+        assert np.allclose(_valid(ts), ndvi_val, atol=1e-5)
 
     def test_t2_nan_for_s1_rows(self):
         df = _make_df(source="S1")
         ts = self.sig.compute(df)
-        assert ts.isna().all()
+        assert _all_nan(ts)
 
     def test_t3_nan_for_low_scl_purity(self):
         df = _make_df(source="S2", scl_purity=0.3)
         ts = self.sig.compute(df)
-        assert ts.isna().all()
+        assert _all_nan(ts)
 
     def test_t4_output_dtype_float32(self):
         ts = self.sig.compute(_make_df())
-        assert ts.dtype == np.float32
+        assert ts.dtype == pl.Float32
 
     def test_t5_std_nonzero_for_varying_ndvi(self):
-        df = _make_df(n=20)
-        df["NDVI"] = np.linspace(0.1, 0.9, 20).astype("float32")
+        df = _make_df(n=20).with_columns(
+            pl.Series("NDVI", np.linspace(0.1, 0.9, 20).astype("float32"))
+        )
         ts = self.sig.compute(df)
         stats = self.sig.summarise(ts, df)
         assert stats["std"] > 0.0

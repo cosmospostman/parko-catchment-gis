@@ -29,7 +29,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
+import polars as pl
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -196,7 +196,8 @@ def _extract_item(
     for all pixels with at least one valid observation, or None if the item
     has no overlap with bbox_wgs84.
     """
-    date = pd.to_datetime(item.datetime).date()
+    _dt = item.datetime
+    date = _dt.replace(tzinfo=None) if hasattr(_dt, "replace") else _dt
     orbit_state = item.properties.get("sat:orbit_state", None)
 
     _MARGIN = 0.01
@@ -413,7 +414,7 @@ def _collect_s1_shards(
                 "point_id": pa.array(buf_pid,  pa.string()),
                 "lon":      pa.array(buf_lon,  pa.float64()),
                 "lat":      pa.array(buf_lat,  pa.float64()),
-                "date":     pa.array([pd.Timestamp(d) for d in buf_date], pa.timestamp("ms")),
+                "date":     pa.array([d if hasattr(d, "year") else d for d in buf_date], pa.timestamp("ms")),
                 "source":   pa.array(["S1"] * len(buf_pid), pa.string()),
                 "vh":       pa.array(buf_vh,   pa.float32()),
                 "vv":       pa.array(buf_vv,   pa.float32()),
@@ -479,7 +480,7 @@ def collect_s1(
     cache_dir: Path | None = None,
     point_shard_size: int = 50_000,
     n_workers: int = 4,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """Fetch S1 VH/VV observations for a pixel grid and return as a DataFrame.
 
     Parameters
@@ -517,7 +518,7 @@ def collect_s1(
     items = _resolve_s1_items(bbox_wgs84, start, end, resolved_cache)
     if not items:
         logger.info("No S1 items found for bbox %s in %s/%s", bbox_wgs84, start, end)
-        return pd.DataFrame()
+        return pl.DataFrame()
 
     with tempfile.TemporaryDirectory(prefix="s1_collect_") as _tmp:
         shard_paths = _collect_s1_shards(
@@ -532,13 +533,10 @@ def collect_s1(
 
         if not shard_paths:
             logger.info("S1: no usable observations extracted")
-            return pd.DataFrame()
+            return pl.DataFrame()
 
-        if len(shard_paths) == 1:
-            df = pq.read_table(shard_paths[0]).to_pandas()
-        else:
-            df = pq.read_table(shard_paths).to_pandas()
+        df = pl.read_parquet(shard_paths if len(shard_paths) > 1 else shard_paths[0])
 
-    df["date"] = pd.to_datetime(df["date"])
-    logger.info("S1: %d observations for %d unique dates", len(df), df["date"].nunique())
+    n_unique_dates = df["date"].n_unique()
+    logger.info("S1: %d observations for %d unique dates", len(df), n_unique_dates)
     return df

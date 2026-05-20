@@ -24,7 +24,7 @@ Bands required: B04, B11, B12 — all present in training tile parquets.
 from __future__ import annotations
 
 import numpy as np
-import pandas as pd
+import polars as pl
 
 from signals.base import Signal
 from signals.s2_bands import B12B11Signal
@@ -35,17 +35,13 @@ class NDSVISignal(Signal):
 
     name = "ndsvi"
 
-    def compute(self, df: pd.DataFrame) -> pd.Series:
-        good = self.quality_mask(df)
-        out = pd.Series(np.nan, index=df.index, dtype="float32")
+    def compute(self, df: pl.DataFrame) -> pl.Series:
+        good = self.quality_mask(df).to_numpy()
+        out = np.full(len(df), np.nan, dtype="float32")
         if good.any():
-            b11 = df.loc[good, "B11"].values.astype("float32")
-            b04 = df.loc[good, "B04"].values.astype("float32")
+            b11 = df["B11"].to_numpy().astype("float32")
+            b04 = df["B04"].to_numpy().astype("float32")
             denom = b11 + b04
-            result = np.full(denom.shape, np.nan, dtype="float32")
-            valid = denom != 0
-            result[valid] = (b11[valid] - b04[valid]) / denom[valid]
-            out[good] = result
-        return out
-
-
+            valid = good & (denom != 0)
+            out[valid] = (b11[valid] - b04[valid]) / denom[valid]
+        return pl.Series(out)

@@ -12,6 +12,7 @@ import polars as pl
 
 if TYPE_CHECKING:
     import pyarrow as pa
+    import polars as pl
 
 
 _WRITE_OPTS = dict(
@@ -65,8 +66,8 @@ def _conform_table(tbl: "pa.Table", schema: "pa.Schema") -> "pa.Table":
     )
 
 
-def _s1_df_to_arrow(df_s1: "pd.DataFrame", schema: "pa.Schema") -> "pa.Table":
-    """Convert an S1 DataFrame to a PyArrow table conforming to the combined schema.
+def _s1_df_to_arrow(df_s1: "pl.DataFrame", schema: "pa.Schema") -> "pa.Table":
+    """Convert an S1 Polars DataFrame to a PyArrow table conforming to the combined schema.
 
     S2-only columns (B02…B12, scl_purity, etc.) are filled with null.
     """
@@ -79,7 +80,7 @@ def _s1_df_to_arrow(df_s1: "pd.DataFrame", schema: "pa.Schema") -> "pa.Table":
         if field.name in s1_cols:
             col = df_s1[field.name]
             try:
-                arrays.append(pa.array(col.tolist(), type=field.type))
+                arrays.append(pa.array(col.to_list(), type=field.type))
             except Exception:
                 arrays.append(pa.array([None] * rows, type=field.type))
         else:

@@ -10,8 +10,10 @@ from __future__ import annotations
 import io
 from pathlib import Path
 
+import datetime
+
 import numpy as np
-import pandas as pd
+import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -45,20 +47,17 @@ def _make_parquet(
     tile_tag: str | None = None,
     filename: str = "pixels.parquet",
 ) -> Path:
-    """Write a parquet with one row group per (pixel, year) combination.
-
-    pixels × years are the cross product of observations to generate.
-    Each combination gets N_OBS_PER_YEAR rows spread uniformly through the year.
-    """
+    """Write a parquet with one row group per (pixel, year) combination."""
     rng = np.random.default_rng(0)
     rows = []
     for pid in pixels:
         for yr in years:
-            dates = pd.date_range(f"{yr}-01-15", periods=N_OBS_PER_YEAR, freq="23D")
+            start = datetime.date(yr, 1, 15)
+            dates = [start + datetime.timedelta(days=23 * i) for i in range(N_OBS_PER_YEAR)]
             for d in dates:
                 row = {
                     "point_id": pid,
-                    "date": d,
+                    "date": datetime.datetime(d.year, d.month, d.day),
                     "scl_purity": scl_purity,
                 }
                 if tile_tag is not None:
@@ -66,12 +65,11 @@ def _make_parquet(
                 row.update(_band_row(rng))
                 rows.append(row)
 
-    df = pd.DataFrame(rows)
-    # Store date as timestamp[us] — matches what the real collector writes
-    df["date"] = pd.to_datetime(df["date"]).astype("datetime64[us]")
-
+    df = pl.DataFrame(rows).with_columns(
+        pl.col("date").cast(pl.Datetime("us"))
+    )
     path = tmp_path / filename
-    pq.write_table(pa.Table.from_pandas(df, preserve_index=False), path, row_group_size=N_OBS_PER_YEAR)
+    pq.write_table(df.to_arrow(), path, row_group_size=N_OBS_PER_YEAR)
     return path
 
 
@@ -107,8 +105,8 @@ class TestTS1EndYearFiltersObservations:
         rng = np.random.default_rng(1)
 
         rows = []
-        dates_2021 = pd.date_range("2021-01-15", periods=N_OBS_PER_YEAR, freq="23D")
-        dates_2022 = pd.date_range("2022-01-15", periods=N_OBS_PER_YEAR, freq="23D")
+        dates_2021 = [datetime.date(2021,1,15)+datetime.timedelta(days=23*i) for i in range(N_OBS_PER_YEAR)]
+        dates_2022 = [datetime.date(2022,1,15)+datetime.timedelta(days=23*i) for i in range(N_OBS_PER_YEAR)]
 
         shared_bands = _band_row(rng)  # identical for both pixels
 
@@ -121,10 +119,9 @@ class TestTS1EndYearFiltersObservations:
                 rows.append({"point_id": pid, "date": d, "scl_purity": 1.0,
                              **{b: unique_val for b in BAND_COLS}})
 
-        df = pd.DataFrame(rows)
-        df["date"] = pd.to_datetime(df["date"]).astype("datetime64[us]")
+        df = pl.DataFrame(rows).with_columns(pl.col("date").cast(pl.Datetime("us")))
         path = tmp_path / "pixels.parquet"
-        pq.write_table(pa.Table.from_pandas(df, preserve_index=False), path)
+        pq.write_table(df.to_arrow(), path)
 
         model, band_mean, band_std = _stub_model()
         result = score_pixels_chunked(
@@ -133,8 +130,8 @@ class TestTS1EndYearFiltersObservations:
         )
 
         assert set(result["point_id"]) == {"px_a", "px_b"}
-        score_a = result.loc[result["point_id"] == "px_a", "prob_tam"].iloc[0]
-        score_b = result.loc[result["point_id"] == "px_b", "prob_tam"].iloc[0]
+        score_a = result.filter(pl.col("point_id") == "px_a")["prob_tam"][0]
+        score_b = result.filter(pl.col("point_id") == "px_b")["prob_tam"][0]
         # With end_year=2021 both pixels saw the same data — scores must be identical
         assert score_a == pytest.approx(score_b, abs=1e-5)
 
@@ -143,8 +140,8 @@ class TestTS1EndYearFiltersObservations:
         rng = np.random.default_rng(1)
 
         rows = []
-        dates_2021 = pd.date_range("2021-01-15", periods=N_OBS_PER_YEAR, freq="23D")
-        dates_2022 = pd.date_range("2022-01-15", periods=N_OBS_PER_YEAR, freq="23D")
+        dates_2021 = [datetime.date(2021,1,15)+datetime.timedelta(days=23*i) for i in range(N_OBS_PER_YEAR)]
+        dates_2022 = [datetime.date(2022,1,15)+datetime.timedelta(days=23*i) for i in range(N_OBS_PER_YEAR)]
         shared_bands = _band_row(rng)
 
         for pid in ["px_a", "px_b"]:
@@ -155,10 +152,9 @@ class TestTS1EndYearFiltersObservations:
                 rows.append({"point_id": pid, "date": d, "scl_purity": 1.0,
                              **{b: unique_val for b in BAND_COLS}})
 
-        df = pd.DataFrame(rows)
-        df["date"] = pd.to_datetime(df["date"]).astype("datetime64[us]")
+        df = pl.DataFrame(rows).with_columns(pl.col("date").cast(pl.Datetime("us")))
         path = tmp_path / "pixels.parquet"
-        pq.write_table(pa.Table.from_pandas(df, preserve_index=False), path)
+        pq.write_table(df.to_arrow(), path)
 
         model, band_mean, band_std = _stub_model()
         result = score_pixels_chunked(
@@ -166,8 +162,8 @@ class TestTS1EndYearFiltersObservations:
             end_year=2022, decay=0.0, device="cpu",
         )
 
-        score_a = result.loc[result["point_id"] == "px_a", "prob_tam"].iloc[0]
-        score_b = result.loc[result["point_id"] == "px_b", "prob_tam"].iloc[0]
+        score_a = result.filter(pl.col("point_id") == "px_a")["prob_tam"][0]
+        score_b = result.filter(pl.col("point_id") == "px_b")["prob_tam"][0]
         assert score_a != pytest.approx(score_b, abs=1e-3)
 
     def test_no_end_year_uses_all_data(self, tmp_path):
@@ -192,7 +188,7 @@ class TestTS2SclPurityThreshold:
         """A pixel whose only observations are below the threshold must not appear."""
         rng = np.random.default_rng(2)
         rows = []
-        dates = pd.date_range("2023-01-15", periods=N_OBS_PER_YEAR, freq="23D")
+        dates = [datetime.date(2023,1,15)+datetime.timedelta(days=23*i) for i in range(N_OBS_PER_YEAR)]
 
         # px_clean: all observations at purity 1.0 — should be scored
         for d in dates:
@@ -202,10 +198,9 @@ class TestTS2SclPurityThreshold:
         for d in dates:
             rows.append({"point_id": "px_cloudy", "date": d, "scl_purity": 0.1, **_band_row(rng)})
 
-        df = pd.DataFrame(rows)
-        df["date"] = pd.to_datetime(df["date"]).astype("datetime64[us]")
+        df = pl.DataFrame(rows).with_columns(pl.col("date").cast(pl.Datetime("us")))
         path = tmp_path / "pixels.parquet"
-        pq.write_table(pa.Table.from_pandas(df, preserve_index=False), path)
+        pq.write_table(df.to_arrow(), path)
 
         model, band_mean, band_std = _stub_model()
         result = score_pixels_chunked(
@@ -213,8 +208,8 @@ class TestTS2SclPurityThreshold:
             scl_purity_min=0.5, device="cpu",
         )
 
-        assert "px_clean" in result["point_id"].values
-        assert "px_cloudy" not in result["point_id"].values
+        assert "px_clean" in result["point_id"].to_list()
+        assert "px_cloudy" not in result["point_id"].to_list()
 
     def test_purity_zero_includes_all(self, tmp_path):
         """scl_purity_min=0.0 passes every observation."""
@@ -224,7 +219,7 @@ class TestTS2SclPurityThreshold:
             path, model, band_mean, band_std,
             scl_purity_min=0.0, device="cpu",
         )
-        assert "px1" in result["point_id"].values
+        assert "px1" in result["point_id"].to_list()
 
 
 # ---------------------------------------------------------------------------
@@ -256,8 +251,8 @@ class TestTS3DecayWeighting:
                  np.array([0.1], dtype=np.float32), np.array([0.9], dtype=np.float32)]
 
         df = aggregate_year_probs(pids, years, probs, end_year=end_year, decay=decay)
-        recent = df.loc[df["point_id"] == "px_recent", "prob_tam"].iloc[0]
-        old    = df.loc[df["point_id"] == "px_old",    "prob_tam"].iloc[0]
+        recent = df.filter(pl.col("point_id") == "px_recent")["prob_tam"][0]
+        old    = df.filter(pl.col("point_id") == "px_old")["prob_tam"][0]
         assert recent > old
 
     def test_zero_decay_equalises_years(self):
@@ -272,8 +267,8 @@ class TestTS3DecayWeighting:
                  np.array([0.1], np.float32), np.array([0.9], np.float32)]
 
         df = aggregate_year_probs(pids, years, probs, end_year=2024, decay=0.0)
-        score_a = df.loc[df["point_id"] == "px_a", "prob_tam"].iloc[0]
-        score_b = df.loc[df["point_id"] == "px_b", "prob_tam"].iloc[0]
+        score_a = df.filter(pl.col("point_id") == "px_a")["prob_tam"][0]
+        score_b = df.filter(pl.col("point_id") == "px_b")["prob_tam"][0]
         assert score_a == pytest.approx(score_b, abs=1e-5)
 
     def test_decay_flag_passed_through_to_aggregation(self, tmp_path):
@@ -285,13 +280,12 @@ class TestTS3DecayWeighting:
         rng = np.random.default_rng(3)
         rows = []
         for yr in [2020, 2024]:
-            for d in pd.date_range(f"{yr}-01-15", periods=N_OBS_PER_YEAR, freq="23D"):
+            for d in [datetime.date(yr,1,15)+datetime.timedelta(days=23*i) for i in range(N_OBS_PER_YEAR)]:
                 rows.append({"point_id": "px1", "date": d, "scl_purity": 1.0,
                              **_band_row(rng)})
-        df = pd.DataFrame(rows)
-        df["date"] = pd.to_datetime(df["date"]).astype("datetime64[us]")
+        df = pl.DataFrame(rows).with_columns(pl.col("date").cast(pl.Datetime("us")))
         path = tmp_path / "pixels.parquet"
-        pq.write_table(pa.Table.from_pandas(df, preserve_index=False), path)
+        pq.write_table(df.to_arrow(), path)
 
         model, band_mean, band_std = _stub_model()
         r0 = score_pixels_chunked(path, model, band_mean, band_std,
@@ -299,8 +293,8 @@ class TestTS3DecayWeighting:
         r5 = score_pixels_chunked(path, model, band_mean, band_std,
                                   end_year=2024, decay=5.0, device="cpu")
 
-        s0 = r0.loc[r0["point_id"] == "px1", "prob_tam"].iloc[0]
-        s5 = r5.loc[r5["point_id"] == "px1", "prob_tam"].iloc[0]
+        s0 = r0.filter(pl.col("point_id") == "px1")["prob_tam"][0]
+        s5 = r5.filter(pl.col("point_id") == "px1")["prob_tam"][0]
         # The two runs used different decay — scores must differ
         assert s0 != pytest.approx(s5, abs=1e-4)
 
@@ -316,7 +310,7 @@ class TestTS4TileIdFilter:
         """Pixels that appear only in tile B should be absent when filtering for tile A."""
         rng = np.random.default_rng(4)
         rows = []
-        dates = pd.date_range("2023-01-15", periods=N_OBS_PER_YEAR, freq="23D")
+        dates = [datetime.date(2023,1,15)+datetime.timedelta(days=23*i) for i in range(N_OBS_PER_YEAR)]
 
         for d in dates:
             rows.append({"point_id": "px_tile_a", "date": d, "scl_purity": 1.0,
@@ -325,10 +319,9 @@ class TestTS4TileIdFilter:
             rows.append({"point_id": "px_tile_b", "date": d, "scl_purity": 1.0,
                          "item_id": "S2_54HWE_2023", **_band_row(rng)})
 
-        df = pd.DataFrame(rows)
-        df["date"] = pd.to_datetime(df["date"]).astype("datetime64[us]")
+        df = pl.DataFrame(rows).with_columns(pl.col("date").cast(pl.Datetime("us")))
         path = tmp_path / "pixels.parquet"
-        pq.write_table(pa.Table.from_pandas(df, preserve_index=False), path)
+        pq.write_table(df.to_arrow(), path)
 
         model, band_mean, band_std = _stub_model()
         result = score_pixels_chunked(
@@ -336,26 +329,24 @@ class TestTS4TileIdFilter:
             tile_id="55HBU", device="cpu",
         )
 
-        assert "px_tile_a" in result["point_id"].values
-        assert "px_tile_b" not in result["point_id"].values
+        assert "px_tile_a" in result["point_id"].to_list()
+        assert "px_tile_b" not in result["point_id"].to_list()
 
     def test_no_tile_filter_returns_all(self, tmp_path):
         """tile_id=None must return all pixels regardless of item_id."""
         rng = np.random.default_rng(4)
         rows = []
-        dates = pd.date_range("2023-01-15", periods=N_OBS_PER_YEAR, freq="23D")
+        dates = [datetime.date(2023,1,15)+datetime.timedelta(days=23*i) for i in range(N_OBS_PER_YEAR)]
 
         for pid, tile in [("px_a", "55HBU"), ("px_b", "54HWE")]:
             for d in dates:
                 rows.append({"point_id": pid, "date": d, "scl_purity": 1.0,
                              "item_id": f"S2_{tile}_2023", **_band_row(rng)})
 
-        df = pd.DataFrame(rows)
-        df["date"] = pd.to_datetime(df["date"]).astype("datetime64[us]")
+        df = pl.DataFrame(rows).with_columns(pl.col("date").cast(pl.Datetime("us")))
         path = tmp_path / "pixels.parquet"
         # tile_id=None means item_id column is not read — write without it
-        df_notile = df.drop(columns=["item_id"])
-        pq.write_table(pa.Table.from_pandas(df_notile, preserve_index=False), path)
+        pq.write_table(df.drop("item_id").to_arrow(), path)
 
         model, band_mean, band_std = _stub_model()
         result = score_pixels_chunked(
@@ -392,7 +383,7 @@ class TestTS5OutputSchema:
         model, band_mean, band_std = _stub_model()
         result = score_pixels_chunked(path, model, band_mean, band_std, device="cpu")
         assert len(result) == len(pixels)
-        assert result["point_id"].nunique() == len(pixels)
+        assert result["point_id"].n_unique() == len(pixels)
 
 
 # ---------------------------------------------------------------------------
@@ -421,7 +412,7 @@ class TestMultiTileScoring:
         )
         all_pixels = pixels_a + pixels_b
         assert set(result["point_id"]) == set(all_pixels)
-        assert result["point_id"].nunique() == len(all_pixels)
+        assert result["point_id"].n_unique() == len(all_pixels)
 
     def test_multi_tile_matches_merged_parquet(self, tmp_path):
         """Scores from per-tile parquets match scores from a single merged parquet."""
@@ -433,11 +424,9 @@ class TestMultiTileScoring:
         path_b = _make_parquet(tmp_path, pixels=pixels_b, years=years, filename="tileB.parquet")
 
         # Build merged parquet from both tiles
-        df_a = pd.read_parquet(path_a)
-        df_b = pd.read_parquet(path_b)
-        merged = pd.concat([df_a, df_b], ignore_index=True).sort_values(["point_id", "date"])
+        merged = pl.concat([pl.read_parquet(path_a), pl.read_parquet(path_b)]).sort(["point_id", "date"])
         merged_path = tmp_path / "merged.parquet"
-        pq.write_table(pa.Table.from_pandas(merged, preserve_index=False), merged_path, row_group_size=N_OBS_PER_YEAR)
+        pq.write_table(merged.to_arrow(), merged_path, row_group_size=N_OBS_PER_YEAR)
 
         model, band_mean, band_std = _stub_model()
 
@@ -445,15 +434,17 @@ class TestMultiTileScoring:
             year_parquets=[(y, p) for y in years for p in [path_a, path_b]],
             model=model, band_mean=band_mean, band_std=band_std,
             device="cpu", end_year=max(years),
-        ).sort_values("point_id").reset_index(drop=True)
+        ).sort("point_id")
 
         result_merged = score_location_years(
             year_parquets=[(y, merged_path) for y in years],
             model=model, band_mean=band_mean, band_std=band_std,
             device="cpu", end_year=max(years),
-        ).sort_values("point_id").reset_index(drop=True)
+        ).sort("point_id")
 
-        pd.testing.assert_frame_equal(result_tiled, result_merged, check_like=True)
+        assert result_tiled["point_id"].to_list() == result_merged["point_id"].to_list()
+        for a, b in zip(result_tiled["prob_tam"].to_list(), result_merged["prob_tam"].to_list()):
+            assert a == pytest.approx(b, abs=1e-5)
 
 
 # ---------------------------------------------------------------------------
@@ -505,7 +496,7 @@ class TestTileShardedOutput:
 
         import pyarrow.parquet as pq
         tbl = pq.read_table(final_paths[0])
-        assert tbl.schema.field("point_id").type == pa.string()
+        assert tbl.schema.field("point_id").type in (pa.string(), pa.large_string())
         assert tbl.schema.field("prob_tam").type == pa.uint8()
         scores = tbl.column("prob_tam").to_pylist()
         assert all(0 <= v <= 100 for v in scores)
@@ -529,9 +520,9 @@ class TestTileShardedOutput:
             out_dir=out_dir, device="cpu", end_year=2022,
         )
 
-        by_name = {p.name: pd.read_parquet(p) for p in final_paths}
-        pids_a = set(by_name["54LWH.scores.parquet"]["point_id"])
-        pids_b = set(by_name["54LWJ.scores.parquet"]["point_id"])
+        by_name = {p.name: pl.read_parquet(p) for p in final_paths}
+        pids_a = set(by_name["54LWH.scores.parquet"]["point_id"].to_list())
+        pids_b = set(by_name["54LWJ.scores.parquet"]["point_id"].to_list())
         assert pids_a == set(pixels_a)
         assert pids_b == set(pixels_b)
         assert pids_a.isdisjoint(pids_b)
@@ -564,15 +555,16 @@ class TestTileShardedOutput:
         )
 
         paths1 = score_tiles_chunked(**kwargs)
-        df1 = pd.read_parquet(paths1[0]).sort_values("point_id").reset_index(drop=True)
+        df1 = pl.read_parquet(paths1[0]).sort("point_id")
 
         # Remove final output so phase 2 re-runs, but leave no staging (already cleaned)
         paths1[0].unlink()
 
         paths2 = score_tiles_chunked(**kwargs)
-        df2 = pd.read_parquet(paths2[0]).sort_values("point_id").reset_index(drop=True)
+        df2 = pl.read_parquet(paths2[0]).sort("point_id")
 
-        pd.testing.assert_frame_equal(df1, df2)
+        assert df1["point_id"].to_list() == df2["point_id"].to_list()
+        assert df1["prob_tam"].to_list() == df2["prob_tam"].to_list()
 
 
 # ---------------------------------------------------------------------------
@@ -604,7 +596,7 @@ def _make_split_parquet(
     n_total = N_OBS_PER_YEAR
     rows = []
     for pid in pixels:
-        dates = pd.date_range("2023-01-15", periods=n_total, freq="23D")
+        dates = [datetime.date(2023,1,15)+datetime.timedelta(days=23*i) for i in range(n_total)]
         for d in dates:
             rows.append({
                 "point_id": pid,
@@ -612,14 +604,9 @@ def _make_split_parquet(
                 "scl_purity": 1.0,
                 **_band_row(rng),
             })
-    df = pd.DataFrame(rows)
-    df["date"] = pd.to_datetime(df["date"]).astype("datetime64[us]")
+    df = pl.DataFrame(rows).with_columns(pl.col("date").cast(pl.Datetime("us")))
     path = tmp_path / filename
-    pq.write_table(
-        pa.Table.from_pandas(df, preserve_index=False),
-        path,
-        row_group_size=obs_per_rg,
-    )
+    pq.write_table(df.to_arrow(), path, row_group_size=obs_per_rg)
     return path
 
 
@@ -643,8 +630,8 @@ class TestReaderBufferSplit:
         )
 
         assert set(r_split["point_id"]) == {"px1"}
-        s_split = r_split.loc[r_split["point_id"] == "px1", "prob_tam"].iloc[0]
-        s_bulk  = r_bulk.loc[r_bulk["point_id"] == "px1",  "prob_tam"].iloc[0]
+        s_split = r_split.filter(pl.col("point_id") == "px1")["prob_tam"][0]
+        s_bulk  = r_bulk.filter(pl.col("point_id") == "px1")["prob_tam"][0]
         assert s_split == pytest.approx(s_bulk, abs=1e-5)
 
     def test_split_scores_match_no_split_multiple_pixels(self, tmp_path):
@@ -656,15 +643,17 @@ class TestReaderBufferSplit:
         r_split = score_pixels_chunked(
             path, model, band_mean, band_std,
             device="cpu", buffer_row_groups=1,
-        ).sort_values("point_id").reset_index(drop=True)
+        ).sort("point_id")
 
         r_bulk = score_pixels_chunked(
             path, model, band_mean, band_std,
             device="cpu", buffer_row_groups=999,
-        ).sort_values("point_id").reset_index(drop=True)
+        ).sort("point_id")
 
         assert set(r_split["point_id"]) == set(pixels)
-        pd.testing.assert_frame_equal(r_split, r_bulk, check_like=True)
+        assert r_split["point_id"].to_list() == r_bulk["point_id"].to_list()
+        for a, b in zip(r_split["prob_tam"].to_list(), r_bulk["prob_tam"].to_list()):
+            assert a == pytest.approx(b, abs=1e-5)
 
     def test_split_produces_one_row_per_pixel(self, tmp_path):
         """buffer_row_groups=1 must not create duplicate rows for the same pixel."""
@@ -677,7 +666,7 @@ class TestReaderBufferSplit:
             device="cpu", buffer_row_groups=1,
         )
 
-        assert result["point_id"].nunique() == len(pixels)
+        assert result["point_id"].n_unique() == len(pixels)
         assert len(result) == len(pixels)
 
     def test_split_boundary_pixel_not_dropped(self, tmp_path):
@@ -694,14 +683,12 @@ class TestReaderBufferSplit:
         # followed by "if not leftover.empty: raw_q.put(leftover)".
         rng = np.random.default_rng(42)
         rows = []
-        for d in pd.date_range("2023-01-15", periods=N_OBS_PER_YEAR, freq="23D"):
+        for d in [datetime.date(2023,1,15)+datetime.timedelta(days=23*i) for i in range(N_OBS_PER_YEAR)]:
             rows.append({"point_id": "px_last", "date": d, "scl_purity": 1.0, **_band_row(rng)})
-        df = pd.DataFrame(rows)
-        df["date"] = pd.to_datetime(df["date"]).astype("datetime64[us]")
+        df = pl.DataFrame(rows).with_columns(pl.col("date").cast(pl.Datetime("us")))
         path = tmp_path / "last.parquet"
         # Single row group — pixel is always the boundary/leftover candidate.
-        pq.write_table(pa.Table.from_pandas(df, preserve_index=False), path,
-                       row_group_size=N_OBS_PER_YEAR)
+        pq.write_table(df.to_arrow(), path, row_group_size=N_OBS_PER_YEAR)
 
         model, band_mean, band_std = _stub_model()
         result = score_pixels_chunked(
@@ -709,7 +696,7 @@ class TestReaderBufferSplit:
             device="cpu", buffer_row_groups=1,
         )
 
-        assert "px_last" in result["point_id"].values
+        assert "px_last" in result["point_id"].to_list()
 
     def test_split_leftover_when_entire_buffer_is_one_pixel(self, tmp_path):
         """When every row in the buffer belongs to the boundary pixel, the chunk
@@ -723,13 +710,11 @@ class TestReaderBufferSplit:
         # The leftover should then be prepended to the next buffer.
         rows = []
         for pid in ["px_a", "px_b"]:
-            for d in pd.date_range("2023-01-15", periods=N_OBS_PER_YEAR, freq="23D"):
+            for d in [datetime.date(2023,1,15)+datetime.timedelta(days=23*i) for i in range(N_OBS_PER_YEAR)]:
                 rows.append({"point_id": pid, "date": d, "scl_purity": 1.0, **_band_row(rng)})
-        df = pd.DataFrame(rows)
-        df["date"] = pd.to_datetime(df["date"]).astype("datetime64[us]")
+        df = pl.DataFrame(rows).with_columns(pl.col("date").cast(pl.Datetime("us")))
         path = tmp_path / "twopix.parquet"
-        pq.write_table(pa.Table.from_pandas(df, preserve_index=False), path,
-                       row_group_size=N_OBS_PER_YEAR)
+        pq.write_table(df.to_arrow(), path, row_group_size=N_OBS_PER_YEAR)
 
         model, band_mean, band_std = _stub_model()
         result = score_pixels_chunked(
@@ -752,7 +737,7 @@ def _make_s1_parquet(tmp_path: Path, pixels: list[str], years: list[int],
     rows = []
     for pid in pixels:
         for yr in years:
-            dates = pd.date_range(f"{yr}-01-01", periods=N_OBS_PER_YEAR, freq="6D")
+            dates = [datetime.date(yr,1,1)+datetime.timedelta(days=6*i) for i in range(N_OBS_PER_YEAR)]
             for d in dates:
                 rows.append({
                     "point_id": pid,
@@ -762,11 +747,9 @@ def _make_s1_parquet(tmp_path: Path, pixels: list[str], years: list[int],
                     "vv": float(rng.uniform(1e-4, 1e-2)),
                     "orbit": "ascending",
                 })
-    df = pd.DataFrame(rows)
-    df["date"] = pd.to_datetime(df["date"]).astype("datetime64[us]")
+    df = pl.DataFrame(rows).with_columns(pl.col("date").cast(pl.Datetime("us")))
     path = tmp_path / filename
-    pq.write_table(pa.Table.from_pandas(df, preserve_index=False), path,
-                   row_group_size=N_OBS_PER_YEAR)
+    pq.write_table(df.to_arrow(), path, row_group_size=N_OBS_PER_YEAR)
     return path
 
 
@@ -792,7 +775,7 @@ class TestTSDS1DespeckleLookup:
     def test_returns_dataframe_with_expected_columns(self, tmp_path):
         path = _make_s1_parquet(tmp_path, pixels=["px1", "px2"], years=[2023])
         result = _compute_s1_despeckle_lookup(path, window=3)
-        assert isinstance(result, pd.DataFrame)
+        assert isinstance(result, pl.DataFrame)
         for col in ("point_id", "date", "vh", "vv"):
             assert col in result.columns, f"Missing column: {col}"
 
@@ -807,21 +790,18 @@ class TestTSDS1DespeckleLookup:
         raw = _compute_s1_despeckle_lookup(path, window=1)   # no-op
         smoothed = _compute_s1_despeckle_lookup(path, window=5)
         # window=5 should change at least some values vs window=1 (no-op)
-        assert not raw["vh"].reset_index(drop=True).equals(
-            smoothed["vh"].reset_index(drop=True)
-        )
+        assert not raw["vh"].equals(smoothed["vh"])
 
     def test_empty_parquet_returns_empty_dataframe(self, tmp_path):
         # Parquet with no S1 rows (S2 only — no vh/vv columns at all)
         rng = np.random.default_rng(0)
-        rows = [{"point_id": "px1", "date": pd.Timestamp("2023-01-01"),
+        rows = [{"point_id": "px1", "date": datetime.datetime(2023, 1, 1),
                  "scl_purity": 1.0, **{b: 0.1 for b in BAND_COLS}}]
-        df = pd.DataFrame(rows)
-        df["date"] = pd.to_datetime(df["date"]).astype("datetime64[us]")
+        df = pl.DataFrame(rows).with_columns(pl.col("date").cast(pl.Datetime("us")))
         path = tmp_path / "s2only.parquet"
-        pq.write_table(pa.Table.from_pandas(df, preserve_index=False), path)
+        pq.write_table(df.to_arrow(), path)
         result = _compute_s1_despeckle_lookup(path, window=3)
-        assert isinstance(result, pd.DataFrame)
+        assert isinstance(result, pl.DataFrame)
         assert len(result) == 0
 
 
@@ -838,7 +818,7 @@ class TestTSDS2ScorePixelsChunkedS1Despeckle:
             device="cpu", s1_only=True, s1_despeckle_window=3,
         )
         assert set(result["point_id"]) == {"px1", "px2"}
-        assert result["prob_tam"].between(0, 1).all()
+        assert result["prob_tam"].is_between(0, 1).all()
 
     def test_despeckle_changes_scores_vs_no_despeckle(self, tmp_path):
         path = _make_s1_parquet(tmp_path, pixels=["px1", "px2"], years=[2023])
@@ -846,11 +826,11 @@ class TestTSDS2ScorePixelsChunkedS1Despeckle:
         r_raw   = score_pixels_chunked(
             path, model, band_mean, band_std,
             device="cpu", s1_only=True, s1_despeckle_window=0,
-        ).set_index("point_id")
+        ).sort("point_id")
         r_clean = score_pixels_chunked(
             path, model, band_mean, band_std,
             device="cpu", s1_only=True, s1_despeckle_window=5,
-        ).set_index("point_id")
+        ).sort("point_id")
         # At least one pixel's score should differ after smoothing
         diffs = (r_raw["prob_tam"] - r_clean["prob_tam"]).abs()
         assert diffs.max() > 1e-4, "Expected scores to differ after despeckle"
@@ -870,9 +850,11 @@ class TestTSDS2ScorePixelsChunkedS1Despeckle:
         r_default = score_pixels_chunked(
             path, model, band_mean, band_std,
             device="cpu", s1_only=True,
-        ).set_index("point_id")
+        ).sort("point_id")
         r_zero = score_pixels_chunked(
             path, model, band_mean, band_std,
             device="cpu", s1_only=True, s1_despeckle_window=0,
-        ).set_index("point_id")
-        pd.testing.assert_frame_equal(r_default, r_zero)
+        ).sort("point_id")
+        assert r_default["point_id"].to_list() == r_zero["point_id"].to_list()
+        for a, b in zip(r_default["prob_tam"].to_list(), r_zero["prob_tam"].to_list()):
+            assert a == pytest.approx(b, abs=1e-6)

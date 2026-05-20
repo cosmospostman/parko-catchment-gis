@@ -35,8 +35,10 @@ evaluate() contracts
 
 from __future__ import annotations
 
+import datetime
+
 import numpy as np
-import pandas as pd
+import polars as pl
 import pytest
 from unittest.mock import patch
 
@@ -64,7 +66,7 @@ def _make_obs_df(
     source: str = "S2",
     scl_purity: float = 1.0,
     n_obs_per_year: int = 10,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """Return a synthetic observation dataframe for given pixels and years."""
     rows = []
     for pid in point_ids:
@@ -72,7 +74,7 @@ def _make_obs_df(
             for i in range(n_obs_per_year):
                 rows.append({
                     "point_id": pid,
-                    "date": pd.Timestamp(f"{yr}-06-{i+1:02d}"),
+                    "date": datetime.date(yr, 6, i + 1),
                     "source": source,
                     "scl_purity": scl_purity,
                     "B05": 0.2,
@@ -80,20 +82,19 @@ def _make_obs_df(
                     "B08": 0.5,
                     "B8A": signal_val,   # controls NDRE output
                 })
-    return pd.DataFrame(rows)
+    return pl.DataFrame(rows)
 
 
 class _FixedSignal(Signal):
     """Returns a fixed value per group of rows, driven by B8A column."""
     name = "fixed"
 
-    def compute(self, df: pd.DataFrame) -> pd.Series:
-        good = self.quality_mask(df)
-        out = pd.Series(np.nan, index=df.index, dtype="float32")
+    def compute(self, df: pl.DataFrame) -> pl.Series:
+        good = self.quality_mask(df).to_numpy()
+        out = np.full(len(df), np.nan, dtype="float32")
         if good.any():
-            # Use B8A as the signal value directly for test control
-            out[good] = df.loc[good, "B8A"].values.astype("float32")
-        return out
+            out[good] = df["B8A"].to_numpy().astype("float32")[good]
+        return pl.Series(out)
 
 
 def _make_pixel_year_frame(
@@ -103,7 +104,7 @@ def _make_pixel_year_frame(
     signal_val: float,
     signal_name: str = "fixed",
     n_obs: int = 10,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """Return a pre-aggregated pixel-year frame as _load_region would produce."""
     records = []
     for pid in point_ids:
@@ -121,7 +122,7 @@ def _make_pixel_year_frame(
                 f"{signal_name}_amplitude": 0.0,
                 f"{signal_name}_n_obs": n_obs,
             })
-    return pd.DataFrame(records)
+    return pl.DataFrame(records)
 
 
 # ---------------------------------------------------------------------------
@@ -223,8 +224,8 @@ class TestEvaluate:
 
         def _fake_load(region_id: str, label: str, signal: Signal, **kwargs):
             if label == "presence":
-                return pres_frame.copy()
-            return abs_frame.copy()
+                return pres_frame.clone()
+            return abs_frame.clone()
 
         return patch("signals.eval._load_region", side_effect=_fake_load)
 
@@ -244,7 +245,7 @@ class TestEvaluate:
 
         def _fake_load(region_id, label, signal, **kwargs):
             if region_id == "good_region":
-                return pres_frame.copy()
+                return pres_frame.clone()
             return None  # missing
 
         with patch("signals.eval._load_region", side_effect=_fake_load):

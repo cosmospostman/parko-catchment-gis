@@ -52,7 +52,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -641,13 +641,13 @@ def test_e2e_collect_s1_returns_rows(monkeypatch, _patch_rasterio_realistic):
     ]
     df = mod.collect_s1(bbox, "2022-01-01", "2022-12-31", points)
 
-    assert not df.empty, (
+    assert not df.is_empty(), (
         "collect_s1 returned empty DataFrame — S1 rows were not produced. "
         "This reproduces the production bug where _pixel_window raised WindowError."
     )
     assert (df["source"] == "S1").all()
-    assert df["vh"].notna().any()
-    assert df["vv"].notna().any()
+    assert df["vh"].is_not_null().any()
+    assert df["vv"].is_not_null().any()
 
 
 def test_e2e_collect_s1_out_of_extent_item_skipped(monkeypatch, _patch_rasterio_realistic):
@@ -677,7 +677,7 @@ def test_e2e_collect_s1_out_of_extent_item_skipped(monkeypatch, _patch_rasterio_
     points = [("px_0000", 137.21, -19.585)]
 
     df = mod.collect_s1(bbox, "2022-01-01", "2022-12-31", points)
-    assert df.empty, (
+    assert df.is_empty(), (
         "Expected empty DataFrame when item does not cover target bbox — "
         "collect_s1 must not crash or return phantom rows."
     )
@@ -790,8 +790,8 @@ def test_collect_s1_uses_cache_on_second_call(tmp_path, monkeypatch):
     df2 = collect_s1(bbox, "2022-01-01", "2022-12-31", points, cache_dir=cache_dir)
 
     assert len(df1) == len(df2)
-    np.testing.assert_array_almost_equal(df1["vh"].values, df2["vh"].values)
-    np.testing.assert_array_almost_equal(df1["vv"].values, df2["vv"].values)
+    np.testing.assert_array_almost_equal(df1["vh"].to_numpy(), df2["vh"].to_numpy())
+    np.testing.assert_array_almost_equal(df1["vv"].to_numpy(), df2["vv"].to_numpy())
 
 
 def test_collect_s1_empty_when_no_items(monkeypatch):
@@ -800,7 +800,7 @@ def test_collect_s1_empty_when_no_items(monkeypatch):
     monkeypatch.setattr(mod, "filter_items_by_bbox", lambda items, bbox: items)
     monkeypatch.setattr(mod, "setup_gdal_env", lambda: None)
     df = collect_s1([145.0, -23.0, 145.1, -22.9], "2022-01-01", "2022-12-31", [])
-    assert df.empty
+    assert df.is_empty()
 
 
 def test_collect_s1_columns_and_dtypes(monkeypatch):
@@ -815,12 +815,12 @@ def test_collect_s1_columns_and_dtypes(monkeypatch):
     points = [("px_0000", 145.0 + 0.5 * res, -22.9 - 0.5 * res)]
     df = collect_s1(bbox, "2022-01-01", "2022-12-31", points)
 
-    assert not df.empty
+    assert not df.is_empty()
     for col in ["point_id", "lon", "lat", "date", "source", "vh", "vv"]:
         assert col in df.columns, f"Missing column: {col}"
-    assert df["source"].iloc[0] == "S1"
-    assert pd.api.types.is_float_dtype(df["vh"])
-    assert pd.api.types.is_float_dtype(df["vv"])
+    assert df["source"][0] == "S1"
+    assert df["vh"].dtype in (pl.Float32, pl.Float64)
+    assert df["vv"].dtype in (pl.Float32, pl.Float64)
 
 
 def test_collect_s1_source_always_s1(monkeypatch):
@@ -865,14 +865,13 @@ def test_collect_s1_spatial_alignment(monkeypatch):
     bbox = [lon_origin, lat_origin - nrows * res, lon_origin + ncols * res, lat_origin]
 
     df = collect_s1(bbox, "2022-01-01", "2022-12-31", points)
-    assert not df.empty
+    assert not df.is_empty()
 
-    for _, row in df.iterrows():
-        pid = row["point_id"]
+    for pid, lon, lat in df.select(["point_id", "lon", "lat"]).iter_rows():
         assert pid in point_locs, f"Unknown point_id: {pid}"
         expected_lon, expected_lat = point_locs[pid]
-        assert abs(row["lon"] - expected_lon) < 1e-9, f"{pid} lon mismatch"
-        assert abs(row["lat"] - expected_lat) < 1e-9, f"{pid} lat mismatch"
+        assert abs(lon - expected_lon) < 1e-9, f"{pid} lon mismatch"
+        assert abs(lat - expected_lat) < 1e-9, f"{pid} lat mismatch"
 
 
 # ---------------------------------------------------------------------------
@@ -951,11 +950,12 @@ def test_s1_df_to_arrow_s2_columns_null():
         pa.field("vh", pa.float32()),
         pa.field("vv", pa.float32()),
     ])
-    df = pd.DataFrame({
+    from datetime import date as _date
+    df = pl.DataFrame({
         "point_id": ["px_0000", "px_0001"],
         "lon": [145.0, 145.001],
         "lat": [-22.9, -22.901],
-        "date": [pd.Timestamp("2022-08-15"), pd.Timestamp("2022-08-15")],
+        "date": [_date(2022, 8, 15), _date(2022, 8, 15)],
         "source": ["S1", "S1"],
         "vh": [0.001, 0.002],
         "vv": [0.003, 0.004],
@@ -976,7 +976,7 @@ def test_s1_df_to_arrow_row_count():
         pa.field("vh", pa.float32()),
         pa.field("vv", pa.float32()),
     ])
-    df = pd.DataFrame({
+    df = pl.DataFrame({
         "point_id": [f"px_{i:04d}" for i in range(7)],
         "source": ["S1"] * 7,
         "vh": np.random.rand(7).astype(np.float32),
@@ -995,14 +995,14 @@ def _make_s2_parquet(path: Path, region_id: str, n_pixels: int = 3) -> None:
     from analysis.constants import BANDS, SPECTRAL_INDEX_COLS
     rows = []
     for i in range(n_pixels):
-        for dt in [pd.Timestamp("2022-06-01"), pd.Timestamp("2022-07-01")]:
+        for dt in [date(2022, 6, 1), date(2022, 7, 1)]:
             rows.append({
                 "point_id": f"{region_id}_{i:04d}_0000",
                 "lon": 145.0 + i * 0.0001,
                 "lat": -22.9 - i * 0.0001,
                 "date": dt,
                 "source": "S2",
-                "item_id": f"S2A_tile_{dt.date()}",
+                "item_id": f"S2A_tile_{dt}",
                 "tile_id": "55HBU",
                 **{b: 0.1 + i * 0.01 for b in BANDS},
                 "scl_purity": 1.0,
@@ -1014,13 +1014,11 @@ def _make_s2_parquet(path: Path, region_id: str, n_pixels: int = 3) -> None:
                 "vh": None,
                 "vv": None,
             })
-    df = pd.DataFrame(rows)
-    df["date"] = pd.to_datetime(df["date"])
-    tbl = pa.Table.from_pandas(df, preserve_index=False)
+    tbl = pl.DataFrame(rows).to_arrow()
     pq.write_table(tbl, path)
 
 
-def _make_s1_df(region_id: str, n_pixels: int = 3) -> pd.DataFrame:
+def _make_s1_df(region_id: str, n_pixels: int = 3) -> pl.DataFrame:
     """Return a minimal S1 DataFrame for mocking collect_s1."""
     rows = []
     for i in range(n_pixels):
@@ -1028,12 +1026,12 @@ def _make_s1_df(region_id: str, n_pixels: int = 3) -> pd.DataFrame:
             "point_id": f"{region_id}_{i:04d}_0000",
             "lon": 145.0 + i * 0.0001,
             "lat": -22.9 - i * 0.0001,
-            "date": pd.Timestamp("2022-06-10"),
+            "date": date(2022, 6, 10),
             "source": "S1",
             "vh": 0.001 * (i + 1),
             "vv": 0.002 * (i + 1),
         })
-    return pd.DataFrame(rows)
+    return pl.DataFrame(rows)
 
 
 @pytest.fixture()
@@ -1094,7 +1092,7 @@ def _run_ensure(
         import pyarrow as pa
         import pyarrow.parquet as _pq
         existing = _pq.read_table(tile_path)
-        s1_tbl = pa.Table.from_pandas(s1_df, preserve_index=False)
+        s1_tbl = s1_df.to_arrow()
         combined = pa.concat_tables([existing, s1_tbl], promote_options="default")
         # Cast back to the original schema column types where possible
         combined = combined.select(existing.schema.names)
@@ -1106,49 +1104,43 @@ def _run_ensure(
 
     region_parquet = collector_dirs / "regions" / f"{region_id}.parquet"
     assert region_parquet.exists(), "Region parquet not created"
-    return pd.read_parquet(region_parquet)
+    return pl.read_parquet(region_parquet)
 
 
 def test_ensure_training_pixels_contains_s2_and_s1_rows(tmp_path, collector_dirs, monkeypatch):
     df = _run_ensure(tmp_path, collector_dirs, monkeypatch)
-    assert "S2" in df["source"].values, "No S2 rows found"
-    assert "S1" in df["source"].values, "No S1 rows found"
+    assert "S2" in df["source"].to_list(), "No S2 rows found"
+    assert "S1" in df["source"].to_list(), "No S1 rows found"
 
 
 def test_ensure_training_pixels_sort_order(tmp_path, collector_dirs, monkeypatch):
     """Rows are sortable by (point_id, date) with no duplicate (point_id, date, source)."""
     df = _run_ensure(tmp_path, collector_dirs, monkeypatch)
-    df_sorted = df.sort_values(["point_id", "date"]).reset_index(drop=True)
-    # No duplicate (point_id, date, source) after sorting
-    dupes = df_sorted.duplicated(subset=["point_id", "date", "source"])
-    assert not dupes.any(), f"Duplicate (point_id, date, source) rows:\n{df_sorted[dupes]}"
-    # S1 and S2 observations for the same pixel can share the same date only if sources differ
-    pid_date_groups = df_sorted.groupby(["point_id", "date"])["source"].apply(set)
-    for key, sources in pid_date_groups.items():
-        # Any overlap between S1 and S2 dates is fine — they have different sources
-        assert len(sources) == len(sources), "Sanity check"
+    df_sorted = df.sort(["point_id", "date"])
+    n_unique = df_sorted.unique(subset=["point_id", "date", "source"]).height
+    assert n_unique == len(df_sorted), "Duplicate (point_id, date, source) rows found"
 
 
 def test_ensure_training_pixels_source_labels(tmp_path, collector_dirs, monkeypatch):
     df = _run_ensure(tmp_path, collector_dirs, monkeypatch)
-    assert (df[df["source"] == "S2"]["source"] == "S2").all()
-    assert (df[df["source"] == "S1"]["source"] == "S1").all()
+    assert (df.filter(pl.col("source") == "S2")["source"] == "S2").all()
+    assert (df.filter(pl.col("source") == "S1")["source"] == "S1").all()
 
 
 def test_ensure_training_pixels_vh_vv_null_on_s2(tmp_path, collector_dirs, monkeypatch):
     df = _run_ensure(tmp_path, collector_dirs, monkeypatch)
-    s2_rows = df[df["source"] == "S2"]
-    s1_rows = df[df["source"] == "S1"]
-    assert s2_rows["vh"].isna().all(), "S2 rows should have null vh"
-    assert s2_rows["vv"].isna().all(), "S2 rows should have null vv"
-    assert s1_rows["vh"].notna().all(), "S1 rows should have non-null vh"
-    assert s1_rows["vv"].notna().all(), "S1 rows should have non-null vv"
+    s2_rows = df.filter(pl.col("source") == "S2")
+    s1_rows = df.filter(pl.col("source") == "S1")
+    assert s2_rows["vh"].is_null().all(), "S2 rows should have null vh"
+    assert s2_rows["vv"].is_null().all(), "S2 rows should have null vv"
+    assert s1_rows["vh"].is_not_null().all(), "S1 rows should have non-null vh"
+    assert s1_rows["vv"].is_not_null().all(), "S1 rows should have non-null vv"
 
 
 def test_s1_point_ids_match_s2_pixel_grid(tmp_path, collector_dirs, monkeypatch):
     """S1 point_ids must all appear in the S2 pixel grid — no phantom pixels."""
     df = _run_ensure(tmp_path, collector_dirs, monkeypatch)
-    s2_pids = set(df[df["source"] == "S2"]["point_id"].unique())
-    s1_pids = set(df[df["source"] == "S1"]["point_id"].unique())
+    s2_pids = set(df.filter(pl.col("source") == "S2")["point_id"].to_list())
+    s1_pids = set(df.filter(pl.col("source") == "S1")["point_id"].to_list())
     phantom = s1_pids - s2_pids
     assert not phantom, f"S1 has point_ids not in S2 grid: {phantom}"

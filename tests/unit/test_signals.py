@@ -22,7 +22,7 @@ NDRESignal contracts
   N3.  compute returns correct NDRE value: (B8A - B05) / (B8A + B05)
   N4.  compute returns NaN when denominator is zero (B8A + B05 == 0)
   N5.  compute output dtype is float32
-  N6.  compute index matches input df index
+  N6.  compute length matches input df
 
 CIRESignal contracts
 --------------------
@@ -35,7 +35,7 @@ CIRESignal contracts
 from __future__ import annotations
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import pytest
 
 from signals.base import Signal
@@ -54,29 +54,37 @@ def _make_df(
     B07: float = 0.3,
     B08: float = 0.5,
     B8A: float = 0.4,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """Return a minimal observation dataframe with uniform values."""
-    return pd.DataFrame({
+    dates = pl.date_range(
+        pl.date(2023, 1, 1), pl.date(2023, 1, 1).dt.offset_by(f"{(n-1)*5}d"),
+        interval="5d", eager=True,
+    )
+    return pl.DataFrame({
         "point_id":   [f"px_{i:04d}" for i in range(n)],
-        "date":       pd.date_range("2023-01-01", periods=n, freq="5D"),
-        "source":     source,
-        "scl_purity": scl_purity,
-        "B05":        float(B05),
-        "B07":        float(B07),
-        "B08":        float(B08),
-        "B8A":        float(B8A),
+        "date":       dates,
+        "source":     [source] * n,
+        "scl_purity": [scl_purity] * n,
+        "B05":        [float(B05)] * n,
+        "B07":        [float(B07)] * n,
+        "B08":        [float(B08)] * n,
+        "B8A":        [float(B8A)] * n,
     })
 
 
-def _mixed_df() -> pd.DataFrame:
+def _mixed_df() -> pl.DataFrame:
     """Return a dataframe with a mix of S2/S1 rows and varying scl_purity."""
-    rows = [
-        dict(point_id="p0", date=pd.Timestamp("2023-06-01"), source="S2",  scl_purity=1.0,  B05=0.2, B07=0.3, B08=0.5, B8A=0.4),
-        dict(point_id="p0", date=pd.Timestamp("2023-06-06"), source="S1",  scl_purity=np.nan, B05=np.nan, B07=np.nan, B08=np.nan, B8A=np.nan),
-        dict(point_id="p0", date=pd.Timestamp("2023-06-11"), source="S2",  scl_purity=0.3,  B05=0.2, B07=0.3, B08=0.5, B8A=0.4),
-        dict(point_id="p0", date=pd.Timestamp("2023-06-16"), source="S2",  scl_purity=0.8,  B05=0.1, B07=0.4, B08=0.6, B8A=0.5),
-    ]
-    return pd.DataFrame(rows)
+    return pl.DataFrame({
+        "point_id":   ["p0", "p0", "p0", "p0"],
+        "date":       [pl.date(2023, 6, 1), pl.date(2023, 6, 6),
+                       pl.date(2023, 6, 11), pl.date(2023, 6, 16)],
+        "source":     ["S2", "S1", "S2", "S2"],
+        "scl_purity": [1.0, None, 0.3, 0.8],
+        "B05":        [0.2, None, 0.2, 0.1],
+        "B07":        [0.3, None, 0.3, 0.4],
+        "B08":        [0.5, None, 0.5, 0.6],
+        "B8A":        [0.4, None, 0.4, 0.5],
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -90,11 +98,11 @@ class _ConstantSignal(Signal):
     def __init__(self, value: float = 1.0):
         self._value = value
 
-    def compute(self, df: pd.DataFrame) -> pd.Series:
-        good = self.quality_mask(df)
-        out = pd.Series(np.nan, index=df.index, dtype="float32")
+    def compute(self, df: pl.DataFrame) -> pl.Series:
+        good = self.quality_mask(df).to_numpy()
+        out = np.full(len(df), np.nan, dtype="float32")
         out[good] = self._value
-        return out
+        return pl.Series(out)
 
 
 # ---------------------------------------------------------------------------
@@ -105,27 +113,27 @@ class TestQualityMask:
     def test_b1_passes_good_s2_rows(self):
         df = _make_df(source="S2", scl_purity=1.0)
         mask = Signal.quality_mask(df)
-        assert mask.all()
+        assert mask.to_numpy().all()
 
     def test_b2_rejects_s1_rows(self):
         df = _make_df(source="S1", scl_purity=1.0)
         mask = Signal.quality_mask(df)
-        assert not mask.any()
+        assert not mask.to_numpy().any()
 
     def test_b3_rejects_low_scl_purity(self):
         df = _make_df(source="S2", scl_purity=0.3)
         mask = Signal.quality_mask(df)
-        assert not mask.any()
+        assert not mask.to_numpy().any()
 
     def test_b4_permissive_without_columns(self):
-        df = pd.DataFrame({"B05": [0.2, 0.3], "B8A": [0.4, 0.5]})
+        df = pl.DataFrame({"B05": [0.2, 0.3], "B8A": [0.4, 0.5]})
         mask = Signal.quality_mask(df)
-        assert mask.all()
+        assert mask.to_numpy().all()
 
     def test_b5_custom_threshold(self):
         df = _make_df(source="S2", scl_purity=0.6)
-        assert Signal.quality_mask(df, scl_purity_min=0.5).all()
-        assert not Signal.quality_mask(df, scl_purity_min=0.7).any()
+        assert Signal.quality_mask(df, scl_purity_min=0.5).to_numpy().all()
+        assert not Signal.quality_mask(df, scl_purity_min=0.7).to_numpy().any()
 
 
 class TestDefaultSummarise:
@@ -140,29 +148,28 @@ class TestDefaultSummarise:
             assert key in result, f"missing key: {key}"
 
     def test_b7_all_nan_input_returns_nan_scalars(self):
-        ts = pd.Series(np.nan, index=self.df.index, dtype="float32")
+        ts = pl.Series(np.full(len(self.df), np.nan, dtype="float32"))
         result = self.sig.summarise(ts, self.df)
         for key in ("p05", "p25", "p50", "p75", "p95", "std", "amplitude"):
             assert np.isnan(result[key]), f"{key} should be NaN"
         assert result["n_obs"] == 0
 
     def test_b8_n_obs_counts_non_nan(self):
-        ts = self.sig.compute(self.df)
-        # Manually null half
-        ts.iloc[:5] = np.nan
+        ts_arr = self.sig.compute(self.df).to_numpy().copy()
+        ts_arr[:5] = np.nan
+        ts = pl.Series(ts_arr)
         result = self.sig.summarise(ts, self.df)
         assert result["n_obs"] == 15
 
     def test_b9_amplitude_equals_p95_minus_p05(self):
-        # Use varying values so percentiles differ
         df = _make_df(n=20)
-        ts = pd.Series(np.linspace(0.1, 0.9, 20), index=df.index, dtype="float32")
+        ts = pl.Series(np.linspace(0.1, 0.9, 20).astype("float32"))
         result = self.sig.summarise(ts, df)
         assert abs(result["amplitude"] - (result["p95"] - result["p05"])) < 1e-6
 
     def test_b10_summarise_does_not_require_extra_df_cols(self):
-        df_minimal = pd.DataFrame({"point_id": ["p0"] * 10})
-        ts = pd.Series([0.5] * 10, dtype="float32")
+        df_minimal = pl.DataFrame({"point_id": ["p0"] * 10})
+        ts = pl.Series([0.5] * 10)
         result = self.sig.summarise(ts, df_minimal)
         assert result["n_obs"] == 10
 
@@ -178,47 +185,48 @@ class TestNDRESignal:
     def test_n1_nan_for_s1_rows(self):
         df = _make_df(source="S1")
         ts = self.sig.compute(df)
-        assert ts.isna().all()
+        assert np.isnan(ts.to_numpy()).all()
 
     def test_n2_nan_for_low_scl_purity(self):
         df = _make_df(source="S2", scl_purity=0.1)
         ts = self.sig.compute(df)
-        assert ts.isna().all()
+        assert np.isnan(ts.to_numpy()).all()
 
     def test_n3_correct_ndre_value(self):
         b8a, b05 = 0.4, 0.2
         expected = (b8a - b05) / (b8a + b05)
         df = _make_df(B8A=b8a, B05=b05)
         ts = self.sig.compute(df)
-        assert np.allclose(ts.dropna(), expected, atol=1e-5)
+        valid = ts.to_numpy()
+        valid = valid[~np.isnan(valid)]
+        assert np.allclose(valid, expected, atol=1e-5)
 
     def test_n4_nan_when_denominator_zero(self):
         df = _make_df(B8A=0.0, B05=0.0)
         ts = self.sig.compute(df)
-        assert ts.isna().all()
+        assert np.isnan(ts.to_numpy()).all()
 
     def test_n5_output_dtype_float32(self):
         df = _make_df()
         ts = self.sig.compute(df)
-        assert ts.dtype == np.float32
+        assert ts.dtype == pl.Float32
 
-    def test_n6_index_matches_input(self):
+    def test_n6_length_matches_input(self):
         df = _make_df(n=15)
-        df.index = range(100, 115)
         ts = self.sig.compute(df)
-        assert list(ts.index) == list(df.index)
+        assert len(ts) == len(df)
 
     def test_n_mixed_rows_only_good_s2_computed(self):
         df = _mixed_df()
-        ts = self.sig.compute(df)
+        ts = self.sig.compute(df).to_numpy()
         # row 0: good S2 → value
-        assert not np.isnan(ts.iloc[0])
+        assert not np.isnan(ts[0])
         # row 1: S1 → NaN
-        assert np.isnan(ts.iloc[1])
+        assert np.isnan(ts[1])
         # row 2: low scl_purity → NaN
-        assert np.isnan(ts.iloc[2])
+        assert np.isnan(ts[2])
         # row 3: good S2 → value
-        assert not np.isnan(ts.iloc[3])
+        assert not np.isnan(ts[3])
 
 
 # ---------------------------------------------------------------------------
@@ -234,19 +242,21 @@ class TestCIRESignal:
         expected = b07 / b05 - 1.0
         df = _make_df(B07=b07, B05=b05)
         ts = self.sig.compute(df)
-        assert np.allclose(ts.dropna(), expected, atol=1e-5)
+        valid = ts.to_numpy()
+        valid = valid[~np.isnan(valid)]
+        assert np.allclose(valid, expected, atol=1e-5)
 
     def test_c2_nan_when_b05_zero(self):
         df = _make_df(B05=0.0, B07=0.3)
         ts = self.sig.compute(df)
-        assert ts.isna().all()
+        assert np.isnan(ts.to_numpy()).all()
 
     def test_c3_nan_for_quality_failed_rows(self):
         df = _make_df(source="S2", scl_purity=0.2)
         ts = self.sig.compute(df)
-        assert ts.isna().all()
+        assert np.isnan(ts.to_numpy()).all()
 
     def test_c4_output_dtype_float32(self):
         df = _make_df()
         ts = self.sig.compute(df)
-        assert ts.dtype == np.float32
+        assert ts.dtype == pl.Float32

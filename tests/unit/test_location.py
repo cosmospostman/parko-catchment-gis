@@ -423,9 +423,10 @@ def _make_multi_rg_s2_parquet(path: Path, pixel_rows: list[dict]) -> None:
 
     Each row dict must have: point_id, lon, lat, date, B02..B12, scl_purity, scl.
     """
+    import datetime
     import pyarrow as pa
     import pyarrow.parquet as pq
-    import pandas as pd
+    import polars as pl
 
     schema = pa.schema([
         pa.field("point_id",   pa.string()),
@@ -439,9 +440,11 @@ def _make_multi_rg_s2_parquet(path: Path, pixel_rows: list[dict]) -> None:
     ])
     writer = pq.ParquetWriter(path, schema)
     for row in pixel_rows:
-        df = pd.DataFrame([row])
-        df["date"] = pd.to_datetime(df["date"]).astype("datetime64[us]")
-        writer.write_table(pa.Table.from_pandas(df, schema=schema, preserve_index=False))
+        row = dict(row)
+        if isinstance(row.get("date"), str):
+            row["date"] = datetime.datetime.fromisoformat(row["date"])
+        df = pl.DataFrame([row]).with_columns(pl.col("date").cast(pl.Datetime("us")))
+        writer.write_table(df.to_arrow().cast(schema))
     writer.close()
 
 

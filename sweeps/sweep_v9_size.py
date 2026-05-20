@@ -29,6 +29,8 @@ import logging
 import sys
 from pathlib import Path
 
+import polars as pl
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -69,7 +71,6 @@ logger = logging.getLogger("sweep_v9_size")
 def _load_pixels(base_out: Path):
     import importlib
     import pyarrow.parquet as pq
-    import pandas as pd
     from tam.utils import label_pixels
     from utils.regions import select_regions
     from utils.training_collector import tile_ids_for_regions, tile_parquet_path
@@ -92,20 +93,19 @@ def _load_pixels(base_out: Path):
         read_cols = base_cols + [c for c in exp.feature_cols if c in available] + s1_cols + s2_extra
         read_cols = list(dict.fromkeys(read_cols))
         for rg in range(pf.metadata.num_row_groups):
-            chunks.append(pf.read_row_group(rg, columns=read_cols).to_pandas())
+            chunks.append(pl.from_arrow(pf.read_row_group(rg, columns=read_cols)))
 
-    pixel_df = pd.concat(chunks, ignore_index=True)
-    dates = pd.to_datetime(pixel_df["date"])
-    pixel_df["year"] = dates.dt.year
-    pixel_df["doy"]  = dates.dt.day_of_year
+    pixel_df = pl.concat(chunks).with_columns([
+        pl.col("date").cast(pl.Date).dt.year().alias("year"),
+        pl.col("date").cast(pl.Date).dt.ordinal_day().alias("doy"),
+    ])
 
-    pixel_coords = (
-        pixel_df[["point_id", "lon", "lat"]]
-        .drop_duplicates("point_id")
-        .reset_index(drop=True)
-    )
-    labelled = label_pixels(pixel_coords, regions).dropna(subset=["is_presence"])
-    labels = labelled.set_index("point_id")["is_presence"].map({True: 1.0, False: 0.0})
+    pixel_coords = pixel_df.select(["point_id", "lon", "lat"]).unique("point_id")
+    labelled = label_pixels(pixel_coords, regions).filter(pl.col("is_presence").is_not_null())
+    labels = {
+        row["point_id"]: 1.0 if row["is_presence"] else 0.0
+        for row in labelled.iter_rows(named=True)
+    }
 
     logger.info("Pixels loaded: %d unique points", len(pixel_coords))
     return pixel_df, pixel_coords, labels
@@ -168,7 +168,7 @@ def run_one(run: dict, out_dir: Path, pixel_df, pixel_coords, labels, device) ->
 
     try:
         _, best_val_auc = train_tam(
-            pixel_df=pixel_df[pixel_df["point_id"].isin(labels.index)],
+            pixel_df=pixel_df.filter(pl.col("point_id").is_in(set(labels))),
             labels=labels,
             pixel_coords=pixel_coords,
             out_dir=out_dir,

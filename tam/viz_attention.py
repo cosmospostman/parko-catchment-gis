@@ -23,7 +23,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import pyarrow.parquet as pq
 import torch
 import matplotlib
@@ -165,10 +165,10 @@ def main() -> None:
     cfg = TAMConfig.from_dict(cfg_dict)
     saved_feature_cols = cfg_dict.get("feature_cols") or (list(cfg.feature_cols_override) if cfg.feature_cols_override else None)
 
-    global_feat_df: pd.DataFrame | None = None
+    global_feat_df: pl.DataFrame | None = None
     cache_path = ckpt_dir / "global_features_cache.parquet"
     if cache_path.exists():
-        global_feat_df = pd.read_parquet(cache_path)
+        global_feat_df = pl.read_parquet(cache_path)
 
     n_heads = model.n_heads
     rng     = np.random.default_rng(42)
@@ -193,7 +193,7 @@ def main() -> None:
         site_regions = select_regions(site_region_ids)
         tile_ids     = tile_ids_for_regions(site_region_ids)
 
-        chunks: list[pd.DataFrame] = []
+        chunks: list[pl.DataFrame] = []
         for tid in tile_ids:
             path = tile_parquet_path(tid)
             if not path.exists():
@@ -204,18 +204,22 @@ def main() -> None:
             base_cols = ["point_id", "lon", "lat", "date", "scl_purity"]
             read_cols = base_cols + [c for c in exp.feature_cols if c in available] + s1_cols
             for rg in range(pf.metadata.num_row_groups):
-                chunks.append(pf.read_row_group(rg, columns=read_cols).to_pandas())
+                chunks.append(pl.from_arrow(pf.read_row_group(rg, columns=read_cols)))
 
-        pixel_df = pd.concat(chunks, ignore_index=True)
+        pixel_df = pl.concat(chunks).with_columns([
+            pl.col("date").cast(pl.Date).dt.year().alias("year"),
+            pl.col("date").cast(pl.Date).dt.ordinal_day().alias("doy"),
+        ])
         del chunks
-        pixel_df["year"] = pd.to_datetime(pixel_df["date"]).dt.year
-        pixel_df["doy"]  = pd.to_datetime(pixel_df["date"]).dt.day_of_year
 
-        pixel_coords = pixel_df[["point_id", "lon", "lat"]].drop_duplicates("point_id").reset_index(drop=True)
-        labelled     = label_pixels(pixel_coords, site_regions).dropna(subset=["is_presence"])
-        site_labels  = labelled.set_index("point_id")["is_presence"].map({True: 1.0, False: 0.0})
+        pixel_coords = pixel_df.select(["point_id", "lon", "lat"]).unique("point_id")
+        labelled     = label_pixels(pixel_coords, site_regions).filter(pl.col("is_presence").is_not_null())
+        site_labels  = {
+            row["point_id"]: 1.0 if row["is_presence"] else 0.0
+            for row in labelled.iter_rows(named=True)
+        }
 
-        pixel_df = pixel_df[pixel_df["point_id"].isin(site_labels.index)]
+        pixel_df = pixel_df.filter(pl.col("point_id").is_in(set(site_labels)))
 
         ds = TAMDataset(
             pixel_df, site_labels,
@@ -236,7 +240,7 @@ def main() -> None:
         for cls in [1.0, 0.0]:
             cls_name = "presence" if cls == 1.0 else "absence"
             color    = "steelblue" if cls == 1.0 else "coral"
-            cls_pids = site_labels[site_labels == cls].index.tolist()
+            cls_pids = [pid for pid, v in site_labels.items() if v == cls]
             if not cls_pids:
                 continue
 

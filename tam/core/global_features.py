@@ -30,7 +30,7 @@ from __future__ import annotations
 import os
 
 import numpy as np
-import pandas as pd
+import polars as pl
 
 from tam.core.constants import DRY_DOY_MIN as _DRY_DOY_MIN, DRY_DOY_MAX as _DRY_DOY_MAX
 
@@ -46,7 +46,7 @@ _SMOOTH_DAYS = 30
 _WET_DOY_RANGES = [(305, 365), (1, 120)]   # Nov–Apr wraps around year boundary
 
 
-def compute_global_features(pixel_df: pd.DataFrame) -> pd.DataFrame:
+def compute_global_features(pixel_df: pl.DataFrame) -> pl.DataFrame:
     """Compute per-pixel global features from the full observation time series.
 
     Parameters
@@ -56,167 +56,231 @@ def compute_global_features(pixel_df: pd.DataFrame) -> pd.DataFrame:
 
     Returns
     -------
-    DataFrame indexed by point_id with columns [nir_cv, rec_p, peak_doy, peak_doy_cv].
-    Pixels with insufficient data have NaN for the affected feature.
+    DataFrame with point_id column and global feature columns.
+    Pixels with insufficient data have null for the affected feature.
     """
-    df = pixel_df.copy()
-    if "doy" not in df.columns:
-        df["doy"] = pd.to_datetime(df["date"]).dt.day_of_year
+    if "doy" not in pixel_df.columns:
+        pixel_df = pixel_df.with_columns(
+            pl.col("date").cast(pl.Date).dt.ordinal_day().alias("doy")
+        )
 
-    result = pd.DataFrame(index=df["point_id"].unique())
-    result.index.name = "point_id"
+    all_pids = pixel_df["point_id"].unique().to_list()
+    result = pl.DataFrame({"point_id": all_pids})
 
     if "B08" in pixel_df.columns and "B04" in pixel_df.columns:
-        df["_ndvi"] = (df["B08"] - df["B04"]) / (df["B08"] + df["B04"] + 1e-6)
-        nir_cv, dry_ndvi = _compute_nir_cv_and_dry_ndvi(df)
-        rec_p      = _compute_rec_p(df)
-        peak_stats = _compute_peak_doy(df)
-        result["nir_cv"]      = nir_cv
-        result["rec_p"]       = rec_p
-        result["peak_doy"]    = peak_stats["peak_doy"]
-        result["peak_doy_cv"] = peak_stats["peak_doy_cv"]
-        result["dry_ndvi"]    = dry_ndvi
+        pixel_df = pixel_df.with_columns(
+            ((pl.col("B08") - pl.col("B04")) / (pl.col("B08") + pl.col("B04") + 1e-6)).alias("_ndvi")
+        )
+        nir_cv_df, dry_ndvi_df = _compute_nir_cv_and_dry_ndvi(pixel_df)
+        rec_p_df   = _compute_rec_p(pixel_df)
+        peak_stats = _compute_peak_doy(pixel_df)
+        result = result.join(nir_cv_df, on="point_id", how="left")
+        result = result.join(dry_ndvi_df, on="point_id", how="left")
+        result = result.join(rec_p_df, on="point_id", how="left")
+        result = result.join(peak_stats, on="point_id", how="left")
     else:
         for col in ["nir_cv", "rec_p", "peak_doy", "peak_doy_cv", "dry_ndvi"]:
-            result[col] = np.nan
+            result = result.with_columns(pl.lit(None).cast(pl.Float64).alias(col))
 
     if "vh" in pixel_df.columns and "vv" in pixel_df.columns:
         s1_feats = _compute_s1_globals(pixel_df)
         for col in ["s1_mean_vh_dry", "s1_vh_contrast", "s1_vh_std", "s1_mean_rvi"]:
-            result[col] = s1_feats.get(col, pd.Series(dtype=float))
+            if col in s1_feats.columns:
+                result = result.join(s1_feats.select(["point_id", col]), on="point_id", how="left")
+            else:
+                result = result.with_columns(pl.lit(None).cast(pl.Float64).alias(col))
     else:
         for col in ["s1_mean_vh_dry", "s1_vh_contrast", "s1_vh_std", "s1_mean_rvi"]:
-            result[col] = np.nan
+            result = result.with_columns(pl.lit(None).cast(pl.Float64).alias(col))
 
-    return result[GLOBAL_FEATURE_NAMES]
+    return result.select(["point_id"] + GLOBAL_FEATURE_NAMES)
 
 
-def _compute_nir_cv_and_dry_ndvi(df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+def _compute_nir_cv_and_dry_ndvi(df: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Compute nir_cv and dry_ndvi together — both need the dry-season filter."""
-    dry = df[(df["doy"] >= _DRY_DOY_MIN) & (df["doy"] <= _DRY_DOY_MAX)].copy()
-    dry["_ndvi_dry"] = (dry["B08"] - dry["B04"]) / (dry["B08"] + dry["B04"] + 1e-6)
+    dry = df.filter(
+        (pl.col("doy") >= _DRY_DOY_MIN) & (pl.col("doy") <= _DRY_DOY_MAX)
+    ).with_columns(
+        ((pl.col("B08") - pl.col("B04")) / (pl.col("B08") + pl.col("B04") + 1e-6)).alias("_ndvi_dry")
+    )
 
     annual = (
-        dry.groupby(["point_id", "year"])[["B08", "_ndvi_dry"]]
-        .agg(
-            nir_median=("B08", "median"),
-            nir_count=("B08", "count"),
-            ndvi_median=("_ndvi_dry", "median"),
-        )
-        .reset_index()
+        dry.group_by(["point_id", "year"])
+        .agg([
+            pl.col("B08").median().alias("nir_median"),
+            pl.col("B08").count().alias("nir_count"),
+            pl.col("_ndvi_dry").median().alias("ndvi_median"),
+        ])
+        .filter(pl.col("nir_count") >= _MIN_DRY_OBS)
     )
-    annual = annual[annual["nir_count"] >= _MIN_DRY_OBS]
 
     # nir_cv
-    per_pixel = annual.groupby("point_id")["nir_median"].agg(["mean", "std", "count"])
-    per_pixel = per_pixel[per_pixel["count"] >= 2]
-    nir_cv = (per_pixel["std"] / per_pixel["mean"].clip(lower=1e-6)).rename("nir_cv")
-
-    # dry_ndvi — median of annual dry-season NDVI medians
-    dry_ndvi = annual.groupby("point_id")["ndvi_median"].median().rename("dry_ndvi")
-
-    return nir_cv, dry_ndvi
-
-
-def _compute_rec_p(df: pd.DataFrame) -> pd.Series:
-    annual = (
-        df.groupby(["point_id", "year"])["_ndvi"]
-        .agg(
-            p90=lambda x: np.percentile(x, 90) if len(x) >= _MIN_OBS else np.nan,
-            p10=lambda x: np.percentile(x, 10) if len(x) >= _MIN_OBS else np.nan,
+    per_pixel = (
+        annual.group_by("point_id")
+        .agg([
+            pl.col("nir_median").mean().alias("nir_mean"),
+            pl.col("nir_median").std().alias("nir_std"),
+            pl.col("nir_median").count().alias("nir_year_count"),
+        ])
+        .filter(pl.col("nir_year_count") >= 2)
+        .with_columns(
+            (pl.col("nir_std") / pl.col("nir_mean").clip(lower_bound=1e-6)).alias("nir_cv")
         )
-        .reset_index()
+        .select(["point_id", "nir_cv"])
     )
-    annual["amp"] = annual["p90"] - annual["p10"]
-    return annual.groupby("point_id")["amp"].mean().rename("rec_p")
+
+    # dry_ndvi
+    dry_ndvi = (
+        annual.group_by("point_id")
+        .agg(pl.col("ndvi_median").median().alias("dry_ndvi"))
+    )
+
+    return per_pixel, dry_ndvi
 
 
-def _peak_doy_chunk(chunk_df: pd.DataFrame) -> list[dict]:
+def _compute_rec_p(df: pl.DataFrame) -> pl.DataFrame:
+    annual = (
+        df.group_by(["point_id", "year"])
+        .agg([
+            pl.col("_ndvi").quantile(0.90).alias("p90"),
+            pl.col("_ndvi").quantile(0.10).alias("p10"),
+            pl.col("_ndvi").count().alias("n_obs"),
+        ])
+        .filter(pl.col("n_obs") >= _MIN_OBS)
+        .with_columns((pl.col("p90") - pl.col("p10")).alias("amp"))
+    )
+    return (
+        annual.group_by("point_id")
+        .agg(pl.col("amp").mean().alias("rec_p"))
+    )
+
+
+def _rolling_median(values: np.ndarray, window: int) -> np.ndarray:
+    """Centered rolling median with min_periods=3; returns NaN where insufficient data."""
+    n = len(values)
+    out = np.full(n, np.nan)
+    half = window // 2
+    for i in range(n):
+        lo = max(0, i - half)
+        hi = min(n, i + half + 1)
+        patch = values[lo:hi]
+        valid = patch[~np.isnan(patch)]
+        if len(valid) >= 3:
+            out[i] = np.median(valid)
+    return out
+
+
+def _peak_doy_chunk(chunk_df: pl.DataFrame) -> list[dict]:
+    """Compute peak DOY for each (point_id, year) group using numpy rolling median."""
     results = []
-    for (pid, yr), grp in chunk_df.groupby(["point_id", "year"]):
-        grp = grp.sort_values("doy")
+    for (pid, yr), grp in chunk_df.sort(["point_id", "year", "doy"]).group_by(
+        ["point_id", "year"], maintain_order=True
+    ):
         if len(grp) < _MIN_OBS:
             continue
-        s = grp.set_index("doy")["_ndvi"].sort_index()
-        smoothed = s.rolling(
-            window=min(_SMOOTH_DAYS, len(s)), min_periods=3, center=True
-        ).median()
-        if not smoothed.isna().all():
-            results.append({"point_id": pid, "year": yr, "peak_doy": int(smoothed.idxmax())})
+        doys = grp["doy"].to_numpy()
+        ndvi = grp["_ndvi"].to_numpy().astype(np.float64)
+        w = min(_SMOOTH_DAYS, len(ndvi))
+        smoothed = _rolling_median(ndvi, w)
+        valid = ~np.isnan(smoothed)
+        if valid.any():
+            results.append({"point_id": pid, "year": yr, "peak_doy": int(doys[np.argmax(smoothed)])})
     return results
 
 
-def _compute_peak_doy(df: pd.DataFrame) -> pd.DataFrame:
+def _compute_peak_doy(df: pl.DataFrame) -> pl.DataFrame:
     from joblib import Parallel, delayed
 
     n_jobs = os.cpu_count() or 1
-    pixels = df["point_id"].unique()
-    chunks = np.array_split(pixels, n_jobs)
-    chunk_dfs = [df[df["point_id"].isin(c)] for c in chunks if len(c) > 0]
+    pixels = df["point_id"].unique().to_list()
+    chunk_size = max(1, len(pixels) // n_jobs)
+    chunks = [
+        df.filter(pl.col("point_id").is_in(pixels[i:i + chunk_size]))
+        for i in range(0, len(pixels), chunk_size)
+        if pixels[i:i + chunk_size]
+    ]
 
     nested = Parallel(n_jobs=n_jobs, backend="loky")(
-        delayed(_peak_doy_chunk)(c) for c in chunk_dfs
+        delayed(_peak_doy_chunk)(c) for c in chunks
     )
     results = [row for rows in nested for row in rows]
 
     if not results:
-        return pd.DataFrame(columns=["peak_doy", "peak_doy_cv"], index=pd.Index([], name="point_id"))
+        return pl.DataFrame({"point_id": pl.Series([], dtype=pl.Utf8),
+                              "peak_doy": pl.Series([], dtype=pl.Float64),
+                              "peak_doy_cv": pl.Series([], dtype=pl.Float64)})
 
-    annual = pd.DataFrame(results)
-    return annual.groupby("point_id")["peak_doy"].agg(
-        peak_doy="mean",
-        peak_doy_cv="std",
+    annual = pl.DataFrame(results)
+    return (
+        annual.group_by("point_id")
+        .agg([
+            pl.col("peak_doy").mean().alias("peak_doy"),
+            pl.col("peak_doy").std().alias("peak_doy_cv"),
+        ])
     )
 
 
-def _compute_s1_globals(pixel_df: pd.DataFrame) -> dict[str, pd.Series]:
-    """Compute per-pixel S1 global features from S1 rows in pixel_df.
-
-    Expects rows with source="S1" (or any row where vh/vv are non-null).
-    All backscatter values stored as linear power; converted to dB here.
-    """
+def _compute_s1_globals(pixel_df: pl.DataFrame) -> pl.DataFrame:
+    """Compute per-pixel S1 global features from S1 rows in pixel_df."""
     if "doy" not in pixel_df.columns:
-        df = pixel_df.copy()
-        df["doy"] = pd.to_datetime(df["date"]).dt.day_of_year
+        df = pixel_df.with_columns(
+            pl.col("date").cast(pl.Date).dt.ordinal_day().alias("doy")
+        )
     else:
         df = pixel_df
 
-    # Keep only S1 rows with at least one valid band
     if "source" in df.columns:
-        s1 = df[df["source"] == "S1"].copy()
+        s1 = df.filter(pl.col("source") == "S1")
     else:
-        s1 = df[df["vh"].notna() | df["vv"].notna()].copy()
+        s1 = df.filter(pl.col("vh").is_not_null() | pl.col("vv").is_not_null())
 
-    if s1.empty:
-        empty = pd.Series(dtype=float)
-        return {k: empty for k in ["s1_mean_vh_dry", "s1_vh_contrast", "s1_vh_std", "s1_mean_rvi"]}
+    if s1.is_empty():
+        return pl.DataFrame({"point_id": pl.Series([], dtype=pl.Utf8)})
 
-    # Convert linear power → dB (guard against zero/negative)
-    s1["_vh_db"] = 10 * np.log10(s1["vh"].clip(lower=1e-10))
-    s1["_vv_db"] = 10 * np.log10(s1["vv"].clip(lower=1e-10))
+    vh_lin = s1["vh"].to_numpy().astype("float32")
+    vv_lin = s1["vv"].to_numpy().astype("float32")
+    vh_db = (10 * np.log10(np.clip(vh_lin, 1e-10, None))).astype("float32")
+    vv_db = (10 * np.log10(np.clip(vv_lin, 1e-10, None))).astype("float32")
 
-    # RVI: 4·VH_lin / (VV_lin + VH_lin); requires both bands
-    both = s1["vh"].notna() & s1["vv"].notna()
-    s1["_rvi"] = np.nan
-    s1.loc[both, "_rvi"] = (
-        4 * s1.loc[both, "vh"] / (s1.loc[both, "vv"] + s1.loc[both, "vh"])
+    both = (~np.isnan(vh_lin)) & (~np.isnan(vv_lin))
+    rvi = np.full(len(s1), np.nan, dtype="float32")
+    denom = vh_lin[both] + vv_lin[both]
+    rvi[both] = np.where(denom > 0, 4 * vh_lin[both] / denom, np.nan)
+
+    s1 = s1.with_columns([
+        pl.Series("_vh_db", vh_db),
+        pl.Series("_vv_db", vv_db),
+        pl.Series("_rvi", rvi),
+    ])
+
+    dry = s1.filter(
+        (pl.col("doy") >= _DRY_DOY_MIN) & (pl.col("doy") <= _DRY_DOY_MAX) &
+        pl.col("_vh_db").is_not_null() & pl.col("_vh_db").is_not_nan()
+    )
+    wet = s1.filter(
+        ((pl.col("doy") > _DRY_DOY_MAX) | (pl.col("doy") < _DRY_DOY_MIN)) &
+        pl.col("_vh_db").is_not_null() & pl.col("_vh_db").is_not_nan()
     )
 
-    dry_mask = (s1["doy"] >= _DRY_DOY_MIN) & (s1["doy"] <= _DRY_DOY_MAX)
-    wet_mask = (s1["doy"] > _DRY_DOY_MAX) | (s1["doy"] < _DRY_DOY_MIN)
+    mean_vh_dry = dry.group_by("point_id").agg(pl.col("_vh_db").mean().alias("s1_mean_vh_dry"))
+    mean_vh_wet = wet.group_by("point_id").agg(pl.col("_vh_db").mean().alias("_vh_wet"))
+    vh_std_df = (
+        s1.filter(pl.col("_vh_db").is_not_null() & pl.col("_vh_db").is_not_nan())
+        .group_by("point_id")
+        .agg(pl.col("_vh_db").std().alias("s1_vh_std"))
+    )
+    mean_rvi = (
+        s1.filter(pl.col("_rvi").is_not_null() & pl.col("_rvi").is_not_nan())
+        .group_by("point_id")
+        .agg(pl.col("_rvi").mean().alias("s1_mean_rvi"))
+    )
 
-    dry = s1[dry_mask & s1["_vh_db"].notna()]
-    wet = s1[wet_mask & s1["_vh_db"].notna()]
+    result = mean_vh_dry
+    result = result.join(mean_vh_wet, on="point_id", how="left")
+    result = result.with_columns(
+        (pl.col("_vh_wet") - pl.col("s1_mean_vh_dry")).alias("s1_vh_contrast")
+    ).drop("_vh_wet")
+    result = result.join(vh_std_df, on="point_id", how="left")
+    result = result.join(mean_rvi, on="point_id", how="left")
 
-    mean_vh_dry = dry.groupby("point_id")["_vh_db"].mean().rename("s1_mean_vh_dry")
-    mean_vh_wet = wet.groupby("point_id")["_vh_db"].mean()
-    vh_contrast = (mean_vh_wet - mean_vh_dry).rename("s1_vh_contrast")
-    vh_std      = s1[s1["_vh_db"].notna()].groupby("point_id")["_vh_db"].std().rename("s1_vh_std")
-    mean_rvi    = s1[s1["_rvi"].notna()].groupby("point_id")["_rvi"].mean().rename("s1_mean_rvi")
-
-    return {
-        "s1_mean_vh_dry": mean_vh_dry,
-        "s1_vh_contrast": vh_contrast,
-        "s1_vh_std":      vh_std,
-        "s1_mean_rvi":    mean_rvi,
-    }
+    return result

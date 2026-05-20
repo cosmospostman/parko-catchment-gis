@@ -5,7 +5,6 @@ from pathlib import Path
 import numpy as np
 import pytest
 import xarray as xr
-import geopandas as gpd
 from shapely.geometry import Polygon
 import rioxarray  # noqa: F401
 
@@ -87,17 +86,15 @@ def test_check_crs_fails():
 def test_check_geometry_validity_passes():
     from utils.verification import check_geometry_validity
     poly = Polygon([(0, 0), (1, 0), (1, 1), (0, 1)])
-    gdf = gpd.GeoDataFrame(geometry=[poly], crs="EPSG:7844")
-    check_geometry_validity(gdf)
+    check_geometry_validity([poly])
 
 
 def test_check_geometry_validity_fails():
     from utils.verification import check_geometry_validity
     # Self-intersecting polygon (bowtie)
     invalid = Polygon([(0, 0), (1, 1), (1, 0), (0, 1)])
-    gdf = gpd.GeoDataFrame(geometry=[invalid], crs="EPSG:7844")
     with pytest.raises(AssertionError, match="invalid geometries"):
-        check_geometry_validity(gdf)
+        check_geometry_validity([invalid])
 
 
 def test_check_catchment_median_passes():

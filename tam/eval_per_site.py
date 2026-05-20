@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import pyarrow.parquet as pq
 import torch
 from sklearn.metrics import roc_auc_score
@@ -55,7 +55,7 @@ def main() -> None:
     regions  = select_regions(exp.region_ids)
     tile_ids = tile_ids_for_regions(exp.region_ids)
 
-    chunks: list[pd.DataFrame] = []
+    chunks: list[pl.DataFrame] = []
     for tid in tile_ids:
         path = tile_parquet_path(tid)
         if not path.exists():
@@ -66,16 +66,19 @@ def main() -> None:
             tbl = pf.read_row_group(
                 rg, columns=["point_id", "lon", "lat", "date", "scl_purity"] + exp.feature_cols
             )
-            chunks.append(tbl.to_pandas())
+            chunks.append(pl.from_arrow(tbl))
 
-    pixel_df = pd.concat(chunks, ignore_index=True)
-    dates = pd.to_datetime(pixel_df["date"])
-    pixel_df["year"] = dates.dt.year
-    pixel_df["doy"]  = dates.dt.day_of_year
+    pixel_df = pl.concat(chunks).with_columns([
+        pl.col("date").cast(pl.Date).dt.year().alias("year"),
+        pl.col("date").cast(pl.Date).dt.ordinal_day().alias("doy"),
+    ])
 
-    pixel_coords = pixel_df[["point_id", "lon", "lat"]].drop_duplicates("point_id").reset_index(drop=True)
-    labelled      = label_pixels(pixel_coords, regions).dropna(subset=["is_presence"])
-    all_labels    = labelled.set_index("point_id")["is_presence"].map({True: 1.0, False: 0.0})
+    pixel_coords = pixel_df.select(["point_id", "lon", "lat"]).unique("point_id")
+    labelled     = label_pixels(pixel_coords, regions).filter(pl.col("is_presence").is_not_null())
+    all_labels   = {
+        row["point_id"]: 1.0 if row["is_presence"] else 0.0
+        for row in labelled.iter_rows(named=True)
+    }
 
     # --- Load checkpoint ------------------------------------------------------
     model, band_mean, band_std, *_ = load_tam(out_dir)
@@ -85,28 +88,29 @@ def main() -> None:
     with open(out_dir / "tam_config.json") as fh:
         cfg = TAMConfig.from_dict(json.load(fh))
 
-    global_feat_df: pd.DataFrame | None = None
+    global_feat_df: pl.DataFrame | None = None
     cache_path = out_dir / "global_features_cache.parquet"
     if cache_path.exists():
-        global_feat_df = pd.read_parquet(cache_path)
+        global_feat_df = pl.read_parquet(cache_path)
 
     # --- Per-site eval --------------------------------------------------------
     print(f"{'site':<24}  {'val_auc':<10}  {'n_px'}")
 
     for site in args.sites:
-        site_labels = all_labels[all_labels.index.map(point_site) == site]
+        site_labels = {pid: v for pid, v in all_labels.items() if point_site(pid) == site}
         n_px = len(site_labels)
 
         if n_px == 0:
             print(f"{site:<24}  {'n/a':<10}  0  (no pixels)")
             continue
 
-        if site_labels.nunique() < 2:
-            only = "presence-only" if site_labels.iloc[0] == 1 else "absence-only"
+        unique_vals = set(site_labels.values())
+        if len(unique_vals) < 2:
+            only = "presence-only" if 1.0 in unique_vals else "absence-only"
             print(f"{site:<24}  {'n/a':<10}  {n_px}  ({only})")
             continue
 
-        site_pixel_df = pixel_df[pixel_df["point_id"].isin(site_labels.index)]
+        site_pixel_df = pixel_df.filter(pl.col("point_id").is_in(set(site_labels)))
 
         ds = TAMDataset(
             site_pixel_df, site_labels,

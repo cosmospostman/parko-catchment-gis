@@ -44,7 +44,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
 from pyproj import Transformer
@@ -156,7 +156,7 @@ def extract_item_to_df(
     lats: np.ndarray,
     apply_nbar: bool = True,
     utm_crs: str = "EPSG:32755",
-) -> pd.DataFrame | None:
+) -> pl.DataFrame | None:
     """Extract all usable pixels for one STAC item into a DataFrame.
 
     Uses store.get_all_points() to fetch entire bands as numpy arrays,
@@ -166,7 +166,8 @@ def extract_item_to_df(
     item_id = item.id
     m = _TILE_ID_RE.match(item_id)
     tile_id = m.group(1) if m else item.properties.get("s2:mgrs_tile", "")
-    item_date = pd.Timestamp(item.datetime.replace(tzinfo=None))
+    _dt = item.datetime.replace(tzinfo=None)
+    item_date = _dt
     n = len(point_ids)
 
     # --- SCL: per-point clear-pixel mask ------------------------------------
@@ -228,24 +229,33 @@ def extract_item_to_df(
 
     # --- Filter to clear pixels only ----------------------------------------
     idx = np.where(clear_mask)[0]
-    df = pd.DataFrame({
-        "point_id":   np.array(point_ids)[idx],
-        "lon":        lons[idx],
-        "lat":        lats[idx],
-        "date":       item_date,
-        "item_id":    item_id,
-        "tile_id":    tile_id,
-        "scl_purity": scl_purity[idx],
-        "scl":        scl_int[idx].astype(np.int8),
-        "aot":        aot_quality[idx],
-        "view_zenith": view_zenith_col[idx],
-        "sun_zenith":  sun_zenith_col[idx],
-        **{band: band_arrays[band][idx] for band in BANDS},
-    })
+    n_clear = len(idx)
+    if n_clear == 0:
+        return None
+
+    band_data = {band: band_arrays[band][idx] for band in BANDS}
 
     # Drop rows where all spectral bands are NaN
-    if df[list(BANDS)].isna().all(axis=1).all():
+    all_nan_mask = np.ones(n_clear, dtype=bool)
+    for arr in band_data.values():
+        all_nan_mask &= np.isnan(arr)
+    if all_nan_mask.all():
         return None
+
+    df = pl.DataFrame({
+        "point_id":    list(np.array(point_ids)[idx]),
+        "lon":         lons[idx].astype(np.float64),
+        "lat":         lats[idx].astype(np.float64),
+        "date":        pl.Series([item_date] * n_clear),
+        "item_id":     [item_id] * n_clear,
+        "tile_id":     [tile_id] * n_clear,
+        "scl_purity":  scl_purity[idx].astype(np.float32),
+        "scl":         scl_int[idx].astype(np.int8),
+        "aot":         aot_quality[idx].astype(np.float32),
+        "view_zenith": view_zenith_col[idx].astype(np.float32),
+        "sun_zenith":  sun_zenith_col[idx].astype(np.float32),
+        **{band: arr.astype(np.float32) for band, arr in band_data.items()},
+    })
 
     return add_spectral_indices(df)
 
@@ -618,8 +628,8 @@ def collect(
                     in_flight.pop(fut)
                     item_id, batch_df = fut.result()
 
-                    if batch_df is not None and not batch_df.empty:
-                        table = pa.Table.from_pandas(batch_df[col_order], preserve_index=False)
+                    if batch_df is not None and len(batch_df) > 0:
+                        table = batch_df.select(col_order).to_arrow()
                         shard_buf.append(table)
                         shard_buf_rows += len(table)
                         shard_rows += len(table)

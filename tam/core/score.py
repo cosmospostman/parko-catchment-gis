@@ -10,7 +10,7 @@ from threading import Thread
 from typing import NamedTuple
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import torch
 
 from tam.core.dataset import ALL_FEATURE_COLS, BAND_COLS, MAX_SEQ_LEN, S1_FEATURE_COLS, despeckle_s1, lin_to_db
@@ -42,27 +42,35 @@ def _compute_pixel_s1_stats(parquet: Path) -> tuple[dict, dict, dict, dict]:
     read_cols = [c for c in ["point_id", "source", "vh", "vv"] if c in available]
     chunks = []
     for rg in range(pf.metadata.num_row_groups):
-        df = pf.read_row_group(rg, columns=read_cols).to_pandas()
-        if "source" in df.columns:
-            df = df[df["source"] == "S1"]
-        df = df.dropna(subset=["vh", "vv"])
-        if not df.empty:
-            chunks.append(df[["point_id", "vh", "vv"]])
+        chunk = pl.from_arrow(pf.read_row_group(rg, columns=read_cols))
+        if "source" in chunk.columns:
+            chunk = chunk.filter(pl.col("source") == "S1")
+        chunk = chunk.drop_nulls(subset=["vh", "vv"])
+        if not chunk.is_empty():
+            chunks.append(chunk.select(["point_id", "vh", "vv"]))
     if not chunks:
         return {}, {}, {}, {}
-    all_s1 = pd.concat(chunks, ignore_index=True)
-    all_s1["vh_db"] = lin_to_db(all_s1["vh"].values.astype(np.float32))
-    all_s1["vv_db"] = lin_to_db(all_s1["vv"].values.astype(np.float32))
-    grp = all_s1.groupby("point_id")
-    vh_mean = grp["vh_db"].mean()
-    vh_std  = grp["vh_db"].std().clip(lower=0.1)
-    vv_mean = grp["vv_db"].mean()
-    vv_std  = grp["vv_db"].std().clip(lower=0.1)
-    return (vh_mean.to_dict(), vh_std.to_dict(),
-            vv_mean.to_dict(), vv_std.to_dict())
+    all_s1 = pl.concat(chunks)
+    vh_db = lin_to_db(all_s1["vh"].to_numpy().astype(np.float32))
+    vv_db = lin_to_db(all_s1["vv"].to_numpy().astype(np.float32))
+    all_s1 = all_s1.with_columns([
+        pl.Series("vh_db", vh_db),
+        pl.Series("vv_db", vv_db),
+    ])
+    agg = all_s1.group_by("point_id").agg([
+        pl.col("vh_db").mean().alias("vh_mean"),
+        pl.col("vh_db").std().clip(lower_bound=0.1).alias("vh_std"),
+        pl.col("vv_db").mean().alias("vv_mean"),
+        pl.col("vv_db").std().clip(lower_bound=0.1).alias("vv_std"),
+    ])
+    vh_mean_d = dict(zip(agg["point_id"].to_list(), agg["vh_mean"].to_list()))
+    vh_std_d  = dict(zip(agg["point_id"].to_list(), agg["vh_std"].to_list()))
+    vv_mean_d = dict(zip(agg["point_id"].to_list(), agg["vv_mean"].to_list()))
+    vv_std_d  = dict(zip(agg["point_id"].to_list(), agg["vv_std"].to_list()))
+    return vh_mean_d, vh_std_d, vv_mean_d, vv_std_d
 
 
-def _compute_s1_despeckle_lookup(parquet: Path, window: int) -> pd.DataFrame:
+def _compute_s1_despeckle_lookup(parquet: Path, window: int) -> pl.DataFrame:
     """One-pass pre-read to compute despeckled linear vh/vv per pixel.
 
     Returns a DataFrame with columns [point_id, date, vh, vv] where vh/vv are
@@ -75,28 +83,29 @@ def _compute_s1_despeckle_lookup(parquet: Path, window: int) -> pd.DataFrame:
     read_cols = [c for c in ["point_id", "date", "source", "vh", "vv"] if c in available]
     chunks = []
     for rg in range(pf.metadata.num_row_groups):
-        df = pf.read_row_group(rg, columns=read_cols).to_pandas()
-        if "source" in df.columns:
-            df = df[df["source"] == "S1"]
-        if "vh" not in df.columns or "vv" not in df.columns:
+        chunk = pl.from_arrow(pf.read_row_group(rg, columns=read_cols))
+        if "source" in chunk.columns:
+            chunk = chunk.filter(pl.col("source") == "S1")
+        if "vh" not in chunk.columns or "vv" not in chunk.columns:
             continue
-        df = df.dropna(subset=["vh", "vv"])
-        if not df.empty:
-            chunks.append(df[["point_id", "date", "vh", "vv"]])
+        chunk = chunk.drop_nulls(subset=["vh", "vv"])
+        if not chunk.is_empty():
+            chunks.append(chunk.select(["point_id", "date", "vh", "vv"]))
     if not chunks:
-        return pd.DataFrame(columns=["point_id", "date", "vh", "vv"])
-    all_s1 = pd.concat(chunks, ignore_index=True)
-    return despeckle_s1(all_s1, window)[["point_id", "date", "vh", "vv"]]
+        return pl.DataFrame(schema={"point_id": pl.Utf8, "date": pl.Datetime,
+                                     "vh": pl.Float32, "vv": pl.Float32})
+    all_s1 = pl.concat(chunks)
+    return despeckle_s1(all_s1, window).select(["point_id", "date", "vh", "vv"])
 
 
 def _extract_s1_features(
-    chunk: pd.DataFrame,
+    chunk: pl.DataFrame,
     pixel_zscore: bool = False,
     vh_mean: dict | None = None,
     vh_std:  dict | None = None,
     vv_mean: dict | None = None,
     vv_std:  dict | None = None,
-    despeckle_lookup: dict | None = None,
+    despeckle_lookup: pl.DataFrame | None = None,
 ) -> np.ndarray:
     """Extract 4 S1 features (vh_db, vv_db, vh_vv, rvi) from linear vh/vv columns.
 
@@ -107,20 +116,23 @@ def _extract_s1_features(
 
     When despeckle_lookup is provided (a DataFrame with columns [point_id, date,
     vh, vv] from _compute_s1_despeckle_lookup), smoothed linear vh/vv values are
-    substituted before dB conversion via a (point_id, date) merge.
+    substituted before dB conversion via a (point_id, date) join.
     """
-    if despeckle_lookup is not None and not despeckle_lookup.empty and "date" in chunk.columns:
-        idx = chunk.index
-        merged = chunk[["point_id", "date"]].merge(
-            despeckle_lookup.rename(columns={"vh": "_vh_s", "vv": "_vv_s"}),
-            on=["point_id", "date"], how="left",
+    if despeckle_lookup is not None and not despeckle_lookup.is_empty() and "date" in chunk.columns:
+        chunk = (
+            chunk
+            .join(
+                despeckle_lookup.rename({"vh": "_vh_s", "vv": "_vv_s"}),
+                on=["point_id", "date"], how="left",
+            )
+            .with_columns([
+                pl.when(pl.col("_vh_s").is_not_null()).then(pl.col("_vh_s")).otherwise(pl.col("vh")).alias("vh"),
+                pl.when(pl.col("_vv_s").is_not_null()).then(pl.col("_vv_s")).otherwise(pl.col("vv")).alias("vv"),
+            ])
+            .drop(["_vh_s", "_vv_s"])
         )
-        chunk = chunk.copy()
-        chunk["vh"] = merged["_vh_s"].where(merged["_vh_s"].notna(), chunk["vh"]).values
-        chunk["vv"] = merged["_vv_s"].where(merged["_vv_s"].notna(), chunk["vv"]).values
-        chunk.index = idx
-    vh_lin = chunk["vh"].values.astype(np.float32)
-    vv_lin = chunk["vv"].values.astype(np.float32)
+    vh_lin = chunk["vh"].to_numpy().astype(np.float32)
+    vv_lin = chunk["vv"].to_numpy().astype(np.float32)
     vh_db  = lin_to_db(vh_lin)
     vv_db  = lin_to_db(vv_lin)
     vh_vv  = vh_db - vv_db
@@ -161,7 +173,7 @@ class _PreparedBatch(NamedTuple):
 
 
 def _preprocess(
-    chunk: pd.DataFrame,
+    chunk: pl.DataFrame,
     band_mean: np.ndarray,
     band_std: np.ndarray,
     scl_purity_min: float,
@@ -173,7 +185,7 @@ def _preprocess(
     vh_std:  dict | None = None,
     vv_mean: dict | None = None,
     vv_std:  dict | None = None,
-    despeckle_lookup: pd.DataFrame | None = None,
+    despeckle_lookup: pl.DataFrame | None = None,
     feature_cols: list[str] | None = None,
     pixel_zscore_stats: tuple[dict, dict] | None = None,
     max_seq_len: int = MAX_SEQ_LEN,
@@ -189,11 +201,12 @@ def _preprocess(
     from tam.core._preprocess_numba import extract_features, fill_windows
 
     if s1_only:
-        chunk = chunk[chunk["source"] == "S1"].copy() if "source" in chunk.columns else chunk
-        chunk = chunk.dropna(subset=["vh", "vv"])
+        if "source" in chunk.columns:
+            chunk = chunk.filter(pl.col("source") == "S1")
+        chunk = chunk.drop_nulls(subset=["vh", "vv"])
     elif "scl_purity" in chunk.columns:
-        chunk = chunk[chunk["scl_purity"] >= scl_purity_min]
-    if chunk.empty:
+        chunk = chunk.filter(pl.col("scl_purity") >= scl_purity_min)
+    if chunk.is_empty():
         return None
 
     N = len(chunk)
@@ -211,25 +224,25 @@ def _preprocess(
             n_feat = _N_FEATURES
             feat = np.empty((N, n_feat), dtype=np.float32)
             extract_features(
-                chunk["B02"].values, chunk["B03"].values, chunk["B04"].values,
-                chunk["B05"].values, chunk["B06"].values, chunk["B07"].values,
-                chunk["B08"].values, chunk["B8A"].values, chunk["B11"].values,
-                chunk["B12"].values,
+                chunk["B02"].to_numpy(), chunk["B03"].to_numpy(), chunk["B04"].to_numpy(),
+                chunk["B05"].to_numpy(), chunk["B06"].to_numpy(), chunk["B07"].to_numpy(),
+                chunk["B08"].to_numpy(), chunk["B8A"].to_numpy(), chunk["B11"].to_numpy(),
+                chunk["B12"].to_numpy(),
                 feat,
             )
         else:
-            # Pandas path for non-default feature sets (e.g. V9: no B06, no EVI)
+            # Polars path for non-default feature sets (e.g. V9: no B06, no EVI)
             from analysis.constants import add_spectral_indices
             _cols_needed = set(feature_cols) - set(chunk.columns)
             if _cols_needed:
                 chunk = add_spectral_indices(chunk)
             n_feat = len(feature_cols)
-            feat = chunk[feature_cols].values.astype(np.float32)
+            feat = chunk.select(feature_cols).to_numpy().astype(np.float32)
 
     # Step 2: find group boundaries (pixel-year windows)
-    pid_arr  = chunk["point_id"].values
-    year_arr = chunk["year"].values.astype(np.int32)
-    doy_arr  = chunk["doy"].values.astype(np.int32)
+    pid_arr  = chunk["point_id"].to_numpy()
+    year_arr = chunk["year"].to_numpy().astype(np.int32)
+    doy_arr  = chunk["doy"].to_numpy().astype(np.int32)
 
     pid_change  = np.empty(N, dtype=bool)
     year_change = np.empty(N, dtype=bool)
@@ -313,27 +326,36 @@ def _compute_s2_pixel_zscore_stats(
     raw_band_cols = [c for c in feature_cols if c not in ("NDVI", "NDWI", "EVI")]
     read_cols = ["point_id", "scl_purity"] + raw_band_cols
 
-    chunks: list[pd.DataFrame] = []
+    chunks: list[pl.DataFrame] = []
     for _, path in sorted(year_parquets):
         pf = pq.ParquetFile(path)
         available = set(pf.schema_arrow.names)
         cols = [c for c in read_cols if c in available]
         for rg in range(pf.metadata.num_row_groups):
-            chunk = pf.read_row_group(rg, columns=cols).to_pandas()
+            chunk = pl.from_arrow(pf.read_row_group(rg, columns=cols))
             if "scl_purity" in chunk.columns:
-                chunk = chunk[chunk["scl_purity"] >= scl_purity_min]
+                chunk = chunk.filter(pl.col("scl_purity") >= scl_purity_min)
             chunks.append(chunk)
 
     if not chunks:
         return {}, {}
 
-    df = pd.concat(chunks, ignore_index=True)
+    df = pl.concat(chunks)
     index_cols = [c for c in feature_cols if c in ("NDVI", "NDWI", "EVI")]
     if index_cols:
         df = add_spectral_indices(df)
 
-    grp = df.groupby("point_id")
-    pids = grp[feature_cols[0]].mean().index.values
+    agg_exprs = [pl.col("point_id")]
+    for col in feature_cols:
+        if col in df.columns:
+            agg_exprs.append(pl.col(col).mean().alias(f"{col}_mean"))
+            agg_exprs.append(pl.col(col).std().fill_null(1.0).clip(lower_bound=1e-6).alias(f"{col}_std"))
+    grp = df.group_by("point_id").agg([
+        *(pl.col(col).mean().alias(f"{col}_mean") for col in feature_cols if col in df.columns),
+        *(pl.col(col).std().fill_null(1.0).clip(lower_bound=1e-6).alias(f"{col}_std")
+          for col in feature_cols if col in df.columns),
+    ])
+    pids = grp["point_id"].to_numpy()
 
     means: list[np.ndarray] = []
     stds:  list[np.ndarray] = []
@@ -342,9 +364,8 @@ def _compute_s2_pixel_zscore_stats(
             means.append(np.zeros(len(pids), dtype=np.float32))
             stds.append(np.ones(len(pids),  dtype=np.float32))
             continue
-        vals = grp[col]
-        means.append(vals.mean().reindex(pids).fillna(0).values.astype(np.float32))
-        stds.append( vals.std().reindex(pids).fillna(1).clip(lower=1e-6).values.astype(np.float32))
+        means.append(grp[f"{col}_mean"].fill_null(0.0).to_numpy().astype(np.float32))
+        stds.append(grp[f"{col}_std"].fill_null(1.0).to_numpy().astype(np.float32))
 
     mean_matrix = np.column_stack(means)  # (n_pixels, n_feat)
     std_matrix  = np.column_stack(stds)
@@ -374,21 +395,21 @@ def _compute_band_summaries_from_parquets(
     raw_band_cols = [c for c in feature_cols if c not in ("NDVI", "NDWI", "EVI")]
     read_cols = ["point_id", "scl_purity"] + raw_band_cols
 
-    chunks: list[pd.DataFrame] = []
+    chunks: list[pl.DataFrame] = []
     for _, path in sorted(year_parquets):
         pf = pq.ParquetFile(path)
         available = set(pf.schema_arrow.names)
         cols = [c for c in read_cols if c in available]
         for rg in range(pf.metadata.num_row_groups):
-            chunk = pf.read_row_group(rg, columns=cols).to_pandas()
+            chunk = pl.from_arrow(pf.read_row_group(rg, columns=cols))
             if "scl_purity" in chunk.columns:
-                chunk = chunk[chunk["scl_purity"] >= scl_purity_min]
+                chunk = chunk.filter(pl.col("scl_purity") >= scl_purity_min)
             chunks.append(chunk)
 
     if not chunks:
         return {}
 
-    df = pd.concat(chunks, ignore_index=True)
+    df = pl.concat(chunks)
 
     # Compute spectral indices if needed
     index_cols = [c for c in feature_cols if c in ("NDVI", "NDWI", "EVI")]
@@ -398,18 +419,25 @@ def _compute_band_summaries_from_parquets(
     # Compute raw p5/p95/std per pixel for each feature col (no normalisation yet)
     # NOTE: pixel z-score is intentionally NOT applied here — training computes band
     # summaries from raw reflectances (before z-scoring), so inference must match.
-    grp = df.groupby("point_id")
-    pids = grp[feature_cols[0]].mean().index.values  # stable key order
+    agg_exprs = []
+    for col in feature_cols:
+        if col in df.columns:
+            agg_exprs += [
+                pl.col(col).quantile(0.05).alias(f"{col}_p5"),
+                pl.col(col).quantile(0.95).alias(f"{col}_p95"),
+                pl.col(col).std().fill_null(0.0).alias(f"{col}_std"),
+            ]
+    grp = df.group_by("point_id").agg(agg_exprs)
+    pids = grp["point_id"].to_numpy()
     summary_cols: list[np.ndarray] = []
     for col in feature_cols:
         if col not in df.columns:
             z = np.zeros(len(pids), dtype=np.float32)
             summary_cols += [z, z, z]
             continue
-        vals = grp[col]
-        p5  = vals.quantile(0.05).reindex(pids).fillna(0).values.astype(np.float32)
-        p95 = vals.quantile(0.95).reindex(pids).fillna(0).values.astype(np.float32)
-        std = vals.std().fillna(0).reindex(pids).fillna(0).values.astype(np.float32)
+        p5  = grp[f"{col}_p5"].fill_null(0.0).to_numpy().astype(np.float32)
+        p95 = grp[f"{col}_p95"].fill_null(0.0).to_numpy().astype(np.float32)
+        std = grp[f"{col}_std"].fill_null(0.0).to_numpy().astype(np.float32)
         summary_cols += [p5, p95, std]
 
     summary_matrix = np.column_stack(summary_cols)  # (n_pixels, n_cols*3)
@@ -466,14 +494,15 @@ def aggregate_year_probs(
     all_probs: list,
     end_year: int,
     decay: float = 0.7,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """Aggregate per-(pixel, year) probabilities into a single score per pixel.
 
     Vectorised: concatenates all arrays, applies decay weights, then uses
-    pandas groupby to compute weighted mean per pixel.
+    Polars groupby to compute weighted mean per pixel.
     """
     if not all_pids:
-        return pd.DataFrame(columns=["point_id", "prob_tam"])
+        return pl.DataFrame({"point_id": pl.Series([], dtype=pl.Utf8),
+                              "prob_tam": pl.Series([], dtype=pl.Float32)})
 
     pids_np  = np.concatenate(all_pids)
     years_np = np.concatenate(all_years).astype(np.int32)
@@ -482,10 +511,18 @@ def aggregate_year_probs(
     weights = np.exp(-decay * (end_year - years_np)).astype(np.float32)
     weighted_probs = weights * probs_np
 
-    df = pd.DataFrame({"point_id": pids_np, "wp": weighted_probs, "w": weights})
-    agg = df.groupby("point_id", sort=False)[["wp", "w"]].sum()
-    agg["prob_tam"] = agg["wp"] / agg["w"]
-    return agg[["prob_tam"]].reset_index()
+    df = pl.DataFrame({
+        "point_id": pids_np,
+        "wp": weighted_probs,
+        "w": weights,
+    })
+    agg = df.group_by("point_id", maintain_order=False).agg([
+        pl.col("wp").sum().alias("wp_sum"),
+        pl.col("w").sum().alias("w_sum"),
+    ]).with_columns(
+        (pl.col("wp_sum") / pl.col("w_sum")).alias("prob_tam")
+    ).select(["point_id", "prob_tam"])
+    return agg
 
 
 def score_pixels_chunked(
@@ -513,7 +550,7 @@ def score_pixels_chunked(
     _all_pids:  list | None = None,
     _all_years: list | None = None,
     _all_probs: list | None = None,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """Score all pixels in a single-year parquet with a three-stage concurrent pipeline.
 
     Stage 1 (reader thread):          reads row groups → raw DataFrame queue
@@ -580,38 +617,43 @@ def score_pixels_chunked(
 
     # --- Stage 1: reader ---
     def _reader() -> None:
-        leftover: pd.DataFrame = pd.DataFrame()
-        buffer: list[pd.DataFrame] = []
+        leftover: pl.DataFrame = pl.DataFrame()
+        buffer: list[pl.DataFrame] = []
 
-        def _emit(buf: list[pd.DataFrame], lo: pd.DataFrame, is_last: bool) -> pd.DataFrame:
+        def _emit(buf: list[pl.DataFrame], lo: pl.DataFrame, is_last: bool) -> pl.DataFrame:
             if not buf:
                 return lo
-            chunk = pd.concat(buf, ignore_index=True)
-            if not lo.empty:
-                chunk = pd.concat([lo, chunk], ignore_index=True)
+            chunk = pl.concat(buf)
+            if not lo.is_empty():
+                chunk = pl.concat([lo, chunk])
             if not is_last:
-                boundary_pid = chunk["point_id"].iloc[-1]
-                new_lo = chunk[chunk["point_id"] == boundary_pid].copy()
-                chunk = chunk[chunk["point_id"] != boundary_pid]
+                boundary_pid = chunk["point_id"][-1]
+                new_lo = chunk.filter(pl.col("point_id") == boundary_pid)
+                chunk = chunk.filter(pl.col("point_id") != boundary_pid)
             else:
-                new_lo = pd.DataFrame()
-            if not chunk.empty:
+                new_lo = pl.DataFrame()
+            if not chunk.is_empty():
                 raw_q.put(chunk)
             return new_lo
 
         for rg in range(n_rg):
-            chunk = pf.read_row_group(rg, columns=read_cols).to_pandas()
+            chunk = pl.from_arrow(pf.read_row_group(rg, columns=read_cols))
             if tile_prefix:
-                chunk = chunk[chunk["item_id"].str.contains(tile_prefix, regex=False)]
+                chunk = chunk.filter(pl.col("item_id").str.contains(tile_prefix, literal=True))
             if not s1_only and "scl_purity" in chunk.columns:
-                chunk = chunk[chunk["scl_purity"] >= scl_purity_min]
-            if chunk.empty:
+                chunk = chunk.filter(pl.col("scl_purity") >= scl_purity_min)
+            if chunk.is_empty():
                 continue
-            ts_us = pd.to_datetime(chunk["date"]).values.astype("datetime64[us]").astype("int64")
-            chunk["year"], chunk["doy"] = _extract_year_doy(ts_us)
+            # Extract year/doy from date column
+            ts_us = chunk["date"].cast(pl.Datetime("us")).to_numpy(allow_copy=True).astype("int64")
+            year_arr, doy_arr = _extract_year_doy(ts_us)
+            chunk = chunk.with_columns([
+                pl.Series("year", year_arr.astype(np.int32)),
+                pl.Series("doy",  doy_arr.astype(np.int32)),
+            ])
             if end_year:
-                chunk = chunk[chunk["year"] <= end_year]
-            if chunk.empty:
+                chunk = chunk.filter(pl.col("year") <= end_year)
+            if chunk.is_empty():
                 continue
             buffer.append(chunk)
             if len(buffer) >= buffer_row_groups:
@@ -619,7 +661,7 @@ def score_pixels_chunked(
                 buffer = []
 
         leftover = _emit(buffer, leftover, is_last=True)
-        if not leftover.empty:
+        if not leftover.is_empty():
             raw_q.put(leftover)
         for _ in range(n_prep_workers):
             raw_q.put(_SENTINEL)
@@ -697,7 +739,7 @@ def score_location_years(
     feature_cols: list[str] | None = None,
     global_feat_mean: np.ndarray | None = None,
     global_feat_std: np.ndarray | None = None,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """Score a location across multiple annual parquets and aggregate.
 
     year_parquets: [(year, path), ...] — must be pixel-sorted parquets.
@@ -830,11 +872,12 @@ def score_tile_year(
         s1_despeckle_window=s1_despeckle_window,
     )
 
-    scores["year"] = np.int16(year)
-    tbl = pa.Table.from_pandas(
-        scores[["point_id", "year", "prob_tam"]].rename(columns={"prob_tam": "prob_tam_raw"}),
-        preserve_index=False,
-    )
+    scores = scores.with_columns(pl.lit(np.int16(year)).alias("year"))
+    tbl = scores.select([
+        "point_id",
+        "year",
+        pl.col("prob_tam").alias("prob_tam_raw"),
+    ]).to_arrow()
     tmp_path = out_path.with_suffix(".tmp.parquet")
     pq.write_table(tbl, tmp_path, **_STAGING_WRITE_OPTS)
     tmp_path.rename(out_path)  # atomic on POSIX; only visible once complete
@@ -964,19 +1007,23 @@ def score_tiles_chunked(
         logger.info("Aggregating tile %s across %d years ...", tile_id, len(s_paths))
 
         # Read all staging parquets for this tile
-        chunks = [pd.read_parquet(p, columns=["point_id", "year", "prob_tam_raw"]) for p in s_paths]
-        raw = pd.concat(chunks, ignore_index=True)
+        raw = pl.concat([
+            pl.read_parquet(p, columns=["point_id", "year", "prob_tam_raw"])
+            for p in s_paths
+        ])
 
-        all_pids  = [raw["point_id"].values]
-        all_years = [raw["year"].values.astype(np.int32)]
-        all_probs = [raw["prob_tam_raw"].values.astype(np.float32)]
+        all_pids  = [raw["point_id"].to_numpy()]
+        all_years = [raw["year"].to_numpy().astype(np.int32)]
+        all_probs = [raw["prob_tam_raw"].to_numpy().astype(np.float32)]
 
         agg = aggregate_year_probs(all_pids, all_years, all_probs, end_year=_eff_end_year, decay=decay)
 
         # Convert float [0,1] → uint8 [0,100]
-        agg["prob_tam"] = (agg["prob_tam"].clip(0.0, 1.0) * 100).round().astype(np.uint8)
+        agg = agg.with_columns(
+            (pl.col("prob_tam").clip(0.0, 1.0) * 100).round().cast(pl.UInt8).alias("prob_tam")
+        )
 
-        tbl = pa.Table.from_pandas(agg[["point_id", "prob_tam"]], preserve_index=False)
+        tbl = agg.select(["point_id", "prob_tam"]).to_arrow()
         final_path = out_dir / f"{tile_id}.scores.parquet"
         pq.write_table(tbl, final_path, **_FINAL_WRITE_OPTS)
         logger.info("Wrote %s (%d pixels)", final_path.name, len(agg))

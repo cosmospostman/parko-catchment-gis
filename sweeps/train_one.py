@@ -12,6 +12,8 @@ import logging
 import sys
 from pathlib import Path
 
+import polars as pl
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -43,15 +45,14 @@ def main() -> None:
     )
     log = logging.getLogger("train_one")
 
+    import importlib
     import pyarrow.parquet as pq
-    import pandas as pd
     from tam.core.config import TAMConfig
     from tam.core.dataset import V9_FEATURE_COLS
     from tam.core.train import train_tam
     from tam.utils import label_pixels
     from utils.regions import select_regions
     from utils.training_collector import tile_ids_for_regions, tile_parquet_path
-    import importlib
 
     exp = importlib.import_module("tam.experiments.v9_spectral").EXPERIMENT
     regions = select_regions(exp.region_ids)
@@ -71,20 +72,19 @@ def main() -> None:
             base + [c for c in exp.feature_cols if c in available] + extra
         ))
         for rg in range(pf.metadata.num_row_groups):
-            chunks.append(pf.read_row_group(rg, columns=read_cols).to_pandas())
+            chunks.append(pl.from_arrow(pf.read_row_group(rg, columns=read_cols)))
 
-    pixel_df = pd.concat(chunks, ignore_index=True)
-    dates = pd.to_datetime(pixel_df["date"])
-    pixel_df["year"] = dates.dt.year
-    pixel_df["doy"] = dates.dt.day_of_year
+    pixel_df = pl.concat(chunks).with_columns([
+        pl.col("date").cast(pl.Date).dt.year().alias("year"),
+        pl.col("date").cast(pl.Date).dt.ordinal_day().alias("doy"),
+    ])
 
-    pixel_coords = (
-        pixel_df[["point_id", "lon", "lat"]]
-        .drop_duplicates("point_id")
-        .reset_index(drop=True)
-    )
-    labelled = label_pixels(pixel_coords, regions).dropna(subset=["is_presence"])
-    labels = labelled.set_index("point_id")["is_presence"].map({True: 1.0, False: 0.0})
+    pixel_coords = pixel_df.select(["point_id", "lon", "lat"]).unique("point_id")
+    labelled = label_pixels(pixel_coords, regions).filter(pl.col("is_presence").is_not_null())
+    labels = {
+        row["point_id"]: 1.0 if row["is_presence"] else 0.0
+        for row in labelled.iter_rows(named=True)
+    }
 
     use_band_summaries = not args.no_summaries
     log.info(
@@ -118,7 +118,7 @@ def main() -> None:
     )
 
     _, best_val_auc = train_tam(
-        pixel_df=pixel_df[pixel_df["point_id"].isin(labels.index)],
+        pixel_df=pixel_df.filter(pl.col("point_id").is_in(set(labels))),
         labels=labels,
         pixel_coords=pixel_coords,
         out_dir=out_dir,

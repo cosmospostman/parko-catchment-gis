@@ -2,50 +2,47 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pandas as pd
+import polars as pl
 
 
-def label_pixels(features_df: pd.DataFrame, train_loc) -> pd.DataFrame:
+def label_pixels(features_df: pl.DataFrame, train_loc) -> pl.DataFrame:
     """Assign is_presence from labeled regions or a Location's sub_bboxes.
 
     Accepts either:
     - A Location object (uses sub_bboxes with role "presence"/"absence")
     - A list of TrainingRegion objects (uses bbox + label "presence"/"absence")
 
-    Returns a copy of features_df with an is_presence column (True / False / NaN).
-    Pixels outside any labelled bbox get NaN — scored but not trained on.
+    Returns features_df with an is_presence column (True / False / None).
+    Pixels outside any labelled bbox get None — scored but not trained on.
     """
-    df = features_df.copy()
-    df["is_presence"] = pd.NA
+    is_presence: list[bool | None] = [None] * len(features_df)
+    lons = features_df["lon"].to_list()
+    lats = features_df["lat"].to_list()
 
     if isinstance(train_loc, list):
         for region in train_loc:
             lon_min, lat_min, lon_max, lat_max = region.bbox
-            mask = (
-                df["lon"].between(lon_min, lon_max) &
-                df["lat"].between(lat_min, lat_max)
-            )
-            if region.label == "presence":
-                df.loc[mask, "is_presence"] = True
-            elif region.label == "absence":
-                df.loc[mask, "is_presence"] = False
+            val = True if region.label == "presence" else (False if region.label == "absence" else None)
+            if val is None:
+                continue
+            for i, (lon, lat) in enumerate(zip(lons, lats)):
+                if lon_min <= lon <= lon_max and lat_min <= lat <= lat_max:
+                    is_presence[i] = val
     else:
         for sub in train_loc.sub_bboxes.values():
             lon_min, lat_min, lon_max, lat_max = sub.bbox
-            mask = (
-                df["lon"].between(lon_min, lon_max) &
-                df["lat"].between(lat_min, lat_max)
-            )
-            if sub.role == "presence":
-                df.loc[mask, "is_presence"] = True
-            elif sub.role == "absence":
-                df.loc[mask, "is_presence"] = False
+            val = True if sub.role == "presence" else (False if sub.role == "absence" else None)
+            if val is None:
+                continue
+            for i, (lon, lat) in enumerate(zip(lons, lats)):
+                if lon_min <= lon <= lon_max and lat_min <= lat <= lat_max:
+                    is_presence[i] = val
 
-    return df
+    return features_df.with_columns(pl.Series("is_presence", is_presence, dtype=pl.Boolean))
 
 
 def summarise(
-    scored_df: pd.DataFrame,
+    scored_df: pl.DataFrame,
     loc,
     *,
     show_scene_percentiles: bool = True,
@@ -56,16 +53,16 @@ def summarise(
     print(f"Site: {loc.name}  ({len(scored_df):,} pixels)")
     print(f"{'='*60}")
 
-    labelled = scored_df[scored_df["is_presence"].notna()]
-    if not labelled.empty:
+    labelled = scored_df.filter(pl.col("is_presence").is_not_null())
+    if len(labelled) > 0:
         print("\nProbability by class (mean / median / std):")
         for val, label in [(True, "Presence"), (False, "Absence")]:
-            sub = labelled[labelled["is_presence"] == val][prob_col]
-            if not sub.empty:
+            sub = labelled.filter(pl.col("is_presence") == val)[prob_col].drop_nulls()
+            if len(sub) > 0:
                 print(f"  {label:10s}  mean={sub.mean():.3f}  median={sub.median():.3f}  std={sub.std():.3f}")
 
     if show_scene_percentiles:
-        all_scored = scored_df[prob_col].dropna()
+        all_scored = scored_df[prob_col].drop_nulls()
         print(f"\nFull scene  ({len(all_scored):,} scored pixels):")
         print(f"  mean={all_scored.mean():.3f}  median={all_scored.median():.3f}  std={all_scored.std():.3f}")
         for pct in (75, 90, 95):
@@ -73,7 +70,7 @@ def summarise(
 
 
 def save_pixel_ranking(
-    scored_df: pd.DataFrame,
+    scored_df: pl.DataFrame,
     out_path: Path,
     features: list[str],
 ) -> None:
@@ -81,7 +78,6 @@ def save_pixel_ranking(
     prob_cols = [c for c in scored_df.columns if c.startswith("prob_")]
     extra = [f for f in features if f not in prob_cols]
     cols = ["point_id", "lon", "lat", "is_presence"] + prob_cols + ["rank"] + extra
-    scored_df[[c for c in cols if c in scored_df.columns]].sort_values("rank").to_csv(
-        out_path, index=False, float_format="%.4f"
-    )
+    out = scored_df.select([c for c in cols if c in scored_df.columns]).sort("rank")
+    out.write_csv(out_path, float_precision=4)
     print(f"Saved: {out_path}")

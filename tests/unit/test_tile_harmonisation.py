@@ -97,10 +97,12 @@ def test_calibrate_exact_ratio(tmp_path):
 
     # 54LWH has more total observations (it is the reference) — no row for it.
     # 54LWJ row for B07 in 2022 should have scale ≈ 1/1.02
-    j_row = result[(result["tile_id"] == "54LWJ") & (result["band"] == "B07") & (result["year"] == 2022)]
+    j_row = result.filter(
+        (pl.col("tile_id") == "54LWJ") & (pl.col("band") == "B07") & (pl.col("year") == 2022)
+    )
     assert len(j_row) == 1, "Expected exactly one correction row for (54LWJ, B07, 2022)"
 
-    scale = j_row["scale_factor"].iloc[0]
+    scale = j_row[0, "scale_factor"]
     expected = 1.0 / 1.02
     assert math.isclose(scale, expected, rel_tol=0.005), (
         f"Expected scale ≈ {expected:.4f}, got {scale:.4f}"
@@ -143,9 +145,9 @@ def test_calibrate_clamping(tmp_path):
 
     result = calibrate(parquet, out, bands=["B07"])
 
-    j_row = result[(result["tile_id"] == "54LWJ") & (result["band"] == "B07")]
+    j_row = result.filter((pl.col("tile_id") == "54LWJ") & (pl.col("band") == "B07"))
     assert len(j_row) == 1
-    scale = j_row["scale_factor"].iloc[0]
+    scale = j_row[0, "scale_factor"]
     assert scale == pytest.approx(0.85, abs=1e-6), (
         f"Scale {scale:.4f} should be clamped to 0.85 (lower bound)"
     )
@@ -172,14 +174,13 @@ def test_corrections_applied_via_join():
     import tempfile, os
 
     # Write a minimal correction table: 54LWJ B07 2022 → scale=0.98
-    import pandas as pd
-    corr_df = pd.DataFrame([
+    corr_df = pl.DataFrame([
         {"tile_id": "54LWJ", "band": "B07", "year": 2022, "scale_factor": 0.98},
     ])
     with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as f:
         tmp_path = f.name
     try:
-        corr_df.to_parquet(tmp_path, index=False)
+        corr_df.write_parquet(tmp_path)
         corrections = load_corrections(Path(tmp_path))
     finally:
         os.unlink(tmp_path)
@@ -305,9 +306,9 @@ def test_calibrate_matches_collocated_pixels(tmp_path):
     out = tmp_path / "corr.parquet"
     result = calibrate(parquet, out, bands=["B07"])
 
-    j_row = result[(result["tile_id"] == "54LWJ") & (result["band"] == "B07")]
+    j_row = result.filter((pl.col("tile_id") == "54LWJ") & (pl.col("band") == "B07"))
     assert len(j_row) == 1, "Co-located pixels should produce a correction row"
-    scale = j_row["scale_factor"].iloc[0]
+    scale = j_row[0, "scale_factor"]
     expected = 1.0 / 1.08
     assert math.isclose(scale, expected, rel_tol=0.01), (
         f"Expected scale ≈ {expected:.4f} (1/1.08), got {scale:.4f}"

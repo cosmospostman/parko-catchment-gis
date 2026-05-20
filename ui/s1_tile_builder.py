@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
+import polars as pl
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 PIXELS_DIR = PROJECT_ROOT / "data" / "pixels"
@@ -38,27 +38,28 @@ def build_bin(location: str, band: str, date: str, out_path: Path) -> None:
     if not loc_dir.exists():
         raise FileNotFoundError(f"Location not found: {loc_dir}")
 
-    frames: list[pd.DataFrame] = []
+    frames: list[pl.DataFrame] = []
     for year_dir in sorted(loc_dir.iterdir()):
         if not year_dir.is_dir():
             continue
         for pq in sorted(year_dir.glob("*.parquet")):
             if "coords" in pq.name:
                 continue
-            df = pd.read_parquet(pq, columns=["point_id", "lon", "lat", "date", "source", band])
-            df = df[(df["source"] == "S1") & (df["date"].astype(str) == date)]
+            df = pl.read_parquet(pq, columns=["point_id", "lon", "lat", "date", "source", band])
+            df = df.filter((pl.col("source") == "S1") & (pl.col("date").cast(pl.Utf8) == date))
             if len(df) > 0:
                 frames.append(df)
 
     if not frames:
         raise ValueError(f"No S1 data found for location={location} band={band} date={date}")
 
-    df = pd.concat(frames, ignore_index=True)
+    df = pl.concat(frames)
 
     # Extract xi, yi from point_id ("px_XXXX_YYYY")
-    parts = df["point_id"].str.split("_", expand=True)
-    df["xi"] = parts[1].astype(int)
-    df["yi"] = parts[2].astype(int)
+    df = df.with_columns([
+        pl.col("point_id").str.split("_").list.get(1).cast(pl.Int32).alias("xi"),
+        pl.col("point_id").str.split("_").list.get(2).cast(pl.Int32).alias("yi"),
+    ])
 
     xi_max = int(df["xi"].max())
     yi_max = int(df["yi"].max())
@@ -66,9 +67,9 @@ def build_bin(location: str, band: str, date: str, out_path: Path) -> None:
     height = yi_max + 1
 
     # Derive grid origin from NW corner pixel (xi=0, yi=yi_max)
-    nw = df[(df["xi"] == 0) & (df["yi"] == yi_max)]
-    ne = df[(df["xi"] == xi_max) & (df["yi"] == yi_max)]
-    sw = df[(df["xi"] == 0) & (df["yi"] == 0)]
+    nw = df.filter((pl.col("xi") == 0) & (pl.col("yi") == yi_max))
+    ne = df.filter((pl.col("xi") == xi_max) & (pl.col("yi") == yi_max))
+    sw = df.filter((pl.col("xi") == 0) & (pl.col("yi") == 0))
 
     if len(nw) == 0 or len(ne) == 0 or len(sw) == 0:
         # Fallback: derive from overall extents
@@ -77,10 +78,10 @@ def build_bin(location: str, band: str, date: str, out_path: Path) -> None:
         res_x   = (float(df["lon"].max()) - lon_min) / max(xi_max, 1)
         res_y   = (lat_max - float(df["lat"].min())) / max(yi_max, 1)
     else:
-        lon_nw = float(nw["lon"].iloc[0])
-        lat_nw = float(nw["lat"].iloc[0])
-        lon_ne = float(ne["lon"].iloc[0])
-        lat_sw = float(sw["lat"].iloc[0])
+        lon_nw = float(nw["lon"][0])
+        lat_nw = float(nw["lat"][0])
+        lon_ne = float(ne["lon"][0])
+        lat_sw = float(sw["lat"][0])
         lon_min = lon_nw
         lat_max = lat_nw
         res_x   = (lon_ne - lon_nw) / max(xi_max, 1)
@@ -88,12 +89,12 @@ def build_bin(location: str, band: str, date: str, out_path: Path) -> None:
 
     # Normalise band values to [0, 1]
     lo, hi = BAND_NORM.get(band, (float(df[band].min()), float(df[band].max())))
-    vals_raw = df[band].values.astype(np.float32)
+    vals_raw = df[band].to_numpy().astype(np.float32)
     vals_norm = np.clip((vals_raw - lo) / (hi - lo), 0.0, 1.0)
 
     # key = (yi_max - yi) * width + xi  (yi=0 → southernmost, flip to north-first)
-    yi_flipped = yi_max - df["yi"].values
-    keys = (yi_flipped * width + df["xi"].values).astype(np.uint32)
+    yi_flipped = yi_max - df["yi"].to_numpy()
+    keys = (yi_flipped * width + df["xi"].to_numpy()).astype(np.uint32)
 
     # Sort by key
     order = np.argsort(keys)

@@ -21,7 +21,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import pandas as pd
+import polars as pl
 import pyarrow.parquet as pq
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -51,29 +51,30 @@ _INDEX_PATH   = _TRAINING_DIR / "index.parquet"
 # Index management
 # ---------------------------------------------------------------------------
 
-def _load_index() -> pd.DataFrame:
+def _load_index() -> pl.DataFrame:
     """Load the region→tile sidecar index, or return an empty frame."""
     if _INDEX_PATH.exists():
-        return pd.read_parquet(_INDEX_PATH)
-    return pd.DataFrame(columns=["region_id", "tile_id"])
+        return pl.read_parquet(_INDEX_PATH)
+    return pl.DataFrame({"region_id": pl.Series([], dtype=pl.Utf8),
+                          "tile_id":   pl.Series([], dtype=pl.Utf8)})
 
 
-def _save_index(df: pd.DataFrame) -> None:
+def _save_index(df: pl.DataFrame) -> None:
     _INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(_INDEX_PATH, index=False)
+    df.write_parquet(_INDEX_PATH)
 
 
 def _update_index(region_id: str, tile_ids: list[str]) -> None:
     """Add or refresh the index entries for one region."""
     df = _load_index()
-    df = df[df["region_id"] != region_id]  # remove stale entries
+    df = df.filter(pl.col("region_id") != region_id)  # remove stale entries
     if not tile_ids:
         raise ValueError(
             f"_update_index: region {region_id!r} maps to zero tiles — "
             "check that bbox_to_tile_ids() returns at least one tile."
         )
-    new_rows = pd.DataFrame({"region_id": region_id, "tile_id": tile_ids})
-    df = pd.concat([df, new_rows], ignore_index=True)
+    new_rows = pl.DataFrame({"region_id": [region_id] * len(tile_ids), "tile_id": tile_ids})
+    df = pl.concat([df, new_rows])
     _save_index(df)
 
 
@@ -83,13 +84,13 @@ def tile_ids_for_regions(region_ids: list[str]) -> list[str]:
     Consults the sidecar index — regions must have been collected first.
     """
     df = _load_index()
-    hits = df[df["region_id"].isin(region_ids)]
-    if hits.empty:
+    hits = df.filter(pl.col("region_id").is_in(region_ids))
+    if hits.is_empty():
         raise RuntimeError(
             f"No tile index entries found for regions {region_ids}. "
             "Run 'ensure-training-pixels' first."
         )
-    return sorted(hits["tile_id"].unique().tolist())
+    return sorted(hits["tile_id"].unique().to_list())
 
 
 def tile_parquet_path(tile_id: str) -> Path:
@@ -113,9 +114,10 @@ def _best_tile_for_region(region: "TrainingRegion", tile_ids: list[str]) -> str:
     cy = (region.bbox[1] + region.bbox[3]) / 2
     centroid = Point(cx, cy)
     grid = get_au_tile_grid()
+    tile_map = dict(grid)
     for tile_id in tile_ids:
-        row = grid[grid["Name"] == tile_id]
-        if not row.empty and row.iloc[0].geometry.contains(centroid):
+        geom = tile_map.get(tile_id)
+        if geom is not None and geom.contains(centroid):
             return tile_id
     return tile_ids[0]
 
@@ -346,7 +348,7 @@ def _rebuild_tile_parquet(tile_id: str) -> None:
     with _index_lock:
         all_indexed = _load_index()
         all_indexed_ids = set(
-            all_indexed.loc[all_indexed["tile_id"] == tile_id, "region_id"]
+            all_indexed.filter(pl.col("tile_id") == tile_id)["region_id"].to_list()
         )
 
     region_paths = [

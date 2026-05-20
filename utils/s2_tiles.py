@@ -1,23 +1,30 @@
 """utils/s2_tiles.py — S2 MGRS tile grid, fetch-and-cache.
 
 The full global S2 tile grid (~56k tiles) is fetched once from a public mirror,
-clipped to Australia, and cached at data/cache/s2_tiles_au.gpkg.  Subsequent
+clipped to Australia, and cached at data/cache/s2_tiles_au.parquet.  Subsequent
 calls load from the cache — no network access needed.
 
 Public source: Sentinel-2 MGRS tiling grid published by ESA/Sinergise.
 Fetched from Zenodo (DOI 10.5281/zenodo.10998972) with CDN fallback.
+
+Each record has two fields:
+    name     : str     — MGRS tile ID e.g. '54LWH'
+    geometry : object  — shapely Polygon (EPSG:4326)
 """
 
 from __future__ import annotations
 
+import json
 import logging
-import sys
 from pathlib import Path
+
+import shapely.wkb
+from shapely.geometry import box, shape
 
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_CACHE_PATH = PROJECT_ROOT / "data" / "cache" / "s2_tiles_au.gpkg"
+_CACHE_PATH = PROJECT_ROOT / "data" / "cache" / "s2_tiles_au.parquet"
 
 # Australia bounding box (generous margin)
 _AU_BBOX = (110.0, -45.0, 155.0, -10.0)
@@ -31,49 +38,81 @@ _GRID_URLS = [
     "https://unpkg.com/sentinel-2-grid/data/grid.json",
 ]
 
+# Internal representation: list of (name, shapely_geometry)
+_TileRow = tuple[str, object]
 
-def get_au_tile_grid() -> "geopandas.GeoDataFrame":
-    """Return S2 MGRS tile grid clipped to Australia as a GeoDataFrame.
 
-    Fetches and caches on first call; subsequent calls load from disk.
-    Columns: Name (tile ID e.g. '54LWH'), geometry (Polygon, EPSG:4326).
-    """
-    import geopandas as gpd
+def _load_parquet(path: Path) -> list[_TileRow]:
+    import polars as pl
+    df = pl.read_parquet(path)
+    return [
+        (row["name"], shapely.wkb.loads(bytes(row["geometry"])))
+        for row in df.iter_rows(named=True)
+    ]
 
-    if _CACHE_PATH.exists():
-        return gpd.read_file(_CACHE_PATH)
 
-    _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+def _save_parquet(rows: list[_TileRow], path: Path) -> None:
+    import polars as pl
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df = pl.DataFrame({
+        "name": [r[0] for r in rows],
+        "geometry": [shapely.wkb.dumps(r[1]) for r in rows],
+    })
+    df.write_parquet(path)
 
-    grid = None
+
+def _fetch_and_clip() -> list[_TileRow]:
+    """Download the global tile grid, clip to Australia, return rows."""
+    import urllib.request
+
+    au_box = box(*_AU_BBOX)
     last_exc: Exception | None = None
+
     for url in _GRID_URLS:
         logger.info("S2 tile grid not cached — fetching from %s", url)
         try:
-            grid = gpd.read_file(url)
+            with urllib.request.urlopen(url, timeout=60) as resp:
+                raw = resp.read()
             break
         except Exception as exc:
             logger.warning("Failed to fetch S2 tile grid from %s: %s", url, exc)
             last_exc = exc
-
-    if grid is None:
+    else:
         raise RuntimeError(
             f"Could not fetch S2 tile grid from any source: {_GRID_URLS}. "
             "Check your internet connection or manually place the file at "
             f"{_CACHE_PATH}."
         ) from last_exc
 
-    west, south, east, north = _AU_BBOX
-    from shapely.geometry import box
-    au_box = box(west, south, east, north)
-    au_grid = grid[grid.geometry.intersects(au_box)].copy()
-    au_grid = au_grid.reset_index(drop=True)
+    fc = json.loads(raw)
+    features = fc.get("features", fc) if isinstance(fc, dict) else fc
 
-    au_grid.to_file(_CACHE_PATH, driver="GPKG")
-    logger.info(
-        "Cached %d AU S2 tiles to %s", len(au_grid), _CACHE_PATH
-    )
-    return au_grid
+    rows: list[_TileRow] = []
+    for feat in features:
+        props = feat.get("properties") or {}
+        name = props.get("Name") or props.get("name") or props.get("NAME", "")
+        geom = shape(feat["geometry"])
+        if geom.intersects(au_box):
+            rows.append((name, geom))
+
+    return rows
+
+
+def get_au_tile_grid() -> list[_TileRow]:
+    """Return S2 MGRS tile grid clipped to Australia.
+
+    Returns a list of (name, geometry) tuples where name is the MGRS tile ID
+    (e.g. '54LWH') and geometry is a Shapely Polygon in EPSG:4326.
+
+    Fetches and caches on first call; subsequent calls load from disk.
+    """
+    if _CACHE_PATH.exists():
+        return _load_parquet(_CACHE_PATH)
+
+    rows = _fetch_and_clip()
+    _save_parquet(rows, _CACHE_PATH)
+    logger.info("Cached %d AU S2 tiles to %s", len(rows), _CACHE_PATH)
+    return rows
 
 
 def bbox_to_tile_ids(bbox: tuple[float, float, float, float]) -> list[str]:
@@ -89,15 +128,9 @@ def bbox_to_tile_ids(bbox: tuple[float, float, float, float]) -> list[str]:
     list[str]
         Tile IDs e.g. ['54LWH', '54LWJ'].  Empty if no tiles intersect.
     """
-    from shapely.geometry import box
-
-    grid = get_au_tile_grid()
     query_box = box(*bbox)
-
-    # Column may be 'Name' or 'name' depending on source version
-    name_col = "Name" if "Name" in grid.columns else "name"
-    hits = grid[grid.geometry.intersects(query_box)]
-    return sorted(hits[name_col].tolist())
+    grid = get_au_tile_grid()
+    return sorted(name for name, geom in grid if geom.intersects(query_box))
 
 
 def geometry_to_tile_ids(
@@ -125,16 +158,11 @@ def geometry_to_tile_ids(
     list[str]
         Sorted tile IDs that will actually produce observations.
     """
-    from shapely.geometry import box
-
     grid = get_au_tile_grid()
-    name_col = "Name" if "Name" in grid.columns else "name"
 
     # Candidates: tiles whose footprint intersects the catchment polygon itself
-    # (not just the bbox envelope).
-    candidates = grid[grid.geometry.intersects(geometry)]
     tile_geoms: dict[str, object] = {
-        row[name_col]: row.geometry for _, row in candidates.iterrows()
+        name: geom for name, geom in grid if geom.intersects(geometry)
     }
 
     if len(tile_geoms) <= 1:
@@ -160,13 +188,12 @@ def geometry_to_tile_ids(
     changed = True
     while changed:
         changed = False
-        for tid in sorted(kept):   # deterministic order
+        for tid in sorted(kept):
             ci = catchment_in[tid]
             if ci.is_empty:
                 kept.discard(tid)
                 changed = True
                 continue
-            # Union of overlap zones between this tile and each kept neighbour.
             covered = None
             for nbr in overlaps[tid]:
                 if nbr not in kept:
@@ -175,8 +202,6 @@ def geometry_to_tile_ids(
                 covered = ov if covered is None else covered.union(ov)
             if covered is None:
                 continue
-            # If the catchment inside this tile is entirely within the covered
-            # zone, this tile adds nothing that a neighbour won't provide.
             unique = ci.difference(covered)
             if unique.is_empty:
                 kept.discard(tid)

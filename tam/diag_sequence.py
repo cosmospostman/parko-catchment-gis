@@ -28,7 +28,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import pyarrow.parquet as pq
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -42,11 +42,13 @@ def _read_pixels_for_band(
     feature_cols: list[str],
     scl_purity_min: float,
     year: int,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """Load all observations for pixels whose lat rounds to lat_lo or lat_hi."""
+    import re
     target_lats = {lat_lo, lat_hi}
     raw_band_cols = [c for c in feature_cols if c not in ("NDVI", "NDWI", "EVI")]
     read_cols = ["point_id", "lat", "date", "tile_id", "item_id", "scl_purity"] + raw_band_cols
+    _re = re.compile(r"^S2[ABC]_(\d{2}[A-Z]{3})_")
 
     chunks = []
     for tp in tile_paths:
@@ -54,66 +56,64 @@ def _read_pixels_for_band(
         available = set(pf.schema_arrow.names)
         cols = [c for c in read_cols if c in available]
         for i in range(pf.metadata.num_row_groups):
-            chunk = pf.read_row_group(i, columns=cols).to_pandas()
-            chunk["lat_f64"] = chunk["lat"].astype("float64")
-            chunk["lat_r"]   = chunk["lat_f64"].round(3)
-            chunk = chunk[chunk["lat_r"].isin(target_lats)]
-            if chunk.empty:
+            chunk = pl.from_arrow(pf.read_row_group(i, columns=cols)).with_columns(
+                pl.col("lat").cast(pl.Float64).round(3).alias("lat_r")
+            ).filter(pl.col("lat_r").is_in(list(target_lats))).filter(
+                pl.col("scl_purity") >= scl_purity_min
+            ).with_columns([
+                pl.col("date").cast(pl.Date).dt.year().alias("yr"),
+                pl.col("date").cast(pl.Date).dt.ordinal_day().alias("doy"),
+                pl.col("date").cast(pl.Date).dt.month().alias("month"),
+            ]).filter(pl.col("yr") == year)
+            if chunk.is_empty():
                 continue
-            chunk = chunk[chunk["scl_purity"] >= scl_purity_min]
-            chunk["date"] = pd.to_datetime(chunk["date"])
-            chunk["yr"]   = chunk["date"].dt.year
-            chunk = chunk[chunk["yr"] == year]
-            if chunk.empty:
-                continue
-            chunk["doy"]  = chunk["date"].dt.dayofyear
-            chunk["month"] = chunk["date"].dt.month
             chunks.append(chunk)
 
     if not chunks:
         raise ValueError(f"No data found for lat bands {lat_lo}/{lat_hi}")
 
-    df = pd.concat(chunks, ignore_index=True)
+    df = pl.concat(chunks)
 
     # derive tile_id from item_id where blank
-    if "item_id" in df.columns:
-        import re
-        _re = re.compile(r"^S2[ABC]_(\d{2}[A-Z]{3})_")
-        mask = df["tile_id"].isna() | (df["tile_id"] == "")
-        if mask.any():
-            df.loc[mask, "tile_id"] = (df.loc[mask, "item_id"]
-                                        .str.extract(_re, expand=False))
+    if "item_id" in df.columns and "tile_id" in df.columns:
+        tile_ids = df["tile_id"].to_list()
+        item_ids = df["item_id"].to_list()
+        fixed = [
+            tid if tid else (m.group(1) if (m := _re.match(iid or "")) else None)
+            for tid, iid in zip(tile_ids, item_ids)
+        ]
+        df = df.with_columns(pl.Series("tile_id", fixed))
     return df
 
 
-def _sequence_stats(df: pd.DataFrame, feature_cols: list[str]) -> dict:
+def _sequence_stats(df: pl.DataFrame, feature_cols: list[str]) -> pl.DataFrame:
     """Per-pixel sequence statistics."""
     raw_cols = [c for c in feature_cols if c in df.columns]
     stats = []
-    for pid, grp in df.groupby("point_id"):
-        grp = grp.sort_values("doy")
-        n = len(grp)
-        doys = grp["doy"].values
-        tile_counts = grp["tile_id"].value_counts().to_dict()
-        row = {
+    for (pid,), grp in df.sort("doy").group_by(["point_id"], maintain_order=True):
+        doys = grp["doy"].to_numpy()
+        n = len(doys)
+        tile_arr = grp["tile_id"].to_list() if "tile_id" in grp.columns else []
+        from collections import Counter
+        tile_counts = dict(Counter(tile_arr))
+        row: dict = {
             "point_id": pid,
-            "lat_r": grp["lat_r"].iloc[0],
-            "n_obs": n,
-            "doy_mean": doys.mean(),
-            "doy_std": doys.std(),
-            "doy_min": doys.min(),
-            "doy_max": doys.max(),
-            "doy_range": doys.max() - doys.min(),
-            "tile_counts": tile_counts,
+            "lat_r":    float(grp["lat_r"][0]),
+            "n_obs":    n,
+            "doy_mean": float(doys.mean()),
+            "doy_std":  float(doys.std()),
+            "doy_min":  float(doys.min()),
+            "doy_max":  float(doys.max()),
+            "doy_range": float(doys.max() - doys.min()),
+            "n_wet": int(((doys >= 305) | (doys <= 90)).sum()),
+            "n_dry": int(((doys >= 121) & (doys <= 273)).sum()),
         }
-        # DOY coverage in wet vs dry
-        row["n_wet"] = int(((doys >= 305) | (doys <= 90)).sum())   # Nov–Mar
-        row["n_dry"] = int(((doys >= 121) & (doys <= 273)).sum())  # May–Sep
         for col in raw_cols:
-            row[f"{col}_mean"] = grp[col].mean()
-            row[f"{col}_std"]  = grp[col].std()
+            vals = grp[col].drop_nulls().to_numpy()
+            row[f"{col}_mean"] = float(vals.mean()) if len(vals) > 0 else float("nan")
+            row[f"{col}_std"]  = float(vals.std())  if len(vals) > 1 else float("nan")
         stats.append(row)
-    return pd.DataFrame(stats)
+    return pl.DataFrame(stats) if stats else pl.DataFrame()
 
 
 def run(
@@ -152,34 +152,46 @@ def run(
     print(f"Loading observations for lat {lat_lo} and {lat_hi} ...")
     df = _read_pixels_for_band(lat_lo, lat_hi, tile_paths, feature_cols,
                                 scl_purity_min, year)
-    print(f"  {len(df):,} observations, {df['point_id'].nunique():,} unique pixels")
+    print(f"  {len(df):,} observations, {df['point_id'].n_unique():,} unique pixels")
 
     # ── join scores ────────────────────────────────────────────────────────
-    scores = pd.read_csv(score_csv)[["point_id", "prob_tam"]]
-    df = df.merge(scores, on="point_id", how="left")
+    scores = pl.read_csv(score_csv).select(["point_id", "prob_tam"])
+    pid_score_map = {r["point_id"]: r["prob_tam"] for r in scores.iter_rows(named=True)}
+    df = df.join(scores, on="point_id", how="left")
 
     # ── sub-sample pixels ─────────────────────────────────────────────────
     rng = np.random.default_rng(42)
     sampled_pids: dict[float, list] = {}
-    for lat_r, grp in df.groupby("lat_r"):
-        pids = grp["point_id"].unique()
+    for (lat_r,), grp in df.group_by(["lat_r"], maintain_order=True):
+        pids = grp["point_id"].unique().to_list()
         chosen = rng.choice(pids, size=min(n_pixels, len(pids)), replace=False)
-        sampled_pids[lat_r] = list(chosen)
+        sampled_pids[float(lat_r)] = list(chosen)
 
-    dfs: dict[float, pd.DataFrame] = {}
+    dfs: dict[float, pl.DataFrame] = {}
     for lat_r, pids in sampled_pids.items():
-        dfs[lat_r] = df[df["point_id"].isin(pids)].copy()
+        dfs[lat_r] = df.filter(pl.col("point_id").is_in(pids))
 
     # ── per-pixel sequence stats ───────────────────────────────────────────
-    pid_scores = scores.set_index("point_id")["prob_tam"]
-    stats: dict[float, pd.DataFrame] = {}
+    stats: dict[float, pl.DataFrame] = {}
     for lat_r, sub in dfs.items():
         st = _sequence_stats(sub, feature_cols)
-        st["prob_tam"] = st["point_id"].map(pid_scores)
+        if not st.is_empty():
+            st = st.with_columns(
+                pl.col("point_id").map_elements(
+                    lambda p: pid_score_map.get(p, float("nan")), return_dtype=pl.Float64
+                ).alias("prob_tam")
+            )
         stats[lat_r] = st
 
-    lat_labels = {lat_lo: f"lat {lat_lo}  (median prob={scores.merge(pd.DataFrame({'point_id': sampled_pids[lat_lo]}))['prob_tam'].median():.3f})",
-                  lat_hi: f"lat {lat_hi}  (median prob={scores.merge(pd.DataFrame({'point_id': sampled_pids[lat_hi]}))['prob_tam'].median():.3f})"}
+    def _median_prob(pids: list) -> float:
+        vals = [pid_score_map.get(p, float("nan")) for p in pids]
+        valid = [v for v in vals if not np.isnan(v)]
+        return float(np.median(valid)) if valid else float("nan")
+
+    lat_labels = {
+        lat_lo: f"lat {lat_lo}  (median prob={_median_prob(sampled_pids[lat_lo]):.3f})",
+        lat_hi: f"lat {lat_hi}  (median prob={_median_prob(sampled_pids[lat_hi]):.3f})",
+    }
     colors = {lat_lo: "steelblue", lat_hi: "darkorange"}
 
     # ── plot ──────────────────────────────────────────────────────────────
@@ -192,7 +204,9 @@ def run(
 
     def _hist(ax, col, title, xlabel, bins=20):
         for lat_r, st in stats.items():
-            vals = st[col].dropna()
+            if st.is_empty() or col not in st.columns:
+                continue
+            vals = st[col].drop_nulls().to_numpy()
             ax.hist(vals, bins=bins, alpha=0.6, color=colors[lat_r],
                     label=lat_labels[lat_r], density=True)
         ax.set_title(title)
@@ -202,7 +216,10 @@ def run(
 
     def _scatter(ax, xcol, ycol, title):
         for lat_r, st in stats.items():
-            ax.scatter(st[xcol].dropna(), st[ycol].dropna(),
+            if st.is_empty() or xcol not in st.columns or ycol not in st.columns:
+                continue
+            sub = st.select([xcol, ycol]).drop_nulls()
+            ax.scatter(sub[xcol].to_numpy(), sub[ycol].to_numpy(),
                        alpha=0.3, s=8, color=colors[lat_r],
                        label=lat_labels[lat_r])
         ax.set_title(title)
@@ -222,8 +239,9 @@ def run(
     _hist(axes[1, 2], "doy_std", "DOY std dev", "std (days)")
 
     # Row 2: key band means, n_obs vs prob_tam scatter
+    first_st = next(iter(stats.values())) if stats else pl.DataFrame()
     plot_bands = [f"{b}_mean" for b in ["B11", "B08", "B04"]
-                  if f"{b}_mean" in next(iter(stats.values())).columns]
+                  if f"{b}_mean" in first_st.columns]
     for ax, band in zip(axes[2, :2], plot_bands[:2]):
         _hist(ax, band, f"{band} distribution", band)
 
@@ -241,9 +259,11 @@ def run(
     for lat_r, st in stats.items():
         print(f"\n  lat {lat_r}  (n={len(st)} pixels):")
         for col in stat_cols:
-            if col not in st.columns:
+            if st.is_empty() or col not in st.columns:
                 continue
-            print(f"    {col:20s}  {st[col].mean():.3f}  ±  {st[col].std():.3f}")
+            vals = st[col].drop_nulls().to_numpy()
+            if len(vals) > 0:
+                print(f"    {col:20s}  {vals.mean():.3f}  ±  {vals.std():.3f}")
 
 
 def _main() -> None:

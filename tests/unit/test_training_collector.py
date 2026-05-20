@@ -32,7 +32,7 @@ from __future__ import annotations
 import re
 from types import SimpleNamespace
 
-import pandas as pd
+import polars as pl
 import pytest
 
 from utils.regions import TrainingRegion
@@ -164,16 +164,17 @@ def test_update_index_adds_new_region(training_dirs):
     _update_index("r1", ["55HBU"])
     df = _load_index()
     assert len(df) == 1
-    assert df.iloc[0]["region_id"] == "r1"
-    assert df.iloc[0]["tile_id"] == "55HBU"
+    assert df.row(0)[df.columns.index("region_id")] == "r1"
+    assert df.row(0)[df.columns.index("tile_id")] == "55HBU"
 
 
 def test_update_index_replaces_stale_entries(training_dirs):
     _update_index("r1", ["55HBU"])
     _update_index("r1", ["55HBV"])
     df = _load_index()
-    assert set(df[df["region_id"] == "r1"]["tile_id"]) == {"55HBV"}
-    assert "55HBU" not in df["tile_id"].values
+    r1_tiles = set(df.filter(pl.col("region_id") == "r1")["tile_id"].to_list())
+    assert r1_tiles == {"55HBV"}
+    assert "55HBU" not in df["tile_id"].to_list()
 
 
 def test_update_index_empty_tile_ids_silently_removes_region(training_dirs):
@@ -287,12 +288,13 @@ def test_within_tile_dedup_does_not_remove_cross_tile_items():
 def test_cross_tile_boundary_pixel_deduplicated_in_output():
     """A pixel appearing in two tile parquets (cross-tile boundary) produces
     only one row in a combined output after (point_id, date) dedup."""
-    import pandas as pd
+    import datetime
+    import polars as pl
 
     from analysis.constants import BANDS, SPECTRAL_INDEX_COLS
 
     pid = "boundary_region_0000_0000"
-    dt  = pd.Timestamp("2022-08-15")
+    dt  = datetime.date(2022, 8, 15)
 
     def _row(tile_id, scl_purity):
         return {
@@ -308,20 +310,17 @@ def test_cross_tile_boundary_pixel_deduplicated_in_output():
             **{c: 0.25 for c in SPECTRAL_INDEX_COLS},
         }
 
-    df_hbu = pd.DataFrame([_row("55HBU", 0.7)])
-    df_hbv = pd.DataFrame([_row("55HBV", 0.95)])
-    combined_raw = pd.concat([df_hbu, df_hbv], ignore_index=True)
+    combined_raw = pl.DataFrame([_row("55HBU", 0.7), _row("55HBV", 0.95)])
 
     df_dedup = (
         combined_raw
-        .sort_values(["point_id", "date", "scl_purity"], ascending=[True, True, False])
-        .drop_duplicates(subset=["point_id", "date"], keep="first")
-        .sort_values(["point_id", "date"])
-        .reset_index(drop=True)
+        .sort(["point_id", "date", "scl_purity"], descending=[False, False, True])
+        .unique(subset=["point_id", "date"], keep="first")
+        .sort(["point_id", "date"])
     )
 
     assert len(df_dedup) == 1
-    assert df_dedup.iloc[0]["tile_id"] == "55HBV"
+    assert df_dedup["tile_id"][0] == "55HBV"
 
 
 # ---------------------------------------------------------------------------
@@ -370,7 +369,7 @@ def test_tile_rebuild_includes_all_indexed_regions(training_dirs, monkeypatch):
     tile_path = tile_parquet_path(tile_id)
 
     all_indexed = _load_index()
-    all_indexed_ids = set(all_indexed.loc[all_indexed["tile_id"] == tile_id, "region_id"])
+    all_indexed_ids = set(all_indexed.filter(pl.col("tile_id") == tile_id)["region_id"].to_list())
     region_paths = [
         _region_parquet_path(rid)
         for rid in sorted(all_indexed_ids)
@@ -577,9 +576,9 @@ def test_do_region_indexes_under_actual_tile_not_primary(training_dirs, monkeypa
         _update_index(region.id, [actual_tile])
 
     df = tc._load_index()
-    row = df[df["region_id"] == "boundary_region"]
+    row = df.filter(pl.col("region_id") == "boundary_region")
     assert len(row) == 1
-    assert row.iloc[0]["tile_id"] == "54KZC", (
+    assert row[0, "tile_id"] == "54KZC", (
         "Index must record the actual tile (54KZC), not the primary tile (55KBT)"
     )
     assert "54KZC" in tiles_with_new

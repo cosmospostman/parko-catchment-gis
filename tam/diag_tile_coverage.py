@@ -22,7 +22,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import pyarrow.parquet as pq
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -36,54 +36,59 @@ DRY_MONTHS   = {5, 6, 7, 8, 9}     # May–Sep
 FEATURE_BANDS = ["B04", "B08", "B11", "NDVI"]
 
 
-def _read_tile(path: Path, bands: list[str]) -> pd.DataFrame:
+def _read_tile(path: Path, bands: list[str]) -> pl.DataFrame:
     """Read a tile parquet, return point_id / lat / date / tile_id / bands."""
+    import re
     pf = pq.ParquetFile(path)
     available = set(pf.schema_arrow.names)
     cols = [c for c in ["point_id", "lat", "date", "item_id", "tile_id", "scl_purity"] + bands
             if c in available]
-    chunks = [pf.read_row_group(i, columns=cols).to_pandas()
+    chunks = [pl.from_arrow(pf.read_row_group(i, columns=cols))
               for i in range(pf.metadata.num_row_groups)]
-    df = pd.concat(chunks, ignore_index=True)
-    df = df[df["scl_purity"] >= 0.5]
-    df["date"] = pd.to_datetime(df["date"])
-    df["month"] = df["date"].dt.month
-    df["season"] = pd.cut(df["month"],
-                          bins=[0, 3, 9, 12],
-                          labels=["wet", "dry", "wet2"]).astype(str)
-    # merge wet/wet2
-    df["season"] = df["season"].replace("wet2", "wet")
+    df = pl.concat(chunks).filter(pl.col("scl_purity") >= 0.5).with_columns([
+        pl.col("date").cast(pl.Date).dt.month().alias("month"),
+    ])
+    # season: months 1-3 and 10-12 → wet, 4-9 → dry
+    df = df.with_columns(
+        pl.when(pl.col("month").is_between(4, 9)).then(pl.lit("dry")).otherwise(pl.lit("wet")).alias("season")
+    )
     # derive tile_id from item_id if tile_id column is blank
-    if "item_id" in df.columns:
-        mask = df["tile_id"].isna() | (df["tile_id"] == "")
-        if mask.any():
-            import re
-            _re = re.compile(r"^S2[ABC]_(\d{2}[A-Z]{3})_")
-            derived = df.loc[mask, "item_id"].str.extract(_re, expand=False)
-            df.loc[mask, "tile_id"] = derived
+    if "item_id" in df.columns and "tile_id" in df.columns:
+        _re = re.compile(r"^S2[ABC]_(\d{2}[A-Z]{3})_")
+        def _extract_tile(s: str) -> str | None:
+            m = _re.match(s or "")
+            return m.group(1) if m else None
+        tile_ids = df["tile_id"].to_list()
+        item_ids = df["item_id"].to_list()
+        fixed = [
+            tid if tid else _extract_tile(iid)
+            for tid, iid in zip(tile_ids, item_ids)
+        ]
+        df = df.with_columns(pl.Series("tile_id", fixed))
     return df
 
 
-def _lat_band_stats(df: pd.DataFrame, bands: list[str]) -> pd.DataFrame:
+def _lat_band_stats(df: pl.DataFrame, bands: list[str]) -> pl.DataFrame:
     """Per lat-band (0.001 deg): obs count, wet/dry mean per band."""
-    df = df.copy()
-    df["lat_r"] = df["lat"].astype("float64").round(3)
-
-    rows = []
-    for lat_r, grp in df.groupby("lat_r"):
-        row: dict = {"lat_r": lat_r}
-        row["n_obs"] = len(grp)
-        row["n_pts"] = grp["point_id"].nunique()
-        row["obs_per_pt"] = row["n_obs"] / max(row["n_pts"], 1)
-        for band in bands:
-            if band not in grp.columns:
-                continue
-            row[f"{band}_wet"] = grp.loc[grp["season"] == "wet",  band].mean()
-            row[f"{band}_dry"] = grp.loc[grp["season"] == "dry",  band].mean()
-            row[f"{band}_all"] = grp[band].mean()
-        rows.append(row)
-
-    return pd.DataFrame(rows).sort_values("lat_r").reset_index(drop=True)
+    df = df.with_columns(
+        pl.col("lat").cast(pl.Float64).round(3).alias("lat_r")
+    )
+    agg_exprs = [
+        pl.len().alias("n_obs"),
+        pl.col("point_id").n_unique().alias("n_pts"),
+    ]
+    for band in bands:
+        if band not in df.columns:
+            continue
+        agg_exprs += [
+            pl.col(band).filter(pl.col("season") == "wet").mean().alias(f"{band}_wet"),
+            pl.col(band).filter(pl.col("season") == "dry").mean().alias(f"{band}_dry"),
+            pl.col(band).mean().alias(f"{band}_all"),
+        ]
+    result = df.group_by("lat_r").agg(agg_exprs).sort("lat_r")
+    return result.with_columns(
+        (pl.col("n_obs") / pl.col("n_pts").clip(lower_bound=1)).alias("obs_per_pt")
+    )
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -109,31 +114,32 @@ def run(location: str, year: int, score_csv: Path, out_path: Path) -> None:
     print(f"Tiles: {[p.name for p in tile_paths]}")
 
     # ── read each tile ────────────────────────────────────────────────────────
-    tile_dfs: dict[str, pd.DataFrame] = {}
+    tile_dfs: dict[str, pl.DataFrame] = {}
     for tp in tile_paths:
         print(f"  Reading {tp.name} ...")
         df = _read_tile(tp, FEATURE_BANDS)
-        tile_id = df["tile_id"].mode().iloc[0] if len(df) > 0 else tp.stem
+        tile_id = df["tile_id"].drop_nulls().mode()[0] if len(df) > 0 else tp.stem
         tile_dfs[tile_id] = df
 
     # ── per-tile lat-band stats ───────────────────────────────────────────────
-    tile_stats: dict[str, pd.DataFrame] = {}
+    tile_stats: dict[str, pl.DataFrame] = {}
     for tile_id, df in tile_dfs.items():
         tile_stats[tile_id] = _lat_band_stats(df, FEATURE_BANDS)
 
     # ── combined lat-band stats (all tiles together) ──────────────────────────
-    all_df = pd.concat(tile_dfs.values(), ignore_index=True)
+    all_df = pl.concat(list(tile_dfs.values()))
     combined_stats = _lat_band_stats(all_df, FEATURE_BANDS)
 
     # ── score CSV ─────────────────────────────────────────────────────────────
-    scores = pd.read_csv(score_csv)
-    scores["lat_r"] = scores["lat"].round(3)
-    score_lat = (scores.groupby("lat_r")["prob_tam"]
-                 .agg(["median", "std"])
-                 .rename(columns={"median": "prob_median", "std": "prob_std"})
-                 .reset_index())
+    scores = pl.read_csv(score_csv).with_columns(
+        pl.col("lat").cast(pl.Float64).round(3).alias("lat_r")
+    )
+    score_lat = scores.group_by("lat_r").agg([
+        pl.col("prob_tam").median().alias("prob_median"),
+        pl.col("prob_tam").std().alias("prob_std"),
+    ])
 
-    merged = combined_stats.merge(score_lat, on="lat_r", how="left")
+    merged = combined_stats.join(score_lat, on="lat_r", how="left")
 
     # ── plot ──────────────────────────────────────────────────────────────────
     tiles = list(tile_stats.keys())
@@ -144,12 +150,12 @@ def run(location: str, year: int, score_csv: Path, out_path: Path) -> None:
     fig.suptitle(f"{location} {year} — tile coverage diagnostic\n({score_csv.name})",
                  fontsize=11)
 
-    lats = merged["lat_r"]
+    lats = merged["lat_r"].to_numpy()
 
     # Row 0: observations per pixel per tile
     ax = axes[0]
     for tile_id, st in tile_stats.items():
-        ax.plot(st["lat_r"], st["obs_per_pt"], label=tile_id, linewidth=1)
+        ax.plot(st["lat_r"].to_numpy(), st["obs_per_pt"].to_numpy(), label=tile_id, linewidth=1)
     ax.set_ylabel("obs / pixel")
     ax.set_title("Observations per pixel by tile")
     ax.legend(fontsize=8)
@@ -157,10 +163,10 @@ def run(location: str, year: int, score_csv: Path, out_path: Path) -> None:
 
     # Row 1: prob_tam with std band
     ax = axes[1]
-    ax.plot(lats, merged["prob_median"], color="steelblue", linewidth=1.2, label="median")
-    ax.fill_between(lats,
-                    merged["prob_median"] - merged["prob_std"],
-                    merged["prob_median"] + merged["prob_std"],
+    prob_med = merged["prob_median"].to_numpy()
+    prob_std = merged["prob_std"].fill_null(0).to_numpy()
+    ax.plot(lats, prob_med, color="steelblue", linewidth=1.2, label="median")
+    ax.fill_between(lats, prob_med - prob_std, prob_med + prob_std,
                     alpha=0.2, color="steelblue", label="±1σ")
     ax.set_ylabel("prob_tam")
     ax.set_ylim(0, 1)
@@ -176,7 +182,7 @@ def run(location: str, year: int, score_csv: Path, out_path: Path) -> None:
             col = f"{band}_{season}"
             if col not in merged.columns:
                 continue
-            ax.plot(lats, merged[col], color=color, linewidth=1,
+            ax.plot(lats, merged[col].to_numpy(), color=color, linewidth=1,
                     label=f"{season} season", alpha=0.85)
         ax.set_ylabel(band)
         ax.set_title(f"{band} — wet vs dry season mean")
@@ -193,8 +199,10 @@ def run(location: str, year: int, score_csv: Path, out_path: Path) -> None:
     # ── text summary ──────────────────────────────────────────────────────────
     print("\n── Correlation: obs_per_pt vs prob_tam ──")
     for tile_id, st in tile_stats.items():
-        m = st.merge(score_lat, on="lat_r", how="inner")
-        r = m["obs_per_pt"].corr(m["prob_median"])
+        m = st.join(score_lat, on="lat_r", how="inner")
+        if m.is_empty():
+            continue
+        r = float(np.corrcoef(m["obs_per_pt"].to_numpy(), m["prob_median"].to_numpy())[0, 1])
         print(f"  {tile_id}: r = {r:.3f}")
 
     print("\n── Correlation: band means vs prob_tam ──")
@@ -203,8 +211,11 @@ def run(location: str, year: int, score_csv: Path, out_path: Path) -> None:
             col = f"{band}_{season}"
             if col not in merged.columns:
                 continue
-            r = merged[col].corr(merged["prob_median"])
-            print(f"  {band} ({season}): r = {r:.3f}")
+            x = merged[col].drop_nulls().to_numpy()
+            y = merged.filter(pl.col(col).is_not_null())["prob_median"].to_numpy()
+            if len(x) > 1:
+                r = float(np.corrcoef(x, y)[0, 1])
+                print(f"  {band} ({season}): r = {r:.3f}")
 
 
 def _main() -> None:

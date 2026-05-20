@@ -24,7 +24,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import polars as pl
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -42,7 +41,7 @@ def calibrate(
     parquet_paths: Path | list[Path],
     out_path: Path,
     bands: list[str] = _DEFAULT_BANDS,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """Compute per-(tile, band, year) scale factors from overlap observations.
 
     Reads the parquet row-group by row-group.  For each row group, finds all
@@ -71,7 +70,7 @@ def calibrate(
 
     Returns
     -------
-    pandas DataFrame with columns [tile_id, band, year, scale_factor].
+    Polars DataFrame with columns [tile_id, band, year, scale_factor].
     """
     import concurrent.futures
     import pyarrow.parquet as pq
@@ -131,9 +130,14 @@ def calibrate(
 
     if len(tile_counts) < 2:
         print("  [calibrate] only one tile found — no corrections needed.")
-        empty = pd.DataFrame(columns=["tile_id", "band", "year", "scale_factor"])
+        empty = pl.DataFrame({
+            "tile_id": pl.Series([], dtype=pl.Utf8),
+            "band":    pl.Series([], dtype=pl.Utf8),
+            "year":    pl.Series([], dtype=pl.Int32),
+            "scale_factor": pl.Series([], dtype=pl.Float32),
+        })
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        empty.to_parquet(out_path, index=False)
+        empty.write_parquet(out_path)
         return empty
 
     ref_tile    = sorted(tile_counts.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
@@ -239,9 +243,14 @@ def calibrate(
 
     if not all_results:
         print("  [calibrate] no overlap observations found — empty correction table.")
-        empty = pd.DataFrame(columns=["tile_id", "band", "year", "scale_factor"])
+        empty = pl.DataFrame({
+            "tile_id": pl.Series([], dtype=pl.Utf8),
+            "band":    pl.Series([], dtype=pl.Utf8),
+            "year":    pl.Series([], dtype=pl.Int32),
+            "scale_factor": pl.Series([], dtype=pl.Float32),
+        })
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        empty.to_parquet(out_path, index=False)
+        empty.write_parquet(out_path)
         return empty
 
     # Weighted median across row-group medians:
@@ -275,19 +284,18 @@ def calibrate(
                      "scale_factor": scale_factor})
 
     result = (
-        pd.DataFrame(rows)
-        .sort_values(["tile_id", "band", "year"])
-        .reset_index(drop=True)
+        pl.DataFrame(rows)
+        .sort(["tile_id", "band", "year"])
+        .with_columns(pl.col("year").cast(pl.Int32))
     )
-    result["year"] = result["year"].astype(int)
 
     # Print summary
     print(f"\n  [calibrate] correction table ({len(result)} rows):")
-    print(result.to_string(index=False))
+    print(result)
     print()
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    result.to_parquet(out_path, index=False)
+    result.write_parquet(out_path)
     print(f"  [calibrate] written → {out_path}")
     return result
 
@@ -307,13 +315,13 @@ def load_corrections(
     if not calibration_path.exists():
         return None
 
-    df = pd.read_parquet(calibration_path)
-    if df.empty:
+    df = pl.read_parquet(calibration_path)
+    if df.is_empty():
         return {}
 
     return {
-        (row["tile_id"], row["band"], int(row["year"])): float(row["scale_factor"])
-        for _, row in df.iterrows()
+        (row[0], row[1], int(row[2])): float(row[3])
+        for row in df.select(["tile_id", "band", "year", "scale_factor"]).iter_rows()
     }
 
 

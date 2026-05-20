@@ -20,7 +20,7 @@ Bands required: B04, B08, B11 — all present in training tile parquets.
 from __future__ import annotations
 
 import numpy as np
-import pandas as pd
+import polars as pl
 
 from signals.base import Signal
 
@@ -30,16 +30,14 @@ class MAVISignal(Signal):
 
     name = "mavi"
 
-    def compute(self, df: pd.DataFrame) -> pd.Series:
-        good = self.quality_mask(df)
-        out = pd.Series(np.nan, index=df.index, dtype="float32")
+    def compute(self, df: pl.DataFrame) -> pl.Series:
+        good = self.quality_mask(df).to_numpy()
+        out = np.full(len(df), np.nan, dtype="float32")
         if good.any():
-            b08 = df.loc[good, "B08"].values.astype("float32")
-            b04 = df.loc[good, "B04"].values.astype("float32")
-            b11 = df.loc[good, "B11"].values.astype("float32")
+            b08 = df["B08"].to_numpy().astype("float32")
+            b04 = df["B04"].to_numpy().astype("float32")
+            b11 = df["B11"].to_numpy().astype("float32")
             denom = b08 + b04 + b11
-            result = np.full(denom.shape, np.nan, dtype="float32")
-            valid = denom != 0
-            result[valid] = (b08[valid] - b04[valid]) / denom[valid]
-            out[good] = result
-        return out
+            valid = good & (denom != 0)
+            out[valid] = (b08[valid] - b04[valid]) / denom[valid]
+        return pl.Series(out)

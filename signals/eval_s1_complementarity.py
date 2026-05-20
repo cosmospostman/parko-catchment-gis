@@ -34,7 +34,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import pyarrow.parquet as pq
 from scipy.stats import spearmanr
 
@@ -180,7 +180,7 @@ def _group_std(values: np.ndarray, group_idx: np.ndarray, n_groups: int,
 # Per-region loader
 # ---------------------------------------------------------------------------
 
-def _load_region(region_id: str, label: str) -> pd.DataFrame | None:
+def _load_region(region_id: str, label: str) -> pl.DataFrame | None:
     path = _region_parquet_path(region_id)
     if not path.exists():
         return None
@@ -197,21 +197,21 @@ def _load_region(region_id: str, label: str) -> pd.DataFrame | None:
 
     for rg_idx in range(n_rg):
         print(f"  [{region_id}] row group {rg_idx + 1}/{n_rg} …", flush=True)
-        chunk = pf.read_row_group(rg_idx).to_pandas()
-        chunk["date"] = pd.to_datetime(chunk["date"])
-        chunk["year"] = chunk["date"].dt.year.astype("int16")
-        chunk["doy"]  = chunk["date"].dt.day_of_year.astype("int16")
+        chunk = pl.from_arrow(pf.read_row_group(rg_idx)).with_columns([
+            pl.col("date").cast(pl.Date).dt.year().cast(pl.Int16).alias("year"),
+            pl.col("date").cast(pl.Date).dt.ordinal_day().cast(pl.Int16).alias("doy"),
+        ])
 
-        all_pid.append(chunk["point_id"].values)
-        all_yr.append(chunk["year"].values)
-        all_doy.append(chunk["doy"].values)
+        all_pid.append(chunk["point_id"].to_numpy())
+        all_yr.append(chunk["year"].to_numpy())
+        all_doy.append(chunk["doy"].to_numpy())
         for sig in ALL_SIGNALS:
-            all_ts[sig.name].append(sig.compute(chunk).values)
+            all_ts[sig.name].append(sig.compute(chunk).to_numpy())
 
         # Raw VH (linear) for S1 rows — NaN elsewhere
         if "vh" in chunk.columns and "source" in chunk.columns:
-            vh = np.where(chunk["source"].values == "S1",
-                          chunk["vh"].values.astype("float32"), np.nan)
+            vh = np.where(chunk["source"].to_numpy() == "S1",
+                          chunk["vh"].to_numpy().astype("float32"), np.nan)
         else:
             vh = np.full(len(chunk), np.nan, dtype="float32")
         all_vh_lin.append(vh)
@@ -263,10 +263,9 @@ def _load_region(region_id: str, label: str) -> pd.DataFrame | None:
     rows["vh_dry_std"] = dry_vh_std
     rows["vh_dry_cv"]  = dry_vh_cv
 
-    df = pd.DataFrame(rows)
-    df["point_id"] = [k.split("\x00")[0] for k in unique_keys]
-    df["year"]     = [int(k.split("\x00")[1]) for k in unique_keys]
-    df["label"]    = label
+    rows["point_id"] = np.array([k.split("\x00")[0] for k in unique_keys])
+    rows["year"]     = np.array([int(k.split("\x00")[1]) for k in unique_keys])
+    rows["label"]    = np.array([label] * n_groups)
 
     s2_ok = s2_n_obs >= MIN_S2_OBS
     s1_ok = np.zeros(n_groups, dtype=bool)
@@ -274,8 +273,11 @@ def _load_region(region_id: str, label: str) -> pd.DataFrame | None:
         s1_ok |= (s1_dry_n[sig.name] >= MIN_S1_DRY_OBS)
     s1_ok |= (dry_vh_n >= MIN_S1_DRY_OBS)
 
-    df = df[s2_ok & s1_ok].reset_index(drop=True)
-    return df if len(df) > 0 else None
+    mask = s2_ok & s1_ok
+    filtered = {k: v[mask] for k, v in rows.items()}
+    if not filtered["point_id"].any():
+        return None
+    return pl.DataFrame(filtered)
 
 
 # ---------------------------------------------------------------------------
@@ -340,7 +342,7 @@ def _run_site(site: SiteSpec) -> None:
     print(f"# SITE: {site.name}  ({len(site.regions)} regions)")
     print(f"{'#' * 72}")
 
-    frames: list[pd.DataFrame] = []
+    frames: list[pl.DataFrame] = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futures = {
             pool.submit(_load_region, rid, lbl): rid
@@ -359,25 +361,26 @@ def _run_site(site: SiteSpec) -> None:
         print("  SKIP: no data")
         return
 
-    combined = pd.concat(frames, ignore_index=True)
+    combined = pl.concat(frames)
 
     is_pres  = combined["label"] == "presence"
-    fails_vh = is_pres & (combined["s1_vh_db"] < PRESENCE_MIN_VH_DRY_DB)
-    combined = combined[~fails_vh].copy()
-    print(f"\n  VH filter: dropped {fails_vh.sum()} presence pixel-years")
+    fails_vh_mask = is_pres & (combined["s1_vh_db"].to_numpy() < PRESENCE_MIN_VH_DRY_DB)
+    n_dropped = int(fails_vh_mask.sum())
+    combined = combined.filter(~pl.Series(fails_vh_mask))
+    print(f"\n  VH filter: dropped {n_dropped} presence pixel-years")
 
     drop_cols = [f"s2_{s.name}" for s in S2_SIGNALS] + S1_COL_NAMES
-    combined  = combined.dropna(subset=drop_cols)
+    combined  = combined.drop_nulls(subset=drop_cols)
 
-    labels = (combined["label"] == "presence").values
+    labels = (combined["label"] == "presence").to_numpy()
     print(f"  Remaining: {labels.sum()} presence, {(~labels).sum()} absence pixel-years\n")
 
     if labels.sum() < 4 or (~labels).sum() < 4:
         print("  SKIP: insufficient class samples")
         return
 
-    s2_scores_map  = {s.name: combined[f"s2_{s.name}"].values for s in S2_SIGNALS}
-    s1_scores_map  = {col: combined[col].values for col in S1_COL_NAMES}
+    s2_scores_map  = {s.name: combined[f"s2_{s.name}"].to_numpy() for s in S2_SIGNALS}
+    s1_scores_map  = {col: combined[col].to_numpy() for col in S1_COL_NAMES}
     s1_display_map = {f"s1_{s.name}": s.name for s in S1_SIGNALS}
     s1_display_map.update({c: lbl for c, lbl in S1_TEMPORAL_COLS})
 

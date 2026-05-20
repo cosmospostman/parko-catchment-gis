@@ -25,7 +25,7 @@ Ratio signals (structural decoupling, hypothesised in ndsvi.py)
 from __future__ import annotations
 
 import numpy as np
-import pandas as pd
+import polars as pl
 
 from signals.base import Signal
 
@@ -36,12 +36,12 @@ def _band_signal(band: str) -> type[Signal]:
     class _BandSignal(Signal):
         name = band.lower()
 
-        def compute(self, df: pd.DataFrame) -> pd.Series:
-            good = self.quality_mask(df)
-            out = pd.Series(np.nan, index=df.index, dtype="float32")
+        def compute(self, df: pl.DataFrame) -> pl.Series:
+            good = self.quality_mask(df).to_numpy()
+            out = np.full(len(df), np.nan, dtype="float32")
             if good.any():
-                out[good] = df.loc[good, band].values.astype("float32")
-            return out
+                out[good] = df[band].to_numpy().astype("float32")[good]
+            return pl.Series(out)
 
     _BandSignal.__name__ = f"{band}Signal"
     _BandSignal.__qualname__ = f"{band}Signal"
@@ -69,17 +69,15 @@ class B12B11Signal(Signal):
 
     name = "b12_b11"
 
-    def compute(self, df: pd.DataFrame) -> pd.Series:
-        good = self.quality_mask(df)
-        out = pd.Series(np.nan, index=df.index, dtype="float32")
+    def compute(self, df: pl.DataFrame) -> pl.Series:
+        good = self.quality_mask(df).to_numpy()
+        out = np.full(len(df), np.nan, dtype="float32")
         if good.any():
-            b12 = df.loc[good, "B12"].values.astype("float32")
-            b11 = df.loc[good, "B11"].values.astype("float32")
-            result = np.full(b11.shape, np.nan, dtype="float32")
-            valid = b11 != 0
-            result[valid] = b12[valid] / b11[valid]
-            out[good] = result
-        return out
+            b12 = df["B12"].to_numpy().astype("float32")
+            b11 = df["B11"].to_numpy().astype("float32")
+            valid = good & (b11 != 0)
+            out[valid] = b12[valid] / b11[valid]
+        return pl.Series(out)
 
 
 class B11B08Signal(Signal):
@@ -93,14 +91,12 @@ class B11B08Signal(Signal):
 
     name = "b11_b08"
 
-    def compute(self, df: pd.DataFrame) -> pd.Series:
-        good = self.quality_mask(df)
-        out = pd.Series(np.nan, index=df.index, dtype="float32")
+    def compute(self, df: pl.DataFrame) -> pl.Series:
+        good = self.quality_mask(df).to_numpy()
+        out = np.full(len(df), np.nan, dtype="float32")
         if good.any():
-            b11 = df.loc[good, "B11"].values.astype("float32")
-            b08 = df.loc[good, "B08"].values.astype("float32")
-            result = np.full(b08.shape, np.nan, dtype="float32")
-            valid = b08 != 0
-            result[valid] = b11[valid] / b08[valid]
-            out[good] = result
-        return out
+            b11 = df["B11"].to_numpy().astype("float32")
+            b08 = df["B08"].to_numpy().astype("float32")
+            valid = good & (b08 != 0)
+            out[valid] = b11[valid] / b08[valid]
+        return pl.Series(out)

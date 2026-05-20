@@ -66,16 +66,34 @@ FLOWERING_THRESHOLD: float = 0.15
 # Spectral index computation
 # ---------------------------------------------------------------------------
 
-def add_spectral_indices(df: "pd.DataFrame") -> "pd.DataFrame":
-    """Return df with NDVI, NDWI, EVI, MAVI, NDRE, CI_RE columns appended."""
+def add_spectral_indices(df):
+    """Return df with NDVI, NDWI, EVI, MAVI, NDRE, CI_RE columns appended.
+
+    Accepts both polars.DataFrame and pandas.DataFrame.
+    """
+    import polars as pl
     from signals.ndvi import NDVISignal, NDWISignal, EVISignal
     from signals.mavi import MAVISignal
     from signals.ndre import NDRESignal, CIRESignal
+
+    if isinstance(df, pl.DataFrame):
+        return df.with_columns([
+            NDVISignal().compute(df).alias("NDVI"),
+            NDWISignal().compute(df).alias("NDWI"),
+            EVISignal().compute(df).alias("EVI"),
+            MAVISignal().compute(df).alias("MAVI"),
+            NDRESignal().compute(df).alias("NDRE"),
+            CIRESignal().compute(df).alias("CI_RE"),
+        ])
+
+    # pandas path — for analysis/ scripts that are out of migration scope.
+    # Signals return pl.Series; .to_numpy() gives a numpy array pandas accepts.
     df = df.copy()
-    df["NDVI"]  = NDVISignal().compute(df)
-    df["NDWI"]  = NDWISignal().compute(df)
-    df["EVI"]   = EVISignal().compute(df)
-    df["MAVI"]  = MAVISignal().compute(df)
-    df["NDRE"]  = NDRESignal().compute(df)
-    df["CI_RE"] = CIRESignal().compute(df)
+    _pl_df = pl.from_pandas(df)
+    df["NDVI"]  = NDVISignal().compute(_pl_df).to_numpy()
+    df["NDWI"]  = NDWISignal().compute(_pl_df).to_numpy()
+    df["EVI"]   = EVISignal().compute(_pl_df).to_numpy()
+    df["MAVI"]  = MAVISignal().compute(_pl_df).to_numpy()
+    df["NDRE"]  = NDRESignal().compute(_pl_df).to_numpy()
+    df["CI_RE"] = CIRESignal().compute(_pl_df).to_numpy()
     return df

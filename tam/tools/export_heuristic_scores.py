@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
+import polars as pl
 
 _REPO = Path(__file__).resolve().parent.parent.parent
 if str(_REPO) not in sys.path:
@@ -53,41 +53,38 @@ def _region_label(region_id: str) -> str:
     return "unknown"
 
 
-def _apply_heuristic(s1: pd.DataFrame) -> pd.Series:
+def _apply_heuristic(s1: pl.DataFrame) -> dict[str, float]:
     """Compute per-pixel heuristic score from S1 observations.
 
-    Parameters
-    ----------
-    s1 : DataFrame with columns point_id, vh (linear power), date or doy.
-
-    Returns
-    -------
-    Series indexed by point_id with float score ∈ {0.0, 0.5, 1.0}.
+    Returns dict mapping point_id → score ∈ {0.0, 1.0, nan}.
     """
-    df = s1.copy()
-    if "doy" not in df.columns:
-        df["doy"] = pd.to_datetime(df["date"]).dt.day_of_year
+    if "doy" not in s1.columns:
+        s1 = s1.with_columns(
+            pl.col("date").cast(pl.Date).dt.ordinal_day().alias("doy")
+        )
 
-    vh_lin = df["vh"].values.astype(np.float64)
-    valid  = vh_lin > 0
-    df["_vh_db"] = np.where(valid, 10.0 * np.log10(vh_lin), np.nan)
+    vh_lin = s1["vh"].to_numpy().astype(np.float64)
+    vh_db  = np.where(vh_lin > 0, 10.0 * np.log10(vh_lin), np.nan)
+    s1 = s1.with_columns(pl.Series("_vh_db", vh_db))
 
-    has_db = df["_vh_db"].notna()
-    dry_mask = (df["doy"] >= _DRY_DOY_MIN) & (df["doy"] <= _DRY_DOY_MAX)
+    dry = s1.filter(
+        pl.col("_vh_db").is_not_null() & pl.col("_vh_db").is_not_nan() &
+        (pl.col("doy") >= _DRY_DOY_MIN) & (pl.col("doy") <= _DRY_DOY_MAX)
+    )
 
-    dry_df = df[has_db & dry_mask]
+    mean_vh = {
+        row["point_id"]: row["mean_vh"]
+        for row in dry.group_by("point_id")
+                      .agg(pl.col("_vh_db").mean().alias("mean_vh"))
+                      .iter_rows(named=True)
+    }
 
-    mean_vh_dry = dry_df.groupby("point_id")["_vh_db"].mean()
-
-    all_pids = pd.Index(df["point_id"].unique(), name="point_id")
-    mean_vh_dry = mean_vh_dry.reindex(all_pids)
-
-    scores = pd.Series(np.nan, index=all_pids, name="prob_woody", dtype=float)
-
-    scores[mean_vh_dry >= _VH_WOODY_FLOOR_DB] = 1.0
-    scores[mean_vh_dry <  _VH_WOODY_FLOOR_DB] = 0.0
-
-    return scores
+    all_pids = s1["point_id"].unique().to_list()
+    return {
+        pid: (1.0 if mean_vh[pid] >= _VH_WOODY_FLOOR_DB else 0.0)
+             if pid in mean_vh else float("nan")
+        for pid in all_pids
+    }
 
 
 def export_region(region_id: str) -> str:
@@ -95,68 +92,67 @@ def export_region(region_id: str) -> str:
     _OUT_DIR.mkdir(parents=True, exist_ok=True)
     out_path = _OUT_DIR / f"{region_id}.json"
 
-    idx = pd.read_parquet(_DATA_DIR / "index.parquet")
-    rows = idx[idx["region_id"] == region_id]
-    if rows.empty:
+    import pyarrow.parquet as pq
+
+    idx = pl.read_parquet(_DATA_DIR / "index.parquet")
+    rows = idx.filter(pl.col("region_id") == region_id)
+    if rows.is_empty():
         raise ValueError(f"Region '{region_id}' not found in training index.")
-    tile_id = rows["tile_id"].iloc[0]
+    tile_id = rows["tile_id"][0]
 
     tile_path = _DATA_DIR / "tiles" / f"{tile_id}.parquet"
     print(f"Loading tile {tile_id} ...", file=sys.stderr)
 
-    import pyarrow.parquet as pq
     pf = pq.ParquetFile(tile_path)
     available = set(pf.schema_arrow.names)
     want = ["point_id", "lon", "lat", "date", "source", "vh", "vv"]
     read_cols = [c for c in want if c in available]
 
-    chunks = [pf.read_row_group(rg, columns=read_cols).to_pandas()
+    chunks = [pl.from_arrow(pf.read_row_group(rg, columns=read_cols))
               for rg in range(pf.metadata.num_row_groups)]
-    tile_df = pd.concat(chunks, ignore_index=True)
+    tile_df = pl.concat(chunks)
 
     prefix = region_id + "_"
-    pixel_df = tile_df[tile_df["point_id"].str.startswith(prefix)].copy()
+    pixel_df = tile_df.filter(pl.col("point_id").str.starts_with(prefix))
 
     label = _region_label(region_id)
 
-    if pixel_df.empty:
+    if pixel_df.is_empty():
         print(f"No pixels found for region '{region_id}' — writing empty result.", file=sys.stderr)
         payload = {"region_id": region_id, "label": label, "pixels": [], "missing_data": True}
         out_path.write_text(json.dumps(payload, separators=(",", ":")))
         return str(out_path)
 
     print(f"  {len(pixel_df):,} observations, "
-          f"{pixel_df['point_id'].nunique():,} unique pixels", file=sys.stderr)
+          f"{pixel_df['point_id'].n_unique():,} unique pixels", file=sys.stderr)
 
-    coords = (
-        pixel_df[["point_id", "lon", "lat"]]
-        .drop_duplicates("point_id")
-        .set_index("point_id")
-    )
+    coords = {
+        row["point_id"]: (row["lon"], row["lat"])
+        for row in pixel_df.select(["point_id", "lon", "lat"])
+                            .unique("point_id")
+                            .iter_rows(named=True)
+    }
 
     # S1 only
     if "source" in pixel_df.columns:
-        s1_df = pixel_df[pixel_df["source"] == "S1"].copy()
+        s1_df = pixel_df.filter(pl.col("source") == "S1")
     else:
-        s1_df = pd.DataFrame()
+        s1_df = pl.DataFrame()
 
-    if not s1_df.empty and "vh" in s1_df.columns:
+    if not s1_df.is_empty() and "vh" in s1_df.columns:
         scores = _apply_heuristic(s1_df)
     else:
         print("  No S1 data found — all pixels will have score=None", file=sys.stderr)
-        scores = pd.Series(np.nan, index=pd.Index(pixel_df["point_id"].unique(), name="point_id"))
-
-    joined = coords.join(scores.rename("prob_woody"), how="left")
+        scores = {pid: float("nan") for pid in coords}
 
     pixels = []
-    for pid, row in joined.iterrows():
-        score = row["prob_woody"]
+    for pid, (lon, lat) in coords.items():
+        score = scores.get(pid, float("nan"))
         pixels.append({
             "id":         pid,
-            "lon":        round(float(row["lon"]), 7),
-            "lat":        round(float(row["lat"]), 7),
-            "prob_woody": None if (score is None or (isinstance(score, float) and np.isnan(score)))
-                          else round(float(score), 1),
+            "lon":        round(float(lon), 7),
+            "lat":        round(float(lat), 7),
+            "prob_woody": None if np.isnan(score) else round(float(score), 1),
         })
 
     payload = {"region_id": region_id, "label": label, "pixels": pixels}

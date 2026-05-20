@@ -25,7 +25,7 @@ Bands required: NDVI column — pre-computed in all training tile parquets.
 from __future__ import annotations
 
 import numpy as np
-import pandas as pd
+import polars as pl
 
 from signals.base import Signal
 
@@ -40,9 +40,9 @@ class TemporalVarianceSignal(Signal):
 
     name = "ndvi_sigma_t"
 
-    def compute(self, df: pd.DataFrame) -> pd.Series:
-        good = self.quality_mask(df)
-        out = pd.Series(np.nan, index=df.index, dtype="float32")
+    def compute(self, df: pl.DataFrame) -> pl.Series:
+        good = self.quality_mask(df).to_numpy()
+        out = np.full(len(df), np.nan, dtype="float32")
         if good.any():
-            out[good] = df.loc[good, "NDVI"].values.astype("float32")
-        return out
+            out[good] = df["NDVI"].to_numpy().astype("float32")[good]
+        return pl.Series(out)

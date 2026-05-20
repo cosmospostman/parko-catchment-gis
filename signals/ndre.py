@@ -24,7 +24,7 @@ Bands required: B05, B07, B8A — all present in training tile parquets.
 from __future__ import annotations
 
 import numpy as np
-import pandas as pd
+import polars as pl
 
 from signals.base import Signal
 
@@ -34,18 +34,16 @@ class NDRESignal(Signal):
 
     name = "ndre"
 
-    def compute(self, df: pd.DataFrame) -> pd.Series:
-        good = self.quality_mask(df)
-        out = pd.Series(np.nan, index=df.index, dtype="float32")
+    def compute(self, df: pl.DataFrame) -> pl.Series:
+        good = self.quality_mask(df).to_numpy()
+        out = np.full(len(df), np.nan, dtype="float32")
         if good.any():
-            b8a = df.loc[good, "B8A"].values.astype("float32")
-            b05 = df.loc[good, "B05"].values.astype("float32")
+            b8a = df["B8A"].to_numpy().astype("float32")
+            b05 = df["B05"].to_numpy().astype("float32")
             denom = b8a + b05
-            result = np.full(denom.shape, np.nan, dtype="float32")
-            valid = denom != 0
-            result[valid] = (b8a[valid] - b05[valid]) / denom[valid]
-            out[good] = result
-        return out
+            valid = good & (denom != 0)
+            out[valid] = (b8a[valid] - b05[valid]) / denom[valid]
+        return pl.Series(out)
 
 
 class CIRESignal(Signal):
@@ -58,14 +56,12 @@ class CIRESignal(Signal):
 
     name = "ci_re"
 
-    def compute(self, df: pd.DataFrame) -> pd.Series:
-        good = self.quality_mask(df)
-        out = pd.Series(np.nan, index=df.index, dtype="float32")
+    def compute(self, df: pl.DataFrame) -> pl.Series:
+        good = self.quality_mask(df).to_numpy()
+        out = np.full(len(df), np.nan, dtype="float32")
         if good.any():
-            b07 = df.loc[good, "B07"].values.astype("float32")
-            b05 = df.loc[good, "B05"].values.astype("float32")
-            result = np.full(b05.shape, np.nan, dtype="float32")
-            valid = b05 != 0
-            result[valid] = b07[valid] / b05[valid] - 1.0
-            out[good] = result
-        return out
+            b07 = df["B07"].to_numpy().astype("float32")
+            b05 = df["B05"].to_numpy().astype("float32")
+            valid = good & (b05 != 0)
+            out[valid] = b07[valid] / b05[valid] - 1.0
+        return pl.Series(out)

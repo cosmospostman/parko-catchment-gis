@@ -108,7 +108,7 @@ def cmd_info(args: argparse.Namespace) -> None:
     if not years:
         return
 
-    import pandas as pd
+    import polars as pl
 
     print()
     print(f"  Fetched years: {', '.join(str(y) for y in years)}")
@@ -118,18 +118,19 @@ def cmd_info(args: argparse.Namespace) -> None:
         tile_paths = tile_paths_by_year.get(year, [])
         total_size = sum(p.stat().st_size for p in tile_paths)
         size_str = _fmt_size(total_size)
-        dfs = [pd.read_parquet(p, columns=["date"]) for p in tile_paths]
-        df = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame(columns=["date"])
-        df["date"] = pd.to_datetime(df["date"])
+        dfs = [pl.read_parquet(p, columns=["date"]) for p in tile_paths]
+        df = pl.concat(dfs) if dfs else pl.DataFrame({"date": pl.Series([], dtype=pl.Date)})
         counts = (
-            df.groupby(df["date"].dt.to_period("M"))["date"]
-            .nunique()
-            .rename("n")
+            df.with_columns(pl.col("date").cast(pl.Date).dt.truncate("1mo").alias("month"))
+            .group_by("month")
+            .agg(pl.col("date").n_unique().alias("n"))
+            .sort("month")
         )
         print()
         print(f"  {year}  ({size_str})  — scene count per month")
-        for period, n in counts.items():
-            label = period.strftime("%b %Y").upper()
+        for row in counts.iter_rows(named=True):
+            label = row["month"].strftime("%b %Y").upper()
+            n = row["n"]
             bar = "#" * n
             print(f"    {label:<12} {n:>4}  {bar}")
 
@@ -207,8 +208,7 @@ def cmd_training_fetch(args: argparse.Namespace) -> None:
 
 
 def cmd_training_verify(args: argparse.Namespace) -> None:
-    import numpy as np
-    import pandas as pd
+    import polars as pl
     from utils.regions import load_regions
     from utils.training_collector import _region_parquet_path, tile_parquet_path, _load_index
 
@@ -230,21 +230,25 @@ def cmd_training_verify(args: argparse.Namespace) -> None:
             issues.append(f"MISSING  {r.id} — parquet not found at {path}")
             continue
 
-        df = pd.read_parquet(path)
-        s2 = df[df["source"] == "S2"] if "source" in df.columns else df
+        df = pl.read_parquet(path)
+        s2 = df.filter(pl.col("source") == "S2") if "source" in df.columns else df
 
-        n_pixels = s2["point_id"].nunique()
+        n_pixels = s2["point_id"].n_unique()
         n_obs    = len(s2)
-        dupes    = s2.duplicated(subset=["point_id", "date"]).sum()
+        dupes    = len(s2) - len(s2.unique(subset=["point_id", "date"]))
 
         # Observations per pixel
-        obs_per_pixel = s2.groupby("point_id").size()
-        obs_min, obs_med, obs_max = obs_per_pixel.min(), obs_per_pixel.median(), obs_per_pixel.max()
+        obs_per_pixel = s2.group_by("point_id").agg(pl.len().alias("n"))["n"]
+        obs_min = int(obs_per_pixel.min())
+        obs_med = int(obs_per_pixel.median())
+        obs_max = int(obs_per_pixel.max())
 
         # Band stats — mean and std across S2 obs only
-        band_means = s2[BAND_COLS].mean()
-        band_stds  = s2[BAND_COLS].std()
-        nan_counts = s2[BAND_COLS].isna().sum().sum()
+        band_means = [s2[c].mean() for c in BAND_COLS]
+        band_stds  = [s2[c].std()  for c in BAND_COLS]
+        nan_counts = sum(s2[c].is_null().sum() for c in BAND_COLS)
+        mean_of_means = sum(band_means) / len(band_means)
+        mean_of_stds  = sum(band_stds)  / len(band_stds)
 
         # Flag suspicious values
         region_issues = []
@@ -256,20 +260,21 @@ def cmd_training_verify(args: argparse.Namespace) -> None:
             region_issues.append(f"LOW_OBS  {r.id} — some pixels have <4 observations (min={obs_min})")
         if nan_counts > 0:
             region_issues.append(f"NAN      {r.id} — {nan_counts} NaN band values")
-        if band_means.max() > 1.5 or band_means.min() < -0.5:
-            region_issues.append(f"RANGE    {r.id} — band means outside expected range [{band_means.min():.2f}, {band_means.max():.2f}]")
+        bm_min, bm_max = min(band_means), max(band_means)
+        if bm_max > 1.5 or bm_min < -0.5:
+            region_issues.append(f"RANGE    {r.id} — band means outside expected range [{bm_min:.2f}, {bm_max:.2f}]")
 
         # S1 backscatter sanity checks — VH lives in the tile parquet, not the region parquet
         index = _load_index()
-        tile_ids = index.loc[index["region_id"] == r.id, "tile_id"].tolist()
+        tile_ids = index.filter(pl.col("region_id") == r.id)["tile_id"].to_list()
         for tile_id in tile_ids:
             tp = tile_parquet_path(tile_id)
             if not tp.exists():
                 region_issues.append(f"S1_MISS  {r.id} — tile parquet {tile_id} not built yet")
                 continue
-            tile_df = pd.read_parquet(tp, columns=["point_id", "vh"])
+            tile_df = pl.read_parquet(tp, columns=["point_id", "vh"])
             region_prefix = r.id + "_"
-            vh = tile_df.loc[tile_df["point_id"].str.startswith(region_prefix), "vh"].dropna()
+            vh = tile_df.filter(pl.col("point_id").str.starts_with(region_prefix))["vh"].drop_nulls()
             if len(vh) == 0:
                 region_issues.append(f"S1_MISS  {r.id} — no S1 vh data in tile {tile_id}")
             elif vh.median() > 1.0:
@@ -282,8 +287,8 @@ def cmd_training_verify(args: argparse.Namespace) -> None:
         else:
             issues.extend(region_issues)
 
-        rows.append((r.id, r.label, n_pixels, n_obs, int(obs_min), int(obs_med), int(obs_max),
-                     f"{band_means.mean():.3f}", f"{band_stds.mean():.3f}"))
+        rows.append((r.id, r.label, n_pixels, n_obs, obs_min, obs_med, obs_max,
+                     f"{mean_of_means:.3f}", f"{mean_of_stds:.3f}"))
 
     # Print table
     headers = ("REGION", "LABEL", "PIXELS", "OBS", "MIN_OBS", "MED_OBS", "MAX_OBS", "MEAN_BAND", "STD_BAND")

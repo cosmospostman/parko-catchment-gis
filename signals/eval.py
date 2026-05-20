@@ -49,7 +49,7 @@ from pathlib import Path
 from typing import Sequence
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import pyarrow.parquet as pq
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -119,49 +119,56 @@ class EvalResult:
 # Presence VH filter
 # ---------------------------------------------------------------------------
 
-def _vh_dry_mean(df: pd.DataFrame) -> pd.Series:
+def _vh_dry_mean(df: pl.DataFrame) -> dict[tuple, float]:
     """Compute mean dry-season VH (dB) per (point_id, year) from S1 rows.
 
-    Returns a Series indexed by (point_id, year). Pixel-years with no S1 dry
-    observations get NaN — they are not dropped by the filter (NaN = no data,
+    Returns a dict keyed by (point_id, year). Pixel-years with no S1 dry
+    observations are absent — they are not dropped by the filter (no entry = no data,
     not low-VH).
     """
     if "vh" not in df.columns or "source" not in df.columns:
-        return pd.Series(dtype="float64")
+        return {}
 
-    s1 = df[df["source"] == "S1"].copy()
-    if s1.empty:
-        return pd.Series(dtype="float64")
+    s1 = df.filter(pl.col("source") == "S1")
+    if s1.is_empty():
+        return {}
 
-    s1["date"] = pd.to_datetime(s1["date"])
-    s1["year"] = s1["date"].dt.year
-    s1["doy"]  = s1["date"].dt.day_of_year
-    dry = s1[(s1["doy"] >= _DRY_DOY_MIN) & (s1["doy"] <= _DRY_DOY_MAX)]
-    if dry.empty:
-        return pd.Series(dtype="float64")
+    s1 = s1.with_columns([
+        pl.col("date").cast(pl.Date).dt.year().alias("year"),
+        pl.col("date").cast(pl.Date).dt.ordinal_day().alias("doy"),
+    ])
+    dry = s1.filter(
+        (pl.col("doy") >= _DRY_DOY_MIN) & (pl.col("doy") <= _DRY_DOY_MAX)
+    )
+    if dry.is_empty():
+        return {}
 
-    vh_lin = dry["vh"].values.astype("float32")
+    vh_lin = dry["vh"].to_numpy().astype("float32")
     with np.errstate(divide="ignore", invalid="ignore"):
         vh_db = 10.0 * np.log10(np.where(vh_lin > 0, vh_lin, np.nan))
-    dry = dry.copy()
-    dry["_vh_db"] = vh_db
-    return dry.groupby(["point_id", "year"])["_vh_db"].mean()
+    dry = dry.with_columns(pl.Series("_vh_db", vh_db))
+
+    agg = (
+        dry.group_by(["point_id", "year"])
+        .agg(pl.col("_vh_db").mean().alias("mean_vh_db"))
+    )
+    return {(row[0], row[1]): row[2] for row in agg.iter_rows()}
 
 
 def _apply_presence_vh_filter(
-    frame: pd.DataFrame,
+    frame: pl.DataFrame,
     min_vh_db: float,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """Drop presence pixel-years whose mean dry-season VH is below min_vh_db.
 
-    Pixel-years with no S1 dry observations (NaN mean VH) are retained — absence
+    Pixel-years with no S1 dry observations (null mean VH) are retained — absence
     of S1 data is not evidence of low backscatter.
     """
     if "_mean_vh_dry_db" not in frame.columns:
         return frame
-    is_presence = frame["label"] == "presence"
-    fails = is_presence & (frame["_mean_vh_dry_db"] < min_vh_db)
-    return frame[~fails]
+    is_presence = pl.col("label") == "presence"
+    fails = is_presence & (pl.col("_mean_vh_dry_db") < min_vh_db)
+    return frame.filter(~fails)
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +180,7 @@ def _load_region(
     label: str,
     signal: Signal,
     presence_min_vh_dry_db: float | None = None,
-) -> pd.DataFrame | None:
+) -> pl.DataFrame | None:
     """Load one region parquet, compute the signal, return a pixel-year summary frame.
 
     Returns None if the parquet does not exist (region not yet fetched).
@@ -189,41 +196,42 @@ def _load_region(
         return None
 
     pf = pq.ParquetFile(path)
-    chunks: list[pd.DataFrame] = []
-    for rg in range(pf.metadata.num_row_groups):
-        chunks.append(pf.read_row_group(rg).to_pandas())
-    df = pd.concat(chunks, ignore_index=True)
+    chunks = [pf.read_row_group(rg) for rg in range(pf.metadata.num_row_groups)]
+    df = pl.from_arrow(chunks[0] if len(chunks) == 1 else __import__("pyarrow").concat_tables(chunks))
 
     # Derive signal time series
     ts = signal.compute(df)
 
     # Attach year for grouping
-    df["_ts"] = ts
-    df["date"] = pd.to_datetime(df["date"])
-    df["year"] = df["date"].dt.year
+    df = df.with_columns([
+        pl.Series("_ts", ts.to_numpy()),
+        pl.col("date").cast(pl.Date).dt.year().alias("year"),
+    ])
 
     # Pre-compute VH dry-season mean per pixel-year for presence filter
     vh_dry = (
         _vh_dry_mean(df)
         if (label == "presence" and presence_min_vh_dry_db is not None)
-        else pd.Series(dtype="float64")
+        else {}
     )
 
     # Per pixel-year summarise
     records = []
-    for (pid, yr), grp in df.groupby(["point_id", "year"], sort=False):
-        stats = signal.summarise(grp["_ts"], grp)
+    for (pid, yr), grp in df.group_by(["point_id", "year"], maintain_order=False):
+        ts_grp = grp["_ts"]
+        df_grp = grp
+        stats = signal.summarise(ts_grp, df_grp)
         if stats["n_obs"] == 0:
             continue
         row = {"point_id": pid, "year": yr, "label": label}
         row.update({f"{signal.name}_{k}": v for k, v in stats.items()})
-        if not vh_dry.empty:
+        if vh_dry:
             row["_mean_vh_dry_db"] = vh_dry.get((pid, yr), np.nan)
         records.append(row)
 
     if not records:
         return None
-    return pd.DataFrame(records)
+    return pl.DataFrame(records)
 
 
 # ---------------------------------------------------------------------------
@@ -255,17 +263,15 @@ def _auroc(pres_vals: np.ndarray, abs_vals: np.ndarray) -> float:
     n_p, n_a = len(pres_vals), len(abs_vals)
     if n_p == 0 or n_a == 0:
         return np.nan
-    # Rank all values jointly; ties get average rank (standard U-stat approach)
     combined = np.concatenate([pres_vals, abs_vals])
     order = np.argsort(combined, kind="stable")
     ranks = np.empty(len(combined), dtype="float64")
-    # Assign average ranks to ties
     i = 0
     while i < len(order):
         j = i + 1
         while j < len(order) and combined[order[j]] == combined[order[i]]:
             j += 1
-        avg_rank = (i + j + 1) / 2.0  # 1-based average rank
+        avg_rank = (i + j + 1) / 2.0
         ranks[order[i:j]] = avg_rank
         i = j
     u = ranks[:n_p].sum() - n_p * (n_p + 1) / 2.0
@@ -337,7 +343,7 @@ def evaluate(
         if verbose:
             print(f"[{site.name}] loading {len(site.regions)} regions …")
 
-        frames: list[pd.DataFrame] = []
+        frames: list[pl.DataFrame] = []
         missing: list[str] = []
         with ThreadPoolExecutor(max_workers=len(site.regions)) as pool:
             futures = {
@@ -363,7 +369,7 @@ def evaluate(
                 print(f"  SKIP: no data for site {site.name!r}")
             continue
 
-        combined = pd.concat(frames, ignore_index=True)
+        combined = pl.concat(frames, how="diagonal")
 
         # Apply presence VH filter — mirrors TAM training presence filter
         if presence_min_vh_dry_db is not None:
@@ -373,12 +379,12 @@ def evaluate(
             if verbose and n_dropped > 0:
                 print(f"  VH filter (<{presence_min_vh_dry_db} dB): dropped {n_dropped} presence pixel-years")
         if "_mean_vh_dry_db" in combined.columns:
-            combined = combined.drop(columns=["_mean_vh_dry_db"])
+            combined = combined.drop("_mean_vh_dry_db")
 
         # Apply minimum obs filter
         n_obs_col = f"{signal.name}_n_obs"
         if n_obs_col in combined.columns:
-            combined = combined[combined[n_obs_col] >= min_obs_per_year]
+            combined = combined.filter(pl.col(n_obs_col) >= min_obs_per_year)
 
         if score_col not in combined.columns:
             raise ValueError(
@@ -386,16 +392,18 @@ def evaluate(
                 f"Available columns: {[c for c in combined.columns if c.startswith(signal.name)]}"
             )
 
-        pres = combined[combined["label"] == "presence"]
-        abs_ = combined[combined["label"] == "absence"]
+        pres = combined.filter(pl.col("label") == "presence")
+        abs_ = combined.filter(pl.col("label") == "absence")
 
-        pres_vals = pres[score_col].dropna().values
-        abs_vals  = abs_[score_col].dropna().values
+        pres_vals = pres[score_col].drop_nulls().to_numpy()
+        pres_vals = pres_vals[~np.isnan(pres_vals)]
+        abs_vals  = abs_[score_col].drop_nulls().to_numpy()
+        abs_vals  = abs_vals[~np.isnan(abs_vals)]
 
         pres_stats = _class_stats("presence", pres_vals)
         abs_stats  = _class_stats("absence",  abs_vals)
-        pres_stats.n_pixels = pres["point_id"].nunique()
-        abs_stats.n_pixels  = abs_["point_id"].nunique()
+        pres_stats.n_pixels = pres["point_id"].n_unique()
+        abs_stats.n_pixels  = abs_["point_id"].n_unique()
 
         result = EvalResult(
             site=site.name,

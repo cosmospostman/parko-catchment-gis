@@ -33,8 +33,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import datetime
+
 import numpy as np
-import pandas as pd
+import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -68,16 +70,18 @@ def _write_full_parquet(path: Path, groups: list[list[str]], rng) -> Path:
     """
     from tam.core.dataset import BAND_COLS
 
+    start = datetime.date(2023, 1, 1)
     writer = None
     for pids in groups:
         n = len(pids)
-        df = pd.DataFrame({
+        dates = [start + datetime.timedelta(days=20 * i) for i in range(n)]
+        df = pl.DataFrame({
             "point_id": pids,
-            "date": pd.date_range("2023-01-01", periods=n, freq="20D").astype("datetime64[us]"),
+            "date": [datetime.datetime(d.year, d.month, d.day) for d in dates],
             "scl_purity": [1.0] * n,
-            **{b: rng.uniform(0, 1, n).astype(np.float32) for b in BAND_COLS},
-        })
-        tbl = pa.Table.from_pandas(df, preserve_index=False)
+            **{b: rng.uniform(0, 1, n).astype(np.float32).tolist() for b in BAND_COLS},
+        }).with_columns(pl.col("date").cast(pl.Datetime("us")))
+        tbl = df.to_arrow()
         if writer is None:
             writer = pq.ParquetWriter(path, tbl.schema)
         writer.write_table(tbl)
@@ -288,14 +292,15 @@ def test_sort_parquet_by_pixel_requires_underscore_ids(tmp_path):
     from tam.core.dataset import BAND_COLS
 
     rng = np.random.default_rng(11)
-    df = pd.DataFrame({
+    _start = datetime.date(2023, 1, 1)
+    df = pl.DataFrame({
         "point_id": ["px1", "px2"],
-        "date": pd.date_range("2023-01-01", periods=2, freq="20D").astype("datetime64[us]"),
+        "date": [datetime.datetime(_start.year, _start.month, _start.day + 20 * i) for i in range(2)],
         "scl_purity": [1.0, 1.0],
-        **{b: rng.uniform(0, 1, 2).astype(np.float32) for b in BAND_COLS},
-    })
+        **{b: rng.uniform(0, 1, 2).astype(np.float32).tolist() for b in BAND_COLS},
+    }).with_columns(pl.col("date").cast(pl.Datetime("us")))
     src = tmp_path / "bad_ids.parquet"
-    pq.write_table(pa.Table.from_pandas(df, preserve_index=False), src, row_group_size=1)
+    pq.write_table(df.to_arrow(), src, row_group_size=1)
 
     dst = tmp_path / "bad_ids_sorted.parquet"
     with pytest.raises(ZeroDivisionError):
@@ -346,19 +351,22 @@ def test_sort_groups_by_northing_not_easting(tmp_path):
     for _ in range(3):
         groups.append(pids)  # repeat all 4 pixels → 4 obs each, 3 row groups
 
+    _start12 = datetime.date(2023, 1, 1)
+
     def _make_df(pid_list):
         n = len(pid_list)
-        return pd.DataFrame({
+        dates = [datetime.datetime(2023, 1, 1) + datetime.timedelta(days=20 * i) for i in range(n)]
+        return pl.DataFrame({
             "point_id": pid_list,
-            "date": pd.date_range("2023-01-01", periods=n, freq="20D").astype("datetime64[us]"),
+            "date": dates,
             "scl_purity": [1.0] * n,
-            **{b: rng.uniform(0, 1, n).astype(np.float32) for b in BAND_COLS},
-        })
+            **{b: rng.uniform(0, 1, n).astype(np.float32).tolist() for b in BAND_COLS},
+        }).with_columns(pl.col("date").cast(pl.Datetime("us")))
 
     src = tmp_path / "tile.parquet"
     writer = None
     for pid_list in groups:
-        tbl = pa.Table.from_pandas(_make_df(pid_list), preserve_index=False)
+        tbl = _make_df(pid_list).to_arrow()
         if writer is None:
             writer = pq.ParquetWriter(src, tbl.schema)
         writer.write_table(tbl)
@@ -424,17 +432,18 @@ def test_sort_does_not_mix_northing_rows(tmp_path):
 
     def _make_df(pid_list):
         n = len(pid_list)
-        return pd.DataFrame({
+        dates = [datetime.datetime(2023, 1, 1) + datetime.timedelta(days=20 * i) for i in range(n)]
+        return pl.DataFrame({
             "point_id": pid_list,
-            "date": pd.date_range("2023-01-01", periods=n, freq="20D").astype("datetime64[us]"),
+            "date": dates,
             "scl_purity": [1.0] * n,
-            **{b: rng.uniform(0, 1, n).astype(np.float32) for b in BAND_COLS},
-        })
+            **{b: rng.uniform(0, 1, n).astype(np.float32).tolist() for b in BAND_COLS},
+        }).with_columns(pl.col("date").cast(pl.Datetime("us")))
 
     src = tmp_path / "tile.parquet"
     # Write all 3 pixels into a single interleaved row group so the sort must
     # actually separate them.
-    tbl = pa.Table.from_pandas(_make_df(pids * 4), preserve_index=False)
+    tbl = _make_df(pids * 4).to_arrow()
     pq.write_table(tbl, src, row_group_size=len(pids) * 4)
 
     dst = tmp_path / "tile_sorted.parquet"

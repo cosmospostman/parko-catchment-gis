@@ -20,7 +20,7 @@ import os
 import sys
 from pathlib import Path
 
-import pandas as pd
+import polars as pl
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -90,17 +90,17 @@ def _cmd_train(args: argparse.Namespace) -> None:
         read_cols = base_cols + [c for c in exp.feature_cols if c in available] + s1_cols + s2_global_cols
         tile_specs.append((path, read_cols, pf.metadata.num_row_groups))
 
-    def _read_tile(path: Path, cols: list[str], n_rg: int) -> pd.DataFrame:
+    def _read_tile(path: Path, cols: list[str], n_rg: int) -> pl.DataFrame:
         """Read all row groups of one tile with bounded parallelism."""
         pf = pq.ParquetFile(path)
-        rg_chunks: list[pd.DataFrame] = []
+        rg_chunks: list[pl.DataFrame] = []
         # 4 threads per tile overlaps I/O without blowing memory across tiles.
         n_workers = min(4, n_rg)
         with ThreadPoolExecutor(max_workers=n_workers) as ex:
             futures = {ex.submit(pf.read_row_group, rg, columns=cols): rg for rg in range(n_rg)}
             for fut in as_completed(futures):
-                rg_chunks.append(fut.result().to_pandas())
-        return pd.concat(rg_chunks, ignore_index=True)
+                rg_chunks.append(pl.from_arrow(fut.result()))
+        return pl.concat(rg_chunks)
 
     # Filter to known training region point_ids before accumulating tiles.
     # point_id format is <region_id>_<row>_<col>; strip the trailing two numeric
@@ -110,9 +110,10 @@ def _cmd_train(args: argparse.Namespace) -> None:
     _suffix_re = _re.compile(r"_\d+_\d+$")
     known_region_ids = set(exp.region_ids)
 
-    def _filter_to_regions(df: pd.DataFrame) -> pd.DataFrame:
-        pid_region = df["point_id"].str.replace(_suffix_re, "", regex=True)
-        return df[pid_region.isin(known_region_ids)]
+    def _filter_to_regions(df: pl.DataFrame) -> pl.DataFrame:
+        return df.filter(
+            df["point_id"].str.replace(_suffix_re.pattern, "", literal=False).is_in(known_region_ids)
+        )
 
     # Load-time spatial stride: thin unique point_ids per tile before accumulating.
     # This mirrors the train_tam spatial_stride logic but runs early enough to keep
@@ -121,21 +122,26 @@ def _cmd_train(args: argparse.Namespace) -> None:
     # which is harmless (the strided pixels are simply absent from pixel_df).
     _load_stride = args.spatial_stride or exp.train_kwargs.get("spatial_stride", 1) or 1
 
-    def _stride_tile(df: pd.DataFrame, stride: int) -> pd.DataFrame:
+    def _stride_tile(df: pl.DataFrame, stride: int) -> pl.DataFrame:
         if stride <= 1:
             return df
         # Sort by lat/lon for a geographically systematic (reproducible) sample.
-        coords = df[["point_id", "lat", "lon"]].drop_duplicates("point_id")
-        keep = set(coords.sort_values(["lat", "lon"])["point_id"].iloc[::stride])
-        return df[df["point_id"].isin(keep)]
+        keep = set(
+            df.select(["point_id", "lat", "lon"])
+            .unique("point_id")
+            .sort(["lat", "lon"])["point_id"]
+            .gather(list(range(0, df["point_id"].n_unique(), stride)))
+            .to_list()
+        )
+        return df.filter(pl.col("point_id").is_in(keep))
 
     # Read tiles one at a time, filter and thin immediately — peak memory per
     # iteration is one raw tile, not the accumulation of all tiles.
-    tile_dfs: list[pd.DataFrame] = []
+    tile_dfs: list[pl.DataFrame] = []
     for path, cols, n_rg in tile_specs:
         logger.info("Loading tile %s (%d row groups) ...", path.name, n_rg)
         tile_df = _stride_tile(_filter_to_regions(_read_tile(path, cols, n_rg)), _load_stride)
-        if not tile_df.empty:
+        if len(tile_df) > 0:
             tile_dfs.append(tile_df)
         del tile_df
         gc.collect()
@@ -144,59 +150,47 @@ def _cmd_train(args: argparse.Namespace) -> None:
         logger.error("No training data found for experiment %s", exp.name)
         sys.exit(1)
 
-    # Build shared CategoricalDtype for high-cardinality string columns before concat.
-    # When all frames share the same dtype, pd.concat allocates int codes (not object
-    # strings) for the output — avoiding a 2× peak from concurrent object arrays.
-    for _col in ("point_id", "source", "date"):
-        if _col not in tile_dfs[0].columns:
-            continue
-        _all_cats = pd.api.types.union_categoricals(
-            [pd.Categorical(df[_col]) for df in tile_dfs]
-        )
-        _shared_dtype = pd.CategoricalDtype(categories=_all_cats.categories, ordered=False)
-        for df in tile_dfs:
-            df[_col] = df[_col].astype(_shared_dtype)
-        del _all_cats, _shared_dtype
-    gc.collect()
-
-    pixel_df = pd.concat(tile_dfs, ignore_index=True)
+    pixel_df = pl.concat(tile_dfs)
     del tile_dfs
     gc.collect()
     logger.info("After region filter: %d rows", len(pixel_df))
 
-    # Apply date filter
-    dates = pd.to_datetime(pixel_df["date"])
-    pixel_df["year"] = dates.dt.year
-    pixel_df["doy"]  = dates.dt.day_of_year
-    del dates
+    # Parse date column and derive year/doy.
+    pixel_df = pixel_df.with_columns(
+        pl.col("date").cast(pl.Utf8).str.to_date().alias("_date_parsed")
+    ).with_columns(
+        pl.col("_date_parsed").dt.year().alias("year"),
+        pl.col("_date_parsed").dt.ordinal_day().alias("doy"),
+    ).drop("_date_parsed")
 
     # Per-region year pinning: drop observations outside [min(years), max(years)]
     # (guards against post-clearance imagery; window is now explicit in the YAML).
-    keep_mask = pd.Series(True, index=pixel_df.index)
+    drop_mask = pl.lit(False)
     for region in regions:
         lon_min, lat_min, lon_max, lat_max = region.bbox
         in_region = (
-            pixel_df["lon"].between(lon_min, lon_max) &
-            pixel_df["lat"].between(lat_min, lat_max)
+            pl.col("lon").is_between(lon_min, lon_max) &
+            pl.col("lat").is_between(lat_min, lat_max)
         )
         out_of_window = in_region & (
-            (pixel_df["year"] < min(region.years)) |
-            (pixel_df["year"] > max(region.years))
+            (pl.col("year") < min(region.years)) |
+            (pl.col("year") > max(region.years))
         )
-        keep_mask &= ~out_of_window
-    pixel_df = pixel_df[keep_mask].reset_index(drop=True)
-    del keep_mask
+        drop_mask = drop_mask | out_of_window
+    pixel_df = pixel_df.filter(~drop_mask)
     gc.collect()
 
     # Build labels from regions
     pixel_coords = (
-        pixel_df[["point_id", "lon", "lat"]]
-        .drop_duplicates("point_id")
-        .reset_index(drop=True)
+        pixel_df.select(["point_id", "lon", "lat"])
+        .unique("point_id")
     )
     labelled = label_pixels(pixel_coords, regions)
-    labelled_known = labelled.dropna(subset=["is_presence"])
-    labels = labelled_known.set_index("point_id")["is_presence"].map({True: 1.0, False: 0.0})
+    labelled_known = labelled.filter(pl.col("is_presence").is_not_null())
+    labels: dict[str, float] = {
+        row[0]: 1.0 if row[1] else 0.0
+        for row in labelled_known.select(["point_id", "is_presence"]).iter_rows()
+    }
 
     out_dir = Path(args.output_dir) if args.output_dir else PROJECT_ROOT / "outputs" / "models" / f"tam-{exp.name}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -236,7 +230,8 @@ def _cmd_train(args: argparse.Namespace) -> None:
         **overrides,
     )
 
-    pixel_df = pixel_df[pixel_df["point_id"].isin(labels.index)].reset_index(drop=True)
+    labeled_pids = set(labels.keys())
+    pixel_df = pixel_df.filter(pl.col("point_id").is_in(labeled_pids))
     gc.collect()
 
     _, best_val_auc = train_tam(
@@ -290,7 +285,7 @@ def _cmd_score(args: argparse.Namespace) -> None:
 
     if coords_cache.exists():
         logger.info("Loading pixel coords from cache ...")
-        pixel_coords = pd.read_parquet(coords_cache)
+        pixel_coords = pl.read_parquet(coords_cache)
     else:
         logger.info("Resolving pixel coords from %d tile parquet(s) for year %d ...", len(first_year_parquets), first_year)
         coord_chunks = []
@@ -298,29 +293,28 @@ def _cmd_score(args: argparse.Namespace) -> None:
             pf_coords = pq.ParquetFile(tile_parquet)
             n_rg_coords = pf_coords.metadata.num_row_groups
 
-            def _read_coord_rg(rg: int, _path: Path = tile_parquet) -> pd.DataFrame:
+            def _read_coord_rg(rg: int, _path: Path = tile_parquet) -> pl.DataFrame:
                 pf = pq.ParquetFile(_path)
-                chunk = pf.read_row_group(rg, columns=["point_id", "lon", "lat"]).to_pandas()
-                return chunk.drop_duplicates("point_id")
+                chunk = pl.from_arrow(pf.read_row_group(rg, columns=["point_id", "lon", "lat"]))
+                return chunk.unique(subset=["point_id"])
 
             n_done = 0
             with ThreadPoolExecutor(max_workers=8) as ex:
                 futures = {ex.submit(_read_coord_rg, rg): rg for rg in range(n_rg_coords)}
                 for fut in as_completed(futures):
                     chunk = fut.result()
-                    if not chunk.empty:
+                    if not chunk.is_empty():
                         coord_chunks.append(chunk)
                     n_done += 1
                     if n_done % 100 == 0:
                         logger.info("  coords %d/%d row groups (%s)", n_done, n_rg_coords, tile_parquet.name)
 
         pixel_coords = (
-            pd.concat(coord_chunks, ignore_index=True)
-            .groupby("point_id")[["lon", "lat"]]
-            .first()
-            .reset_index()
+            pl.concat(coord_chunks)
+            .group_by("point_id")
+            .agg([pl.col("lon").first(), pl.col("lat").first()])
         )
-        pixel_coords.to_parquet(coords_cache, index=False)
+        pixel_coords.write_parquet(coords_cache)
         logger.info("Cached pixel coords to %s", coords_cache)
 
     logger.info("Unique pixels: %d", len(pixel_coords))
@@ -397,10 +391,17 @@ def _cmd_score(args: argparse.Namespace) -> None:
         global_feat_mean=global_feat_mean,
         global_feat_std=global_feat_std,
     )
-
-    scored = pixel_coords.merge(scores, on="point_id", how="left")
-    scored = scored.merge(labelled[["point_id", "is_presence"]], on="point_id", how="left")
-    scored["rank"] = scored["prob_tam"].rank(ascending=False, method="first").astype("Int64")
+    scored = (
+        pixel_coords
+        .join(scores.select(["point_id", "prob_tam"]), on="point_id", how="left")
+        .join(labelled.select(["point_id", "is_presence"]), on="point_id", how="left")
+        .with_columns(
+            pl.col("prob_tam")
+            .rank(descending=True, method="ordinal")
+            .cast(pl.Int64)
+            .alias("rank")
+        )
+    )
 
     summarise(scored, loc, prob_col="prob_tam")
     csv_path = out_csv if out_csv else out_dir / "tam_pixel_ranking.csv"

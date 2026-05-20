@@ -71,16 +71,18 @@ def check_crs(da: xr.DataArray, expected_crs: str, name: str = "raster") -> None
     logger.debug("%s CRS check passed: %s", name, actual)
 
 
-def check_geometry_validity(gdf: "gpd.GeoDataFrame", name: str = "geodataframe") -> None:  # noqa: F821
-    """Assert all geometries in a GeoDataFrame are valid."""
-    import geopandas as gpd
+def check_geometry_validity(geometries, name: str = "geodataframe") -> None:
+    """Assert all Shapely geometries are valid.
 
-    invalid = gdf[~gdf.geometry.is_valid]
-    if len(invalid) > 0:
+    Accepts any iterable of Shapely geometry objects.
+    """
+    geoms = list(geometries)
+    invalid = [g for g in geoms if not g.is_valid]
+    if invalid:
         raise AssertionError(
-            f"{name}: {len(invalid)} invalid geometries found out of {len(gdf)}"
+            f"{name}: {len(invalid)} invalid geometries found out of {len(geoms)}"
         )
-    logger.debug("%s geometry validity check passed: %d features", name, len(gdf))
+    logger.debug("%s geometry validity check passed: %d features", name, len(geoms))
 
 
 def check_catchment_median(

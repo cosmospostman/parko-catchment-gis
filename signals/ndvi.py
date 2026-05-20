@@ -18,7 +18,7 @@ for rows where the denominator is zero.
 from __future__ import annotations
 
 import numpy as np
-import pandas as pd
+import polars as pl
 
 from signals.base import Signal
 
@@ -28,18 +28,16 @@ class NDVISignal(Signal):
 
     name = "ndvi"
 
-    def compute(self, df: pd.DataFrame) -> pd.Series:
-        good = self.quality_mask(df)
-        out = pd.Series(np.nan, index=df.index, dtype="float32")
+    def compute(self, df: pl.DataFrame) -> pl.Series:
+        good = self.quality_mask(df).to_numpy()
+        out = np.full(len(df), np.nan, dtype="float32")
         if good.any():
-            b08 = df.loc[good, "B08"].values.astype("float32")
-            b04 = df.loc[good, "B04"].values.astype("float32")
+            b08 = df["B08"].to_numpy().astype("float32")
+            b04 = df["B04"].to_numpy().astype("float32")
             denom = b08 + b04
-            result = np.full(denom.shape, np.nan, dtype="float32")
-            valid = denom != 0
-            result[valid] = (b08[valid] - b04[valid]) / denom[valid]
-            out[good] = result
-        return out
+            valid = good & (denom != 0)
+            out[valid] = (b08[valid] - b04[valid]) / denom[valid]
+        return pl.Series(out)
 
 
 class NDWISignal(Signal):
@@ -47,18 +45,16 @@ class NDWISignal(Signal):
 
     name = "ndwi"
 
-    def compute(self, df: pd.DataFrame) -> pd.Series:
-        good = self.quality_mask(df)
-        out = pd.Series(np.nan, index=df.index, dtype="float32")
+    def compute(self, df: pl.DataFrame) -> pl.Series:
+        good = self.quality_mask(df).to_numpy()
+        out = np.full(len(df), np.nan, dtype="float32")
         if good.any():
-            b03 = df.loc[good, "B03"].values.astype("float32")
-            b08 = df.loc[good, "B08"].values.astype("float32")
+            b03 = df["B03"].to_numpy().astype("float32")
+            b08 = df["B08"].to_numpy().astype("float32")
             denom = b03 + b08
-            result = np.full(denom.shape, np.nan, dtype="float32")
-            valid = denom != 0
-            result[valid] = (b03[valid] - b08[valid]) / denom[valid]
-            out[good] = result
-        return out
+            valid = good & (denom != 0)
+            out[valid] = (b03[valid] - b08[valid]) / denom[valid]
+        return pl.Series(out)
 
 
 class EVISignal(Signal):
@@ -66,16 +62,14 @@ class EVISignal(Signal):
 
     name = "evi"
 
-    def compute(self, df: pd.DataFrame) -> pd.Series:
-        good = self.quality_mask(df)
-        out = pd.Series(np.nan, index=df.index, dtype="float32")
+    def compute(self, df: pl.DataFrame) -> pl.Series:
+        good = self.quality_mask(df).to_numpy()
+        out = np.full(len(df), np.nan, dtype="float32")
         if good.any():
-            b02 = df.loc[good, "B02"].values.astype("float32")
-            b04 = df.loc[good, "B04"].values.astype("float32")
-            b08 = df.loc[good, "B08"].values.astype("float32")
+            b02 = df["B02"].to_numpy().astype("float32")
+            b04 = df["B04"].to_numpy().astype("float32")
+            b08 = df["B08"].to_numpy().astype("float32")
             denom = b08 + 6 * b04 - 7.5 * b02 + 1
-            result = np.full(denom.shape, np.nan, dtype="float32")
-            valid = denom != 0
-            result[valid] = 2.5 * (b08[valid] - b04[valid]) / denom[valid]
-            out[good] = result
-        return out
+            valid = good & (denom != 0)
+            out[valid] = 2.5 * (b08[valid] - b04[valid]) / denom[valid]
+        return pl.Series(out)

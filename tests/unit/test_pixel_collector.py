@@ -49,11 +49,11 @@ PC-SB2. Parquet spatial variance guard: a parquet where all pixels share the sam
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import pytest
 from rasterio.crs import CRS
 from rasterio.transform import from_bounds
@@ -220,7 +220,7 @@ def test_extract_item_to_df_clear_pixels():
     for col in expected_cols:
         assert col in df.columns, f"missing column: {col}"
 
-    assert df["B03"].iloc[0] == pytest.approx(0.15, rel=1e-4)
+    assert df[0, "B03"] == pytest.approx(0.15, rel=1e-4)
     assert (df["scl_purity"] == 1.0).all()   # 1×1 chip, clear → purity=1
     assert (df["item_id"] == item.id).all()
     assert (df["tile_id"] == "55HBU").all()
@@ -290,15 +290,17 @@ def test_extract_item_to_df_partial_nan_rows_not_dropped():
     # Simulate the DataFrame that extract_item_to_df would produce before the guard:
     # row 0: valid bands; row 1: all-NaN bands (but clear SCL)
     n_rows = 2
-    band_data = {band: [0.15, np.nan] for band in BANDS}
-    df = pd.DataFrame({
+    band_data = {band: [0.15, None] for band in BANDS}
+    df = pl.DataFrame({
         "point_id": ["px_0000_0000", "px_0001_0000"],
         **band_data,
     })
 
     # Current guard:
-    rows_all_nan = df[list(BANDS)].isna().all(axis=1)  # [False, True]
-    guard_triggers = rows_all_nan.all()                  # False → guard does NOT trigger
+    rows_all_nan = df.select(list(BANDS)).with_columns(
+        pl.all_horizontal([pl.col(b).is_null() for b in BANDS]).alias("all_null")
+    )["all_null"]
+    guard_triggers = rows_all_nan.all()  # False → guard does NOT trigger
 
     assert not guard_triggers, "guard should NOT trigger when only some rows are all-NaN"
     assert rows_all_nan.sum() == 1, "exactly one row is all-NaN"
@@ -306,7 +308,7 @@ def test_extract_item_to_df_partial_nan_rows_not_dropped():
     # Bug PC4: with the current guard, the all-NaN row survives.
     # After the fix (df = df[~rows_all_nan]), only row 0 remains.
     df_after_buggy_guard = df  # no drop happens
-    df_after_fix = df[~rows_all_nan]
+    df_after_fix = df.filter(~rows_all_nan)
 
     assert len(df_after_buggy_guard) == 2  # bug: all-NaN row survives
     assert len(df_after_fix) == 1           # expected after fix
@@ -323,7 +325,7 @@ def test_extract_item_to_df_has_spectral_index_columns():
     assert df is not None
     for col in SPECTRAL_INDEX_COLS:
         assert col in df.columns
-        assert not df[col].isna().all()
+        assert not df[col].is_nan().all()
 
 
 # ---------------------------------------------------------------------------
@@ -397,10 +399,11 @@ def test_extract_item_to_df_band_values_aligned_to_point_ids():
     df = extract_item_to_df(item, store, point_ids, lons, lats, apply_nbar=False)
 
     assert df is not None
-    df = df.set_index("point_id")
+    pid_to_row = {row[0]: row for row in df.select(["point_id"] + list(BANDS)).iter_rows()}
+    b0_idx = 1  # BANDS[0] is at position 1 in the selected cols
     for i, pid in enumerate(point_ids):
         expected_sr = (i + 1) / 10.0
-        actual = float(df.loc[pid, BANDS[0]])
+        actual = float(pid_to_row[pid][b0_idx])
         assert abs(actual - expected_sr) < 1e-3, (
             f"{pid}: expected SR {expected_sr:.3f}, got {actual:.3f} — "
             "point_id/band-value ordering mismatch"
@@ -486,13 +489,13 @@ def test_canonical_tile_suppression_removed():
 
     # 3. The combined observation count must equal both tiles' contributions.
     #    Before the fix, one tile's rows were zeroed out, halving coverage.
-    import pandas as pd
-    combined = pd.concat([df1, df2], ignore_index=True)
+    import polars as _pl
+    combined = _pl.concat([df1, df2])
     assert len(combined) == 6, (
         f"expected 6 obs (3 per tile), got {len(combined)} — "
         "one tile's observations are being suppressed"
     )
-    assert set(combined["tile_id"]) == {"55KBB", "55KCB"}, (
+    assert set(combined["tile_id"].to_list()) == {"55KBB", "55KCB"}, (
         "both tiles must appear in combined observations"
     )
 
@@ -524,12 +527,13 @@ def test_extract_item_to_df_two_tiles_produce_separate_rows():
     assert df_hbu is not None
     assert df_hbv is not None
 
-    combined = pd.concat([df_hbu, df_hbv], ignore_index=True)
+    import polars as _pl
+    combined = _pl.concat([df_hbu, df_hbv])
     # Same point_id and date, different tile_id — no dedup at this layer.
     assert len(combined) == 2
-    assert combined["point_id"].nunique() == 1
-    assert combined["tile_id"].nunique() == 2
-    assert set(combined["tile_id"]) == {"55HBU", "55HBV"}
+    assert combined["point_id"].n_unique() == 1
+    assert combined["tile_id"].n_unique() == 2
+    assert set(combined["tile_id"].to_list()) == {"55HBU", "55HBV"}
 
 
 # ---------------------------------------------------------------------------
@@ -576,7 +580,8 @@ def test_nbar_nan_angles_do_not_produce_nan_bands():
         df = extract_item_to_df(item, store, pids, lons, lats, apply_nbar=True)
 
     assert df is not None, "NaN angles must not cause all rows to be dropped"
-    assert df[list(BANDS)].isna().sum().sum() == 0, (
+    nan_count = sum(df[b].is_nan().sum() for b in BANDS)
+    assert nan_count == 0, (
         "NaN c-factors must not propagate to band columns — "
         "fall back to uncorrected reflectance instead"
     )
@@ -601,11 +606,12 @@ def test_nbar_all_nan_angles_do_not_produce_nan_bands():
         df = extract_item_to_df(item, store, pids, lons, lats, apply_nbar=True)
 
     assert df is not None
-    assert df[list(BANDS)].isna().sum().sum() == 0, (
+    nan_count = sum(df[b].is_nan().sum() for b in BANDS)
+    assert nan_count == 0, (
         "All-NaN angles must not corrupt any band — fall back to uncorrected"
     )
     # Values should be the uncorrected raw/10000 = 800/10000 = 0.08
-    assert abs(float(df["B02"].iloc[0]) - 0.08) < 1e-4, (
+    assert abs(float(df[0, "B02"]) - 0.08) < 1e-4, (
         "Uncorrected fallback value should be raw DN / 10000"
     )
 
@@ -633,7 +639,7 @@ def test_nbar_valid_angles_are_still_applied():
     a = angles["B02"]
     cf = compute_cf(a["sza"], a["vza"], a["saa"] - a["vaa"], "B02")
     expected = float(np.clip(500.0 / 10000.0 * cf[0], 0.0, 1.0))
-    actual = float(df["B02"].iloc[0])
+    actual = float(df[0, "B02"])
     assert abs(actual - expected) < 1e-4, (
         f"Valid-angle pixels should be NBAR-corrected: expected {expected:.4f}, got {actual:.4f}"
     )
@@ -749,10 +755,9 @@ def test_polygon_mask_drops_exterior_points():
 
 def _dedup_row(tile_id, scl_purity, point_id="px_0000_0000", dt=None):
     """Build a minimal pixel row dict for dedup tests."""
-    import pandas as pd
     from analysis.constants import BANDS, SPECTRAL_INDEX_COLS
     if dt is None:
-        dt = pd.Timestamp("2022-08-15")
+        dt = date(2022, 8, 15)
     return {
         "point_id": point_id,
         "lon": 145.41, "lat": -22.78,
@@ -769,42 +774,45 @@ def _dedup_row(tile_id, scl_purity, point_id="px_0000_0000", dt=None):
 
 def _apply_dedup(out_path):
     """Run the same two-pass streaming dedup logic as collect() and return (df, n_removed)."""
-    import pyarrow as pa
     import pyarrow.parquet as pq
 
     pf = pq.ParquetFile(out_path)
-    n_before = pf.metadata.num_rows
     key_cols = ["point_id", "date", "scl_purity", "tile_id"]
-    keys_df = pf.read(columns=key_cols).to_pandas()
-    keys_df = keys_df.sort_values(
+    keys_df = pl.from_arrow(pf.read(columns=key_cols)).sort(
         ["point_id", "date", "scl_purity", "tile_id"],
-        ascending=[True, True, False, True],
-    ).reset_index(drop=True)
-    dup_mask = keys_df.duplicated(subset=["point_id", "date"], keep="first")
-    n_dedup = int(dup_mask.sum())
+        descending=[False, False, True, False],
+    )
+    # Find losers: duplicates keeping the first (highest scl_purity, then lowest tile_id)
+    deduped = keys_df.unique(subset=["point_id", "date"], keep="first")
+    n_dedup = len(keys_df) - len(deduped)
 
     if not n_dedup:
         del pf
-        return pq.read_table(out_path).to_pandas(), 0
+        return pl.read_parquet(out_path), 0
 
-    losers = (
-        keys_df[dup_mask][["point_id", "date", "tile_id"]]
-        .assign(_drop=True)
-        .reset_index(drop=True)
-    )
+    losers = keys_df.join(
+        deduped.select(["point_id", "date", "tile_id"]).with_columns(pl.lit(True).alias("_keep")),
+        on=["point_id", "date", "tile_id"],
+        how="left",
+    ).filter(pl.col("_keep").is_null()).select(["point_id", "date", "tile_id"])
+
     schema = pf.schema_arrow
     tmp_path = out_path.with_suffix(".tmp.parquet")
-    tmp_writer = pq.ParquetWriter(tmp_path, schema)
+    import pyarrow.parquet as pq2
+    tmp_writer = pq2.ParquetWriter(tmp_path, schema)
     for rg_idx in range(pf.metadata.num_row_groups):
-        rg_df = pf.read_row_group(rg_idx).to_pandas()
-        merged = rg_df.merge(losers, on=["point_id", "date", "tile_id"], how="left")
-        filtered = rg_df[merged["_drop"].isna()]
+        rg = pl.from_arrow(pf.read_row_group(rg_idx))
+        filtered = rg.join(
+            losers.with_columns(pl.lit(True).alias("_drop")),
+            on=["point_id", "date", "tile_id"],
+            how="left",
+        ).filter(pl.col("_drop").is_null()).drop("_drop")
         if len(filtered):
-            tmp_writer.write_table(pa.Table.from_pandas(filtered, schema=schema, preserve_index=False))
+            tmp_writer.write_table(filtered.to_arrow().cast(schema))
     tmp_writer.close()
     del pf
     tmp_path.replace(out_path)
-    return pq.read_table(out_path).to_pandas(), n_dedup
+    return pl.read_parquet(out_path), n_dedup
 
 
 # ---------------------------------------------------------------------------
@@ -815,17 +823,16 @@ def test_collect_output_deduplicates_cross_tile_rows(tmp_path):
     """Two rows sharing (point_id, date) from different tiles: higher scl_purity wins."""
     import pyarrow as pa
     import pyarrow.parquet as pq
-    import pandas as pd
 
-    df_raw = pd.DataFrame([_dedup_row("55HBU", 0.6), _dedup_row("55HBV", 0.9)])
+    df_raw = pl.DataFrame([_dedup_row("55HBU", 0.6), _dedup_row("55HBV", 0.9)])
     out_path = tmp_path / "out.parquet"
-    pq.write_table(pa.Table.from_pandas(df_raw, preserve_index=False), out_path)
+    pq.write_table(df_raw.to_arrow(), out_path)
 
     result, n_removed = _apply_dedup(out_path)
     assert n_removed == 1
     assert len(result) == 1
-    assert result.iloc[0]["tile_id"] == "55HBV"
-    assert result.iloc[0]["scl_purity"] == pytest.approx(0.9)
+    assert result["tile_id"][0] == "55HBV"
+    assert result["scl_purity"][0] == pytest.approx(0.9)
 
 
 # ---------------------------------------------------------------------------
@@ -836,17 +843,16 @@ def test_dedup_noop_when_no_duplicates(tmp_path):
     """When every (point_id, date) is unique, no rows are removed."""
     import pyarrow as pa
     import pyarrow.parquet as pq
-    import pandas as pd
 
-    dt1 = pd.Timestamp("2022-08-15")
-    dt2 = pd.Timestamp("2022-09-01")
-    df_raw = pd.DataFrame([
+    dt1 = date(2022, 8, 15)
+    dt2 = date(2022, 9, 1)
+    df_raw = pl.DataFrame([
         _dedup_row("55HBU", 0.8, point_id="px_0000_0000", dt=dt1),
-        _dedup_row("55HBU", 0.7, point_id="px_0000_0000", dt=dt2),   # same pixel, different date
-        _dedup_row("55HBU", 0.9, point_id="px_0001_0000", dt=dt1),   # different pixel, same date
+        _dedup_row("55HBU", 0.7, point_id="px_0000_0000", dt=dt2),
+        _dedup_row("55HBU", 0.9, point_id="px_0001_0000", dt=dt1),
     ])
     out_path = tmp_path / "out.parquet"
-    pq.write_table(pa.Table.from_pandas(df_raw, preserve_index=False), out_path)
+    pq.write_table(df_raw.to_arrow(), out_path)
 
     result, n_removed = _apply_dedup(out_path)
     assert n_removed == 0
@@ -861,25 +867,24 @@ def test_dedup_preserves_non_duplicate_rows(tmp_path):
     """Interior pixels with unique (point_id, date) survive alongside the deduped boundary pixel."""
     import pyarrow as pa
     import pyarrow.parquet as pq
-    import pandas as pd
 
-    dt = pd.Timestamp("2022-08-15")
-    df_raw = pd.DataFrame([
-        _dedup_row("55HBU", 0.5, point_id="px_interior_a", dt=dt),   # unique — keep
-        _dedup_row("55HBU", 0.6, point_id="px_boundary",   dt=dt),   # duplicate loser
-        _dedup_row("55HBV", 0.9, point_id="px_boundary",   dt=dt),   # duplicate winner
-        _dedup_row("55HBV", 0.8, point_id="px_interior_b", dt=dt),   # unique — keep
+    dt = date(2022, 8, 15)
+    df_raw = pl.DataFrame([
+        _dedup_row("55HBU", 0.5, point_id="px_interior_a", dt=dt),
+        _dedup_row("55HBU", 0.6, point_id="px_boundary",   dt=dt),
+        _dedup_row("55HBV", 0.9, point_id="px_boundary",   dt=dt),
+        _dedup_row("55HBV", 0.8, point_id="px_interior_b", dt=dt),
     ])
     out_path = tmp_path / "out.parquet"
-    pq.write_table(pa.Table.from_pandas(df_raw, preserve_index=False), out_path)
+    pq.write_table(df_raw.to_arrow(), out_path)
 
     result, n_removed = _apply_dedup(out_path)
     assert n_removed == 1
     assert len(result) == 3
-    surviving_pids = set(result["point_id"])
+    surviving_pids = set(result["point_id"].to_list())
     assert "px_interior_a" in surviving_pids
     assert "px_interior_b" in surviving_pids
-    assert result[result["point_id"] == "px_boundary"].iloc[0]["tile_id"] == "55HBV"
+    assert result.filter(pl.col("point_id") == "px_boundary")["tile_id"][0] == "55HBV"
 
 
 # ---------------------------------------------------------------------------
@@ -890,17 +895,15 @@ def test_dedup_across_row_group_boundary(tmp_path):
     """The dedup correctly removes a loser whose row group differs from the winner's."""
     import pyarrow as pa
     import pyarrow.parquet as pq
-    import pandas as pd
 
-    dt = pd.Timestamp("2022-08-15")
-    # Write each row as its own row group (row_group_size=1) to guarantee the
-    # duplicate pair spans two row groups.
-    winner = pd.DataFrame([_dedup_row("55HBV", 0.9, dt=dt)])
-    loser  = pd.DataFrame([_dedup_row("55HBU", 0.6, dt=dt)])
+    dt = date(2022, 8, 15)
+    winner = pl.DataFrame([_dedup_row("55HBV", 0.9, dt=dt)])
+    loser  = pl.DataFrame([_dedup_row("55HBU", 0.6, dt=dt)])
     out_path = tmp_path / "out.parquet"
-    writer = pq.ParquetWriter(out_path, pa.Table.from_pandas(winner, preserve_index=False).schema)
-    writer.write_table(pa.Table.from_pandas(winner, preserve_index=False))
-    writer.write_table(pa.Table.from_pandas(loser,  preserve_index=False))
+    schema = winner.to_arrow().schema
+    writer = pq.ParquetWriter(out_path, schema)
+    writer.write_table(winner.to_arrow())
+    writer.write_table(loser.to_arrow())
     writer.close()
 
     assert pq.ParquetFile(out_path).metadata.num_row_groups == 2
@@ -908,7 +911,7 @@ def test_dedup_across_row_group_boundary(tmp_path):
     result, n_removed = _apply_dedup(out_path)
     assert n_removed == 1
     assert len(result) == 1
-    assert result.iloc[0]["tile_id"] == "55HBV"
+    assert result["tile_id"][0] == "55HBV"
 
 
 # ---------------------------------------------------------------------------
@@ -916,27 +919,22 @@ def test_dedup_across_row_group_boundary(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_dedup_tiebreak_lower_tile_id_wins(tmp_path):
-    """When scl_purity is equal, the lower tile_id (ascending lexicographic) is kept.
-
-    This is deterministic regardless of the order the rows were written.
-    """
+    """When scl_purity is equal, the lower tile_id (ascending lexicographic) is kept."""
     import pyarrow as pa
     import pyarrow.parquet as pq
-    import pandas as pd
 
-    dt = pd.Timestamp("2022-08-15")
-    # Write HBV first so input order would naively keep HBV — tie-break must override.
-    df_raw = pd.DataFrame([
+    dt = date(2022, 8, 15)
+    df_raw = pl.DataFrame([
         _dedup_row("55HBV", 0.8, dt=dt),
         _dedup_row("55HBU", 0.8, dt=dt),
     ])
     out_path = tmp_path / "out.parquet"
-    pq.write_table(pa.Table.from_pandas(df_raw, preserve_index=False), out_path)
+    pq.write_table(df_raw.to_arrow(), out_path)
 
     result, n_removed = _apply_dedup(out_path)
     assert n_removed == 1
     assert len(result) == 1
-    assert result.iloc[0]["tile_id"] == "55HBU"   # lower tile_id wins
+    assert result["tile_id"][0] == "55HBU"  # lower tile_id wins
 
 
 # ---------------------------------------------------------------------------
@@ -947,14 +945,13 @@ def _make_sorted_shard(tmp_path: Path, rows: list[dict]) -> "Path":
     """Write a sorted shard parquet from a list of row dicts (sorted by point_id)."""
     import pyarrow as pa
     import pyarrow.parquet as pq
-    import pandas as pd
     from analysis.constants import BANDS, SPECTRAL_INDEX_COLS
 
     full_rows = []
     for r in sorted(rows, key=lambda x: x["point_id"]):
         full_rows.append({
             "lon": 145.0, "lat": -23.0,
-            "date": pd.Timestamp("2022-08-15").to_datetime64(),
+            "date": datetime(2022, 8, 15),
             "item_id": f"S2A_{r['tile_id']}_20220815_0_L2A",
             "scl_purity": 1.0, "scl": 4, "aot": 0.9,
             "view_zenith": 0.95, "sun_zenith": 0.80,
@@ -962,18 +959,16 @@ def _make_sorted_shard(tmp_path: Path, rows: list[dict]) -> "Path":
             **{c: 0.3 for c in SPECTRAL_INDEX_COLS},
             **r,
         })
-    df = pd.DataFrame(full_rows)
-    df["date"] = pd.to_datetime(df["date"]).astype("datetime64[us]")
+    df = pl.DataFrame(full_rows).with_columns(pl.col("date").cast(pl.Datetime("us")))
     p = tmp_path / "_collect_shard000_sorted.parquet"
-    pq.write_table(pa.Table.from_pandas(df, preserve_index=False), p)
+    pq.write_table(df.to_arrow(), p)
     return p
 
 
-def _run_split(sorted_shard: "Path", out_dir: "Path") -> "dict[str, pd.DataFrame]":
+def _run_split(sorted_shard: "Path", out_dir: "Path") -> "dict[str, pl.DataFrame]":
     """Invoke the per-tile split logic used inside collect() and return {tile_id: df}."""
     import pyarrow.parquet as pq
     import pyarrow.compute as pc
-    import pandas as pd
 
     pf = pq.ParquetFile(sorted_shard)
     tile_writers: dict = {}
@@ -991,7 +986,7 @@ def _run_split(sorted_shard: "Path", out_dir: "Path") -> "dict[str, pd.DataFrame
         w.close()
 
     return {
-        tid: pq.read_table(out_dir / f"{tid}.parquet").to_pandas()
+        tid: pl.read_parquet(out_dir / f"{tid}.parquet")
         for tid in tile_writers
     }
 
@@ -1011,8 +1006,8 @@ def test_per_tile_split_writes_separate_files(tmp_path):
     result = _run_split(shard, out_dir)
 
     assert set(result.keys()) == {"55HBU", "55HBV"}
-    assert set(result["55HBU"]["point_id"]) == {"px_0000_0000", "px_0001_0000"}
-    assert set(result["55HBV"]["point_id"]) == {"px_0002_0000"}
+    assert set(result["55HBU"]["point_id"].to_list()) == {"px_0000_0000", "px_0001_0000"}
+    assert set(result["55HBV"]["point_id"].to_list()) == {"px_0002_0000"}
 
 
 def test_per_tile_split_each_file_contains_only_its_tile(tmp_path):
@@ -1191,15 +1186,14 @@ def _make_pixel_parquet(tmp_path: "Path", b08_values: "np.ndarray") -> "Path":
     import pyarrow.parquet as pq
 
     n = len(b08_values)
-    # One row per pixel, one observation each — minimal schema
-    df = pd.DataFrame({
+    df = pl.DataFrame({
         "point_id":   [f"px_{i:04d}_0000" for i in range(n)],
-        "date":       pd.Timestamp("2025-04-30"),
-        "B08":        b08_values.astype(np.float32),
-        "scl_purity": np.ones(n, dtype=np.float32),
+        "date":       [date(2025, 4, 30)] * n,
+        "B08":        b08_values.astype(np.float32).tolist(),
+        "scl_purity": [1.0] * n,
     })
     p = tmp_path / "test.parquet"
-    pq.write_table(pa.Table.from_pandas(df, preserve_index=False), p)
+    pq.write_table(df.to_arrow(), p)
     return p
 
 

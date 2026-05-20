@@ -22,7 +22,7 @@ from pathlib import Path
 
 import re
 import numpy as np
-import pandas as pd
+import polars as pl
 import pyarrow.parquet as pq
 import matplotlib
 matplotlib.use("Agg")
@@ -56,99 +56,99 @@ COLOURS = ["steelblue", "coral", "seagreen", "mediumpurple",
 SCL_PURITY_MIN = 0.5
 
 
-def apply_woody_filter(pixel_df: pd.DataFrame) -> pd.DataFrame:
-    """Drop presence pixel-years that fail the S1 VH woody filter.
-
-    Mirrors _apply_presence_filter in train.py:
-      drop if mean_vh_dry < PRESENCE_MIN_VH_DRY_DB
-      AND NOT (mean_vh_dry >= PRESENCE_NDVI_RESCUE_VH_DB AND mean_ndvi_dry >= PRESENCE_NDVI_RESCUE_MIN)
-    Only applied to presence pixels; absence pixels are unchanged.
-
-    VH is computed from S1-sourced rows only (source == "S1").
-    NDVI rescue uses S2-sourced dry-season rows.
-    """
+def apply_woody_filter(pixel_df: pl.DataFrame) -> pl.DataFrame:
+    """Drop presence pixel-years that fail the S1 VH woody filter."""
     if "source" not in pixel_df.columns or "vh" not in pixel_df.columns:
         print("Woody filter: skipped — no source/vh columns")
         return pixel_df
 
-    presence_pids = set(pixel_df[pixel_df["tag_class"].str.contains("presence")]["point_id"])
+    presence_pids = set(
+        pixel_df.filter(pl.col("tag_class").str.contains("presence"))["point_id"].to_list()
+    )
     if not presence_pids:
         return pixel_df
 
-    # S1 rows only — VH in linear, convert to dB
-    s1_pres = pixel_df[
-        (pixel_df["source"] == "S1") &
-        pixel_df["point_id"].isin(presence_pids) &
-        pixel_df["doy"].between(DRY_DOY_MIN, DRY_DOY_MAX)
-    ].copy()
-
-    if s1_pres.empty:
+    s1_pres = pixel_df.filter(
+        (pl.col("source") == "S1") &
+        pl.col("point_id").is_in(presence_pids) &
+        pl.col("doy").is_between(DRY_DOY_MIN, DRY_DOY_MAX)
+    )
+    if s1_pres.is_empty():
         print("Woody filter: skipped — no S1 rows found for presence pixels")
         return pixel_df
 
-    s1_pres["vh_db"] = np.where(s1_pres["vh"] > 0, 10.0 * np.log10(s1_pres["vh"]), np.nan)
-    s1_pres = s1_pres[np.isfinite(s1_pres["vh_db"])]
-    mean_vh = s1_pres.groupby(["point_id", "year"])["vh_db"].mean()
-
-    # S2 NDVI rescue — clear-sky dry-season obs
-    s2_pres = pixel_df[
-        (pixel_df["source"] == "S2") &
-        pixel_df["point_id"].isin(presence_pids) &
-        pixel_df["doy"].between(DRY_DOY_MIN, DRY_DOY_MAX) &
-        pixel_df["NDVI"].notna()
-    ]
-    mean_ndvi = s2_pres.groupby(["point_id", "year"])["NDVI"].mean()
-
-    fails_strict = mean_vh < PRESENCE_MIN_VH_DRY_DB
-    rescued = (
-        (mean_vh >= PRESENCE_NDVI_RESCUE_VH_DB) &
-        (mean_ndvi.reindex(mean_vh.index) >= PRESENCE_NDVI_RESCUE_MIN)
+    vh_lin = s1_pres["vh"].to_numpy().astype(np.float64)
+    vh_db  = np.where(vh_lin > 0, 10.0 * np.log10(vh_lin), np.nan)
+    s1_pres = s1_pres.with_columns(pl.Series("_vh_db", vh_db)).filter(
+        pl.col("_vh_db").is_not_null() & pl.col("_vh_db").is_not_nan()
     )
-    drop_py = set(map(tuple, mean_vh.index[fails_strict & ~rescued.fillna(False)].tolist()))
+    mean_vh_df = s1_pres.group_by(["point_id", "year"]).agg(
+        pl.col("_vh_db").mean().alias("mean_vh")
+    )
+    mean_vh_map = {(r["point_id"], r["year"]): r["mean_vh"]
+                   for r in mean_vh_df.iter_rows(named=True)}
+
+    s2_pres = pixel_df.filter(
+        (pl.col("source") == "S2") &
+        pl.col("point_id").is_in(presence_pids) &
+        pl.col("doy").is_between(DRY_DOY_MIN, DRY_DOY_MAX) &
+        pl.col("NDVI").is_not_null()
+    )
+    mean_ndvi_map = {(r["point_id"], r["year"]): r["mean_ndvi"]
+                     for r in s2_pres.group_by(["point_id", "year"])
+                                     .agg(pl.col("NDVI").mean().alias("mean_ndvi"))
+                                     .iter_rows(named=True)}
+
+    drop_py: set[tuple] = set()
+    for (pid, yr), vh in mean_vh_map.items():
+        if vh < PRESENCE_MIN_VH_DRY_DB:
+            ndvi = mean_ndvi_map.get((pid, yr), float("nan"))
+            rescued = (vh >= PRESENCE_NDVI_RESCUE_VH_DB and
+                       not np.isnan(ndvi) and ndvi >= PRESENCE_NDVI_RESCUE_MIN)
+            if not rescued:
+                drop_py.add((pid, yr))
 
     if drop_py:
-        presence_mask = pixel_df["tag_class"].str.contains("presence")
-        py_index = list(zip(pixel_df["point_id"], pixel_df["year"]))
-        in_drop = pd.Series([tuple(x) in drop_py for x in py_index], index=pixel_df.index)
-        keep = ~(presence_mask & in_drop)
-        n_dropped = (~keep).sum()
-        n_py = len(drop_py)
-        print(f"Woody filter: dropped {n_dropped} presence obs across {n_py} pixel-years")
-        return pixel_df[keep].copy()
+        is_presence = pixel_df["tag_class"].str.contains("presence").to_numpy()
+        pids = pixel_df["point_id"].to_numpy()
+        years = pixel_df["year"].to_numpy()
+        in_drop = np.array([
+            bool(is_presence[i]) and (pids[i], int(years[i])) in drop_py
+            for i in range(len(pixel_df))
+        ])
+        n_dropped = int(in_drop.sum())
+        print(f"Woody filter: dropped {n_dropped} presence obs across {len(drop_py)} pixel-years")
+        return pixel_df.filter(~pl.Series(in_drop))
 
     print("Woody filter: no pixel-years dropped")
     return pixel_df
 
 
-def compute_mavi(df: pd.DataFrame) -> pd.Series:
-    b04 = df["B04"].values.astype("float32")
-    b08 = df["B08"].values.astype("float32")
-    b11 = df["B11"].values.astype("float32")
+def compute_mavi(df: pl.DataFrame) -> pl.Series:
+    b04 = df["B04"].to_numpy().astype("float32")
+    b08 = df["B08"].to_numpy().astype("float32")
+    b11 = df["B11"].to_numpy().astype("float32")
     denom = b08 + b04 + b11
     mavi = np.where(denom != 0, (b08 - b04) / denom, np.nan)
-    return pd.Series(mavi, index=df.index, name="MAVI")
+    return pl.Series("MAVI", mavi)
 
 
-def compute_dmavi(pixel_df: pd.DataFrame) -> pd.DataFrame:
+def compute_dmavi(pixel_df: pl.DataFrame) -> pl.DataFrame:
     """Compute ΔMAVI/Δt (per day) for each pixel's consecutive observations."""
-    pixel_df = pixel_df.sort_values(["point_id", "date"])
-    pixel_df["date_dt"] = pd.to_datetime(pixel_df["date"])
-
+    pixel_df = pixel_df.sort(["point_id", "date"])
     rows = []
-    for pid, grp in pixel_df.groupby("point_id", sort=False):
-        grp = grp.sort_values("date_dt")
-        mavi = grp["MAVI"].values
-        days = grp["date_dt"].values.astype("datetime64[D]").astype(float)
+    for (pid,), grp in pixel_df.group_by(["point_id"], maintain_order=True):
+        mavi = grp["MAVI"].to_numpy().astype(float)
+        days = grp["date"].cast(pl.Date).to_numpy().astype("datetime64[D]").astype(float)
+        doy  = grp["doy"].to_numpy()
+        tag  = grp["tag_class"].to_numpy()
         dt = np.diff(days)
         dm = np.diff(mavi)
-        # rate = dm/dt; assign to the later observation's DOY
         rate = np.where(dt > 0, dm / dt, np.nan)
-        doy  = grp["doy"].values[1:]
-        tag  = grp["tag_class"].values[1:]
         for i in range(len(rate)):
-            rows.append({"point_id": pid, "doy": doy[i],
-                         "DMAVI": rate[i], "tag_class": tag[i]})
-    return pd.DataFrame(rows)
+            rows.append({"point_id": pid, "doy": int(doy[i + 1]),
+                         "DMAVI": float(rate[i]), "tag_class": str(tag[i + 1])})
+    return pl.DataFrame(rows) if rows else pl.DataFrame({"point_id": [], "doy": [], "DMAVI": [], "tag_class": []})
 
 
 # Seasonal windows for histogram: (label, doy_min, doy_max)
@@ -161,26 +161,24 @@ SEASON_WINDOWS = [
 ]
 
 
-def plot_histograms(pixel_df: pd.DataFrame, regions, tag_class_for,
+def plot_histograms(pixel_df: pl.DataFrame, regions, tag_class_for,
                     out_dir: Path, colours: list[str]) -> None:
     """One PNG per region: KDE of per-pixel dry-season MAVI across seasonal windows."""
     from scipy.stats import gaussian_kde
 
-    # Build region_id -> tag_class map for titles
     n_windows = len(SEASON_WINDOWS)
 
     for region in regions:
         lon_min, lat_min, lon_max, lat_max = region.bbox
-        mask = (
-            (pixel_df["lon"] >= lon_min) & (pixel_df["lon"] <= lon_max) &
-            (pixel_df["lat"] >= lat_min) & (pixel_df["lat"] <= lat_max)
-        )
-        rdf = pixel_df[mask][["point_id", "doy", "MAVI"]].dropna()
-        if rdf.empty:
+        rdf = pixel_df.filter(
+            (pl.col("lon") >= lon_min) & (pl.col("lon") <= lon_max) &
+            (pl.col("lat") >= lat_min) & (pl.col("lat") <= lat_max)
+        ).select(["point_id", "doy", "MAVI"]).drop_nulls()
+        if rdf.is_empty():
             continue
 
         tc = tag_class_for(region)
-        n_pix = rdf["point_id"].nunique()
+        n_pix = rdf["point_id"].n_unique()
 
         fig, axes = plt.subplots(1, n_windows, figsize=(4 * n_windows, 4), sharey=False)
         fig.suptitle(f"{region.id}  [{tc}]  —  {n_pix} pixels", fontsize=10)
@@ -188,7 +186,7 @@ def plot_histograms(pixel_df: pd.DataFrame, regions, tag_class_for,
         colour = colours[0] if "presence" in tc else colours[min(3, len(colours) - 1)]
 
         for ax, (win_label, doy_min, doy_max) in zip(axes, SEASON_WINDOWS):
-            vals = rdf[rdf["doy"].between(doy_min, doy_max)]["MAVI"].values
+            vals = rdf.filter(pl.col("doy").is_between(doy_min, doy_max))["MAVI"].to_numpy()
             vals = vals[np.isfinite(vals)]
             ax.set_title(win_label, fontsize=8)
             ax.set_xlabel("MAVI", fontsize=8)
@@ -237,13 +235,13 @@ def bin_mean_std(series_doy: np.ndarray, series_val: np.ndarray
     return means, stds
 
 
-def plot_signal(ax: plt.Axes, df: pd.DataFrame, col: str,
+def plot_signal(ax: plt.Axes, df: pl.DataFrame, col: str,
                 tag_classes: list[str], colours: list[str]) -> None:
     for tag, colour in zip(tag_classes, colours):
-        sub = df[df["tag_class"] == tag][[col, "doy"]].dropna()
-        if sub.empty:
+        sub = df.filter(pl.col("tag_class") == tag).select([col, "doy"]).drop_nulls()
+        if sub.is_empty():
             continue
-        means, stds = bin_mean_std(sub["doy"].values, sub[col].values)
+        means, stds = bin_mean_std(sub["doy"].to_numpy(), sub[col].to_numpy())
         valid = ~np.isnan(means)
         if not valid.any():
             continue
@@ -320,70 +318,80 @@ def main() -> None:
 
     # Load parquet data
     tile_ids = tile_ids_for_regions(region_ids)
-    chunks: list[pd.DataFrame] = []
+    chunks: list[pl.DataFrame] = []
     for tid in tile_ids:
         path = tile_parquet_path(tid)
         if not path.exists():
             continue
         pf = pq.ParquetFile(path)
+        available = set(pf.schema_arrow.names)
+        cols = [c for c in LOAD_COLS if c in available]
         for rg in range(pf.metadata.num_row_groups):
-            tbl = pf.read_row_group(rg, columns=LOAD_COLS)
-            chunks.append(tbl.to_pandas())
+            chunks.append(pl.from_arrow(pf.read_row_group(rg, columns=cols)))
 
     if not chunks:
         print("No parquet data found for the selected regions.", file=sys.stderr)
         sys.exit(1)
 
-    pixel_df = pd.concat(chunks, ignore_index=True)
+    pixel_df = pl.concat(chunks).with_columns(
+        pl.col("date").cast(pl.Date).dt.ordinal_day().alias("doy")
+    )
     # SCL filter applies to S2 rows only; S1 rows have NaN scl_purity — keep them for woody filter
-    pixel_df = pixel_df[(pixel_df["scl_purity"] >= args.min_purity) | (pixel_df["source"] == "S1")].copy()
-    pixel_df["date"] = pd.to_datetime(pixel_df["date"])
-    pixel_df["doy"]  = pixel_df["date"].dt.day_of_year
+    pixel_df = pixel_df.filter(
+        (pl.col("scl_purity") >= args.min_purity) | (pl.col("source") == "S1")
+    )
 
     # Assign tag_class by matching point_id to region bboxes
-    pixel_df["tag_class"] = pd.NA
+    tag_class_arr = [None] * len(pixel_df)
+    lons = pixel_df["lon"].to_numpy()
+    lats = pixel_df["lat"].to_numpy()
     for region in regions:
         lon_min, lat_min, lon_max, lat_max = region.bbox
-        mask = (
-            (pixel_df["lon"] >= lon_min) & (pixel_df["lon"] <= lon_max) &
-            (pixel_df["lat"] >= lat_min) & (pixel_df["lat"] <= lat_max)
-        )
         tc = tag_class_for(region)
-        pixel_df.loc[mask, "tag_class"] = tc
+        mask = (lons >= lon_min) & (lons <= lon_max) & (lats >= lat_min) & (lats <= lat_max)
+        for i in np.where(mask)[0]:
+            tag_class_arr[i] = tc
 
-    pixel_df = pixel_df[pixel_df["tag_class"].notna()].copy()
-    pixel_df["year"] = pixel_df["date"].dt.year
+    pixel_df = pixel_df.with_columns(
+        pl.Series("tag_class", tag_class_arr)
+    ).filter(pl.col("tag_class").is_not_null()).with_columns(
+        pl.col("date").cast(pl.Date).dt.year().alias("year")
+    )
 
     # Apply S1 VH woody filter before dropna (needs vh column)
     if args.woody_filter:
         pixel_df = apply_woody_filter(pixel_df)
 
     # Drop rows with NaN in any required band (matches training dropna)
-    pixel_df = pixel_df.dropna(subset=["B04", "B08", "B11"])
-    obs_counts = pixel_df.groupby(["point_id", "year"]).size()
-    keep = obs_counts[obs_counts >= args.min_obs_per_year].index
-    pixel_df = pixel_df.set_index(["point_id", "year"]).loc[
-        pixel_df.set_index(["point_id", "year"]).index.isin(keep)
-    ].reset_index()
+    pixel_df = pixel_df.drop_nulls(subset=["B04", "B08", "B11"])
+    obs_counts = pixel_df.group_by(["point_id", "year"]).agg(pl.len().alias("n"))
+    keep_py = set(
+        (r["point_id"], r["year"])
+        for r in obs_counts.filter(pl.col("n") >= args.min_obs_per_year).iter_rows(named=True)
+    )
+    py_arr = list(zip(pixel_df["point_id"].to_list(), pixel_df["year"].to_list()))
+    pixel_df = pixel_df.filter(pl.Series([py in keep_py for py in py_arr]))
 
     # Compute MAVI on raw reflectance
-    pixel_df["MAVI"] = compute_mavi(pixel_df)
+    pixel_df = pixel_df.with_columns(compute_mavi(pixel_df))
 
     # Per-pixel z-score of MAVI — mirrors training pixel_zscore=True
-    # Applied to MAVI (not raw bands) so the index formulation is preserved
     if args.pixel_zscore:
-        stats = pixel_df.groupby("point_id")["MAVI"].agg(["mean", "std"])
-        pid_arr = pixel_df["point_id"].values
-        m = stats["mean"].reindex(pid_arr).values
-        s = stats["std"].reindex(pid_arr).clip(lower=1e-6).fillna(1e-6).values
-        pixel_df["MAVI"] = (pixel_df["MAVI"].values - m) / s
+        stats_df = pixel_df.group_by("point_id").agg([
+            pl.col("MAVI").mean().alias("_m"),
+            pl.col("MAVI").std().alias("_s"),
+        ])
+        pixel_df = pixel_df.join(stats_df, on="point_id", how="left").with_columns(
+            ((pl.col("MAVI") - pl.col("_m")) /
+             pl.col("_s").fill_null(1e-6).clip(lower_bound=1e-6)).alias("MAVI")
+        ).drop(["_m", "_s"])
 
-    tag_classes = sorted(pixel_df["tag_class"].unique())
+    tag_classes = sorted(pixel_df["tag_class"].drop_nulls().unique().to_list())
     colours = COLOURS[:len(tag_classes)]
 
     print(f"Tag classes found: {tag_classes}")
     for tc in tag_classes:
-        n = pixel_df[pixel_df["tag_class"] == tc]["point_id"].nunique()
+        n = pixel_df.filter(pl.col("tag_class") == tc)["point_id"].n_unique()
         print(f"  {tc}: {n} pixels")
 
     # Per-bbox histograms
@@ -426,23 +434,24 @@ def main() -> None:
     # Per-class CSV summary of MAVI and ΔMAVI/Δt dry-season minima
     summary_rows = []
     for tc in tag_classes:
-        sub_m  = pixel_df[pixel_df["tag_class"] == tc][["doy", "MAVI"]].dropna()
-        sub_dm = dmavi_df[dmavi_df["tag_class"] == tc][["doy", "DMAVI"]].dropna()
-        # Dry season = DOY 150-270 (roughly May-Sep in northern Australia)
-        dry_m  = sub_m[(sub_m["doy"] >= 150) & (sub_m["doy"] <= 270)]["MAVI"]
-        dry_dm = sub_dm[(sub_dm["doy"] >= 150) & (sub_dm["doy"] <= 270)]["DMAVI"]
+        dry_m  = pixel_df.filter(
+            (pl.col("tag_class") == tc) & pl.col("doy").is_between(150, 270)
+        )["MAVI"].drop_nulls().to_numpy()
+        dry_dm = dmavi_df.filter(
+            (pl.col("tag_class") == tc) & pl.col("doy").is_between(150, 270)
+        )["DMAVI"].drop_nulls().to_numpy()
         summary_rows.append({
-            "tag_class":          tc,
-            "mavi_dry_mean":      dry_m.mean()  if len(dry_m)  > 0 else np.nan,
-            "mavi_dry_std":       dry_m.std()   if len(dry_m)  > 0 else np.nan,
-            "dmavi_dry_mean":     dry_dm.mean() if len(dry_dm) > 0 else np.nan,
-            "dmavi_dry_min":      dry_dm.min()  if len(dry_dm) > 0 else np.nan,
+            "tag_class":      tc,
+            "mavi_dry_mean":  float(np.mean(dry_m))  if len(dry_m)  > 0 else float("nan"),
+            "mavi_dry_std":   float(np.std(dry_m))   if len(dry_m)  > 0 else float("nan"),
+            "dmavi_dry_mean": float(np.mean(dry_dm)) if len(dry_dm) > 0 else float("nan"),
+            "dmavi_dry_min":  float(np.min(dry_dm))  if len(dry_dm) > 0 else float("nan"),
         })
-    summary_df = pd.DataFrame(summary_rows)
+    summary_df = pl.DataFrame(summary_rows)
     csv_path   = out_dir / "mavi_summary.csv"
-    summary_df.to_csv(csv_path, index=False, float_format="%.4f")
+    summary_df.write_csv(csv_path, float_precision=4)
     print(f"Saved: {csv_path}")
-    print(summary_df.to_string(index=False))
+    print(summary_df)
 
 
 if __name__ == "__main__":

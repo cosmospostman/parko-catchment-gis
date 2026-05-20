@@ -17,33 +17,35 @@ All four:
 from __future__ import annotations
 
 import numpy as np
-import pandas as pd
+import polars as pl
 
 from signals.base import Signal
 from tam.core.constants import DRY_DOY_MIN, DRY_DOY_MAX
 
 
-def _get_doy(df_slice: pd.DataFrame) -> pd.Series:
+def _get_doy(df_slice: pl.DataFrame) -> np.ndarray:
     if "doy" in df_slice.columns:
-        return df_slice["doy"]
-    return pd.to_datetime(df_slice["date"]).dt.day_of_year
+        return df_slice["doy"].to_numpy()
+    return df_slice["date"].cast(pl.Date).dt.ordinal_day().to_numpy()
 
 
-def _dry_window_summarise(ts: pd.Series, df_slice: pd.DataFrame) -> dict:
+def _dry_window_summarise(ts: pl.Series, df_slice: pl.DataFrame) -> dict:
     """Shared summarise for S1 signals: dry-season primary keys + full-year percentiles."""
     doy = _get_doy(df_slice)
-    dry_mask = doy.between(DRY_DOY_MIN, DRY_DOY_MAX)
+    ts_arr = ts.to_numpy()
 
-    dry_valid = ts[dry_mask].dropna()
+    dry_mask = (doy >= DRY_DOY_MIN) & (doy <= DRY_DOY_MAX)
+    dry_vals = ts_arr[dry_mask]
+    dry_valid = dry_vals[~np.isnan(dry_vals)]
     dry_n = len(dry_valid)
     if dry_n > 0:
-        dry_mean = float(dry_valid.mean())
-        dry_std = float(dry_valid.std()) if dry_n > 1 else 0.0
+        dry_mean = float(np.mean(dry_valid))
+        dry_std = float(np.std(dry_valid)) if dry_n > 1 else 0.0
     else:
         dry_mean = np.nan
         dry_std = np.nan
 
-    full_valid = ts.dropna()
+    full_valid = ts_arr[~np.isnan(ts_arr)]
     n = len(full_valid)
     if n == 0:
         return dict(dry_mean=np.nan, dry_std=np.nan, dry_n_obs=0,
@@ -70,23 +72,23 @@ class VHSignal(Signal):
     name = "vh_db"
 
     @staticmethod
-    def quality_mask(df: pd.DataFrame, **_) -> pd.Series:
-        mask = pd.Series(True, index=df.index)
+    def quality_mask(df: pl.DataFrame, **_) -> pl.Series:
+        mask = pl.Series([True] * len(df))
         if "source" in df.columns:
-            mask &= df["source"].eq("S1")
+            mask = mask & (df["source"] == "S1")
         return mask
 
-    def compute(self, df: pd.DataFrame) -> pd.Series:
-        good = self.quality_mask(df)
-        out = pd.Series(np.nan, index=df.index, dtype="float32")
+    def compute(self, df: pl.DataFrame) -> pl.Series:
+        good = self.quality_mask(df).to_numpy()
+        out = np.full(len(df), np.nan, dtype="float32")
         if good.any() and "vh" in df.columns:
-            vh_lin = df.loc[good, "vh"].values.astype("float32")
+            vh_lin = df["vh"].to_numpy().astype("float32")
             with np.errstate(divide="ignore", invalid="ignore"):
                 db = np.where(vh_lin > 0, 10.0 * np.log10(vh_lin), np.nan).astype("float32")
-            out[good] = db
-        return out
+            out[good] = db[good]
+        return pl.Series(out)
 
-    def summarise(self, ts: pd.Series, df_slice: pd.DataFrame) -> dict:
+    def summarise(self, ts: pl.Series, df_slice: pl.DataFrame) -> dict:
         return _dry_window_summarise(ts, df_slice)
 
 
@@ -96,23 +98,23 @@ class VVSignal(Signal):
     name = "vv_db"
 
     @staticmethod
-    def quality_mask(df: pd.DataFrame, **_) -> pd.Series:
-        mask = pd.Series(True, index=df.index)
+    def quality_mask(df: pl.DataFrame, **_) -> pl.Series:
+        mask = pl.Series([True] * len(df))
         if "source" in df.columns:
-            mask &= df["source"].eq("S1")
+            mask = mask & (df["source"] == "S1")
         return mask
 
-    def compute(self, df: pd.DataFrame) -> pd.Series:
-        good = self.quality_mask(df)
-        out = pd.Series(np.nan, index=df.index, dtype="float32")
+    def compute(self, df: pl.DataFrame) -> pl.Series:
+        good = self.quality_mask(df).to_numpy()
+        out = np.full(len(df), np.nan, dtype="float32")
         if good.any() and "vv" in df.columns:
-            vv_lin = df.loc[good, "vv"].values.astype("float32")
+            vv_lin = df["vv"].to_numpy().astype("float32")
             with np.errstate(divide="ignore", invalid="ignore"):
                 db = np.where(vv_lin > 0, 10.0 * np.log10(vv_lin), np.nan).astype("float32")
-            out[good] = db
-        return out
+            out[good] = db[good]
+        return pl.Series(out)
 
-    def summarise(self, ts: pd.Series, df_slice: pd.DataFrame) -> dict:
+    def summarise(self, ts: pl.Series, df_slice: pl.DataFrame) -> dict:
         return _dry_window_summarise(ts, df_slice)
 
 
@@ -122,25 +124,25 @@ class VHVVSignal(Signal):
     name = "vh_vv"
 
     @staticmethod
-    def quality_mask(df: pd.DataFrame, **_) -> pd.Series:
-        mask = pd.Series(True, index=df.index)
+    def quality_mask(df: pl.DataFrame, **_) -> pl.Series:
+        mask = pl.Series([True] * len(df))
         if "source" in df.columns:
-            mask &= df["source"].eq("S1")
+            mask = mask & (df["source"] == "S1")
         return mask
 
-    def compute(self, df: pd.DataFrame) -> pd.Series:
-        good = self.quality_mask(df)
-        out = pd.Series(np.nan, index=df.index, dtype="float32")
+    def compute(self, df: pl.DataFrame) -> pl.Series:
+        good = self.quality_mask(df).to_numpy()
+        out = np.full(len(df), np.nan, dtype="float32")
         if good.any() and "vh" in df.columns and "vv" in df.columns:
-            vh_lin = df.loc[good, "vh"].values.astype("float32")
-            vv_lin = df.loc[good, "vv"].values.astype("float32")
+            vh_lin = df["vh"].to_numpy().astype("float32")
+            vv_lin = df["vv"].to_numpy().astype("float32")
             with np.errstate(divide="ignore", invalid="ignore"):
                 vh_db = np.where(vh_lin > 0, 10.0 * np.log10(vh_lin), np.nan).astype("float32")
                 vv_db = np.where(vv_lin > 0, 10.0 * np.log10(vv_lin), np.nan).astype("float32")
-            out[good] = (vh_db - vv_db).astype("float32")
-        return out
+            out[good] = (vh_db - vv_db).astype("float32")[good]
+        return pl.Series(out)
 
-    def summarise(self, ts: pd.Series, df_slice: pd.DataFrame) -> dict:
+    def summarise(self, ts: pl.Series, df_slice: pl.DataFrame) -> dict:
         return _dry_window_summarise(ts, df_slice)
 
 
@@ -153,24 +155,22 @@ class RVISignal(Signal):
     name = "rvi"
 
     @staticmethod
-    def quality_mask(df: pd.DataFrame, **_) -> pd.Series:
-        mask = pd.Series(True, index=df.index)
+    def quality_mask(df: pl.DataFrame, **_) -> pl.Series:
+        mask = pl.Series([True] * len(df))
         if "source" in df.columns:
-            mask &= df["source"].eq("S1")
+            mask = mask & (df["source"] == "S1")
         return mask
 
-    def compute(self, df: pd.DataFrame) -> pd.Series:
-        good = self.quality_mask(df)
-        out = pd.Series(np.nan, index=df.index, dtype="float32")
+    def compute(self, df: pl.DataFrame) -> pl.Series:
+        good = self.quality_mask(df).to_numpy()
+        out = np.full(len(df), np.nan, dtype="float32")
         if good.any() and "vh" in df.columns and "vv" in df.columns:
-            vh_lin = df.loc[good, "vh"].values.astype("float32")
-            vv_lin = df.loc[good, "vv"].values.astype("float32")
+            vh_lin = df["vh"].to_numpy().astype("float32")
+            vv_lin = df["vv"].to_numpy().astype("float32")
             denom = vh_lin + vv_lin
-            result = np.full(denom.shape, np.nan, dtype="float32")
-            valid = denom > 0
-            result[valid] = 4.0 * vh_lin[valid] / denom[valid]
-            out[good] = result
-        return out
+            valid = good & (denom > 0)
+            out[valid] = 4.0 * vh_lin[valid] / denom[valid]
+        return pl.Series(out)
 
-    def summarise(self, ts: pd.Series, df_slice: pd.DataFrame) -> dict:
+    def summarise(self, ts: pl.Series, df_slice: pl.DataFrame) -> dict:
         return _dry_window_summarise(ts, df_slice)

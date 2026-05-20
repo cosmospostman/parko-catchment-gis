@@ -7,8 +7,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 import xarray as xr
-import geopandas as gpd
-from shapely.geometry import box, Point, Polygon
+import json
+from shapely.geometry import box, mapping
 import rioxarray  # noqa: F401 — registers .rio accessor
 
 # Ensure project root is on sys.path
@@ -41,12 +41,15 @@ def tmp_dirs(tmp_path, monkeypatch):
 
     # Place a synthetic catchment GeoJSON
     catchment_path = tmp_path / "base" / "mitchell_catchment.geojson"
-    catchment_gdf = gpd.GeoDataFrame(
-        {"name": ["mitchell"]},
-        geometry=[box(141.0, -17.0, 143.0, -15.0)],
-        crs="EPSG:4326",
-    )
-    catchment_gdf.to_file(str(catchment_path), driver="GeoJSON")
+    geojson = {
+        "type": "FeatureCollection",
+        "features": [{
+            "type": "Feature",
+            "properties": {"name": "mitchell"},
+            "geometry": mapping(box(141.0, -17.0, 143.0, -15.0)),
+        }],
+    }
+    catchment_path.write_text(json.dumps(geojson))
     monkeypatch.setenv("CATCHMENT_GEOJSON", str(catchment_path))
 
     # Reload config with new env vars
@@ -104,31 +107,3 @@ def synthetic_probability_raster() -> xr.DataArray:
     return _make_raster(values)
 
 
-@pytest.fixture()
-def synthetic_flood_gdf() -> gpd.GeoDataFrame:
-    """Small GeoDataFrame with a single flood polygon."""
-    poly = Polygon([(700000, -1600000), (710000, -1600000),
-                    (710000, -1610000), (700000, -1610000)])
-    return gpd.GeoDataFrame(geometry=[poly], crs="EPSG:7844")
-
-
-@pytest.fixture()
-def synthetic_patches_gdf() -> gpd.GeoDataFrame:
-    """GeoDataFrame with two priority patches in different tiers."""
-    poly_a = Polygon([(700000, -1600000), (700500, -1600000),
-                      (700500, -1600500), (700000, -1600500)])
-    poly_b = Polygon([(705000, -1600000), (706000, -1600000),
-                      (706000, -1601000), (705000, -1601000)])
-    return gpd.GeoDataFrame(
-        {
-            "tier": ["A", "B"],
-            "area_ha": [0.25, 1.0],
-            "prob_mean": [0.90, 0.78],
-            "prob_max":  [0.95, 0.85],
-            "dist_to_kowanyama_km": [100.0, 120.0],
-            "seed_flux_score": [0.72, 0.50],
-            "stream_order": [3, 2],
-        },
-        geometry=[poly_a, poly_b],
-        crs="EPSG:7844",
-    )
