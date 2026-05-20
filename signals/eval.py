@@ -50,13 +50,13 @@ from typing import Sequence
 
 import numpy as np
 import polars as pl
-import pyarrow.parquet as pq
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from signals.base import Signal
 from tam.core.constants import DRY_DOY_MIN as _DRY_DOY_MIN, DRY_DOY_MAX as _DRY_DOY_MAX
+from utils.polars_utils import add_year_doy, scan_region_parquet
 from utils.training_collector import _region_parquet_path
 
 
@@ -133,10 +133,7 @@ def _vh_dry_mean(df: pl.DataFrame) -> dict[tuple, float]:
     if s1.is_empty():
         return {}
 
-    s1 = s1.with_columns([
-        pl.col("date").cast(pl.Date).dt.year().alias("year"),
-        pl.col("date").cast(pl.Date).dt.ordinal_day().alias("doy"),
-    ])
+    s1 = add_year_doy(s1)
     dry = s1.filter(
         (pl.col("doy") >= _DRY_DOY_MIN) & (pl.col("doy") <= _DRY_DOY_MAX)
     )
@@ -195,18 +192,13 @@ def _load_region(
     if not path.exists():
         return None
 
-    pf = pq.ParquetFile(path)
-    chunks = [pf.read_row_group(rg) for rg in range(pf.metadata.num_row_groups)]
-    df = pl.from_arrow(chunks[0] if len(chunks) == 1 else __import__("pyarrow").concat_tables(chunks))
+    df = scan_region_parquet(path)
 
     # Derive signal time series
     ts = signal.compute(df)
 
     # Attach year for grouping
-    df = df.with_columns([
-        pl.Series("_ts", ts.to_numpy()),
-        pl.col("date").cast(pl.Date).dt.year().alias("year"),
-    ])
+    df = add_year_doy(df).with_columns(pl.Series("_ts", ts.to_numpy()))
 
     # Pre-compute VH dry-season mean per pixel-year for presence filter
     vh_dry = (

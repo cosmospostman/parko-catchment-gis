@@ -358,8 +358,9 @@ def train_tam(
 
         if cfg.stride_exclude_sites:
             exc_sites = set(cfg.stride_exclude_sites)
+            _site_map = {pid: _site_class(pid)[0] for pid in coord_subset["point_id"].unique().to_list()}
             coord_subset = coord_subset.with_columns(
-                pl.col("point_id").map_elements(lambda p: _site_class(p)[0], return_dtype=pl.Utf8).alias("_site")
+                pl.col("point_id").replace(_site_map).alias("_site")
             )
             excluded_pids = set(coord_subset.filter(pl.col("_site").is_in(exc_sites))["point_id"].to_list())
             to_stride = coord_subset.filter(~pl.col("_site").is_in(exc_sites))
