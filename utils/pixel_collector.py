@@ -173,7 +173,8 @@ def extract_item_to_df(
     scl_vals = store.get_all_points(item_id, SCL_BAND)
     if scl_vals is None:
         return None
-    scl_int = scl_vals.astype(np.int32)
+    with np.errstate(invalid="ignore"):  # NaN→int32 for OOB points is intentional
+        scl_int = scl_vals.astype(np.int32)
     clear_mask = np.isin(scl_int, list(SCL_CLEAR_VALUES))
     if not clear_mask.any():
         return None
@@ -410,11 +411,13 @@ def collect(
             return False
         return "__done__" in dp.read_text()
 
-    # Pre-check: verify that cached spectral patches cover the current bbox.
+    # Pre-check: verify that cached spectral patches were fetched for the current bbox.
     # Patches written for a different bbox (e.g. a training region on the same tile)
     # silently corrupt the output — CachedNpzChipStore clips out-of-bounds coordinates
     # to the patch edge, making every pixel return the same value.
     # If stale patches are found, invalidate shard .done files so shards are rebuilt.
+    # Note: border-tile patches (e.g. 55KBB for a site that spans 55KBB+55KCB) are NOT
+    # stale — they were fetched for this bbox and OOB points are handled as NaN.
     from utils.fetch import _cache_path as _fc_path, _load_patch_cache as _lpc, _patch_covers_bbox as _pcb
     # Scan ALL item dirs in the cache, not just those matching current STAC item IDs.
     # Stale dirs may have been written by a previous fetch with a different date window
@@ -425,9 +428,14 @@ def collect(
         for _item_dir in cache_dir.iterdir():
             if not _item_dir.is_dir():
                 continue
-            for _npz in _item_dir.glob("*.npz"):
+            # Check ALL band patches — a single valid band is not sufficient;
+            # different bands may have been cached at different bbox extents.
+            _npzs = list(_item_dir.glob("*.npz"))
+            if not _npzs:
+                continue
+            for _npz in _npzs:
                 _data = _lpc(_npz)
-                if _data is None or not _pcb(_data, bbox_wgs84):
+                if _data is None or not _pcb(_data, bbox_wgs84, path=_npz):
                     _stale_ids.add(_item_dir.name)
                     break
     if _stale_ids:

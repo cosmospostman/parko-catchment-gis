@@ -7,12 +7,10 @@ Tests
 -----
 1. get() returns a 2-D array with the correct shape.
 2. Missing chip raises FileNotFoundError with path context.
-3. CachedNpzChipStore.get_all_points raises ValueError when points fall outside the patch.
-   Root cause documented: a patch cached for training bbox A is silently reused at
-   inference for bbox B (~10 km away).  np.clip maps every out-of-bounds pixel to the
-   same patch edge, making all pixels return identical values — destroying spatial
-   variation and producing flat model outputs.  The guard converts the silent corruption
-   into a loud failure.
+3. CachedNpzChipStore.get_all_points returns NaN for points that fall outside the
+   cached patch — supports multi-tile sites where a 55KBB item's patch only covers
+   the western portion of the bbox; points in 55KCB territory come back NaN so they
+   are treated as non-clear and dropped by extract_item_to_df.
 """
 
 from pathlib import Path
@@ -130,18 +128,17 @@ def _write_npz_patch(
     _save_patch_cache(path, (patch_arr, transform, crs))
 
 
-def test_cached_npz_store_raises_when_points_far_outside_patch(tmp_path):
-    """CachedNpzChipStore must raise ValueError when points are >1 pixel outside the patch.
+def test_cached_npz_store_returns_nan_for_points_outside_patch(tmp_path):
+    """CachedNpzChipStore returns NaN for points that fall >1 pixel outside the patch.
 
-    Simulates the cross-bbox cache poisoning: a 10×10 pixel patch cached for
-    training bbox A is loaded by an inference run whose points are 1° away.
-    Before the fix, np.clip silently mapped every point to the patch edge,
-    returning the same DN value for all pixels.  After the fix, a ValueError
-    is raised immediately so the caller knows to re-fetch.
+    This supports multi-tile sites (e.g. quaids spanning 55KBB + 55KCB): a 55KBB
+    item's patch only covers the western portion of the full bbox.  Points that fall
+    in 55KCB territory map outside the 55KBB patch and are returned as NaN so
+    extract_item_to_df treats them as non-clear and excludes them from the DataFrame.
 
-    A 1-pixel slop is allowed for tile-edge rounding (coarser bands like SCL
-    at 20 m may be 1 pixel short of the bbox due to floating-point window
-    rounding in rasterio — those pixels are clip-clamped, not errored).
+    A 1-pixel slop is allowed for tile-edge rounding (coarser bands like SCL at 20 m
+    may be 1 pixel short of the bbox due to floating-point window rounding in rasterio
+    — those pixels are clip-clamped, not NaN'd).
     """
     from rasterio.crs import CRS
     from rasterio.transform import from_bounds
@@ -150,13 +147,13 @@ def test_cached_npz_store_raises_when_points_far_outside_patch(tmp_path):
     item_id = "S2A_54LWH_20250430_0_L2A"
     band = "B08"
 
-    # Patch covers a small area anchored at UTM (543000, 8243000) — training bbox
+    # Patch covers a small area anchored at UTM (543000, 8243000)
     crs = CRS.from_epsg(32754)
     patch_arr = np.arange(100, dtype=np.float32).reshape(10, 10) * 100
     transform = from_bounds(543_000, 8_243_000, 543_100, 8_243_100, 10, 10)
     _write_npz_patch(tmp_path, item_id, band, patch_arr, transform, crs)
 
-    # Inference pixels are 10 km east — >1 pixel outside in every direction
+    # Points far outside the patch (>1 pixel in every direction)
     scoring_lons = np.array([141.533, 141.534, 141.535], dtype=np.float64)
     scoring_lats = np.array([-15.808, -15.808, -15.808], dtype=np.float64)
     point_coords = {f"px_{i:04d}_0000": (float(scoring_lons[i]), float(scoring_lats[i]))
@@ -164,8 +161,10 @@ def test_cached_npz_store_raises_when_points_far_outside_patch(tmp_path):
 
     store = CachedNpzChipStore(cache_dir=tmp_path, point_coords=point_coords, bands=[band])
 
-    with pytest.raises(ValueError, match="outside the cached patch"):
-        store.get_all_points(item_id, band)
+    result = store.get_all_points(item_id, band)
+    assert result is not None
+    assert len(result) == 3
+    assert np.all(np.isnan(result)), "All OOB points must be NaN"
 
 
 def test_cached_npz_store_clips_single_pixel_edge_overhang(tmp_path):

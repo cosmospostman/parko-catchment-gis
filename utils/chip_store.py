@@ -226,7 +226,13 @@ class CachedNpzChipStore:
             if data is not None:
                 self._live[band] = data
 
-    def _pixel_coords(self, band: str) -> tuple[np.ndarray, np.ndarray] | None:
+    def _pixel_coords(self, band: str) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+        """Return (rows, cols, oob_mask) for all points, or None if band not loaded.
+
+        oob_mask is True for points that fall outside the patch (e.g. points on a
+        neighbouring S2 tile whose patch only covers the western portion of the bbox).
+        Callers should treat those positions as missing / NaN.
+        """
         if band not in self._live:
             return None
         arr, transform, crs = self._live[band]
@@ -242,40 +248,34 @@ class CachedNpzChipStore:
             cols_f, rows_f = ~transform * (xs, ys)
             rows_raw = np.floor(rows_f).astype(np.intp)
             cols_raw = np.floor(cols_f).astype(np.intp)
-            # Allow 1-pixel overhang at each edge: rasterio sometimes fetches a
-            # window that is 1 pixel short of the bbox due to floating-point rounding,
-            # particularly for coarser-resolution bands (SCL at 20 m, AOT at 60 m).
-            # Beyond 1 pixel the patch was almost certainly fetched for a different bbox.
+            # Allow 1-pixel overhang at each edge for floating-point rounding in
+            # coarser-resolution bands (SCL at 20 m, AOT at 60 m).
             _EDGE_SLOP = 1
-            far_oob = (
-                (rows_raw < -_EDGE_SLOP).any() or (rows_raw >= h + _EDGE_SLOP).any() or
-                (cols_raw < -_EDGE_SLOP).any() or (cols_raw >= w + _EDGE_SLOP).any()
+            oob_mask = (
+                (rows_raw < -_EDGE_SLOP) | (rows_raw >= h + _EDGE_SLOP) |
+                (cols_raw < -_EDGE_SLOP) | (cols_raw >= w + _EDGE_SLOP)
             )
-            if far_oob:
-                n_oob = int(
-                    ((rows_raw < -_EDGE_SLOP) | (rows_raw >= h + _EDGE_SLOP) |
-                     (cols_raw < -_EDGE_SLOP) | (cols_raw >= w + _EDGE_SLOP)).sum()
-                )
-                raise ValueError(
-                    f"CachedNpzChipStore: {n_oob}/{len(rows_raw)} points fall outside the "
-                    f"cached patch ({h}×{w}) for item '{self._live_item}' band '{band}'. "
-                    "The cached patch was likely built for a different bbox. "
-                    "Delete the chip cache for this item and re-fetch."
-                )
             rows = np.clip(rows_raw, 0, h - 1)
             cols = np.clip(cols_raw, 0, w - 1)
-            self._proj_cache[proj_key] = (rows, cols)
+            self._proj_cache[proj_key] = (rows, cols, oob_mask)
         return self._proj_cache[proj_key]
 
     def get_all_points(self, item_id: str, band: str) -> np.ndarray | None:
-        """Return a 1-D float32 array of pixel values for all points, or None if missing."""
+        """Return a 1-D float32 array of pixel values for all points, or None if missing.
+
+        Points that fall outside the cached patch (e.g. on a neighbouring S2 tile)
+        are returned as NaN so that downstream masking treats them as non-clear.
+        """
         self._load_item(item_id)
         coords = self._pixel_coords(band)
         if coords is None:
             return None
-        rows, cols = coords
+        rows, cols, oob_mask = coords
         arr, _, _ = self._live[band]
-        return arr[rows, cols]
+        vals = arr[rows, cols].astype(np.float32)
+        if oob_mask.any():
+            vals[oob_mask] = np.nan
+        return vals
 
     def release_item(self, item_id: str) -> None:
         """Evict the live item from memory."""

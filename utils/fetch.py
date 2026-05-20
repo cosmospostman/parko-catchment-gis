@@ -101,11 +101,38 @@ def _load_patch_cache(path: Path) -> tuple[np.ndarray, object, object] | None:
         return None
 
 
+def _load_patch_cache_bbox(path: Path) -> list[float] | None:
+    """Return the bbox_wgs84 stored in a cached .npz, or None if absent/corrupt."""
+    try:
+        z = np.load(path, allow_pickle=False)
+        if "fetch_bbox" not in z:
+            return None
+        return z["fetch_bbox"].tolist()
+    except Exception:
+        return None
+
+
 def _patch_covers_bbox(
     data: tuple[np.ndarray, object, object],
     bbox_wgs84: list[float],
+    path: Path | None = None,
 ) -> bool:
-    """Return True if the cached patch fully covers bbox_wgs84."""
+    """Return True if the cached patch was fetched for bbox_wgs84.
+
+    Primary check: compare the stored fetch_bbox against the requested bbox (exact
+    match within 1e-6 degrees).  This correctly handles border-tile items whose
+    raster doesn't extend to the full bbox — they are cached as partial patches but
+    are still valid for this bbox; points outside the raster come back as NaN.
+
+    Fallback for legacy patches that lack fetch_bbox: check whether all four WGS84
+    bbox corners project inside the patch extent (±1 pixel slop).
+    """
+    if path is not None:
+        stored_bbox = _load_patch_cache_bbox(path)
+        if stored_bbox is not None:
+            return all(abs(a - b) < 1e-6 for a, b in zip(stored_bbox, bbox_wgs84))
+
+    # Legacy fallback: geometric coverage check (patches written before fetch_bbox was stored)
     from pyproj import Transformer, CRS
     arr, transform, crs = data
     h, w = arr.shape
@@ -120,9 +147,7 @@ def _patch_covers_bbox(
     cols_f = (np.array(xs) - float(a.c)) / float(a.a)
     rows_f = (np.array(ys) - float(a.f)) / float(a.e)
     # Use floor() to match CachedNpzChipStore._pixel_coords, which floors
-    # continuous pixel coordinates before checking bounds.  Checking raw
-    # floats here was too permissive: a corner at rows_f=28.45 passed the
-    # < h+1 test even though floor(28.45+epsilon)=29 could exceed the patch.
+    # continuous pixel coordinates before checking bounds.
     _SLOP = 1
     rows_i = np.floor(rows_f).astype(int)
     cols_i = np.floor(cols_f).astype(int)
@@ -130,16 +155,22 @@ def _patch_covers_bbox(
                 rows_i.min() >= -_SLOP and rows_i.max() < h + _SLOP)
 
 
-def _save_patch_cache(path: Path, data: tuple[np.ndarray, object, object]) -> None:
+def _save_patch_cache(
+    path: Path,
+    data: tuple[np.ndarray, object, object],
+    fetch_bbox: list[float] | None = None,
+) -> None:
     """Save a patch to a .npz file, creating parent dirs as needed."""
     arr, transform, crs = data
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(
-        path,
+    kwargs: dict = dict(
         arr=arr,
         transform_coeffs=np.array(list(transform)[:6], dtype=np.float64),
         crs_wkt=np.frombuffer(crs.to_wkt().encode("utf-8"), dtype=np.uint8),
     )
+    if fetch_bbox is not None:
+        kwargs["fetch_bbox"] = np.array(fetch_bbox, dtype=np.float64)
+    np.savez(path, **kwargs)
 
 
 async def fetch_patches(
@@ -209,7 +240,7 @@ async def fetch_patches(
                 data = await loop.run_in_executor(executor, _load_patch_cache, path)
                 if data is not None:
                     covers = await loop.run_in_executor(
-                        executor, _patch_covers_bbox, data, bbox_wgs84
+                        executor, _patch_covers_bbox, data, bbox_wgs84, path
                     )
                     if covers:
                         cached += 1
@@ -224,8 +255,10 @@ async def fetch_patches(
             errors += 1
             return None
         if cache_dir is not None:
-            await loop.run_in_executor(executor, _save_patch_cache,
-                                       _cache_path(cache_dir, item_id, band), data)
+            await loop.run_in_executor(
+                executor, _save_patch_cache,
+                _cache_path(cache_dir, item_id, band), data, bbox_wgs84,
+            )
         fetched += 1
         return data
 

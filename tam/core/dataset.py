@@ -37,10 +37,12 @@ V9_FEATURE_COLS: list[str] = [
 ]
 S1_SNAP_WINDOW_DAYS: int = 7   # max |S1_date - S2_date| to accept a snap
 
-N_BANDS: int = len(ALL_FEATURE_COLS)          # 13: S2 only (no S1 in time series yet)
-N_BANDS_S1: int = len(ALL_FEATURE_COLS) + len(S1_FEATURE_COLS)  # 17: S2 + S1
+N_BANDS: int = len(ALL_FEATURE_COLS)          # 13: S2 only
+N_BANDS_S1: int = len(ALL_FEATURE_COLS) + len(S1_FEATURE_COLS)  # 17: snapped S1+S2
+N_BANDS_MIXED: int = N_BANDS_S1               # 17: mixed S1+S2 native rows (same width)
 MAX_SEQ_LEN: int = 128       # hard upper bound on stored window length; model seq len set via TAMConfig.max_seq_len
 MIN_OBS_PER_YEAR: int = 8
+MIN_S1_OBS_PER_YEAR: int = 4  # minimum S1 observations per year in mixed mode
 
 
 def lin_to_db(linear: np.ndarray) -> np.ndarray:
@@ -241,7 +243,70 @@ class TAMDataset(Dataset):
         # obs_dropout_min: if >0, subsample each window to Uniform(obs_dropout_min, n)
         # per __getitem__ call, teaching the model to be invariant to obs density.
         # Build observation sequence depending on mode
-        if use_s1 == "s1_only":
+        if use_s1 == "mixed":
+            # Mixed mode: S2 and S1 rows flow through as native observations sorted
+            # by date. S2 rows have NaN in S1 band columns; S1 rows have NaN in S2
+            # band columns. The model attends across all observations using real DOY.
+            # Band layout: ALL_FEATURE_COLS (0..12) + S1_FEATURE_COLS (13..16).
+            if "source" not in pixel_df.columns or "S1" not in pixel_df["source"].values:
+                raise ValueError("mixed mode requires S1 rows in pixel_df (source='S1')")
+
+            s2_rows = pixel_df[pixel_df["source"] == "S2"].copy()
+            s1_rows = pixel_df[pixel_df["source"] == "S1"].copy()
+
+            # SCL filter on S2 rows only — S1 has no cloud mask
+            if "scl_purity" in s2_rows.columns:
+                s2_rows = s2_rows[s2_rows["scl_purity"] >= scl_purity_min]
+
+            s1_rows = despeckle_s1(s1_rows, s1_despeckle_window)
+            vh_lin = s1_rows["vh"].values.astype(np.float32) if "vh" in s1_rows.columns else np.full(len(s1_rows), np.nan, dtype=np.float32)
+            vv_lin = s1_rows["vv"].values.astype(np.float32) if "vv" in s1_rows.columns else np.full(len(s1_rows), np.nan, dtype=np.float32)
+            s1_rows["s1_vh"]    = lin_to_db(vh_lin).astype(np.float32)
+            s1_rows["s1_vv"]    = lin_to_db(vv_lin).astype(np.float32)
+            s1_rows["s1_vh_vv"] = s1_rows["s1_vh"] - s1_rows["s1_vv"]
+            denom = vh_lin + vv_lin
+            s1_rows["s1_rvi"]   = np.where(denom > 0, 4 * vh_lin / denom, np.nan).astype(np.float32)
+            # Drop S1 rows where all four S1 bands are NaN (no usable acquisition)
+            s1_rows = s1_rows.dropna(subset=S1_FEATURE_COLS, how="all")
+
+            # Ensure S2 band columns exist on S1 rows (NaN) and vice versa
+            feature_cols = ALL_FEATURE_COLS + S1_FEATURE_COLS
+            for col in ALL_FEATURE_COLS:
+                if col not in s1_rows.columns:
+                    s1_rows[col] = np.nan
+            for col in S1_FEATURE_COLS:
+                if col not in s2_rows.columns:
+                    s2_rows[col] = np.nan
+
+            # Ensure spectral indices are present on S2 rows
+            if any(c not in s2_rows.columns for c in INDEX_COLS):
+                s2_rows = add_spectral_indices(s2_rows)
+
+            df = pd.concat([s2_rows, s1_rows], ignore_index=True)
+
+            if labels is not None:
+                _keep_pids = (set(labels.index.get_level_values("point_id"))
+                              if isinstance(labels.index, pd.MultiIndex)
+                              else set(labels.index))
+                df = df[df["point_id"].isin(_keep_pids)]
+
+            if pixel_zscore:
+                # Per-pixel z-score S2 and S1 bands independently on their own rows
+                s2_zscore_cols = [c for c in ALL_FEATURE_COLS if c in df.columns]
+                s1_zscore_cols = ["s1_vh", "s1_vv"]
+                for zscore_cols, src in [(s2_zscore_cols, "S2"), (s1_zscore_cols, "S1")]:
+                    src_mask = df["source"] == src
+                    src_df   = df.loc[src_mask, ["point_id"] + zscore_cols]
+                    if src_df.empty:
+                        continue
+                    stats = src_df.groupby("point_id")[zscore_cols].agg(["mean", "std"])
+                    pid_arr = df.loc[src_mask, "point_id"].values
+                    for col in zscore_cols:
+                        m = stats[col]["mean"].reindex(pid_arr).values
+                        s = stats[col]["std"].reindex(pid_arr).clip(lower=1e-6).fillna(1e-6).values
+                        df.loc[src_mask, col] = (df.loc[src_mask, col].values - m) / s
+
+        elif use_s1 == "s1_only":
             # S1-only mode: use S1 rows directly, no snapping to S2 dates.
             # Bands: vh_db, vv_db, vh_vv, rvi — computed from linear vh/vv.
             s1_rows = pixel_df[pixel_df["source"] == "S1"].copy() if "source" in pixel_df.columns else pd.DataFrame()
@@ -324,7 +389,7 @@ class TAMDataset(Dataset):
                         s = stats[col]["std"].reindex(pid_arr).clip(lower=1e-6).fillna(1e-6).values
                         df[col] = (df[col].values - m) / s
 
-        if use_s1 != "s1_only":
+        if use_s1 not in ("s1_only", "mixed"):
             if any(c not in df.columns for c in feature_cols if c in set(INDEX_COLS)):
                 df = add_spectral_indices(df)
 
@@ -376,34 +441,48 @@ class TAMDataset(Dataset):
             df["doy"] = pd.to_datetime(df["date"]).dt.day_of_year
 
         bands_all = ((df[feature_cols].values.astype(np.float32) - self.band_mean) / self.band_std)
-        # Impute NaN → 0 after normalisation. NaN arises in S1 columns for
-        # observations that had no S1 acquisition within the snap window.
-        # 0 in normalised space = feature mean, i.e. "no information".
-        bands_all = np.where(np.isnan(bands_all), 0.0, bands_all).astype(np.float32)
-        doy_all   = df["doy"].values.astype(np.int32)
-        pid_all   = df["point_id"].values
-        yr_all    = df["year"].values
+        # Impute NaN → 0 after normalisation. In mixed mode, NaN is structural
+        # (S2 rows have no S1 values; S1 rows have no S2 values) — 0 in normalised
+        # space encodes "not applicable for this sensor on this observation".
+        bands_all  = np.where(np.isnan(bands_all), 0.0, bands_all).astype(np.float32)
+        doy_all    = df["doy"].values.astype(np.int32)
+        pid_all    = df["point_id"].values
+        yr_all     = df["year"].values
+        # source_all: 1 = S1 row, 0 = S2 row. Used in __getitem__ to restrict
+        # band noise to the sensor that populated each observation.
+        if "source" in df.columns:
+            source_all = (df["source"].values == "S1").astype(np.int8)
+        else:
+            source_all = np.zeros(len(df), dtype=np.int8)
 
+        _is_mixed = (use_s1 == "mixed")
         group_sizes = df.groupby(["point_id", "year"], sort=False, observed=True).size()
         split_points = np.cumsum(group_sizes.values)[:-1]
 
-        bands_split = np.split(bands_all, split_points)
-        doy_split   = np.split(doy_all,   split_points)
-        pid_split   = np.split(pid_all,   split_points)
-        yr_split    = np.split(yr_all,    split_points)
+        bands_split  = np.split(bands_all,  split_points)
+        doy_split    = np.split(doy_all,    split_points)
+        pid_split    = np.split(pid_all,    split_points)
+        yr_split     = np.split(yr_all,     split_points)
+        source_split = np.split(source_all, split_points)
 
-        self._windows: list[tuple[str, int, np.ndarray, np.ndarray]] = []
-        for b, d, p, y in zip(bands_split, doy_split, pid_split, yr_split):
-            if len(b) < min_obs_per_year:
-                continue
+        self._windows: list[tuple[str, int, np.ndarray, np.ndarray, np.ndarray]] = []
+        for b, d, p, y, src in zip(bands_split, doy_split, pid_split, yr_split, source_split):
+            if _is_mixed:
+                n_s2 = int((src == 0).sum())
+                n_s1 = int((src == 1).sum())
+                if n_s2 < min_obs_per_year or n_s1 < MIN_S1_OBS_PER_YEAR:
+                    continue
+            else:
+                if len(b) < min_obs_per_year:
+                    continue
             n = min(len(b), MAX_SEQ_LEN)
-            self._windows.append((p[0], int(y[0]), b[:n], d[:n]))
+            self._windows.append((p[0], int(y[0]), b[:n], d[:n], src[:n]))
 
         # For pixel-year labels, drop windows whose (point_id, year) is not in the label set.
         if labels is not None and self._labels_are_pixel_year:
             valid_py = set(labels.index)
             self._windows = [
-                (p, y, b, d) for p, y, b, d in self._windows if (p, y) in valid_py
+                (p, y, b, d, src) for p, y, b, d, src in self._windows if (p, y) in valid_py
             ]
 
         self._n_features = len(feature_cols)
@@ -450,7 +529,7 @@ class TAMDataset(Dataset):
         return len(self._windows)
 
     def __getitem__(self, idx: int) -> TAMSample:
-        pid, yr, bands_np, doy_np = self._windows[idx]
+        pid, yr, bands_np, doy_np, src_np = self._windows[idx]
         n = len(bands_np)
 
         # Subsample to max_seq_len if needed, incorporating obs_dropout.
@@ -464,15 +543,27 @@ class TAMDataset(Dataset):
             idx_keep = np.sort(np.random.choice(n, keep, replace=False))
             bands_np = bands_np[idx_keep]
             doy_np   = doy_np[idx_keep]
+            src_np   = src_np[idx_keep]
             n        = keep
 
         if self._band_noise_std > 0.0:
-            # Noise applied to S2 columns only — S1 columns (appended after S2)
-            # are NaN-imputed to 0 for unsnapped obs and must not be perturbed.
             n_s2 = min(len(ALL_FEATURE_COLS), self._n_features)
-            offset = np.zeros(self._n_features, dtype=np.float32)
-            offset[:n_s2] = np.random.randn(n_s2).astype(np.float32) * self._band_noise_std
-            bands_np = bands_np + offset
+            n_s1 = self._n_features - n_s2
+            if n_s1 > 0 and src_np.any():
+                # Mixed mode: per-observation noise, restricted to populated columns.
+                # S2 rows receive noise on S2 columns only; S1 rows on S1 columns only.
+                # Observations don't share a common offset — each is perturbed independently.
+                noise  = np.random.randn(n, self._n_features).astype(np.float32) * self._band_noise_std
+                is_s1  = src_np.astype(bool)
+                noise[~is_s1, n_s2:] = 0.0
+                noise[is_s1,  :n_s2] = 0.0
+                bands_np = bands_np + noise
+            else:
+                # S2-only and snap modes: constant per-window offset preserves
+                # within-window band differences (original behaviour).
+                offset = np.zeros(self._n_features, dtype=np.float32)
+                offset[:n_s2] = np.random.randn(n_s2).astype(np.float32) * self._band_noise_std
+                bands_np = bands_np + offset
 
         doy_vals = doy_np.astype(np.int64)
         if self._doy_phase_shift:
@@ -484,6 +575,7 @@ class TAMDataset(Dataset):
             sort_idx = np.argsort(doy_vals, kind="stable")
             doy_vals = doy_vals[sort_idx]
             bands_np = bands_np[sort_idx]
+            src_np   = src_np[sort_idx]
         elif self._doy_jitter > 0:
             offset = np.random.randint(-self._doy_jitter, self._doy_jitter + 1)
             # Clamp to 1–365 rather than wrapping: wrapping would reorder observations
@@ -530,7 +622,7 @@ class TAMDataset(Dataset):
     def unique_pixels(self) -> list[str]:
         seen: set[str] = set()
         out: list[str] = []
-        for pid, _, _b, _d in self._windows:
+        for pid, *_ in self._windows:
             if pid not in seen:
                 seen.add(pid)
                 out.append(pid)

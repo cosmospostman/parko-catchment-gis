@@ -221,7 +221,7 @@ class TestEvaluate:
             [f"aa_{i}" for i in range(5)], [2022, 2023], "absence", abs_val, n_obs=n_obs
         )
 
-        def _fake_load(region_id: str, label: str, signal: Signal):
+        def _fake_load(region_id: str, label: str, signal: Signal, **kwargs):
             if label == "presence":
                 return pres_frame.copy()
             return abs_frame.copy()
@@ -242,7 +242,7 @@ class TestEvaluate:
         site = SiteSpec("site", [("good_region", "presence"), ("missing_region", "absence")])
         pres_frame = _make_pixel_year_frame(["p0", "p1"], [2022], "presence", 0.8)
 
-        def _fake_load(region_id, label, signal):
+        def _fake_load(region_id, label, signal, **kwargs):
             if region_id == "good_region":
                 return pres_frame.copy()
             return None  # missing

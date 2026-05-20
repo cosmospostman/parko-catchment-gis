@@ -19,11 +19,13 @@ SZA_BAND = "SZA"  # sun zenith angle
 # ---------------------------------------------------------------------------
 # SCL (Scene Classification Layer) clear values
 # SCL class codes that indicate usable (non-cloud, non-shadow) pixels:
-#   4 = vegetation, 5 = bare soil, 6 = water, 7 = unclassified,
-#   11 = snow/ice (retained — not cloud)
+#   4 = vegetation, 5 = bare soil, 6 = water, 11 = snow/ice (retained — not cloud)
+# 7 (unclassified) is excluded: Sen2Cor uses it as a catch-all that includes
+# cloud shadow edges and partially shadowed pixels, which can produce near-zero
+# SWIR observations that corrupt time series (confirmed at Quaids, May 2026).
 # ---------------------------------------------------------------------------
 
-SCL_CLEAR_VALUES: set[int] = {4, 5, 6, 7, 11}
+SCL_CLEAR_VALUES: set[int] = {4, 5, 6, 11}
 
 # ---------------------------------------------------------------------------
 # Quality profile masks — passed to ObservationQuality.score(mask=...)
