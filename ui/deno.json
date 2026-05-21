@@ -1,9 +1,21 @@
 {
+  "nodeModulesDir": "auto",
   "imports": {
     "@std/yaml": "jsr:@std/yaml",
     "@std/path": "jsr:@std/path",
     "@std/http/file-server": "jsr:@std/http/file-server",
     "@std/fs": "jsr:@std/fs",
-    "@std/encoding/hex": "jsr:@std/encoding/hex"
+    "@std/encoding/hex": "jsr:@std/encoding/hex",
+    "svelte": "npm:svelte@^5",
+    "@melt-ui/svelte": "npm:@melt-ui/svelte@^0.86",
+    "@floating-ui/dom": "npm:@floating-ui/dom@^1.6",
+    "vite": "npm:vite@^5",
+    "@sveltejs/vite-plugin-svelte": "npm:@sveltejs/vite-plugin-svelte@^4",
+    "maplibre-gl": "npm:maplibre-gl@^4"
+  },
+  "tasks": {
+    "dev": "deno run -A npm:vite --config vite.config.ts",
+    "build": "deno run -A npm:vite build --config vite.config.ts",
+    "serve": "deno run -A server.ts"
   }
 }
