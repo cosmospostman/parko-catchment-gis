@@ -10,6 +10,7 @@
   import { bbox as bboxStore } from '../stores/bbox.svelte.ts';
   import { ranking } from '../stores/ranking.svelte.ts';
   import { imageryInfo } from '../stores/imageryInfo.svelte.ts';
+  import { trainingSelection } from '../stores/trainingSelection.svelte.ts';
   import {
     fetchLocations, fetchRankings, fetchCatchments,
     fetchSightings, fetchImageryInfo,
@@ -18,8 +19,14 @@
     parseBbox, formatBbox, lngLatsToBbox, bboxToFeature,
     bboxToYaml, bboxPixelCount, merc,
   } from '../lib/geo.ts';
+  import { buildS2Grid } from '../lib/s2grid.ts';
 
   declare const maplibregl: typeof import('maplibre-gl');
+
+  interface Props {
+    ontrainingclick?: (bbox: string) => void;
+  }
+  let { ontrainingclick }: Props = $props();
 
   let mapContainer: HTMLDivElement;
   let map: MapLibreMap | null = null;
@@ -126,7 +133,13 @@
   // ---------------------------------------------------------------------------
   function addLocationLayers(geojson: typeof locationsStore.geojson) {
     if (!map || !geojson) return;
-    const trainingFeatures = geojson.features.filter(f => f.properties.parent_id === 'training');
+    const trainingFeatures = geojson.features
+      .filter(f => f.properties.parent_id === 'training')
+      .map(f => {
+        const bbox = parseBbox(f.properties.bbox);
+        const { pixelExtent } = buildS2Grid(bbox, f.properties as any);
+        return pixelExtent.features[0] ?? f;
+      });
     const woodyFeatures    = geojson.features.filter(f => f.properties.parent_id === 'woody-classifier');
     const locationFeatures = geojson.features.filter(f =>
       f.properties.parent_id !== 'training' && f.properties.parent_id !== 'woody-classifier'
@@ -162,6 +175,11 @@
     map.addLayer({ id: 'training-line', type: 'line', source: 'training-regions',
       layout: { visibility: tv },
       paint: { 'line-color': COLOR_EXPR as any, 'line-width': 2 } });
+
+    map.addSource('training-grid', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+    map.addLayer({ id: 'training-grid-lines', type: 'line', source: 'training-grid',
+      paint: { 'line-color': '#ffffff', 'line-width': 0.5, 'line-opacity': 0.4 } });
+
 
     const wv = layerVisibility.woody ? 'visible' : 'none';
     map.addLayer({ id: 'woody-fill', type: 'fill', source: 'woody-regions',
@@ -446,6 +464,10 @@
         if (mapMode.current !== 'locations') return;
         const feat = e.features?.[0];
         if (!feat) return;
+        if (layer === 'training-fill' && feat.properties.bbox) {
+          ontrainingclick?.(feat.properties.bbox);
+          return;
+        }
         popup!.setLngLat(e.lngLat).setHTML(buildLocationPopupHtml(feat.properties)).addTo(map!);
       });
       map.on('mouseenter', layer, () => { if (mapMode.current === 'locations') map!.getCanvas().style.cursor = 'pointer'; });
