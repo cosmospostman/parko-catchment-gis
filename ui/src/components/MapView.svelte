@@ -140,14 +140,12 @@
         const { pixelExtent } = buildS2Grid(bbox, f.properties as any);
         return pixelExtent.features[0] ?? f;
       });
-    const woodyFeatures    = geojson.features.filter(f => f.properties.parent_id === 'woody-classifier');
     const locationFeatures = geojson.features.filter(f =>
-      f.properties.parent_id !== 'training' && f.properties.parent_id !== 'woody-classifier'
+      f.properties.parent_id !== 'training'
     );
 
     map.addSource('locations', { type: 'geojson', data: { type: 'FeatureCollection', features: locationFeatures } });
     map.addSource('training-regions', { type: 'geojson', data: { type: 'FeatureCollection', features: trainingFeatures } });
-    map.addSource('woody-regions', { type: 'geojson', data: { type: 'FeatureCollection', features: woodyFeatures } });
 
     map.addLayer({ id: 'loc-fill-location', type: 'fill', source: 'locations',
       filter: ['==', ['get', 'role'], 'location'],
@@ -181,13 +179,6 @@
       paint: { 'line-color': '#ffffff', 'line-width': 0.5, 'line-opacity': 0.4 } });
 
 
-    const wv = layerVisibility.woody ? 'visible' : 'none';
-    map.addLayer({ id: 'woody-fill', type: 'fill', source: 'woody-regions',
-      layout: { visibility: wv },
-      paint: { 'fill-color': COLOR_EXPR as any, 'fill-opacity': 0.30 } });
-    map.addLayer({ id: 'woody-line', type: 'line', source: 'woody-regions',
-      layout: { visibility: wv },
-      paint: { 'line-color': COLOR_EXPR as any, 'line-width': 2, 'line-dasharray': [4, 3] } });
   }
 
   // ---------------------------------------------------------------------------
@@ -197,14 +188,6 @@
     if (!map || !locationsStore.mapReady) return;
     const vis = layerVisibility.training ? 'visible' : 'none';
     for (const id of ['training-fill', 'training-line']) {
-      if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', vis);
-    }
-  });
-
-  $effect(() => {
-    if (!map || !locationsStore.mapReady) return;
-    const vis = layerVisibility.woody ? 'visible' : 'none';
-    for (const id of ['woody-fill', 'woody-line']) {
       if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', vis);
     }
   });
@@ -458,7 +441,7 @@
   // ---------------------------------------------------------------------------
   function attachLocationPopups() {
     if (!map || !popup) return;
-    const layers = ['loc-fill-location', 'loc-fill-sub', 'loc-fill-score', 'training-fill', 'woody-fill'];
+    const layers = ['loc-fill-location', 'loc-fill-sub', 'loc-fill-score', 'training-fill'];
     for (const layer of layers) {
       map.on('click', layer, (e) => {
         if (mapMode.current !== 'locations') return;

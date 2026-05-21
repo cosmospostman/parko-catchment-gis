@@ -13,29 +13,6 @@ const PORT = Number(Deno.env.get("PORT") ?? 3000);
 ensureDirSync(WMS_CACHE_DIR);
 
 // ---------------------------------------------------------------------------
-// Woody-score build state
-// ---------------------------------------------------------------------------
-
-const woodyScoreBuilding = new Set<string>();
-
-async function buildWoodyScores(regionId: string, outPath: string): Promise<void> {
-  console.log(`Building woody scores for ${regionId} ...`);
-  const scriptPath = join(__dirname, "..", "tam", "tools", "export_woody_scores.py");
-  const repoDirForPy = join(__dirname, "..");
-  const venvPython = join(repoDirForPy, ".venv", "bin", "python3");
-  const cmd = new Deno.Command(venvPython, {
-    args: [scriptPath, regionId],
-    cwd: repoDirForPy,
-    stdout: "inherit",
-    stderr: "inherit",
-  });
-  const { success } = await cmd.output();
-  woodyScoreBuilding.delete(regionId);
-  if (!success) throw new Error(`export_woody_scores.py failed for ${regionId}`);
-  console.log(`Woody scores ready: ${outPath}`);
-}
-
-// ---------------------------------------------------------------------------
 // Heuristic-score build state (VH dry-season threshold, no model required)
 // ---------------------------------------------------------------------------
 
@@ -139,12 +116,10 @@ function loadLocations(): GeoJSON.FeatureCollection {
   const features: GeoJSON.Feature[] = [];
 
   loadRegionsYaml(features, "training.yaml", "training");
-  loadRegionsYaml(features, "woody-classifier.yaml", "woody-classifier");
 
   for (const entry of Deno.readDirSync(LOCATIONS_DIR)) {
     if (!entry.name.endsWith(".yaml")) continue;
     if (entry.name === "training.yaml") continue;
-    if (entry.name === "woody-classifier.yaml") continue;
     const slug = entry.name.replace(/\.yaml$/, "");
     const raw = Deno.readTextFileSync(join(LOCATIONS_DIR, entry.name));
     const loc = parseYaml(raw) as LocationYaml;
@@ -668,65 +643,6 @@ async function handler(req: Request): Promise<Response> {
     } catch (err) {
       console.error("S1 tile render error:", err);
       return new Response("Render error", { status: 500 });
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // Noise-pixel routes
-  // ---------------------------------------------------------------------------
-
-  if (url.pathname === "/api/woody-score-regions") {
-    try {
-      const raw = Deno.readTextFileSync(join(LOCATIONS_DIR, "training.yaml"));
-      const data = parseYaml(raw) as { regions?: Array<{ id: string; label: string }> };
-      const regions = (data.regions ?? []).map(r => ({ id: r.id, label: r.label }));
-      return new Response(JSON.stringify(regions), {
-        headers: { "content-type": "application/json", "cache-control": "public, max-age=300" },
-      });
-    } catch (err) {
-      console.error("Failed to load woody-score regions:", err);
-      return new Response(JSON.stringify([]), { headers: { "content-type": "application/json" } });
-    }
-  }
-
-  if (url.pathname === "/api/woody-scores-status") {
-    const regionId = url.searchParams.get("region");
-    if (!regionId) return new Response("Missing region param", { status: 400 });
-    const jsonPath = join(__dirname, "..", "outputs", "woody_scores", `${regionId}.json`);
-    let state: string;
-    try {
-      Deno.statSync(jsonPath);
-      state = "ready";
-    } catch {
-      state = woodyScoreBuilding.has(regionId) ? "building" : "missing";
-    }
-    return new Response(JSON.stringify({ state }), {
-      headers: { "content-type": "application/json", "cache-control": "no-store" },
-    });
-  }
-
-  if (url.pathname === "/api/woody-scores") {
-    const regionId = url.searchParams.get("region");
-    if (!regionId) return new Response("Missing region param", { status: 400 });
-    const jsonPath = join(__dirname, "..", "outputs", "woody_scores", `${regionId}.json`);
-    try {
-      Deno.statSync(jsonPath);
-      const data = await Deno.readFile(jsonPath);
-      return new Response(data, {
-        headers: { "content-type": "application/json", "cache-control": "no-store" },
-      });
-    } catch {
-      if (!woodyScoreBuilding.has(regionId)) {
-        woodyScoreBuilding.add(regionId);
-        buildWoodyScores(regionId, jsonPath).catch(err => {
-          console.error("woody-scores build error:", err);
-          woodyScoreBuilding.delete(regionId);
-        });
-      }
-      return new Response(JSON.stringify({ state: "building" }), {
-        status: 202,
-        headers: { "content-type": "application/json", "cache-control": "no-store" },
-      });
     }
   }
 

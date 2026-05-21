@@ -1,6 +1,5 @@
 <script lang="ts">
   import BBoxPanel from './panels/BBoxPanel.svelte';
-  import WoodyClassifier from './panels/WoodyClassifier.svelte';
   import Catchments from './panels/Catchments.svelte';
   import S2Tiles from './panels/S2Tiles.svelte';
   import ALASightings from './panels/ALASightings.svelte';
@@ -36,7 +35,6 @@
     >
       Training regions{trainingCount > 0 ? ` (${trainingCount})` : ''}
     </button>
-    <WoodyClassifier />
     <Catchments />
     <S2Tiles />
     <ALASightings />
