@@ -20,7 +20,7 @@ from torch.utils.data import DataLoader
 
 from tam.core.config import TAMConfig
 from tam.core.constants import DRY_DOY_MIN as _DRY_DOY_MIN, DRY_DOY_MAX as _DRY_DOY_MAX
-from tam.core.dataset import MAX_SEQ_LEN, TAMDataset, V9_FEATURE_COLS, collate_fn, lin_to_db
+from tam.core.dataset import MAX_SEQ_LEN, S1_FEATURE_COLS, TAMDataset, V9_FEATURE_COLS, V10_FEATURE_COLS, V10_S1_FEATURE_COLS, collate_fn, lin_to_db
 from tam.core.global_features import GLOBAL_FEATURE_NAMES, compute_global_features
 from tam.core.model import TAMClassifier
 from analysis.constants import add_spectral_indices
@@ -338,7 +338,8 @@ def train_tam(
             _presence_filter_s2_slim = pixel_df.filter(pl.col("source") == "S2").select(_s2_cols)
 
     # Drop S1 rows — no longer needed after band summaries and slim extraction.
-    if "source" in pixel_df.columns:
+    # In mixed mode (use_s1=True/"mixed"), S1 rows must be kept for TAMDataset.
+    if "source" in pixel_df.columns and cfg.use_s1 not in (True, "mixed", "s1_only"):
         pixel_df = pixel_df.filter(pl.col("source") == "S2")
         gc.collect()
     _log_rss("after S1 drop")
@@ -571,11 +572,23 @@ def train_tam(
         )
 
     # --- Datasets -----------------------------------------------------------
-    if "source" in pixel_df.columns:
+    if "source" in pixel_df.columns and cfg.use_s1 not in (True, "mixed", "s1_only"):
         pixel_df = pixel_df.drop("source")
 
-    _log_rss("before train_ds")
     _feature_cols_override = list(cfg.feature_cols_override) if cfg.feature_cols_override else None
+    _s1_feature_cols_override = list(cfg.s1_feature_cols) if cfg.s1_feature_cols else None
+    _active_s1_cols = _s1_feature_cols_override or S1_FEATURE_COLS
+
+    # Trim pixel_df to only the columns TAMDataset needs — raw band columns
+    # not in feature_cols, plus ancillary cols like lon/lat/item_id, are dead
+    # weight at this point and can consume several GB.
+    _s1_raw = ["vh", "vv"] if cfg.use_s1 not in (False, None) else []
+    _keep_cols = {"point_id", "date", "year", "doy", "scl_purity", "scl", "source"} | \
+                 set(_feature_cols_override or []) | set(_active_s1_cols) | set(_s1_raw)
+    pixel_df = pixel_df.select([c for c in pixel_df.columns if c in _keep_cols])
+    gc.collect()
+
+    _log_rss("before train_ds")
     train_ds = TAMDataset(
         pixel_df, train_py_labels,
         scl_purity_min=cfg.scl_purity_min,
@@ -589,6 +602,7 @@ def train_tam(
         pixel_zscore=cfg.pixel_zscore,
         s1_despeckle_window=cfg.s1_despeckle_window,
         feature_cols_override=_feature_cols_override,
+        s1_feature_cols_override=_s1_feature_cols_override,
         max_seq_len=cfg.max_seq_len,
     )
     band_mean, band_std = train_ds.band_stats
@@ -606,23 +620,24 @@ def train_tam(
         pixel_zscore=cfg.pixel_zscore,
         s1_despeckle_window=cfg.s1_despeckle_window,
         feature_cols_override=_feature_cols_override,
+        s1_feature_cols_override=_s1_feature_cols_override,
         max_seq_len=cfg.max_seq_len,
     )
     logger.info("Train windows: %d  |  Val windows: %d", len(train_ds), len(val_ds))
     _log_rss("after val_ds")
 
     n_cpu = os.cpu_count() or 4
-    n_workers = max(2, n_cpu - 2)
+    n_workers = min(max(2, n_cpu - 2), 8)
     torch.set_num_threads(2)
     train_loader = DataLoader(
         train_ds, batch_size=cfg.batch_size, shuffle=True,
         collate_fn=collate_fn, num_workers=n_workers, persistent_workers=True,
-        pin_memory=True, prefetch_factor=4,
+        pin_memory=True, prefetch_factor=2,
     )
     val_loader = DataLoader(
         val_ds, batch_size=cfg.batch_size, shuffle=False,
         collate_fn=collate_fn, num_workers=n_workers, persistent_workers=True,
-        pin_memory=True, prefetch_factor=4,
+        pin_memory=True, prefetch_factor=2,
     )
     _log_rss("after DataLoader creation")
     logger.info("DataLoader workers: %d  PyTorch threads: %d", n_workers, torch.get_num_threads())
@@ -635,6 +650,8 @@ def train_tam(
     # --- Model + optimiser --------------------------------------------------
     if cfg.use_band_summaries and global_feat_df is not None:
         cfg.n_global_features = global_feat_df.width - 1  # exclude point_id column
+    del global_feat_df
+    gc.collect()
     model = TAMClassifier.from_config(cfg)
     model._use_s1 = cfg.use_s1
     model._pixel_zscore = cfg.pixel_zscore
@@ -649,13 +666,20 @@ def train_tam(
 
     if cfg.doy_density_norm:
         train_pids = {k[0] for k in train_py_labels}
-        train_doys = (
-            pixel_df.filter(pl.col("point_id").is_in(train_pids))["doy"]
-            .to_numpy().astype(int)
+        train_df = pixel_df.filter(pl.col("point_id").is_in(train_pids))
+        if "source" in train_df.columns:
+            s2_doys = train_df.filter(pl.col("source") == "S2")["doy"].to_numpy().astype(int)
+            s1_doys = train_df.filter(pl.col("source") == "S1")["doy"].to_numpy().astype(int)
+        else:
+            s2_doys = train_df["doy"].to_numpy().astype(int)
+            s1_doys = s2_doys
+        s2_counts = np.bincount(s2_doys, minlength=366)
+        s1_counts = np.bincount(s1_doys, minlength=366)
+        model.set_doy_frequencies(s2_counts, s1_counts)
+        logger.info(
+            "DOY density normalisation enabled — S2: %d obs, S1: %d obs",
+            len(s2_doys), len(s1_doys),
         )
-        doy_counts = np.bincount(train_doys, minlength=366)
-        model.set_doy_frequencies(doy_counts)
-        logger.info("DOY density normalisation enabled — inverse-freq weights computed from %d training observations", len(train_doys))
 
     del pixel_df
     gc.collect()
@@ -713,7 +737,8 @@ def train_tam(
             label         = batch["label"].to(device)
             weight        = batch["weight"].to(device)
 
-            prob, logit = model(bands, doy, mask, n_obs, global_feats)
+            is_s1 = batch["is_s1"].to(device)
+            prob, logit = model(bands, doy, mask, n_obs, global_feats, is_s1=is_s1)
 
             if torch.isnan(prob).any():
                 nan_mask = torch.isnan(prob)
@@ -759,6 +784,7 @@ def train_tam(
                     batch["mask"].to(device),
                     batch["n_obs"].to(device),
                     batch["global_feats"].to(device),
+                    is_s1=batch["is_s1"].to(device),
                 )
                 val_probs.extend(prob.cpu().numpy())
                 val_labels_list.extend(batch["label"].numpy())

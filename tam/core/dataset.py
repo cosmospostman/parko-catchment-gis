@@ -35,6 +35,15 @@ V9_FEATURE_COLS: list[str] = [
     "B02", "B03", "B04", "B05", "B07", "B08", "B8A", "B11", "B12",
     "NDVI", "NDWI", "MAVI", "NDRE", "CI_RE",
 ]
+
+# V10: joint S1+S2. S2 cols identical to V9; S1 adds VH and VV only.
+# vh_vv ratio and RVI are derived; VH+VV alone until their discriminative
+# value is confirmed in sweep.
+V10_FEATURE_COLS: list[str] = [
+    "B02", "B03", "B04", "B05", "B07", "B08", "B8A", "B11", "B12",
+    "NDVI", "NDWI", "MAVI", "NDRE", "CI_RE",
+]
+V10_S1_FEATURE_COLS: list[str] = ["s1_vh", "s1_vv"]
 N_BANDS: int = len(ALL_FEATURE_COLS)          # 13: S2 only
 N_BANDS_S1: int = len(ALL_FEATURE_COLS) + len(S1_FEATURE_COLS)  # 17: mixed/s1_only S1+S2
 N_BANDS_MIXED: int = N_BANDS_S1               # 17: mixed S1+S2 native rows (same width)
@@ -56,6 +65,7 @@ class TAMSample(NamedTuple):
     global_feats: torch.Tensor   # (N_GLOBAL,)              float32, z-scored global features
     label:        torch.Tensor   # ()                       float32 {0, 1}
     weight:       torch.Tensor   # ()                       float32 confidence weight
+    is_s1:        torch.Tensor   # (MAX_SEQ_LEN,)           bool, True=S1 observation
     point_id: str
     year:     int
 
@@ -98,6 +108,7 @@ def collate_fn(samples: list[TAMSample]) -> dict:
         "global_feats": torch.stack([s.global_feats for s in samples]),
         "label":        torch.stack([s.label        for s in samples]),
         "weight":       torch.stack([s.weight       for s in samples]),
+        "is_s1":        torch.stack([s.is_s1        for s in samples]),
         "point_id": [s.point_id for s in samples],
         "year":     [s.year     for s in samples],
     }
@@ -149,10 +160,13 @@ class TAMDataset(Dataset):
         pixel_zscore: bool = False,
         s1_despeckle_window: int = 0,
         feature_cols_override: list[str] | None = None,
+        s1_feature_cols_override: list[str] | None = None,
         max_seq_len: int = MAX_SEQ_LEN,
     ) -> None:
+        if use_s1 is True:
+            use_s1 = "mixed"
         if use_s1 not in (False, None, "mixed", "s1_only"):
-            raise ValueError(f"use_s1 must be False, 'mixed', or 's1_only'; got {use_s1!r}")
+            raise ValueError(f"use_s1 must be True/False, 'mixed', or 's1_only'; got {use_s1!r}")
 
         # Detect label type: pixel-year dict vs pixel dict
         self._labels_are_pixel_year: bool = False
@@ -194,20 +208,23 @@ class TAMDataset(Dataset):
                 pl.Series("s1_vh_vv", s1_vh_vv),
                 pl.Series("s1_rvi",   s1_rvi),
             ])
-            # Drop S1 rows where all four S1 bands are null
+            _active_s1_cols = list(s1_feature_cols_override) if s1_feature_cols_override is not None else S1_FEATURE_COLS
+            # Drop S1 rows where all active S1 bands are null
             s1_rows = s1_rows.filter(
-                pl.any_horizontal([pl.col(c).is_not_null() for c in S1_FEATURE_COLS])
+                pl.any_horizontal([pl.col(c).is_not_null() for c in _active_s1_cols])
             )
 
-            feature_cols = ALL_FEATURE_COLS + S1_FEATURE_COLS
-            for col in ALL_FEATURE_COLS:
+            s2_feature_cols = list(feature_cols_override) if feature_cols_override is not None else ALL_FEATURE_COLS
+            feature_cols = s2_feature_cols + _active_s1_cols
+            for col in s2_feature_cols:
                 if col not in s1_rows.columns:
                     s1_rows = s1_rows.with_columns(pl.lit(None).cast(pl.Float32).alias(col))
-            for col in S1_FEATURE_COLS:
+            for col in _active_s1_cols:
                 if col not in s2_rows.columns:
                     s2_rows = s2_rows.with_columns(pl.lit(None).cast(pl.Float32).alias(col))
 
-            if any(c not in s2_rows.columns for c in INDEX_COLS):
+            _s2_index_cols = [c for c in s2_feature_cols if c in INDEX_COLS]
+            if any(c not in s2_rows.columns for c in _s2_index_cols):
                 s2_rows = _add_spectral_indices_pl(s2_rows)
 
             df = pl.concat([s2_rows, s1_rows], how="diagonal_relaxed")
@@ -337,12 +354,28 @@ class TAMDataset(Dataset):
         if labels is not None and use_s1 in ("s1_only", "mixed"):
             df = df.filter(pl.col("point_id").is_in(_keep_pids))
 
-        # Compute band stats from training data if not supplied
+        # Compute band stats from training data if not supplied.
+        # In mixed mode, compute per-source to avoid materialising a huge sparse matrix:
+        # S2 cols are NaN in S1 rows and vice versa, so nanmean/nanstd per column is correct
+        # but we avoid the full dense allocation by computing each column independently.
         _band_check_cols = [c for c in feature_cols if c in df.columns]
         if band_mean is None or band_std is None:
-            vals = df.select(_band_check_cols).to_numpy().astype(np.float32)
-            band_mean = np.nanmean(vals, axis=0)
-            band_std  = np.nanstd(vals, axis=0)
+            if use_s1 == "mixed" and "source" in df.columns:
+                _s1_col_set = set(_active_s1_cols)
+                band_mean = np.array([
+                    df.filter(pl.col("source") == ("S1" if c in _s1_col_set else "S2"))[c]
+                    .drop_nulls().mean()
+                    for c in _band_check_cols
+                ], dtype=np.float32)
+                band_std = np.array([
+                    df.filter(pl.col("source") == ("S1" if c in _s1_col_set else "S2"))[c]
+                    .drop_nulls().std()
+                    for c in _band_check_cols
+                ], dtype=np.float32)
+            else:
+                vals = df.select(_band_check_cols).to_numpy().astype(np.float32)
+                band_mean = np.nanmean(vals, axis=0)
+                band_std  = np.nanstd(vals, axis=0)
             band_mean = np.where(np.isnan(band_mean), 0.0, band_mean)
             band_std  = np.where(band_std < 1e-6, 1.0, band_std)
 
@@ -357,10 +390,13 @@ class TAMDataset(Dataset):
                 pl.col("date").cast(pl.Date).dt.ordinal_day().alias("doy")
             )
 
-        # Vectorised extract: normalise bands in bulk, split on group boundaries
+        # Vectorised extract: normalise bands in bulk, split on group boundaries.
+        # Use in-place ops to avoid a second full-size allocation.
         feat_arr = df.select(feature_cols).to_numpy().astype(np.float32)
-        bands_all = (feat_arr - self.band_mean) / self.band_std
-        bands_all = np.where(np.isnan(bands_all), 0.0, bands_all).astype(np.float32)
+        np.subtract(feat_arr, self.band_mean, out=feat_arr)
+        np.divide(feat_arr, self.band_std, out=feat_arr)
+        np.nan_to_num(feat_arr, nan=0.0, copy=False)
+        bands_all = feat_arr
         doy_all   = df["doy"].to_numpy().astype(np.int32)
         pid_all   = df["point_id"].to_numpy()
         yr_all    = df["year"].to_numpy()
@@ -505,6 +541,9 @@ class TAMDataset(Dataset):
         mask = np.ones(seq_cap, dtype=bool)
         mask[:n] = False
 
+        is_s1 = np.zeros(seq_cap, dtype=bool)
+        is_s1[:n] = src_np.astype(bool)
+
         if self._labels is None:
             label = 0.0
         elif self._labels_are_pixel_year:
@@ -523,6 +562,7 @@ class TAMDataset(Dataset):
             global_feats = torch.from_numpy(gf),
             label        = torch.tensor(label,  dtype=torch.float32),
             weight       = torch.tensor(weight, dtype=torch.float32),
+            is_s1        = torch.from_numpy(is_s1),
             point_id     = pid,
             year         = yr,
         )

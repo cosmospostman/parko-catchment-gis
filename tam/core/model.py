@@ -89,11 +89,17 @@ class TAMClassifier(nn.Module):
         self.n_global_features  = n_global_features
         self.doy_density_norm   = doy_density_norm
 
-        # DOY frequency table: shape (366,) — index by DOY (1-365), 0 unused.
-        # Registered as a buffer so it moves with the model to the correct device.
-        # Populated by set_doy_frequencies() before training; defaults to uniform.
+        # DOY frequency tables: shape (366,) — index by DOY (1-365), 0 unused.
+        # Registered as buffers so they move with the model to the correct device.
+        # Populated by set_doy_frequencies() before training; default to uniform.
+        # Separate tables for S2 and S1 so cloud-driven S2 sampling bias doesn't
+        # corrupt the S1 weights (and vice versa for S1 coverage gaps).
         self.register_buffer(
             "doy_inv_freq",
+            torch.ones(366, dtype=torch.float32),
+        )
+        self.register_buffer(
+            "doy_inv_freq_s1",
             torch.ones(366, dtype=torch.float32),
         )
 
@@ -114,22 +120,32 @@ class TAMClassifier(nn.Module):
         nn.init.constant_(self.head.bias, 0.1)  # positive bias → always starts predicting presence > 0.5
 
     # ------------------------------------------------------------------
-    def set_doy_frequencies(self, doy_counts: "np.ndarray") -> None:
-        """Populate inverse-frequency weights from a (366,) observation count array.
+    def set_doy_frequencies(
+        self,
+        s2_counts: "np.ndarray",
+        s1_counts: "np.ndarray | None" = None,
+    ) -> None:
+        """Populate inverse-frequency weights from per-source (366,) observation count arrays.
 
-        doy_counts[d] = number of training observations on day-of-year d (1-indexed).
-        Positions with zero count are given weight 1.0 (no penalty).
-        Weights are normalised so they sum to the number of valid DOY positions,
-        keeping the pooled representation on the same scale as uniform pooling.
+        Counts are indexed by DOY (1-indexed). Positions with zero count get weight 1.0.
+        Weights are normalised so the mean weight over observed DOYs ≈ 1, keeping the
+        pooled representation on the same scale as uniform pooling.
+
+        s1_counts defaults to s2_counts if not provided (backwards-compatible).
         """
         import numpy as np
-        counts = np.array(doy_counts, dtype=np.float32)
-        inv = np.where(counts > 0, 1.0 / counts, 1.0)
-        # Normalise so mean weight over observed DOYs ≈ 1
-        observed = counts > 0
-        if observed.sum() > 0:
-            inv[observed] /= inv[observed].mean()
-        self.doy_inv_freq = torch.from_numpy(inv).to(self.doy_inv_freq.device)
+
+        def _make_inv(counts: "np.ndarray") -> "np.ndarray":
+            counts = np.array(counts, dtype=np.float32)
+            inv = np.where(counts > 0, 1.0 / counts, 1.0)
+            observed = counts > 0
+            if observed.sum() > 0:
+                inv[observed] /= inv[observed].mean()
+            return inv
+
+        self.doy_inv_freq = torch.from_numpy(_make_inv(s2_counts)).to(self.doy_inv_freq.device)
+        s1 = s1_counts if s1_counts is not None else s2_counts
+        self.doy_inv_freq_s1 = torch.from_numpy(_make_inv(s1)).to(self.doy_inv_freq_s1.device)
 
     # ------------------------------------------------------------------
     def forward(
@@ -139,6 +155,7 @@ class TAMClassifier(nn.Module):
         key_padding_mask: torch.Tensor,          # (B, T)  bool, True=padding
         n_obs:            torch.Tensor,          # (B,)    float32, n / MAX_SEQ_LEN
         global_feats:     torch.Tensor | None = None,  # (B, n_global_features)
+        is_s1:            torch.Tensor | None = None,  # (B, T)  bool, True=S1 obs
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return (prob, logit), each shape (B,)."""
         x = self.band_proj(bands) + _doy_encoding(doy, self.d_model)  # (B, T, d_model)
@@ -151,14 +168,21 @@ class TAMClassifier(nn.Module):
 
         x = self.encoder(x, src_key_padding_mask=safe_mask)
 
-        # Pool over non-padded positions, optionally weighted by inverse DOY frequency
+        # Pool over non-padded positions, optionally weighted by inverse DOY frequency.
+        # When is_s1 is provided, use separate S2/S1 weight tables so that cloud-driven
+        # S2 sampling bias and S1 coverage gaps are corrected independently.
         valid = (~key_padding_mask).float()  # (B, T)
         if self.doy_density_norm:
-            # doy_inv_freq indexed by DOY (1-365); padding DOY=0 → weight 0 via valid mask
-            doy_w = self.doy_inv_freq[doy.clamp(0, 365)]  # (B, T)
-            pool_w = (valid * doy_w).unsqueeze(-1)         # (B, T, 1)
+            doy_idx = doy.clamp(0, 365)
+            s2_w = self.doy_inv_freq[doy_idx]      # (B, T)
+            if is_s1 is not None:
+                s1_w = self.doy_inv_freq_s1[doy_idx]  # (B, T)
+                doy_w = torch.where(is_s1, s1_w, s2_w)
+            else:
+                doy_w = s2_w
+            pool_w = (valid * doy_w).unsqueeze(-1)     # (B, T, 1)
         else:
-            pool_w = valid.unsqueeze(-1)                   # (B, T, 1)
+            pool_w = valid.unsqueeze(-1)               # (B, T, 1)
         x_pool = (x * pool_w).sum(dim=1) / pool_w.sum(dim=1).clamp(min=1)  # (B, d_model)
 
         if self.use_n_obs:

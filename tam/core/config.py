@@ -15,12 +15,13 @@ class TAMConfig:
     dropout:    float = 0.3
     use_n_obs:         bool  = True   # append normalised obs-count to pooled repr before head
     n_global_features: int   = 9     # 5 S2 globals + 4 S1 globals (0 to disable)
-    use_s1:  bool | str  = True   # True=snap S1 to S2, "s1_only"=S1 sequence only, False=S2 only
+    use_s1:  bool | str  = True   # True=mixed S1+S2 interleaved, "s1_only"=S1 sequence only, False=S2 only
+    s1_feature_cols: tuple | None = None  # subset of S1_FEATURE_COLS to use; None=all four
     use_band_summaries: bool = False  # if True, append per-band [p5, p95, std] as global features
     feature_cols_override: tuple | None = None  # if set, replaces default S2 feature cols (e.g. V9_FEATURE_COLS)
 
     # Data (mirrors dataset.py constants — change both together)
-    # 13 S2 features + 4 S1 features (s1_vh, s1_vv, s1_vh_vv, s1_rvi) when use_s1=True
+    # 13 S2 features + 4 S1 features (s1_vh, s1_vv, s1_vh_vv, s1_rvi) when use_s1=True or "mixed"
     n_bands:          int   = 17
     max_seq_len:      int   = 128
     min_obs_per_year: int   = 8

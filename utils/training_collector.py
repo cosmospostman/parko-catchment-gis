@@ -22,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import polars as pl
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -367,6 +368,11 @@ def _rebuild_tile_parquet(tile_id: str) -> None:
         pf = pq.ParquetFile(rp)
         for rg_idx in range(pf.metadata.num_row_groups):
             tbl = pf.read_row_group(rg_idx)
+            # Normalise source to pa.string() regardless of how the region was written
+            if "source" in tbl.schema.names:
+                src_idx = tbl.schema.get_field_index("source")
+                if tbl.schema.field("source").type != pa.string():
+                    tbl = tbl.set_column(src_idx, "source", tbl.column("source").cast(pa.string()))
             if writer is None:
                 writer = pq.ParquetWriter(tile_path, tbl.schema)
             writer.write_table(tbl)

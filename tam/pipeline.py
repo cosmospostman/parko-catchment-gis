@@ -65,7 +65,7 @@ def _cmd_train(args: argparse.Namespace) -> None:
     # Load labeled pixels from training tile parquets — row groups read in parallel.
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    _use_s1 = exp.train_kwargs.get("use_s1", True)
+    _use_s1 = args.use_s1 if args.use_s1 is not None else exp.train_kwargs.get("use_s1", True)
     _want_s1_data = _use_s1 is not False
 
     # Build (path, read_cols, n_row_groups) list for tiles that exist.
@@ -213,6 +213,7 @@ def _cmd_train(args: argparse.Namespace) -> None:
         "s1_despeckle_window":   args.s1_despeckle_window,
         "batch_size":            args.batch_size,
         "doy_phase_shift":       args.doy_phase_shift,
+        "use_s1":                args.use_s1,
     }.items() if v is not None}
     if args.val_sites:
         overrides["val_sites"] = tuple(args.val_sites)
@@ -220,6 +221,15 @@ def _cmd_train(args: argparse.Namespace) -> None:
         overrides["val_region_ids"] = tuple(exp.val_region_ids)
     if args.stride_exclude_sites:
         overrides["stride_exclude_sites"] = tuple(args.stride_exclude_sites)
+    # Auto-correct n_bands when --use-s1 is enabled from CLI but the experiment was S2-only.
+    if _use_s1 not in (False, None) and "n_bands" not in overrides:
+        from tam.core.dataset import S1_FEATURE_COLS
+        _active_s1 = list(args.s1_features) if args.s1_features else S1_FEATURE_COLS
+        if args.s1_features:
+            overrides["s1_feature_cols"] = tuple(args.s1_features)
+        base_n_bands = model_kwargs.get("n_bands", train_kwargs.get("n_bands", len(exp.feature_cols)))
+        if base_n_bands == len(exp.feature_cols):
+            overrides["n_bands"] = len(exp.feature_cols) + len(_active_s1)
     positional = {"n_epochs", "patience", "scl_purity_min"}
     cfg = TAMConfig(
         n_epochs=args.epochs or train_kwargs.pop("n_epochs", TAMConfig.__dataclass_fields__["n_epochs"].default),
@@ -465,6 +475,10 @@ if __name__ == "__main__":
                          help="Temporal despeckle window for S1 (rolling median over N acquisitions). 0=off, default=3. Other reasonable values: 5, 7.")
     p_train.add_argument("--batch-size",           type=int,   default=None)
     p_train.add_argument("--scl-purity", type=float, default=0.5)
+    p_train.add_argument("--use-s1", type=lambda x: x.lower() in ("true", "1", "yes") if x.lower() not in ("s1_only",) else "s1_only",
+                         default=None, help="Enable S1: true/false or 's1_only'")
+    p_train.add_argument("--s1-features", nargs="+", default=None,
+                         metavar="COL", help="S1 feature cols to use (default: all 4). E.g. --s1-features s1_vh s1_vv")
     p_train.add_argument("--device", default=None)
 
     # --- score ---
