@@ -240,7 +240,6 @@ class TAMDataset(Dataset):
                     src_mask = pl.col("source") == src
                     if not df.filter(src_mask).height:
                         continue
-                    # Compute per-pixel mean/std from source rows only (lazy — no eager copy).
                     stats = (
                         df.lazy()
                         .filter(src_mask)
@@ -249,8 +248,6 @@ class TAMDataset(Dataset):
                         .agg([pl.col(c).mean().alias(f"{c}__mean") for c in zscore_cols] +
                              [pl.col(c).std().alias(f"{c}__std")  for c in zscore_cols])
                     )
-                    # Apply normalisation in one lazy pass: join stats, normalise only the
-                    # target source rows via pl.when, drop the stats columns, collect once.
                     normed_exprs = [
                         pl.when(src_mask)
                           .then(

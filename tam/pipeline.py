@@ -146,6 +146,60 @@ def _cmd_train(args: argparse.Namespace) -> None:
         from tam.core.dataset import V9_FEATURE_COLS as _V9_FEATURE_COLS
         _bs_feature_cols = _V9_FEATURE_COLS
 
+    _want_pixel_zscore = exp.train_kwargs.get("pixel_zscore", False)
+    _zscore_feature_cols: list[str] | None = (
+        list(exp.train_kwargs["feature_cols_override"]) if "feature_cols_override" in exp.train_kwargs
+        else list(exp.feature_cols)
+    ) if _want_pixel_zscore else None
+
+    def _apply_pixel_zscore(df: pl.DataFrame, feature_cols: list[str]) -> pl.DataFrame:
+        """Z-score each pixel's S2 band values by its own multi-year mean/std.
+
+        All rows for a given point_id reside in the same tile parquet, so
+        per-tile computation is equivalent to computing over the full dataset.
+        Uses group_by on a small tile frame (cheap) rather than over() on the
+        concatenated 137M-row frame (expensive).
+        """
+        s2_cols = [c for c in feature_cols if c in df.columns]
+        if not s2_cols:
+            return df
+        has_source = "source" in df.columns
+        source_filter = (pl.col("source") == "S2") if has_source else pl.lit(True)
+        stats = (
+            df.lazy()
+            .filter(source_filter)
+            .select(["point_id"] + s2_cols)
+            .group_by("point_id")
+            .agg(
+                [pl.col(c).mean().alias(f"{c}__mean") for c in s2_cols] +
+                [pl.col(c).std().alias(f"{c}__std")  for c in s2_cols]
+            )
+        )
+        stat_cols = [f"{c}__mean" for c in s2_cols] + [f"{c}__std" for c in s2_cols]
+        if has_source:
+            s2_mask = pl.col("source") == "S2"
+            normed_exprs = [
+                pl.when(s2_mask)
+                  .then((pl.col(c) - pl.col(f"{c}__mean").fill_null(0.0)) /
+                        pl.col(f"{c}__std").fill_null(1e-6).clip(lower_bound=1e-6))
+                  .otherwise(pl.col(c))
+                  .alias(c)
+                for c in s2_cols
+            ]
+        else:
+            normed_exprs = [
+                ((pl.col(c) - pl.col(f"{c}__mean").fill_null(0.0)) /
+                 pl.col(f"{c}__std").fill_null(1e-6).clip(lower_bound=1e-6)).alias(c)
+                for c in s2_cols
+            ]
+        return (
+            df.lazy()
+            .join(stats, on="point_id", how="left")
+            .with_columns(normed_exprs)
+            .drop(stat_cols)
+            .collect()
+        )
+
     tile_dfs: list[pl.DataFrame] = []
     band_summary_dfs: list[pl.DataFrame] = []
     for path, cols, n_rg in tile_specs:
@@ -154,6 +208,8 @@ def _cmd_train(args: argparse.Namespace) -> None:
         if len(tile_df) > 0:
             if _want_band_summaries and _bs_feature_cols is not None:
                 band_summary_dfs.append(_compute_band_summaries(tile_df, _bs_feature_cols))
+            if _want_pixel_zscore and _zscore_feature_cols is not None:
+                tile_df = _apply_pixel_zscore(tile_df, _zscore_feature_cols)
             tile_dfs.append(tile_df)
         del tile_df
         gc.collect()
@@ -249,6 +305,12 @@ def _cmd_train(args: argparse.Namespace) -> None:
         base_n_bands = model_kwargs.get("n_bands", train_kwargs.get("n_bands", len(exp.feature_cols)))
         if base_n_bands == len(exp.feature_cols):
             overrides["n_bands"] = len(exp.feature_cols) + len(_active_s1)
+    # S2 pixel zscore was already applied per-tile above. Tell train_tam/TAMDataset
+    # not to repeat it. S1 pixel zscore (s1_vh/s1_vv) is a minor effect and is
+    # skipped here; it can be restored later by moving lin_to_db upstream too.
+    if _want_pixel_zscore:
+        train_kwargs["pixel_zscore"] = False
+
     positional = {"n_epochs", "patience", "scl_purity_min"}
     cfg = TAMConfig(
         n_epochs=args.epochs or train_kwargs.pop("n_epochs", TAMConfig.__dataclass_fields__["n_epochs"].default),
@@ -263,8 +325,17 @@ def _cmd_train(args: argparse.Namespace) -> None:
     pixel_df = pixel_df.filter(pl.col("point_id").is_in(labeled_pids))
     gc.collect()
 
+    # Spill to IPC and drop the reference so train_tam's internal `del pixel_df`
+    # hits refcount=0 and actually frees the 19 GB frame from RAM.
+    import tempfile as _tf
+    _spill_dir = Path("/data") if Path("/data").exists() else Path(_tf.gettempdir())
+    _px_ipc = Path(_tf.NamedTemporaryFile(suffix="_pixel_df.ipc", delete=False, dir=_spill_dir).name)
+    pixel_df.write_ipc(_px_ipc)
+    del pixel_df
+    gc.collect()
+
     _, best_val_auc = train_tam(
-        pixel_df=pixel_df,
+        pixel_df=pl.read_ipc(_px_ipc),
         labels=labels,
         pixel_coords=pixel_coords,
         out_dir=out_dir,
@@ -272,6 +343,7 @@ def _cmd_train(args: argparse.Namespace) -> None:
         device=args.device,
         precomputed_band_summaries=band_summaries,
     )
+    _px_ipc.unlink(missing_ok=True)
     logger.info("Checkpoint saved to %s  best_val_auc=%.3f", out_dir, best_val_auc)
 
 

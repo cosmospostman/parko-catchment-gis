@@ -326,8 +326,7 @@ def train_tam(
             with open("/proc/self/status") as f:
                 for line in f:
                     if line.startswith("VmRSS:"):
-                        rss_gb = int(line.split()[1]) / 1e6
-                        logger.info("RSS %s: %.1f GB", tag, rss_gb)
+                        logger.info("RSS %s: %.1f GB", tag, int(line.split()[1]) / 1e6)
                         break
         except Exception:
             pass
@@ -359,6 +358,8 @@ def train_tam(
             ~((pl.col("source") == "S2") & (pl.col("scl") == 6))
         )
         logger.info("SCL=6 exclusion: removed %d observations", n_before - len(pixel_df))
+    if "scl" in pixel_df.columns:
+        pixel_df = pixel_df.drop("scl")
     _log_rss("after SCL exclusion")
 
     # --- Global features + presence-filter slim extracts ---------------------
@@ -664,7 +665,7 @@ def train_tam(
     train_pixel_df = pixel_df.filter(pl.col("point_id").is_in(train_pids_ds))
     val_pixel_df   = pixel_df.filter(pl.col("point_id").is_in(val_pids_ds))
 
-    # DOY density norm needs train DOYs — compute here before pixel_df is freed.
+    # DOY density norm needs train DOYs — compute before pixel_df is freed.
     _doy_s2_counts: np.ndarray | None = None
     _doy_s1_counts: np.ndarray | None = None
     if cfg.doy_density_norm:
@@ -680,7 +681,6 @@ def train_tam(
 
     del pixel_df
     gc.collect()
-
     _log_rss("before train_ds")
     train_ds = TAMDataset(
         train_pixel_df, train_py_labels,
