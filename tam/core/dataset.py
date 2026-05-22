@@ -443,7 +443,15 @@ class TAMDataset(Dataset):
         yr_split     = np.split(yr_all,     split_points)
         source_split = np.split(source_all, split_points)
 
-        self._windows: list[tuple[str, int, np.ndarray, np.ndarray, np.ndarray]] = []
+        _w_pids: list[str] = []
+        _w_years: list[int] = []
+        _w_offsets: list[int] = []
+        _w_lengths: list[int] = []
+        _out_bands: list[np.ndarray] = []
+        _out_doys: list[np.ndarray] = []
+        _out_sources: list[np.ndarray] = []
+
+        write_ptr = 0
         for b, d, p, y, src in zip(bands_split, doy_split, pid_split, yr_split, source_split):
             if _is_mixed:
                 n_s2 = int((src == 0).sum())
@@ -454,14 +462,51 @@ class TAMDataset(Dataset):
                 if len(b) < min_obs_per_year:
                     continue
             n = min(len(b), MAX_SEQ_LEN)
-            self._windows.append((p[0], int(y[0]), b[:n], d[:n], src[:n]))
+            _out_bands.append(b[:n])
+            _out_doys.append(d[:n])
+            _out_sources.append(src[:n])
+            _w_pids.append(p[0])
+            _w_years.append(int(y[0]))
+            _w_offsets.append(write_ptr)
+            _w_lengths.append(n)
+            write_ptr += n
+
+        n_feat = len(feature_cols)
+        self._bands   = np.concatenate(_out_bands,   axis=0) if _out_bands   else np.empty((0, n_feat), dtype=np.float32)
+        self._doys    = np.concatenate(_out_doys,    axis=0) if _out_doys    else np.empty(0, dtype=np.int32)
+        self._sources = np.concatenate(_out_sources, axis=0) if _out_sources else np.empty(0, dtype=np.int8)
+        self._offsets = np.array(_w_offsets, dtype=np.int32)
+        self._lengths = np.array(_w_lengths, dtype=np.int32)
+        self._pids    = np.array(_w_pids,    dtype=object)
+        self._years   = np.array(_w_years,   dtype=np.int32)
 
         # For pixel-year labels, drop windows not in the label set
         if labels is not None and self._labels_are_pixel_year:
             valid_py = set(labels.keys())
-            self._windows = [
-                (p, y, b, d, src) for p, y, b, d, src in self._windows if (p, y) in valid_py
-            ]
+            keep = np.array(
+                [(self._pids[i], int(self._years[i])) in valid_py for i in range(len(self._pids))],
+                dtype=bool,
+            )
+            kept_idx = np.where(keep)[0]
+            if len(kept_idx):
+                new_bands   = np.concatenate([self._bands  [self._offsets[i]:self._offsets[i]+self._lengths[i]] for i in kept_idx], axis=0)
+                new_doys    = np.concatenate([self._doys   [self._offsets[i]:self._offsets[i]+self._lengths[i]] for i in kept_idx], axis=0)
+                new_sources = np.concatenate([self._sources[self._offsets[i]:self._offsets[i]+self._lengths[i]] for i in kept_idx], axis=0)
+                lens = self._lengths[kept_idx]
+                new_offsets = np.concatenate([[0], np.cumsum(lens)[:-1]]).astype(np.int32) if len(kept_idx) > 1 else np.array([0], dtype=np.int32)
+            else:
+                new_bands   = self._bands[:0]
+                new_doys    = self._doys[:0]
+                new_sources = self._sources[:0]
+                new_offsets = np.empty(0, dtype=np.int32)
+                lens        = np.empty(0, dtype=np.int32)
+            self._bands   = new_bands
+            self._doys    = new_doys
+            self._sources = new_sources
+            self._offsets = new_offsets
+            self._lengths = lens if len(kept_idx) else np.empty(0, dtype=np.int32)
+            self._pids    = self._pids[kept_idx]
+            self._years   = self._years[kept_idx]
         # For pixel-level labels, broadcast: auto-expands when __getitem__ is called
         # (stored as dict[str, float]; lookup by pid works for both dict types)
 
@@ -475,17 +520,16 @@ class TAMDataset(Dataset):
 
         # Global features: per-pixel scalars z-scored and stored as float32 arrays
         if global_features_df is not None and len(global_features_df) > 0:
-            # Build pid→row lookup from the pl.DataFrame (indexed by point_id column)
             feat_cols = [c for c in global_features_df.columns if c != "point_id"]
             n_global = len(feat_cols)
-            pid_list = [pid for pid, *_ in self._windows]
 
             gf_lookup: dict[str, int] = {
                 pid: i for i, pid in enumerate(global_features_df["point_id"].to_list())
             }
-            feat_vals = np.full((len(pid_list), n_global), np.nan, dtype=np.float32)
+            n_windows = len(self._pids)
+            feat_vals = np.full((n_windows, n_global), np.nan, dtype=np.float32)
             gf_numpy  = global_features_df.select(feat_cols).to_numpy().astype(np.float32)
-            for i, pid in enumerate(pid_list):
+            for i, pid in enumerate(self._pids):
                 if pid in gf_lookup:
                     feat_vals[i] = gf_numpy[gf_lookup[pid]]
 
@@ -499,24 +543,27 @@ class TAMDataset(Dataset):
             self.global_feat_std  = global_feat_std.astype(np.float32)
 
             normed = (feat_vals - self.global_feat_mean) / self.global_feat_std
-            normed = np.where(np.isnan(normed), 0.0, normed).astype(np.float32)
-            self._global_feats = {
-                pid: normed[i] for i, (pid, *_) in enumerate(self._windows)
-            }
+            self._global_feat_arr = np.where(np.isnan(normed), 0.0, normed).astype(np.float32)
             self._n_global = n_global
         else:
             self.global_feat_mean = np.zeros(0, dtype=np.float32)
             self.global_feat_std  = np.ones(0,  dtype=np.float32)
-            self._global_feats = {}
+            self._global_feat_arr = np.empty((0, 0), dtype=np.float32)
             self._n_global = 0
 
     # ------------------------------------------------------------------
     def __len__(self) -> int:
-        return len(self._windows)
+        return len(self._pids)
 
     def __getitem__(self, idx: int) -> TAMSample:
-        pid, yr, bands_np, doy_np, src_np = self._windows[idx]
-        n = len(bands_np)
+        pid   = self._pids[idx]
+        yr    = int(self._years[idx])
+        start = int(self._offsets[idx])
+        n_obs = int(self._lengths[idx])
+        bands_np = self._bands  [start:start+n_obs].copy()
+        doy_np   = self._doys   [start:start+n_obs].copy()
+        src_np   = self._sources[start:start+n_obs].copy()
+        n = n_obs
 
         seq_cap = self._max_seq_len
         if n > seq_cap or (self._obs_dropout_min > 0 and n > self._obs_dropout_min):
@@ -576,7 +623,7 @@ class TAMDataset(Dataset):
             label = float(self._labels[pid])  # type: ignore[index]
         weight = 1.0
 
-        gf = self._global_feats.get(pid, np.zeros(self._n_global, dtype=np.float32))
+        gf = self._global_feat_arr[idx] if self._n_global > 0 else np.zeros(0, dtype=np.float32)
 
         return TAMSample(
             bands        = torch.from_numpy(bands),
@@ -599,7 +646,7 @@ class TAMDataset(Dataset):
     def unique_pixels(self) -> list[str]:
         seen: set[str] = set()
         out: list[str] = []
-        for pid, *_ in self._windows:
+        for pid in self._pids:
             if pid not in seen:
                 seen.add(pid)
                 out.append(pid)
