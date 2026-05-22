@@ -122,16 +122,48 @@ def _compute_band_summaries(pixel_df: pl.DataFrame, feature_cols: list[str]) -> 
     Returns a DataFrame with columns point_id, <col>_p5, <col>_p95, <col>_std
     for each col in feature_cols.
     Used as global features when cfg.use_band_summaries=True.
-    """
-    s2 = pixel_df.filter(pl.col("source") == "S2") if "source" in pixel_df.columns else pixel_df
-    cols = [c for c in feature_cols if c in s2.columns]
 
+    Index columns (NDVI, NDWI, etc.) are computed inline as Polars expressions
+    inside the lazy plan so they are never materialised as full-frame columns.
+    """
+    # Polars expressions for index columns not already present in pixel_df.
+    # quality guard: scl_purity >= 0.5 (mirrors Signal.quality_mask for S2 rows).
+    _qm = pl.lit(True)
+    if "scl_purity" in pixel_df.columns:
+        _qm = pl.col("scl_purity") >= 0.5
+
+    def _safe_ratio(num: pl.Expr, denom: pl.Expr) -> pl.Expr:
+        return pl.when(_qm & (denom != 0)).then(num / denom).otherwise(pl.lit(None))
+
+    _index_exprs: dict[str, pl.Expr] = {
+        "NDVI":  _safe_ratio(pl.col("B08") - pl.col("B04"), pl.col("B08") + pl.col("B04")),
+        "NDWI":  _safe_ratio(pl.col("B03") - pl.col("B08"), pl.col("B03") + pl.col("B08")),
+        "EVI":   _safe_ratio(
+            2.5 * (pl.col("B08") - pl.col("B04")),
+            pl.col("B08") + 6 * pl.col("B04") - 7.5 * pl.col("B02") + 1,
+        ),
+        "MAVI":  _safe_ratio(pl.col("B08") - pl.col("B04"), pl.col("B08") + pl.col("B04") + pl.col("B11")),
+        "NDRE":  _safe_ratio(pl.col("B8A") - pl.col("B05"), pl.col("B8A") + pl.col("B05")),
+        "CI_RE": pl.when(_qm & (pl.col("B05") != 0)).then(pl.col("B07") / pl.col("B05") - 1).otherwise(pl.lit(None)),
+    }
+
+    lf = pixel_df.lazy()
+    if "source" in pixel_df.columns:
+        lf = lf.filter(pl.col("source") == "S2")
+
+    # Add index columns that are missing from the stored data.
+    extra = {name: expr for name, expr in _index_exprs.items()
+             if name not in pixel_df.columns}
+    if extra:
+        lf = lf.with_columns([expr.alias(name) for name, expr in extra.items()])
+
+    cols = [c for c in feature_cols if c in pixel_df.columns or c in extra]
     aggs = (
         [pl.col(c).quantile(0.05).alias(f"{c}_p5")  for c in cols] +
         [pl.col(c).quantile(0.95).alias(f"{c}_p95") for c in cols] +
         [pl.col(c).std().alias(f"{c}_std")           for c in cols]
     )
-    grp = s2.group_by("point_id").agg(aggs)
+    grp = lf.group_by("point_id").agg(aggs).collect()
     ordered = ["point_id"] + [f"{c}{s}" for c in cols for s in ("_p5", "_p95", "_std")]
     return grp.select([c for c in ordered if c in grp.columns])
 
@@ -252,6 +284,7 @@ def train_tam(
     out_dir: Path,
     cfg: TAMConfig | None = None,
     device: str | None = None,
+    precomputed_band_summaries: pl.DataFrame | None = None,
 ) -> tuple[TAMClassifier, float]:
     """Train a TAMClassifier and save checkpoint to out_dir.
 
@@ -301,6 +334,24 @@ def train_tam(
 
     _log_rss("after load")
 
+    # --- Early column trim — drop lon/lat/item_id and any unrequired bands now
+    # so all subsequent operations (SCL exclusion, presence filter, splits) work
+    # on a narrower frame. _keep_cols is reused later; the second select is a no-op.
+    _feature_cols_override = list(cfg.feature_cols_override) if cfg.feature_cols_override else None
+    _s1_feature_cols_override = list(cfg.s1_feature_cols) if cfg.s1_feature_cols else None
+    _active_s1_cols = _s1_feature_cols_override or S1_FEATURE_COLS
+    _s1_raw = ["vh", "vv"] if cfg.use_s1 not in (False, None) else []
+    _keep_cols = {"point_id", "date", "year", "doy", "scl_purity", "scl", "source"} | \
+                 set(_feature_cols_override or []) | set(_active_s1_cols) | set(_s1_raw)
+    pixel_df = pixel_df.select([c for c in pixel_df.columns if c in _keep_cols])
+    # Cast high-cardinality string cols to Categorical: ~20 bytes/row → 4 bytes/row.
+    # .to_numpy() on Categorical returns decoded strings, so TAMDataset is unaffected.
+    _str_cols = [c for c in ("point_id", "source") if c in pixel_df.columns]
+    if _str_cols:
+        pixel_df = pixel_df.with_columns([pl.col(c).cast(pl.Categorical) for c in _str_cols])
+    gc.collect()
+    _log_rss("after column trim")
+
     # --- SCL=6 exclusion — strip dark-area misclassifications from S2 rows only ---
     if "scl" in pixel_df.columns and "source" in pixel_df.columns:
         n_before = len(pixel_df)
@@ -310,32 +361,60 @@ def train_tam(
         logger.info("SCL=6 exclusion: removed %d observations", n_before - len(pixel_df))
     _log_rss("after SCL exclusion")
 
-    # --- Global features -----------------------------------------------------
+    # --- Global features + presence-filter slim extracts ---------------------
     global_feat_df: pl.DataFrame | None = None
+    _presence_filter_s1_slim: pl.DataFrame | None = None
+    _presence_filter_s2_slim: pl.DataFrame | None = None
+
+    _has_source = "source" in pixel_df.columns
+
     if cfg.use_band_summaries:
-        logger.info("Computing band summaries (%d rows) ...", len(pixel_df))
-        if "NDVI" not in pixel_df.columns or "NDWI" not in pixel_df.columns:
-            pixel_df = add_spectral_indices(pixel_df)
-        global_feat_df = _compute_band_summaries(pixel_df, V9_FEATURE_COLS)
-        logger.info("Band summaries computed: %d pixels, %d features", len(global_feat_df), global_feat_df.width - 1)
+        if precomputed_band_summaries is not None:
+            global_feat_df = precomputed_band_summaries
+            logger.info("Using precomputed band summaries: %d pixels, %d features", len(global_feat_df), global_feat_df.width - 1)
+        else:
+            _s2_n = int((pixel_df["source"] == "S2").sum()) if _has_source else len(pixel_df)
+            logger.info("Computing band summaries (%d rows) ...", _s2_n)
+            global_feat_df = _compute_band_summaries(pixel_df, V9_FEATURE_COLS)
+            logger.info("Band summaries computed: %d pixels, %d features", len(global_feat_df), global_feat_df.width - 1)
     elif cfg.n_global_features > 0:
         global_feat_df = _load_or_compute_global_features(pixel_df, out_dir, GLOBAL_FEATURE_NAMES)
     _log_rss("after band summaries")
 
-    # Pre-extract S1 slim for presence filter, then drop S1 rows to free RAM.
-    _presence_filter_s1_slim: pl.DataFrame | None = None
-    _presence_filter_s2_slim: pl.DataFrame | None = None
+    # Pre-extract slim columns for presence filter.
+    # Restrict to presence pixels + dry-season DOY range so we scan a tiny
+    # fraction of the 82M S2 rows instead of the full frame.
     if (cfg.presence_min_vh_dry_db > -99
-            and "source" in pixel_df.columns
+            and _has_source
             and "vh" in pixel_df.columns):
         _doy_col = "doy" if "doy" in pixel_df.columns else None
         _date_col = "doy" if _doy_col else "date"
+        _presence_pids = {pid for pid, lbl in labels.items() if lbl == 1.0}
         _s1_cols = ["point_id", "year", "vh", _date_col]
-        _presence_filter_s1_slim = pixel_df.filter(pl.col("source") == "S1").select(_s1_cols)
-        if "NDVI" in pixel_df.columns:
-            _has_scl = "scl" in pixel_df.columns
-            _s2_cols = ["point_id", "year", _date_col, "NDVI"] + (["scl"] if _has_scl else [])
-            _presence_filter_s2_slim = pixel_df.filter(pl.col("source") == "S2").select(_s2_cols)
+        _presence_filter_s1_slim = (
+            pixel_df.lazy()
+            .filter(
+                (pl.col("source") == "S1") &
+                pl.col("point_id").is_in(_presence_pids) &
+                pl.col(_date_col).is_between(_DRY_DOY_MIN, _DRY_DOY_MAX)
+            )
+            .select(_s1_cols)
+            .collect()
+        )
+        _has_scl = "scl" in pixel_df.columns
+        _s2_ndvi_cols = ["point_id", "year", _date_col] + (["scl"] if _has_scl else [])
+        _ndvi_expr = (pl.col("B08") - pl.col("B04")) / (pl.col("B08") + pl.col("B04"))
+        _presence_filter_s2_slim = (
+            pixel_df.lazy()
+            .filter(
+                (pl.col("source") == "S2") &
+                pl.col("point_id").is_in(_presence_pids) &
+                pl.col(_date_col).is_between(_DRY_DOY_MIN, _DRY_DOY_MAX)
+            )
+            .with_columns(_ndvi_expr.alias("NDVI"))
+            .select(_s2_ndvi_cols + ["NDVI"])
+            .collect()
+        )
 
     # Drop S1 rows — no longer needed after band summaries and slim extraction.
     # In mixed mode (use_s1=True/"mixed"), S1 rows must be kept for TAMDataset.
@@ -572,25 +651,39 @@ def train_tam(
         )
 
     # --- Datasets -----------------------------------------------------------
+    # Drop source col for S2-only mode now that column trim has already run.
     if "source" in pixel_df.columns and cfg.use_s1 not in (True, "mixed", "s1_only"):
         pixel_df = pixel_df.drop("source")
+        gc.collect()
 
-    _feature_cols_override = list(cfg.feature_cols_override) if cfg.feature_cols_override else None
-    _s1_feature_cols_override = list(cfg.s1_feature_cols) if cfg.s1_feature_cols else None
-    _active_s1_cols = _s1_feature_cols_override or S1_FEATURE_COLS
+    # Pre-split into train/val slices so pixel_df can be freed before val_ds
+    # is constructed — avoids holding the full frame in memory alongside both
+    # filtered copies simultaneously.
+    train_pids_ds  = set(k[0] for k in train_py_labels)
+    val_pids_ds    = set(k[0] for k in val_py_labels)
+    train_pixel_df = pixel_df.filter(pl.col("point_id").is_in(train_pids_ds))
+    val_pixel_df   = pixel_df.filter(pl.col("point_id").is_in(val_pids_ds))
 
-    # Trim pixel_df to only the columns TAMDataset needs — raw band columns
-    # not in feature_cols, plus ancillary cols like lon/lat/item_id, are dead
-    # weight at this point and can consume several GB.
-    _s1_raw = ["vh", "vv"] if cfg.use_s1 not in (False, None) else []
-    _keep_cols = {"point_id", "date", "year", "doy", "scl_purity", "scl", "source"} | \
-                 set(_feature_cols_override or []) | set(_active_s1_cols) | set(_s1_raw)
-    pixel_df = pixel_df.select([c for c in pixel_df.columns if c in _keep_cols])
+    # DOY density norm needs train DOYs — compute here before pixel_df is freed.
+    _doy_s2_counts: np.ndarray | None = None
+    _doy_s1_counts: np.ndarray | None = None
+    if cfg.doy_density_norm:
+        if "source" in train_pixel_df.columns:
+            s2_doys = train_pixel_df.filter(pl.col("source") == "S2")["doy"].to_numpy().astype(int)
+            s1_doys = train_pixel_df.filter(pl.col("source") == "S1")["doy"].to_numpy().astype(int)
+        else:
+            s2_doys = train_pixel_df["doy"].to_numpy().astype(int)
+            s1_doys = s2_doys
+        _doy_s2_counts = np.bincount(s2_doys, minlength=366)
+        _doy_s1_counts = np.bincount(s1_doys, minlength=366)
+        del s2_doys, s1_doys
+
+    del pixel_df
     gc.collect()
 
     _log_rss("before train_ds")
     train_ds = TAMDataset(
-        pixel_df, train_py_labels,
+        train_pixel_df, train_py_labels,
         scl_purity_min=cfg.scl_purity_min,
         min_obs_per_year=cfg.min_obs_per_year,
         doy_jitter=cfg.doy_jitter,
@@ -606,9 +699,11 @@ def train_tam(
         max_seq_len=cfg.max_seq_len,
     )
     band_mean, band_std = train_ds.band_stats
+    del train_pixel_df
+    gc.collect()
     _log_rss("after train_ds, before val_ds")
     val_ds = TAMDataset(
-        pixel_df, val_py_labels,
+        val_pixel_df, val_py_labels,
         band_mean=band_mean, band_std=band_std,
         scl_purity_min=cfg.scl_purity_min,
         min_obs_per_year=cfg.min_obs_per_year,
@@ -623,11 +718,13 @@ def train_tam(
         s1_feature_cols_override=_s1_feature_cols_override,
         max_seq_len=cfg.max_seq_len,
     )
+    del val_pixel_df
+    gc.collect()
     logger.info("Train windows: %d  |  Val windows: %d", len(train_ds), len(val_ds))
     _log_rss("after val_ds")
 
     n_cpu = os.cpu_count() or 4
-    n_workers = min(max(2, n_cpu - 2), 8)
+    n_workers = min(max(2, n_cpu - 2), 4)  # GPU-bound; 4 workers keeps GPU fed without forking excess RAM
     torch.set_num_threads(2)
     train_loader = DataLoader(
         train_ds, batch_size=cfg.batch_size, shuffle=True,
@@ -664,26 +761,13 @@ def train_tam(
         sum(p.numel() for p in model.parameters()),
     )
 
-    if cfg.doy_density_norm:
-        train_pids = {k[0] for k in train_py_labels}
-        train_df = pixel_df.filter(pl.col("point_id").is_in(train_pids))
-        if "source" in train_df.columns:
-            s2_doys = train_df.filter(pl.col("source") == "S2")["doy"].to_numpy().astype(int)
-            s1_doys = train_df.filter(pl.col("source") == "S1")["doy"].to_numpy().astype(int)
-        else:
-            s2_doys = train_df["doy"].to_numpy().astype(int)
-            s1_doys = s2_doys
-        s2_counts = np.bincount(s2_doys, minlength=366)
-        s1_counts = np.bincount(s1_doys, minlength=366)
-        model.set_doy_frequencies(s2_counts, s1_counts)
+    if cfg.doy_density_norm and _doy_s2_counts is not None:
+        model.set_doy_frequencies(_doy_s2_counts, _doy_s1_counts)
         logger.info(
             "DOY density normalisation enabled — S2: %d obs, S1: %d obs",
-            len(s2_doys), len(s1_doys),
+            int(_doy_s2_counts.sum()), int(_doy_s1_counts.sum()),
         )
-
-    del pixel_df
-    gc.collect()
-    _log_rss("after pixel_df free")
+    _log_rss("after model init")
 
     np.savez(out_dir / "tam_band_stats.npz", mean=band_mean, std=band_std)
     if train_ds.global_feat_mean is not None and len(train_ds.global_feat_mean) > 0:

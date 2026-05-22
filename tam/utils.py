@@ -15,30 +15,31 @@ def label_pixels(features_df: pl.DataFrame, train_loc) -> pl.DataFrame:
     Returns features_df with an is_presence column (True / False / None).
     Pixels outside any labelled bbox get None — scored but not trained on.
     """
-    is_presence: list[bool | None] = [None] * len(features_df)
-    lons = features_df["lon"].to_list()
-    lats = features_df["lat"].to_list()
-
+    # Build (bbox, value) pairs from whichever input type we received.
     if isinstance(train_loc, list):
-        for region in train_loc:
-            lon_min, lat_min, lon_max, lat_max = region.bbox
-            val = True if region.label == "presence" else (False if region.label == "absence" else None)
-            if val is None:
-                continue
-            for i, (lon, lat) in enumerate(zip(lons, lats)):
-                if lon_min <= lon <= lon_max and lat_min <= lat <= lat_max:
-                    is_presence[i] = val
+        regions_vals = [
+            (region.bbox, True if region.label == "presence" else False)
+            for region in train_loc
+            if region.label in ("presence", "absence")
+        ]
     else:
-        for sub in train_loc.sub_bboxes.values():
-            lon_min, lat_min, lon_max, lat_max = sub.bbox
-            val = True if sub.role == "presence" else (False if sub.role == "absence" else None)
-            if val is None:
-                continue
-            for i, (lon, lat) in enumerate(zip(lons, lats)):
-                if lon_min <= lon <= lon_max and lat_min <= lat <= lat_max:
-                    is_presence[i] = val
+        regions_vals = [
+            (sub.bbox, True if sub.role == "presence" else False)
+            for sub in train_loc.sub_bboxes.values()
+            if sub.role in ("presence", "absence")
+        ]
 
-    return features_df.with_columns(pl.Series("is_presence", is_presence, dtype=pl.Boolean))
+    # Start with null and overwrite per region using vectorised Polars expressions.
+    result = pl.lit(None, dtype=pl.Boolean)
+    for bbox, val in regions_vals:
+        lon_min, lat_min, lon_max, lat_max = bbox
+        in_bbox = (
+            pl.col("lon").is_between(lon_min, lon_max) &
+            pl.col("lat").is_between(lat_min, lat_max)
+        )
+        result = pl.when(in_bbox).then(pl.lit(val)).otherwise(result)
+
+    return features_df.with_columns(result.alias("is_presence"))
 
 
 def summarise(

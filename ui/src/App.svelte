@@ -20,15 +20,17 @@
     mapView?.setActiveLayer(layer);
   }
 
-  function handleTrainingClick(bboxRaw: string) {
+  function handleTrainingClick(bboxRaw: string, subRole: string | null) {
     trainingCardOpen = true;
     trainingSelection.bbox = JSON.parse(bboxRaw);
+    trainingSelection.sub_role = subRole;
   }
 
   function closeTrainingCard() {
     trainingCardOpen = false;
     layerVisibility.training = false;
     trainingSelection.bbox = null;
+    trainingSelection.sub_role = null;
   }
 
   $effect(() => {

@@ -137,11 +137,23 @@ def _cmd_train(args: argparse.Namespace) -> None:
 
     # Read tiles one at a time, filter and thin immediately — peak memory per
     # iteration is one raw tile, not the accumulation of all tiles.
+    # If band summaries are needed, compute them per tile here so we never need
+    # an S2-only copy of the full pixel_df later (avoids a ~25 GB transient spike).
+    _want_band_summaries = exp.train_kwargs.get("use_band_summaries", True)
+    _bs_feature_cols: list[str] | None = None
+    if _want_band_summaries:
+        from tam.core.train import _compute_band_summaries
+        from tam.core.dataset import V9_FEATURE_COLS as _V9_FEATURE_COLS
+        _bs_feature_cols = _V9_FEATURE_COLS
+
     tile_dfs: list[pl.DataFrame] = []
+    band_summary_dfs: list[pl.DataFrame] = []
     for path, cols, n_rg in tile_specs:
         logger.info("Loading tile %s (%d row groups) ...", path.name, n_rg)
         tile_df = _stride_tile(_filter_to_regions(_read_tile(path, cols, n_rg)), _load_stride)
         if len(tile_df) > 0:
+            if _want_band_summaries and _bs_feature_cols is not None:
+                band_summary_dfs.append(_compute_band_summaries(tile_df, _bs_feature_cols))
             tile_dfs.append(tile_df)
         del tile_df
         gc.collect()
@@ -149,6 +161,13 @@ def _cmd_train(args: argparse.Namespace) -> None:
     if not tile_dfs:
         logger.error("No training data found for experiment %s", exp.name)
         sys.exit(1)
+
+    band_summaries: pl.DataFrame | None = None
+    if band_summary_dfs:
+        band_summaries = pl.concat(band_summary_dfs)
+        del band_summary_dfs
+        gc.collect()
+        logger.info("Band summaries precomputed per tile: %d pixels", len(band_summaries))
 
     pixel_df = pl.concat(tile_dfs)
     del tile_dfs
@@ -251,6 +270,7 @@ def _cmd_train(args: argparse.Namespace) -> None:
         out_dir=out_dir,
         cfg=cfg,
         device=args.device,
+        precomputed_band_summaries=band_summaries,
     )
     logger.info("Checkpoint saved to %s  best_val_auc=%.3f", out_dir, best_val_auc)
 

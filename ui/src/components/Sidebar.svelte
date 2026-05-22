@@ -1,7 +1,6 @@
 <script lang="ts">
   import BBoxPanel from './panels/BBoxPanel.svelte';
   import Catchments from './panels/Catchments.svelte';
-  import S2Tiles from './panels/S2Tiles.svelte';
   import ALASightings from './panels/ALASightings.svelte';
   import S1Renderer from './panels/S1Renderer.svelte';
   import NoiseFilter from './panels/NoiseFilter.svelte';
@@ -36,7 +35,6 @@
       Training regions{trainingCount > 0 ? ` (${trainingCount})` : ''}
     </button>
     <Catchments />
-    <S2Tiles />
     <ALASightings />
     <S1Renderer />
     <NoiseFilter />

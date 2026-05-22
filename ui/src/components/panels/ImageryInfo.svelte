@@ -1,5 +1,6 @@
 <script lang="ts">
   import { imageryInfo } from '../../stores/imageryInfo.svelte.ts';
+  import { layerVisibility } from '../../stores/layerVisibility.svelte.ts';
 
   interface Props {
     onLayerChange: (layer: string) => void;
@@ -23,6 +24,12 @@
         <option {value}>{label}</option>
       {/each}
     </select>
+  </div>
+  <div class="irow">
+    <span class="ikey">S2 tiles</span>
+    <label class="toggle-label">
+      <input type="checkbox" bind:checked={layerVisibility.s2tiles} />
+    </label>
   </div>
   <div class="irow">
     <span class="ikey">captured</span>
@@ -80,4 +87,6 @@
   .ival { font-size: 12px; color: #b0b0b0; line-height: 1.3; word-break: break-word; }
   .ival.mono { font-family: monospace; font-size: 11px; }
   .dim { color: #444; font-style: italic; }
+  .toggle-label { display: flex; align-items: center; cursor: pointer; }
+  .toggle-label input { accent-color: #a78bfa; cursor: pointer; }
 </style>

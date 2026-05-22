@@ -24,7 +24,7 @@
   declare const maplibregl: typeof import('maplibre-gl');
 
   interface Props {
-    ontrainingclick?: (bbox: string) => void;
+    ontrainingclick?: (bbox: string, subRole: string | null) => void;
   }
   let { ontrainingclick }: Props = $props();
 
@@ -167,16 +167,13 @@
       paint: { 'line-color': SCORE_BBOX_COLOR, 'line-width': 2, 'line-dasharray': [4, 3] } });
 
     const tv = layerVisibility.training ? 'visible' : 'none';
-    map.addLayer({ id: 'training-fill', type: 'fill', source: 'training-regions',
-      layout: { visibility: tv },
-      paint: { 'fill-color': COLOR_EXPR as any, 'fill-opacity': 0.30 } });
     map.addLayer({ id: 'training-line', type: 'line', source: 'training-regions',
       layout: { visibility: tv },
       paint: { 'line-color': COLOR_EXPR as any, 'line-width': 2 } });
 
     map.addSource('training-grid', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
     map.addLayer({ id: 'training-grid-lines', type: 'line', source: 'training-grid',
-      paint: { 'line-color': '#ffffff', 'line-width': 0.5, 'line-opacity': 0.4 } });
+      paint: { 'line-color': COLOR_EXPR as any, 'line-width': 1, 'line-opacity': 0.6 } });
 
 
   }
@@ -187,7 +184,7 @@
   $effect(() => {
     if (!map || !locationsStore.mapReady) return;
     const vis = layerVisibility.training ? 'visible' : 'none';
-    for (const id of ['training-fill', 'training-line']) {
+    for (const id of ['training-line']) {
       if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', vis);
     }
   });
@@ -441,14 +438,14 @@
   // ---------------------------------------------------------------------------
   function attachLocationPopups() {
     if (!map || !popup) return;
-    const layers = ['loc-fill-location', 'loc-fill-sub', 'loc-fill-score', 'training-fill'];
+    const layers = ['loc-fill-location', 'loc-fill-sub', 'loc-fill-score', 'training-line'];
     for (const layer of layers) {
       map.on('click', layer, (e) => {
         if (mapMode.current !== 'locations') return;
         const feat = e.features?.[0];
         if (!feat) return;
-        if (layer === 'training-fill' && feat.properties.bbox) {
-          ontrainingclick?.(feat.properties.bbox);
+        if (layer === 'training-line' && feat.properties.bbox) {
+          ontrainingclick?.(feat.properties.bbox, feat.properties.sub_role ?? null);
           return;
         }
         popup!.setLngLat(e.lngLat).setHTML(buildLocationPopupHtml(feat.properties)).addTo(map!);

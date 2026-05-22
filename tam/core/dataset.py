@@ -6,6 +6,7 @@ Sentinel-2 observations with DOY positional indices and a binary presence label.
 
 from __future__ import annotations
 
+import gc
 import sys
 from pathlib import Path
 from typing import NamedTuple
@@ -236,24 +237,38 @@ class TAMDataset(Dataset):
                 s2_zscore_cols = [c for c in ALL_FEATURE_COLS if c in df.columns]
                 s1_zscore_cols = ["s1_vh", "s1_vv"]
                 for zscore_cols, src in [(s2_zscore_cols, "S2"), (s1_zscore_cols, "S1")]:
-                    src_df = df.filter(pl.col("source") == src).select(["point_id"] + zscore_cols)
-                    if src_df.is_empty():
+                    src_mask = pl.col("source") == src
+                    if not df.filter(src_mask).height:
                         continue
+                    # Compute per-pixel mean/std from source rows only (lazy — no eager copy).
                     stats = (
-                        src_df.group_by("point_id")
+                        df.lazy()
+                        .filter(src_mask)
+                        .select(["point_id"] + zscore_cols)
+                        .group_by("point_id")
                         .agg([pl.col(c).mean().alias(f"{c}__mean") for c in zscore_cols] +
                              [pl.col(c).std().alias(f"{c}__std")  for c in zscore_cols])
                     )
-                    src_mask = pl.col("source") == src
-                    joined = df.filter(src_mask).join(stats, on="point_id", how="left")
-                    normed_cols = []
-                    for col in zscore_cols:
-                        m = joined[f"{col}__mean"].fill_null(0.0)
-                        s = joined[f"{col}__std"].fill_null(1e-6).clip(lower_bound=1e-6)
-                        normed_cols.append(((pl.col(col) - m) / s).alias(col))
-                    # Replace the source-specific rows
-                    joined = joined.with_columns(normed_cols).select(df.columns)
-                    df = pl.concat([df.filter(~src_mask), joined])
+                    # Apply normalisation in one lazy pass: join stats, normalise only the
+                    # target source rows via pl.when, drop the stats columns, collect once.
+                    normed_exprs = [
+                        pl.when(src_mask)
+                          .then(
+                              (pl.col(c) - pl.col(f"{c}__mean").fill_null(0.0)) /
+                              pl.col(f"{c}__std").fill_null(1e-6).clip(lower_bound=1e-6)
+                          )
+                          .otherwise(pl.col(c))
+                          .alias(c)
+                        for c in zscore_cols
+                    ]
+                    stat_cols = [f"{c}__mean" for c in zscore_cols] + [f"{c}__std" for c in zscore_cols]
+                    df = (
+                        df.lazy()
+                        .join(stats, on="point_id", how="left")
+                        .with_columns(normed_exprs)
+                        .drop(stat_cols)
+                        .collect()
+                    )
 
         elif use_s1 == "s1_only":
             s1_rows = pixel_df.filter(pl.col("source") == "S1") if "source" in pixel_df.columns else pl.DataFrame()
@@ -284,20 +299,25 @@ class TAMDataset(Dataset):
                 s1_zscore_cols = [c for c in ("s1_vh", "s1_vv") if c in df.columns]
                 if s1_zscore_cols:
                     stats = (
-                        df.select(["point_id"] + s1_zscore_cols)
+                        df.lazy()
+                        .select(["point_id"] + s1_zscore_cols)
                         .group_by("point_id")
                         .agg([pl.col(c).mean().alias(f"{c}__mean") for c in s1_zscore_cols] +
                              [pl.col(c).std().alias(f"{c}__std")  for c in s1_zscore_cols])
                     )
-                    df = df.join(stats, on="point_id", how="left")
-                    normed_cols = []
-                    for col in s1_zscore_cols:
-                        m = df[f"{col}__mean"].fill_null(0.0)
-                        s = df[f"{col}__std"].fill_null(0.1).clip(lower_bound=0.1)
-                        normed_cols.append(((pl.col(col) - m) / s).alias(col))
-                    df = df.with_columns(normed_cols)
-                    drop_cols = [c for c in df.columns if c.endswith("__mean") or c.endswith("__std")]
-                    df = df.drop(drop_cols)
+                    normed_exprs = [
+                        ((pl.col(c) - pl.col(f"{c}__mean").fill_null(0.0)) /
+                         pl.col(f"{c}__std").fill_null(0.1).clip(lower_bound=0.1)).alias(c)
+                        for c in s1_zscore_cols
+                    ]
+                    stat_cols = [f"{c}__mean" for c in s1_zscore_cols] + [f"{c}__std" for c in s1_zscore_cols]
+                    df = (
+                        df.lazy()
+                        .join(stats, on="point_id", how="left")
+                        .with_columns(normed_exprs)
+                        .drop(stat_cols)
+                        .collect()
+                    )
         else:
             feature_cols = feature_cols_override if feature_cols_override is not None else ALL_FEATURE_COLS
 
@@ -318,20 +338,25 @@ class TAMDataset(Dataset):
                 s2_zscore_cols = [c for c in feature_cols if c in df.columns]
                 if s2_zscore_cols:
                     stats = (
-                        df.select(["point_id"] + s2_zscore_cols)
+                        df.lazy()
+                        .select(["point_id"] + s2_zscore_cols)
                         .group_by("point_id")
                         .agg([pl.col(c).mean().alias(f"{c}__mean") for c in s2_zscore_cols] +
                              [pl.col(c).std().alias(f"{c}__std")  for c in s2_zscore_cols])
                     )
-                    df = df.join(stats, on="point_id", how="left")
-                    normed_cols = []
-                    for col in s2_zscore_cols:
-                        m = df[f"{col}__mean"].fill_null(0.0)
-                        s = df[f"{col}__std"].fill_null(1e-6).clip(lower_bound=1e-6)
-                        normed_cols.append(((pl.col(col) - m) / s).alias(col))
-                    df = df.with_columns(normed_cols)
-                    drop_cols = [c for c in df.columns if c.endswith("__mean") or c.endswith("__std")]
-                    df = df.drop(drop_cols)
+                    normed_exprs = [
+                        ((pl.col(c) - pl.col(f"{c}__mean").fill_null(0.0)) /
+                         pl.col(f"{c}__std").fill_null(1e-6).clip(lower_bound=1e-6)).alias(c)
+                        for c in s2_zscore_cols
+                    ]
+                    stat_cols = [f"{c}__mean" for c in s2_zscore_cols] + [f"{c}__std" for c in s2_zscore_cols]
+                    df = (
+                        df.lazy()
+                        .join(stats, on="point_id", how="left")
+                        .with_columns(normed_exprs)
+                        .drop(stat_cols)
+                        .collect()
+                    )
 
         if use_s1 not in ("s1_only", "mixed"):
             if any(c not in df.columns for c in feature_cols if c in set(INDEX_COLS)):
@@ -412,6 +437,8 @@ class TAMDataset(Dataset):
             .to_numpy()
         )
         split_points = np.cumsum(sizes)[:-1]
+        del df
+        gc.collect()
 
         bands_split  = np.split(bands_all,  split_points)
         doy_split    = np.split(doy_all,    split_points)

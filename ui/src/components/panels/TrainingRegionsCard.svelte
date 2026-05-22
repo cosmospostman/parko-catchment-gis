@@ -66,17 +66,17 @@
     }
   });
 
-  function zoomTo(bboxRaw: any) {
+  function zoomTo(bboxRaw: any, subRole?: string) {
     const map = mapCtx.getMap();
     if (!map) return;
     const b = parseBbox(bboxRaw);
     map.fitBounds([[b[0], b[1]], [b[2], b[3]]], { padding: 80, maxZoom: 16 });
-    const { gridLines } = buildS2Grid(b);
+    const { gridLines } = buildS2Grid(b, { sub_role: subRole ?? null });
     setGrid(gridLines);
   }
 
   $effect(() => {
-    if (trainingSelection.bbox) zoomTo(trainingSelection.bbox);
+    if (trainingSelection.bbox) zoomTo(trainingSelection.bbox, trainingSelection.sub_role ?? undefined);
   });
 
   // Strip the location prefix from a name to get a short label
@@ -108,7 +108,7 @@
                 <div class="col">
                   <div class="col-header presence">presence</div>
                   {#each group.presence as feat (feat.properties.id)}
-                    <button class="chip" onclick={() => zoomTo(feat.properties.bbox)} type="button">
+                    <button class="chip" onclick={() => zoomTo(feat.properties.bbox, feat.properties.sub_role)} type="button">
                       {shortLabel(feat.properties.name)}
                     </button>
                   {/each}
@@ -116,12 +116,12 @@
                 <div class="col">
                   <div class="col-header absence">absence</div>
                   {#each group.absence as feat (feat.properties.id)}
-                    <button class="chip" onclick={() => zoomTo(feat.properties.bbox)} type="button">
+                    <button class="chip" onclick={() => zoomTo(feat.properties.bbox, feat.properties.sub_role)} type="button">
                       {shortLabel(feat.properties.name)}
                     </button>
                   {/each}
                   {#each group.survey as feat (feat.properties.id)}
-                    <button class="chip survey" onclick={() => zoomTo(feat.properties.bbox)} type="button">
+                    <button class="chip survey" onclick={() => zoomTo(feat.properties.bbox, feat.properties.sub_role)} type="button">
                       {shortLabel(feat.properties.name)}
                     </button>
                   {/each}

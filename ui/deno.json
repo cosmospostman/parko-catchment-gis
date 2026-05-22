@@ -14,8 +14,9 @@
     "maplibre-gl": "npm:maplibre-gl@^4"
   },
   "tasks": {
-    "dev": "deno run -A npm:vite --config vite.config.ts",
+    "dev": "deno run -A npm:vite --config vite.config.ts --host",
     "build": "deno run -A npm:vite build --config vite.config.ts",
-    "serve": "deno run -A server.ts"
+    "serve": "deno run -A server.ts",
+    "start": "bash start.sh"
   }
 }

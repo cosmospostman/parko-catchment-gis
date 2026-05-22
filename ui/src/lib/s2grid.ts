@@ -168,7 +168,7 @@ export function buildS2Grid(bbox: BBox, properties: Record<string, unknown> = {}
       features: lines.length === 0 ? [] : [{
         type: 'Feature',
         geometry: { type: 'MultiLineString', coordinates: lines },
-        properties: {},
+        properties,
       }],
     },
     pixelExtent: {
