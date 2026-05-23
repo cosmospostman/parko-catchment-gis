@@ -310,6 +310,9 @@ def _cmd_train(args: argparse.Namespace) -> None:
     # skipped here; it can be restored later by moving lin_to_db upstream too.
     if _want_pixel_zscore:
         train_kwargs["pixel_zscore"] = False
+        # Record that inference must apply pixel z-score even though the model
+        # itself was trained on pre-zscored data (pixel_zscore=False in TAMConfig).
+        train_kwargs["inference_pixel_zscore"] = True
 
     positional = {"n_epochs", "patience", "scl_purity_min"}
     cfg = TAMConfig(
@@ -325,17 +328,8 @@ def _cmd_train(args: argparse.Namespace) -> None:
     pixel_df = pixel_df.filter(pl.col("point_id").is_in(labeled_pids))
     gc.collect()
 
-    # Spill to IPC and drop the reference so train_tam's internal `del pixel_df`
-    # hits refcount=0 and actually frees the 19 GB frame from RAM.
-    import tempfile as _tf
-    _spill_dir = Path("/data") if Path("/data").exists() else Path(_tf.gettempdir())
-    _px_ipc = Path(_tf.NamedTemporaryFile(suffix="_pixel_df.ipc", delete=False, dir=_spill_dir).name)
-    pixel_df.write_ipc(_px_ipc)
-    del pixel_df
-    gc.collect()
-
     _, best_val_auc = train_tam(
-        pixel_df=pl.read_ipc(_px_ipc),
+        pixel_df=pixel_df,
         labels=labels,
         pixel_coords=pixel_coords,
         out_dir=out_dir,
@@ -343,7 +337,14 @@ def _cmd_train(args: argparse.Namespace) -> None:
         device=args.device,
         precomputed_band_summaries=band_summaries,
     )
-    _px_ipc.unlink(missing_ok=True)
+    del pixel_df
+    if _want_pixel_zscore:
+        _cfg_path = out_dir / "tam_config.json"
+        with open(_cfg_path) as _fh:
+            _saved = json.load(_fh)
+        _saved["inference_pixel_zscore"] = True
+        with open(_cfg_path, "w") as _fh:
+            json.dump(_saved, _fh, indent=2)
     logger.info("Checkpoint saved to %s  best_val_auc=%.3f", out_dir, best_val_auc)
 
 
@@ -435,11 +436,43 @@ def _cmd_score(args: argparse.Namespace) -> None:
 
     with open(checkpoint_dir / "tam_config.json") as _fh:
         _cfg_dict = json.load(_fh)
-    _n_bands = _cfg_dict.get("n_bands", 13)
-    s1_only = _n_bands == 4
-    pixel_zscore = _cfg_dict.get("pixel_zscore", False)
+    # inference_pixel_zscore: True means the model was trained on pre-zscored data
+    # and inference must apply pixel z-score before feeding the model.
+    # Falls back to band-stats heuristic for old checkpoints that predate this flag.
+    import numpy as _np
+    if _cfg_dict.get("inference_pixel_zscore"):
+        pixel_zscore = True
+    else:
+        pixel_zscore = _cfg_dict.get("pixel_zscore", False)
+        _bm = band_mean[~_np.isnan(band_mean)]
+        _bs = band_std[~_np.isnan(band_std)]
+        if not pixel_zscore and len(_bm) > 0 and abs(float(_bm.mean())) < 0.1 and abs(float(_bs.mean()) - 1.0) < 0.1:
+            logger.warning("band_mean≈0/band_std≈1 but no pixel_zscore flag — inferring inference_pixel_zscore=True from stats")
+            pixel_zscore = True
     s1_despeckle_window = _cfg_dict.get("s1_despeckle_window", 0)
-    feature_cols = _cfg_dict.get("feature_cols", None)
+
+    # Determine scoring mode from config/weights
+    use_s1_cfg = _cfg_dict.get("use_s1", False)
+    s1_feature_cols_cfg = _cfg_dict.get("s1_feature_cols", None)  # e.g. ["s1_vh", "s1_vv"]
+    s1_only = model.n_bands == 4
+    mixed   = (not s1_only) and bool(use_s1_cfg)
+
+    # S2 and S1 feature columns for mixed mode
+    s2_feature_cols_cfg = _cfg_dict.get("feature_cols", None)   # the 14 S2 cols for v10
+    s1_feature_cols_cfg = s1_feature_cols_cfg or (["s1_vh", "s1_vv"] if mixed else None)
+
+    # summary_feature_cols: used for global band-summary head; must match global_feat_mean shape.
+    # For mixed models feature_cols in config = S2 cols only (14), matching n_global_features//3.
+    summary_feature_cols = s2_feature_cols_cfg
+
+    # In non-mixed S2-only mode: validate feature_cols length against model.n_bands
+    feature_cols = s2_feature_cols_cfg
+    if not mixed and feature_cols is not None and len(feature_cols) != model.n_bands:
+        logger.warning(
+            "feature_cols in config has %d entries but model.n_bands=%d — ignoring for preprocessing",
+            len(feature_cols), model.n_bands,
+        )
+        feature_cols = None
 
     if getattr(args, "out_parquet", False):
         # Build {tile_id: [(year, pixel-sorted-path), ...]} for score_tiles_chunked
@@ -487,9 +520,13 @@ def _cmd_score(args: argparse.Namespace) -> None:
         batch_size=args.batch_size,
         n_total_pixels=len(pixel_coords),
         s1_only=s1_only,
+        mixed=mixed,
         pixel_zscore=pixel_zscore,
         s1_despeckle_window=s1_despeckle_window,
         feature_cols=feature_cols,
+        s2_feature_cols=s2_feature_cols_cfg if mixed else None,
+        s1_feature_cols=s1_feature_cols_cfg if mixed else None,
+        summary_feature_cols=summary_feature_cols,
         global_feat_mean=global_feat_mean,
         global_feat_std=global_feat_std,
     )

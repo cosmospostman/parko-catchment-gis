@@ -1,8 +1,16 @@
-import { defineConfig } from 'vite';
+import { defineConfig, createLogger } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 import path from 'node:path';
 
+const logger = createLogger();
+const loggerError = logger.error.bind(logger);
+logger.error = (msg, opts) => {
+  if (opts?.error?.name === 'AbortError' || opts?.error?.message?.includes('cancelled')) return;
+  loggerError(msg, opts);
+};
+
 export default defineConfig({
+  customLogger: logger,
   plugins: [svelte()],
   root: 'src',
   build: {

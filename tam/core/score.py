@@ -70,6 +70,68 @@ def _compute_pixel_s1_stats(parquet: Path) -> tuple[dict, dict, dict, dict]:
     return vh_mean_d, vh_std_d, vv_mean_d, vv_std_d
 
 
+def _compute_pixel_s1_stats_mixed(
+    year_parquets: list[tuple[int, Path]],
+    s1_feature_cols: list[str],
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    """Pre-pass: compute per-pixel mean/std for each s1_feature_col across all year parquets.
+
+    Returns (pid_mean, pid_std) dicts mapping point_id → float32 array of length len(s1_feature_cols).
+    Used in mixed-mode scoring to z-score S1 features by each pixel's own long-run statistics.
+    """
+    import pyarrow.parquet as pq
+
+    chunks: list[pl.DataFrame] = []
+    for _, path in sorted(year_parquets):
+        pf = pq.ParquetFile(path)
+        available = set(pf.schema_arrow.names)
+        read_cols = [c for c in ["point_id", "source", "vh", "vv"] if c in available]
+        for rg in range(pf.metadata.num_row_groups):
+            chunk = pl.from_arrow(pf.read_row_group(rg, columns=read_cols))
+            if "source" in chunk.columns:
+                chunk = chunk.filter(pl.col("source") == "S1")
+            chunk = chunk.drop_nulls(subset=["vh", "vv"])
+            if not chunk.is_empty():
+                chunks.append(chunk.select(["point_id", "vh", "vv"]))
+
+    if not chunks:
+        return {}, {}
+
+    all_s1 = pl.concat(chunks)
+    vh_db = lin_to_db(all_s1["vh"].to_numpy().astype(np.float32))
+    vv_db = lin_to_db(all_s1["vv"].to_numpy().astype(np.float32))
+    vh_vv = vh_db - vv_db
+    vh_lin = all_s1["vh"].to_numpy().astype(np.float32)
+    vv_lin = all_s1["vv"].to_numpy().astype(np.float32)
+    denom  = vh_lin + vv_lin
+    rvi    = np.where(denom > 0, 4 * vh_lin / denom, np.nan).astype(np.float32)
+
+    col_map = {"s1_vh": vh_db, "s1_vv": vv_db, "s1_vh_vv": vh_vv, "s1_rvi": rvi}
+    df = all_s1.with_columns([
+        pl.Series(col, col_map[col]) for col in s1_feature_cols if col in col_map
+    ])
+
+    agg_exprs = []
+    for col in s1_feature_cols:
+        if col in col_map:
+            agg_exprs += [
+                pl.col(col).mean().alias(f"{col}_mean"),
+                pl.col(col).std().clip(lower_bound=0.1).alias(f"{col}_std"),
+            ]
+    grp = df.group_by("point_id").agg(agg_exprs)
+    pids = grp["point_id"].to_numpy()
+
+    means = [grp[f"{col}_mean"].to_numpy().astype(np.float32) for col in s1_feature_cols if col in col_map]
+    stds  = [grp[f"{col}_std"].to_numpy().astype(np.float32)  for col in s1_feature_cols if col in col_map]
+    mean_matrix = np.column_stack(means)
+    std_matrix  = np.column_stack(stds)
+
+    return (
+        {pid: mean_matrix[i] for i, pid in enumerate(pids)},
+        {pid: std_matrix[i]  for i, pid in enumerate(pids)},
+    )
+
+
 def _compute_s1_despeckle_lookup(parquet: Path, window: int) -> pl.DataFrame:
     """One-pass pre-read to compute despeckled linear vh/vv per pixel.
 
@@ -164,12 +226,13 @@ def _extract_year_doy(ts_us: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 class _PreparedBatch(NamedTuple):
-    bands: torch.Tensor   # (W, MAX_SEQ_LEN, N_FEATURES) float32
-    doy:   torch.Tensor   # (W, MAX_SEQ_LEN) int64
-    mask:  torch.Tensor   # (W, MAX_SEQ_LEN) bool
-    n_obs: torch.Tensor   # (W,) float32, n / MAX_SEQ_LEN
-    pids:  np.ndarray     # (W,) object
-    years: np.ndarray     # (W,) int32
+    bands: torch.Tensor            # (W, MAX_SEQ_LEN, N_FEATURES) float32
+    doy:   torch.Tensor            # (W, MAX_SEQ_LEN) int64
+    mask:  torch.Tensor            # (W, MAX_SEQ_LEN) bool
+    n_obs: torch.Tensor            # (W,) float32, n / MAX_SEQ_LEN
+    pids:  np.ndarray              # (W,) object
+    years: np.ndarray              # (W,) int32
+    is_s1: torch.Tensor | None     # (W, MAX_SEQ_LEN) bool, True=S1 obs; None for S2-only models
 
 
 def _preprocess(
@@ -180,6 +243,7 @@ def _preprocess(
     min_obs_per_year: int,
     pin: bool = False,
     s1_only: bool = False,
+    mixed: bool = False,
     pixel_zscore: bool = False,
     vh_mean: dict | None = None,
     vh_std:  dict | None = None,
@@ -188,6 +252,9 @@ def _preprocess(
     despeckle_lookup: pl.DataFrame | None = None,
     feature_cols: list[str] | None = None,
     pixel_zscore_stats: tuple[dict, dict] | None = None,
+    s1_zscore_stats: tuple[dict, dict] | None = None,
+    s2_feature_cols: list[str] | None = None,
+    s1_feature_cols: list[str] | None = None,
     max_seq_len: int = MAX_SEQ_LEN,
 ) -> _PreparedBatch | None:
     """CPU-side preprocessing using numba kernels for maximum throughput.
@@ -199,28 +266,89 @@ def _preprocess(
       4. Fill padded (W, SEQ, F) arrays + normalise via numba parallel kernel
     """
     from tam.core._preprocess_numba import extract_features, fill_windows
+    from tam.core.dataset import MIN_S1_OBS_PER_YEAR
 
-    if s1_only:
+    is_s1_np: np.ndarray | None = None  # (N,) bool — set in mixed mode
+
+    if mixed:
+        # --- Mixed S2+S1 mode ---
+        # chunk contains interleaved S2 and S1 rows (source column distinguishes them).
+        # S2 rows carry spectral bands; S1 rows carry raw linear vh/vv.
+        # Feature vector: [s2_feature_cols (n_s2), s1_feature_cols (n_s1)]
+        # S2 rows: s1 positions are 0; S1 rows: s2 positions are 0.
+        _s2_cols = s2_feature_cols or list(ALL_FEATURE_COLS)
+        _s1_cols = s1_feature_cols or ["s1_vh", "s1_vv"]
+        n_s2 = len(_s2_cols)
+        n_s1 = len(_s1_cols)
+        n_feat = n_s2 + n_s1
+
+        has_source = "source" in chunk.columns
+        is_s1_bool = (chunk["source"].to_numpy() == "S1") if has_source else np.zeros(len(chunk), dtype=bool)
+
+        # Filter S2 rows by SCL purity; keep all S1 rows
+        if "scl_purity" in chunk.columns:
+            purity = chunk["scl_purity"].to_numpy()
+            keep = is_s1_bool | (purity >= scl_purity_min)
+            if not keep.all():
+                chunk = chunk.filter(pl.Series(keep))
+                is_s1_bool = is_s1_bool[keep]
+
+        if chunk.is_empty():
+            return None
+
+        N = len(chunk)
+
+        # Compute s1_vh/s1_vv dB features for S1 rows
+        feat = np.zeros((N, n_feat), dtype=np.float32)
+        s1_idx = np.where(is_s1_bool)[0]
+        s2_idx = np.where(~is_s1_bool)[0]
+
+        # S2 features
+        if len(s2_idx) > 0:
+            s2_chunk = chunk[s2_idx.tolist()]
+            from analysis.constants import add_spectral_indices
+            _need = [c for c in _s2_cols if c not in s2_chunk.columns]
+            if _need:
+                s2_chunk = add_spectral_indices(s2_chunk)
+            s2_vals = s2_chunk.select(_s2_cols).to_numpy().astype(np.float32)
+            feat[s2_idx, :n_s2] = s2_vals
+
+        # S1 features (compute dB from linear vh/vv)
+        if len(s1_idx) > 0:
+            s1_chunk = chunk[s1_idx.tolist()]
+            vh_lin = s1_chunk["vh"].to_numpy().astype(np.float32) if "vh" in s1_chunk.columns else np.full(len(s1_chunk), np.nan, np.float32)
+            vv_lin = s1_chunk["vv"].to_numpy().astype(np.float32) if "vv" in s1_chunk.columns else np.full(len(s1_chunk), np.nan, np.float32)
+            s1_db_map = {
+                "s1_vh":    lin_to_db(vh_lin),
+                "s1_vv":    lin_to_db(vv_lin),
+                "s1_vh_vv": lin_to_db(vh_lin) - lin_to_db(vv_lin),
+                "s1_rvi":   np.where(vh_lin + vv_lin > 0, 4 * vh_lin / (vh_lin + vv_lin), np.nan).astype(np.float32),
+            }
+            for j, col in enumerate(_s1_cols):
+                feat[s1_idx, n_s2 + j] = s1_db_map.get(col, np.zeros(len(s1_idx), np.float32))
+
+        is_s1_np = is_s1_bool
+
+    elif s1_only:
         if "source" in chunk.columns:
             chunk = chunk.filter(pl.col("source") == "S1")
         chunk = chunk.drop_nulls(subset=["vh", "vv"])
-    elif "scl_purity" in chunk.columns:
-        chunk = chunk.filter(pl.col("scl_purity") >= scl_purity_min)
-    if chunk.is_empty():
-        return None
-
-    N = len(chunk)
-
-    if s1_only:
+        if chunk.is_empty():
+            return None
+        N = len(chunk)
         feat = _extract_s1_features(chunk, pixel_zscore=pixel_zscore,
                                     vh_mean=vh_mean, vh_std=vh_std,
                                     vv_mean=vv_mean, vv_std=vv_std,
                                     despeckle_lookup=despeckle_lookup)
         n_feat = _N_FEATURES_S1
     else:
+        if "scl_purity" in chunk.columns:
+            chunk = chunk.filter(pl.col("scl_purity") >= scl_purity_min)
+        if chunk.is_empty():
+            return None
+        N = len(chunk)
         _use_default_cols = feature_cols is None or feature_cols == list(ALL_FEATURE_COLS)
         if _use_default_cols:
-            # Fast path: numba kernel for the standard 16-feature layout (ALL_FEATURE_COLS)
             n_feat = _N_FEATURES
             feat = np.empty((N, n_feat), dtype=np.float32)
             extract_features(
@@ -231,7 +359,6 @@ def _preprocess(
                 feat,
             )
         else:
-            # Polars path for non-default feature sets (e.g. V9: no B06, no EVI)
             from analysis.constants import add_spectral_indices
             _cols_needed = set(feature_cols) - set(chunk.columns)
             if _cols_needed:
@@ -244,16 +371,25 @@ def _preprocess(
     year_arr = chunk["year"].to_numpy().astype(np.int32)
     doy_arr  = chunk["doy"].to_numpy().astype(np.int32)
 
-    pid_change  = np.empty(N, dtype=bool)
-    year_change = np.empty(N, dtype=bool)
+    pid_change  = np.empty(len(chunk), dtype=bool)
+    year_change = np.empty(len(chunk), dtype=bool)
     pid_change[0] = year_change[0] = True
     pid_change[1:]  = pid_arr[1:]  != pid_arr[:-1]
     year_change[1:] = year_arr[1:] != year_arr[:-1]
 
     boundaries = np.where(pid_change | year_change)[0]
-    ends    = np.append(boundaries[1:], N)
+    ends    = np.append(boundaries[1:], len(chunk))
     lengths = ends - boundaries
-    valid   = lengths >= min_obs_per_year
+
+    if mixed:
+        # Require both enough S2 obs and enough S1 obs per window
+        valid = np.zeros(len(boundaries), dtype=bool)
+        for i, (s, e) in enumerate(zip(boundaries, ends)):
+            src_seg = is_s1_np[s:e]
+            valid[i] = ((~src_seg).sum() >= min_obs_per_year and
+                        src_seg.sum() >= MIN_S1_OBS_PER_YEAR)
+    else:
+        valid = lengths >= min_obs_per_year
 
     if not valid.any():
         return None
@@ -262,28 +398,64 @@ def _preprocess(
     capped = np.minimum(lengths[valid], max_seq_len).astype(np.int32)
     W = int(valid.sum())
 
-    # Step 3: fill padded tensors with normalisation via numba parallel kernel
-    bands_np = np.zeros((W, max_seq_len, n_feat), dtype=np.float32)
-    doy_np   = np.zeros((W, max_seq_len), dtype=np.int64)
-    mask_np  = np.ones( (W, max_seq_len), dtype=np.bool_)
+    # Step 3: fill padded tensors
+    bands_np  = np.zeros((W, max_seq_len, n_feat), dtype=np.float32)
+    doy_np    = np.zeros((W, max_seq_len), dtype=np.int64)
+    mask_np   = np.ones( (W, max_seq_len), dtype=np.bool_)
+    is_s1_out = np.zeros((W, max_seq_len), dtype=np.bool_) if mixed else None
 
-    if pixel_zscore_stats is not None and not s1_only:
-        # Per-pixel z-score: normalise each pixel's observations by its own
-        # temporal mean/std, then apply global band_mean/band_std (which are
-        # ~0/1 after pixel z-score so effectively a no-op).
+    pids_at_starts = pid_arr[valid_starts]
+
+    if mixed:
+        # Per-pixel z-score applied separately to S2 and S1 slots
+        _s2_zero = np.zeros(n_s2, np.float32)
+        _s2_one  = np.ones(n_s2,  np.float32)
+        _s1_zero = np.zeros(n_s1, np.float32)
+        _s1_one  = np.ones(n_s1,  np.float32)
+        p_s2_mean = p_s2_std = p_s1_mean = p_s1_std = None
+        if pixel_zscore_stats is not None:
+            p_s2_mean, p_s2_std = pixel_zscore_stats
+        if s1_zscore_stats is not None:
+            p_s1_mean, p_s1_std = s1_zscore_stats
+
+        for k in range(W):
+            s = valid_starts[k]
+            c = capped[k]
+            win_feat = feat[s:s+c].copy()
+            win_src  = is_s1_np[s:s+c]
+            s2_rows  = ~win_src
+            s1_rows  = win_src
+
+            if p_s2_mean is not None and s2_rows.any():
+                pid = pids_at_starts[k]
+                pm = p_s2_mean.get(pid, _s2_zero)
+                ps = p_s2_std.get(pid,  _s2_one)
+                win_feat[s2_rows, :n_s2] = (win_feat[s2_rows, :n_s2] - pm) / ps
+
+            if p_s1_mean is not None and s1_rows.any():
+                pid = pids_at_starts[k]
+                pm1 = p_s1_mean.get(pid, _s1_zero)
+                ps1 = p_s1_std.get(pid,  _s1_one)
+                win_feat[s1_rows, n_s2:] = (win_feat[s1_rows, n_s2:] - pm1) / ps1
+
+            normed = np.where(np.isnan(win_feat), 0.0, win_feat).astype(np.float32)
+            n = min(c, max_seq_len)
+            bands_np[k, :n]  = normed[:n]
+            doy_np[k,  :n]   = doy_arr[s:s+n]
+            mask_np[k, :n]   = False
+            is_s1_out[k, :n] = win_src[:n]
+
+    elif pixel_zscore_stats is not None and not s1_only:
         pid_mean_lookup, pid_std_lookup = pixel_zscore_stats
         _zero = np.zeros(n_feat, dtype=np.float32)
         _one  = np.ones(n_feat,  dtype=np.float32)
-        pids_at_starts = pid_arr[valid_starts]
         for k in range(W):
             s = valid_starts[k]
             c = capped[k]
             pm = pid_mean_lookup.get(pids_at_starts[k], _zero)
             ps = pid_std_lookup.get(pids_at_starts[k],  _one)
-            window = (feat[s:s+c] - pm) / ps  # pixel z-score
-            # then global normalisation (band_mean/band_std ~ 0/1 after zscore)
-            normed = (window - band_mean) / band_std
-            normed = np.where(np.isnan(normed), 0.0, normed).astype(np.float32)
+            window = (feat[s:s+c] - pm) / ps
+            normed = np.where(np.isnan(window), 0.0, window).astype(np.float32)
             n = min(c, max_seq_len)
             bands_np[k, :n] = normed[:n]
             doy_np[k,  :n]  = doy_arr[s:s+n]
@@ -294,20 +466,20 @@ def _preprocess(
 
     pids  = pid_arr[valid_starts]
     years = year_arr[valid_starts]
-
     n_obs_np = (capped / max_seq_len).astype(np.float32)
 
     bands_th = torch.from_numpy(bands_np)
     doy_th   = torch.from_numpy(doy_np)
     mask_th  = torch.from_numpy(mask_np)
     n_obs_th = torch.from_numpy(n_obs_np)
+    is_s1_th = torch.from_numpy(is_s1_out) if is_s1_out is not None else None
     if pin:
         bands_th = bands_th.pin_memory()
         doy_th   = doy_th.pin_memory()
         mask_th  = mask_th.pin_memory()
         n_obs_th = n_obs_th.pin_memory()
 
-    return _PreparedBatch(bands_th, doy_th, mask_th, n_obs_th, pids, years)
+    return _PreparedBatch(bands_th, doy_th, mask_th, n_obs_th, pids, years, is_s1_th)
 
 
 def _compute_s2_pixel_zscore_stats(
@@ -459,7 +631,7 @@ def _gpu_score(
     band_summaries: dict | None = None,
 ) -> None:
     """GPU-side: transfer tensors, run inference, append (pid, year, prob) to lists."""
-    bands_th, doy_th, mask_th, n_obs_th, pids, years = prepared
+    bands_th, doy_th, mask_th, n_obs_th, pids, years, is_s1_th = prepared
     W = len(pids)
 
     global_feats_th: torch.Tensor | None = None
@@ -475,12 +647,14 @@ def _gpu_score(
         for start in range(0, W, batch_size):
             end = min(start + batch_size, W)
             gf_batch = global_feats_th[start:end].to(device, non_blocking=True) if global_feats_th is not None else None
+            is_s1_batch = is_s1_th[start:end].to(device, non_blocking=True) if is_s1_th is not None else None
             prob, _ = model(
                 bands_th[start:end].to(device, non_blocking=True),
                 doy_th[start:end].to(device, non_blocking=True),
                 mask_th[start:end].to(device, non_blocking=True),
                 n_obs_th[start:end].to(device, non_blocking=True),
                 global_feats=gf_batch,
+                is_s1=is_s1_batch,
             )
             prob_np = prob.cpu().numpy()
             all_pids.append(pids[start:end])
@@ -541,11 +715,15 @@ def score_pixels_chunked(
     decay: float = 0.7,
     n_total_pixels: int | None = None,
     s1_only: bool = False,
+    mixed: bool = False,
     pixel_zscore: bool = False,
     s1_despeckle_window: int = 0,
     feature_cols: list[str] | None = None,
+    s2_feature_cols: list[str] | None = None,
+    s1_feature_cols: list[str] | None = None,
     band_summaries: dict | None = None,
     pixel_zscore_stats: tuple[dict, dict] | None = None,
+    s1_zscore_stats: tuple[dict, dict] | None = None,
     # accumulators — pass across years to merge results before final aggregation
     _all_pids:  list | None = None,
     _all_years: list | None = None,
@@ -593,11 +771,19 @@ def score_pixels_chunked(
     n_rg = pf.metadata.num_row_groups
     tile_prefix = f"_{tile_id}_" if tile_id else None
 
-    _s2_band_cols = [c for c in (feature_cols or BAND_COLS) if c not in ("NDVI", "NDWI", "EVI")]
+    _s2_band_cols = [c for c in (s2_feature_cols or feature_cols or BAND_COLS) if c not in ("NDVI", "NDWI", "EVI")]
     if s1_only:
         read_cols = (
             ["point_id", "date", "source"]
             + (["item_id"] if tile_id else [])
+            + ["vh", "vv"]
+        )
+    elif mixed:
+        # Read both S2 spectral bands and S1 raw vh/vv; source column distinguishes rows
+        read_cols = (
+            ["point_id", "date", "source", "scl_purity"]
+            + (["item_id"] if tile_id else [])
+            + _s2_band_cols
             + ["vh", "vv"]
         )
     else:
@@ -636,52 +822,64 @@ def score_pixels_chunked(
                 raw_q.put(chunk)
             return new_lo
 
-        for rg in range(n_rg):
-            chunk = pl.from_arrow(pf.read_row_group(rg, columns=read_cols))
-            if tile_prefix:
-                chunk = chunk.filter(pl.col("item_id").str.contains(tile_prefix, literal=True))
-            if not s1_only and "scl_purity" in chunk.columns:
-                chunk = chunk.filter(pl.col("scl_purity") >= scl_purity_min)
-            if chunk.is_empty():
-                continue
-            # Extract year/doy from date column
-            ts_us = chunk["date"].cast(pl.Datetime("us")).to_numpy(allow_copy=True).astype("int64")
-            year_arr, doy_arr = _extract_year_doy(ts_us)
-            chunk = chunk.with_columns([
-                pl.Series("year", year_arr.astype(np.int32)),
-                pl.Series("doy",  doy_arr.astype(np.int32)),
-            ])
-            if end_year:
-                chunk = chunk.filter(pl.col("year") <= end_year)
-            if chunk.is_empty():
-                continue
-            buffer.append(chunk)
-            if len(buffer) >= buffer_row_groups:
-                leftover = _emit(buffer, leftover, is_last=(rg == n_rg - 1))
-                buffer = []
+        try:
+            for rg in range(n_rg):
+                chunk = pl.from_arrow(pf.read_row_group(rg, columns=read_cols))
+                if tile_prefix:
+                    chunk = chunk.filter(pl.col("item_id").str.contains(tile_prefix, literal=True))
+                if not s1_only and not mixed and "scl_purity" in chunk.columns:
+                    chunk = chunk.filter(pl.col("scl_purity") >= scl_purity_min)
+                if chunk.is_empty():
+                    continue
+                # Extract year/doy from date column
+                ts_us = chunk["date"].cast(pl.Datetime("us")).to_numpy(allow_copy=True).astype("int64")
+                year_arr, doy_arr = _extract_year_doy(ts_us)
+                chunk = chunk.with_columns([
+                    pl.Series("year", year_arr.astype(np.int32)),
+                    pl.Series("doy",  doy_arr.astype(np.int32)),
+                ])
+                if end_year:
+                    chunk = chunk.filter(pl.col("year") <= end_year)
+                if chunk.is_empty():
+                    continue
+                buffer.append(chunk)
+                if len(buffer) >= buffer_row_groups:
+                    leftover = _emit(buffer, leftover, is_last=(rg == n_rg - 1))
+                    buffer = []
 
-        leftover = _emit(buffer, leftover, is_last=True)
-        if not leftover.is_empty():
-            raw_q.put(leftover)
-        for _ in range(n_prep_workers):
-            raw_q.put(_SENTINEL)
+            leftover = _emit(buffer, leftover, is_last=True)
+            if not leftover.is_empty():
+                raw_q.put(leftover)
+        except Exception:
+            logger.exception("Reader thread crashed")
+        finally:
+            for _ in range(n_prep_workers):
+                raw_q.put(_SENTINEL)
 
     # --- Stage 2: preprocessor workers ---
     def _preprocessor() -> None:
-        while True:
-            item = raw_q.get()
-            if item is _SENTINEL:
-                break
-            prepared = _preprocess(item, band_mean, band_std, scl_purity_min, min_obs_per_year, pin=pin, s1_only=s1_only,
-                                   pixel_zscore=pixel_zscore, vh_mean=_vh_mean, vh_std=_vh_std,
-                                   vv_mean=_vv_mean, vv_std=_vv_std,
-                                   despeckle_lookup=_despeckle_lookup,
-                                   feature_cols=feature_cols,
-                                   pixel_zscore_stats=pixel_zscore_stats,
-                                   max_seq_len=getattr(model, "_max_seq_len", MAX_SEQ_LEN))
-            if prepared is not None:
-                prep_q.put(prepared)
-        prep_q.put(_SENTINEL)
+        try:
+            while True:
+                item = raw_q.get()
+                if item is _SENTINEL:
+                    break
+                prepared = _preprocess(item, band_mean, band_std, scl_purity_min, min_obs_per_year, pin=pin,
+                                       s1_only=s1_only, mixed=mixed,
+                                       pixel_zscore=pixel_zscore, vh_mean=_vh_mean, vh_std=_vh_std,
+                                       vv_mean=_vv_mean, vv_std=_vv_std,
+                                       despeckle_lookup=_despeckle_lookup,
+                                       feature_cols=feature_cols,
+                                       pixel_zscore_stats=pixel_zscore_stats,
+                                       s1_zscore_stats=s1_zscore_stats,
+                                       s2_feature_cols=s2_feature_cols,
+                                       s1_feature_cols=s1_feature_cols,
+                                       max_seq_len=getattr(model, "_max_seq_len", MAX_SEQ_LEN))
+                if prepared is not None:
+                    prep_q.put(prepared)
+        except Exception:
+            logger.exception("Preprocessor worker crashed")
+        finally:
+            prep_q.put(_SENTINEL)
 
     reader_thread = Thread(target=_reader, daemon=True)
     reader_thread.start()
@@ -715,7 +913,7 @@ def score_pixels_chunked(
 
     logger.info("Aggregating scores ...")
     if not end_year:
-        end_year = int(np.concatenate(all_years).max())
+        end_year = int(np.concatenate(all_years).max()) if all_years else 0
     return aggregate_year_probs(all_pids, all_years, all_probs, end_year=end_year, decay=decay)
 
 
@@ -734,9 +932,13 @@ def score_location_years(
     decay: float = 0.7,
     n_total_pixels: int | None = None,
     s1_only: bool = False,
+    mixed: bool = False,
     pixel_zscore: bool = False,
     s1_despeckle_window: int = 0,
     feature_cols: list[str] | None = None,
+    s2_feature_cols: list[str] | None = None,
+    s1_feature_cols: list[str] | None = None,
+    summary_feature_cols: list[str] | None = None,
     global_feat_mean: np.ndarray | None = None,
     global_feat_std: np.ndarray | None = None,
 ) -> pl.DataFrame:
@@ -751,27 +953,50 @@ def score_location_years(
     all_years: list[np.ndarray] = []
     all_probs: list[np.ndarray] = []
 
-    # Pre-pass: compute per-pixel stats needed for pixel z-scoring and band summaries.
+    # Resolve effective column lists for the three roles:
+    # - _s2_cols: S2 spectral features (for pixel z-score pre-pass and _preprocess)
+    # - _s1_cols: S1 dB features (for S1 pixel z-score pre-pass; mixed mode only)
+    # - _summary_cols: band-summary global features (must match global_feat_mean shape)
+    _s2_cols      = s2_feature_cols or feature_cols or list(ALL_FEATURE_COLS)
+    _s1_cols      = s1_feature_cols or ["s1_vh", "s1_vv"]
+    _summary_cols = summary_feature_cols or feature_cols
+
     pixel_zscore_stats: tuple[dict, dict] | None = None
+    s1_zscore_stats:    tuple[dict, dict] | None = None
     band_summaries: dict | None = None
-    if feature_cols is not None and not s1_only:
-        logger.info("Pre-pass: computing per-pixel z-score stats (%d feature cols) ...", len(feature_cols))
+
+    if pixel_zscore and not s1_only:
+        logger.info("Pre-pass: computing per-pixel S2 z-score stats (%d feature cols) ...", len(_s2_cols))
         pixel_zscore_stats = _compute_s2_pixel_zscore_stats(
             year_parquets=year_parquets,
-            feature_cols=feature_cols,
+            feature_cols=_s2_cols,
             scl_purity_min=scl_purity_min,
         )
         logger.info("Z-score stats computed for %d pixels", len(pixel_zscore_stats[0]))
+
+        if mixed:
+            logger.info("Pre-pass: computing per-pixel S1 z-score stats (%s) ...", _s1_cols)
+            s1_zscore_stats = _compute_pixel_s1_stats_mixed(
+                year_parquets=year_parquets,
+                s1_feature_cols=_s1_cols,
+            )
+            logger.info("S1 z-score stats computed for %d pixels", len(s1_zscore_stats[0]))
+
         if model.n_global_features > 0:
             if global_feat_mean is None or global_feat_std is None:
                 raise ValueError(
                     "Model has global features but tam_global_feat_stats.npz was not found. "
                     "Re-train to generate it, or pass global_feat_mean/std explicitly."
                 )
-            logger.info("Pre-pass: computing per-pixel band summaries (%d feature cols) ...", len(feature_cols))
+            if _summary_cols is None:
+                raise ValueError(
+                    "Model has global features but summary_feature_cols is unknown. "
+                    "Pass feature_cols or summary_feature_cols matching global_feat_mean shape."
+                )
+            logger.info("Pre-pass: computing per-pixel band summaries (%d feature cols) ...", len(_summary_cols))
             band_summaries = _compute_band_summaries_from_parquets(
                 year_parquets=year_parquets,
-                feature_cols=feature_cols,
+                feature_cols=_summary_cols,
                 scl_purity_min=scl_purity_min,
                 global_feat_mean=global_feat_mean,
                 global_feat_std=global_feat_std,
@@ -800,11 +1025,15 @@ def score_location_years(
             decay=decay,
             n_total_pixels=n_total_pixels,
             s1_only=s1_only,
+            mixed=mixed,
             pixel_zscore=pixel_zscore,
             s1_despeckle_window=s1_despeckle_window,
-            feature_cols=feature_cols,
+            feature_cols=None,  # not used in mixed/pixel_zscore paths
+            s2_feature_cols=_s2_cols,
+            s1_feature_cols=_s1_cols,
             band_summaries=band_summaries,
             pixel_zscore_stats=pixel_zscore_stats,
+            s1_zscore_stats=s1_zscore_stats,
             _all_pids=all_pids,
             _all_years=all_years,
             _all_probs=all_probs,

@@ -544,6 +544,7 @@ async function handler(req: Request): Promise<Response> {
         },
       });
     } catch (err) {
+      if (err instanceof Error && err.name === "AbortError") return new Response(null, { status: 499 });
       console.error("Tile render error:", err);
       return new Response("Render error", { status: 500 });
     }
@@ -733,5 +734,15 @@ async function handler(req: Request): Promise<Response> {
 // Start
 // ---------------------------------------------------------------------------
 
+globalThis.addEventListener("unhandledrejection", (e) => {
+  console.error("[unhandledrejection]", e.reason);
+});
+
 console.log(`parko-gis-ui running at http://localhost:${PORT}`);
-Deno.serve({ port: PORT }, handler);
+Deno.serve({
+  port: PORT,
+  onError(err) {
+    console.error("[server error]", err);
+    return new Response("Internal server error", { status: 500 });
+  },
+}, handler);

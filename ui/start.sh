@@ -23,10 +23,10 @@ restart_loop() {
     done
 }
 
-restart_loop "serve" deno task serve &
+restart_loop "serve" bash -c 'deno task serve 2>&1 | sed "s/^/[serve] /"' &
 serve_pid=$!
 
-restart_loop "dev" deno task dev &
+restart_loop "dev" bash -c 'deno task dev 2>&1 | sed "s/^/[vite]  /"' &
 dev_pid=$!
 
 wait "$serve_pid" "$dev_pid"

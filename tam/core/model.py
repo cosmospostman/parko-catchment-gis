@@ -253,6 +253,7 @@ class TAMClassifier(nn.Module):
             "use_s1":             getattr(self, "_use_s1", None),
             "pixel_zscore":       getattr(self, "_pixel_zscore", None),
             "feature_cols":       getattr(self, "_feature_cols", None),
+            "s1_feature_cols":    getattr(self, "_s1_feature_cols", None),
         }
 
     @classmethod

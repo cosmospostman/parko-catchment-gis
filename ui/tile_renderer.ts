@@ -204,7 +204,9 @@ async function buildBin(csvPath: string, outPath: string): Promise<void> {
     dv.setFloat32(off + 4, sortedVals[i], true);
     off += 8;
   }
-  await Deno.writeFile(outPath, new Uint8Array(buf));
+  const tmpPath = outPath + ".tmp";
+  await Deno.writeFile(tmpPath, new Uint8Array(buf));
+  await Deno.rename(tmpPath, outPath);
   console.log(`Binary cache built in ${(performance.now() - t0).toFixed(0)} ms  (${count} pixels, ${width}×${height})`);
 }
 
@@ -274,7 +276,13 @@ export function loadGrid(location: string, stem: string): Promise<Grid | null> {
     const csv = join(SCORES_DIR, location, `${stem}.csv`);
 
     let binExists = false;
-    try { Deno.statSync(bin); binExists = true; } catch { /* absent */ }
+    try {
+      const st = Deno.statSync(bin);
+      // A valid .bin has at least the header plus one record; a header-only file
+      // means a previous buildBin was interrupted before the atomic rename.
+      binExists = st.size > HEADER_BYTES;
+      if (!binExists) Deno.removeSync(bin);
+    } catch { /* absent */ }
     if (!binExists) {
       try { Deno.statSync(csv); } catch { return null; }
       await buildBin(csv, bin);

@@ -20,7 +20,7 @@ from torch.utils.data import DataLoader
 
 from tam.core.config import TAMConfig
 from tam.core.constants import DRY_DOY_MIN as _DRY_DOY_MIN, DRY_DOY_MAX as _DRY_DOY_MAX
-from tam.core.dataset import MAX_SEQ_LEN, S1_FEATURE_COLS, TAMDataset, V9_FEATURE_COLS, V10_FEATURE_COLS, V10_S1_FEATURE_COLS, collate_fn, lin_to_db
+from tam.core.dataset import BAND_COLS, MAX_SEQ_LEN, S1_FEATURE_COLS, TAMDataset, V9_FEATURE_COLS, V10_FEATURE_COLS, V10_S1_FEATURE_COLS, collate_fn, lin_to_db
 from tam.core.global_features import GLOBAL_FEATURE_NAMES, compute_global_features
 from tam.core.model import TAMClassifier
 from analysis.constants import add_spectral_indices
@@ -340,8 +340,9 @@ def train_tam(
     _s1_feature_cols_override = list(cfg.s1_feature_cols) if cfg.s1_feature_cols else None
     _active_s1_cols = _s1_feature_cols_override or S1_FEATURE_COLS
     _s1_raw = ["vh", "vv"] if cfg.use_s1 not in (False, None) else []
+    _feature_cols_base = set(_feature_cols_override) if _feature_cols_override else set(BAND_COLS)
     _keep_cols = {"point_id", "date", "year", "doy", "scl_purity", "scl", "source"} | \
-                 set(_feature_cols_override or []) | set(_active_s1_cols) | set(_s1_raw)
+                 _feature_cols_base | set(_active_s1_cols) | set(_s1_raw)
     pixel_df = pixel_df.select([c for c in pixel_df.columns if c in _keep_cols])
     # Cast high-cardinality string cols to Categorical: ~20 bytes/row → 4 bytes/row.
     # .to_numpy() on Categorical returns decoded strings, so TAMDataset is unaffected.
@@ -657,15 +658,24 @@ def train_tam(
         pixel_df = pixel_df.drop("source")
         gc.collect()
 
-    # Pre-split into train/val slices so pixel_df can be freed before val_ds
-    # is constructed — avoids holding the full frame in memory alongside both
-    # filtered copies simultaneously.
-    train_pids_ds  = set(k[0] for k in train_py_labels)
-    val_pids_ds    = set(k[0] for k in val_py_labels)
-    train_pixel_df = pixel_df.filter(pl.col("point_id").is_in(train_pids_ds))
-    val_pixel_df   = pixel_df.filter(pl.col("point_id").is_in(val_pids_ds))
+    # Spill pixel_df to IPC then free it. Each split is then read back
+    # independently so only one filtered copy exists at a time, avoiding the
+    # 3× peak (pixel_df + train slice + val slice) that occurred previously.
+    import tempfile as _tf
+    _spill_dir = Path("/data") if Path("/data").exists() else Path(_tf.gettempdir())
+    _px_ipc = Path(_tf.NamedTemporaryFile(suffix="_pixel_df.ipc", delete=False, dir=_spill_dir).name)
+    pixel_df.write_ipc(_px_ipc)
+    del pixel_df
+    gc.collect()
+    _log_rss("after IPC spill")
 
-    # DOY density norm needs train DOYs — compute before pixel_df is freed.
+    train_pids_ds = set(k[0] for k in train_py_labels)
+    val_pids_ds   = set(k[0] for k in val_py_labels)
+
+    # --- Train dataset -------------------------------------------------------
+    _log_rss("before train_ds")
+    train_pixel_df = pl.read_ipc(_px_ipc).filter(pl.col("point_id").is_in(train_pids_ds))
+
     _doy_s2_counts: np.ndarray | None = None
     _doy_s1_counts: np.ndarray | None = None
     if cfg.doy_density_norm:
@@ -679,9 +689,6 @@ def train_tam(
         _doy_s1_counts = np.bincount(s1_doys, minlength=366)
         del s2_doys, s1_doys
 
-    del pixel_df
-    gc.collect()
-    _log_rss("before train_ds")
     train_ds = TAMDataset(
         train_pixel_df, train_py_labels,
         scl_purity_min=cfg.scl_purity_min,
@@ -702,6 +709,11 @@ def train_tam(
     del train_pixel_df
     gc.collect()
     _log_rss("after train_ds, before val_ds")
+
+    # --- Val dataset ---------------------------------------------------------
+    val_pixel_df = pl.read_ipc(_px_ipc).filter(pl.col("point_id").is_in(val_pids_ds))
+    _px_ipc.unlink(missing_ok=True)
+
     val_ds = TAMDataset(
         val_pixel_df, val_py_labels,
         band_mean=band_mean, band_std=band_std,
@@ -753,7 +765,8 @@ def train_tam(
     model._use_s1 = cfg.use_s1
     model._pixel_zscore = cfg.pixel_zscore
     model._max_seq_len = cfg.max_seq_len
-    model._feature_cols = _feature_cols_override
+    model._feature_cols    = _feature_cols_override
+    model._s1_feature_cols = _s1_feature_cols_override
     model.to(device)
     logger.info(
         "Model: d_model=%d n_heads=%d n_layers=%d d_ff=%d  params=%d",
@@ -956,6 +969,10 @@ def load_tam(out_dir: Path, device: str | None = None) -> tuple[TAMClassifier, n
 
     state = torch.load(out_dir / "tam_model.pt", map_location=device, weights_only=True)
 
+    # Derive n_bands from the actual weight shape — config value may be stale
+    # if feature_cols_override was set but n_bands was not updated at save time.
+    cfg.n_bands = state["band_proj.weight"].shape[1]
+
     head_in = state["head.weight"].shape[1]
     extra = head_in - cfg.d_model
     cfg.use_n_obs = extra > 0
@@ -975,6 +992,10 @@ def load_tam(out_dir: Path, device: str | None = None) -> tuple[TAMClassifier, n
     model.eval()
 
     stats = np.load(out_dir / "tam_band_stats.npz")
+    # Columns excluded by feature_cols_override were never computed and saved as NaN.
+    # Replace with identity (mean=0, std=1) so fill_windows passes them through as zero.
+    band_mean_arr = np.where(np.isnan(stats["mean"]), 0.0, stats["mean"]).astype(np.float32)
+    band_std_arr  = np.where(np.isnan(stats["std"]),  1.0, stats["std"]).astype(np.float32)
     gf_stats_path = out_dir / "tam_global_feat_stats.npz"
     if gf_stats_path.exists():
         gf = np.load(gf_stats_path)
@@ -983,4 +1004,4 @@ def load_tam(out_dir: Path, device: str | None = None) -> tuple[TAMClassifier, n
     else:
         global_feat_mean = None
         global_feat_std  = None
-    return model, stats["mean"], stats["std"], global_feat_mean, global_feat_std
+    return model, band_mean_arr, band_std_arr, global_feat_mean, global_feat_std

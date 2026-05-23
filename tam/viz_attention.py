@@ -234,7 +234,7 @@ def main() -> None:
         del pixel_df
 
         pid_to_indices: dict[str, list[int]] = {}
-        for i, (pid, *_) in enumerate(ds._windows):
+        for i, pid in enumerate(ds._pids):
             pid_to_indices.setdefault(pid, []).append(i)
 
         for cls in [1.0, 0.0]:

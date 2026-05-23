@@ -19,7 +19,7 @@ import pyarrow.parquet as pq
 import pytest
 import torch
 
-from tam.core.dataset import BAND_COLS, S1_FEATURE_COLS
+from tam.core.dataset import BAND_COLS, S1_FEATURE_COLS, MIN_S1_OBS_PER_YEAR
 from tam.core.model import TAMClassifier
 from tam.core.score import (
     score_pixels_chunked, score_location_years, score_tiles_chunked,
@@ -858,3 +858,178 @@ class TestTSDS2ScorePixelsChunkedS1Despeckle:
         assert r_default["point_id"].to_list() == r_zero["point_id"].to_list()
         for a, b in zip(r_default["prob_tam"].to_list(), r_zero["prob_tam"].to_list()):
             assert a == pytest.approx(b, abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Helpers for mixed-mode tests
+# ---------------------------------------------------------------------------
+
+N_S1_OBS = max(MIN_S1_OBS_PER_YEAR, 6)  # enough S1 obs to clear the threshold
+
+
+def _make_mixed_parquet(
+    tmp_path: Path,
+    pixels: list[str],
+    years: list[int],
+    include_s1: bool = True,
+    n_s1_obs: int = N_S1_OBS,
+    filename: str = "mixed.parquet",
+) -> Path:
+    """Write a parquet with interleaved S2 and S1 rows (source column).
+
+    S2 rows carry spectral bands + scl_purity.
+    S1 rows carry raw linear vh/vv; all spectral band columns are absent/null.
+    """
+    rng = np.random.default_rng(55)
+    rows = []
+    for pid in pixels:
+        for yr in years:
+            # S2 observations
+            s2_dates = [datetime.date(yr, 1, 15) + datetime.timedelta(days=23 * i)
+                        for i in range(N_OBS_PER_YEAR)]
+            for d in s2_dates:
+                row = {
+                    "point_id": pid,
+                    "date": datetime.datetime(d.year, d.month, d.day),
+                    "source": "S2",
+                    "scl_purity": 1.0,
+                    "vh": None,
+                    "vv": None,
+                }
+                row.update(_band_row(rng))
+                rows.append(row)
+
+            if include_s1:
+                # S1 observations (sparser cadence — ~12-day repeat)
+                s1_dates = [datetime.date(yr, 1, 1) + datetime.timedelta(days=12 * i)
+                            for i in range(n_s1_obs)]
+                for d in s1_dates:
+                    rows.append({
+                        "point_id": pid,
+                        "date": datetime.datetime(d.year, d.month, d.day),
+                        "source": "S1",
+                        "scl_purity": None,
+                        "vh": float(rng.uniform(1e-4, 1e-2)),
+                        "vv": float(rng.uniform(1e-4, 1e-2)),
+                        **{b: None for b in BAND_COLS},
+                    })
+
+    df = pl.DataFrame(rows).with_columns(
+        pl.col("date").cast(pl.Datetime("us"))
+    ).sort(["point_id", "date"])
+    path = tmp_path / filename
+    pq.write_table(df.to_arrow(), path, row_group_size=N_OBS_PER_YEAR + n_s1_obs)
+    return path
+
+
+def _stub_mixed_model(
+    n_s2: int = 3,
+    n_s1: int = 2,
+) -> tuple[TAMClassifier, np.ndarray, np.ndarray]:
+    """Tiny mixed S2+S1 model stub. n_bands = n_s2 + n_s1."""
+    n_bands = n_s2 + n_s1
+    cfg = TAMConfig(d_model=16, n_heads=2, n_layers=1, d_ff=32,
+                    n_bands=n_bands, use_s1="mixed", n_global_features=0)
+    torch.manual_seed(13)
+    model = TAMClassifier.from_config(cfg)
+    model._use_s1 = "mixed"
+    model._pixel_zscore = False
+    model.eval()
+    band_mean = np.zeros(n_bands, dtype=np.float32)
+    band_std  = np.ones(n_bands,  dtype=np.float32)
+    return model, band_mean, band_std
+
+
+# ---------------------------------------------------------------------------
+# TS-MX  Mixed S2+S1 mode
+# ---------------------------------------------------------------------------
+
+class TestMixedModeScoring:
+    """score_pixels_chunked with mixed=True requires both S2 and S1 rows."""
+
+    S2_COLS = ["B02", "B03", "B04"]   # minimal S2 feature set for stub model
+    S1_COLS = ["s1_vh", "s1_vv"]
+
+    def _score(self, tmp_path, parquet_path, **kwargs):
+        model, band_mean, band_std = _stub_mixed_model(n_s2=len(self.S2_COLS),
+                                                        n_s1=len(self.S1_COLS))
+        return score_pixels_chunked(
+            parquet_path, model, band_mean, band_std,
+            device="cpu", mixed=True,
+            s2_feature_cols=self.S2_COLS,
+            s1_feature_cols=self.S1_COLS,
+            **kwargs,
+        )
+
+    def test_scores_produced_when_both_sources_present(self, tmp_path):
+        """Pixels with sufficient S2 and S1 obs must appear in output."""
+        path = _make_mixed_parquet(tmp_path, pixels=["px1", "px2"], years=[2023])
+        result = self._score(tmp_path, path)
+        assert set(result["point_id"]) == {"px1", "px2"}
+        assert result["prob_tam"].is_between(0, 1).all()
+
+    def test_pixels_without_s1_rows_are_excluded(self, tmp_path):
+        """A parquet with no S1 rows must produce zero scored pixels in mixed mode."""
+        path = _make_mixed_parquet(tmp_path, pixels=["px1", "px2"], years=[2023],
+                                   include_s1=False)
+        result = self._score(tmp_path, path)
+        assert len(result) == 0, (
+            "mixed mode must drop pixels with no S1 observations, got: "
+            f"{result['point_id'].to_list()}"
+        )
+
+    def test_pixels_with_too_few_s1_obs_are_excluded(self, tmp_path):
+        """Pixels with fewer than MIN_S1_OBS_PER_YEAR S1 obs must be dropped."""
+        path = _make_mixed_parquet(tmp_path, pixels=["px_sparse_s1"], years=[2023],
+                                   n_s1_obs=MIN_S1_OBS_PER_YEAR - 1)
+        result = self._score(tmp_path, path)
+        assert len(result) == 0, (
+            f"Expected no scores with only {MIN_S1_OBS_PER_YEAR - 1} S1 obs "
+            f"(threshold={MIN_S1_OBS_PER_YEAR}), got: {result['point_id'].to_list()}"
+        )
+
+    def test_minimum_s1_obs_threshold_exactly_met(self, tmp_path):
+        """Exactly MIN_S1_OBS_PER_YEAR S1 obs must be sufficient to score."""
+        path = _make_mixed_parquet(tmp_path, pixels=["px_exact"], years=[2023],
+                                   n_s1_obs=MIN_S1_OBS_PER_YEAR)
+        result = self._score(tmp_path, path)
+        assert "px_exact" in result["point_id"].to_list(), (
+            f"Pixel with exactly {MIN_S1_OBS_PER_YEAR} S1 obs should be scored"
+        )
+
+    def test_s2_scl_filter_does_not_drop_s1_rows(self, tmp_path):
+        """SCL purity filtering must not eliminate S1 rows (they have null scl_purity)."""
+        path = _make_mixed_parquet(tmp_path, pixels=["px1"], years=[2023])
+        # High scl_purity_min would drop S1 rows if filter incorrectly applied to them
+        result = self._score(tmp_path, path, scl_purity_min=0.99)
+        assert "px1" in result["point_id"].to_list(), (
+            "S1 rows must survive SCL purity filter applied to S2 rows"
+        )
+
+    def test_mixed_scores_differ_from_s2_only(self, tmp_path):
+        """A mixed model fed mixed data should score differently than if S1 rows are absent.
+
+        This guards against S1 obs being silently dropped — if they were, the two
+        runs would produce the same scores (same S2 data, same model).
+        """
+        path_mixed  = _make_mixed_parquet(tmp_path, pixels=["px1"], years=[2023],
+                                          include_s1=True,  filename="mixed.parquet")
+        path_s2only = _make_mixed_parquet(tmp_path, pixels=["px1"], years=[2023],
+                                          include_s1=False, filename="s2only.parquet")
+
+        model, band_mean, band_std = _stub_mixed_model(n_s2=len(self.S2_COLS),
+                                                        n_s1=len(self.S1_COLS))
+
+        def _run(path):
+            return score_pixels_chunked(
+                path, model, band_mean, band_std,
+                device="cpu", mixed=True,
+                s2_feature_cols=self.S2_COLS,
+                s1_feature_cols=self.S1_COLS,
+            )
+
+        r_mixed  = _run(path_mixed)
+        r_s2only = _run(path_s2only)
+
+        assert len(r_mixed) == 1, "mixed path must score px1"
+        assert len(r_s2only) == 0, "s2-only path must score nothing (no S1 obs)"
