@@ -19,7 +19,6 @@ Raw band signals
 Ratio signals (structural decoupling, hypothesised in ndsvi.py)
 --------------------------------------------------------------
     B12B11Signal   B12 / B11  — dry cellulose/lignin vs. liquid water
-    B11B08Signal   B11 / B08  — SWIR moisture loading vs. NIR canopy structure
 """
 
 from __future__ import annotations
@@ -77,26 +76,4 @@ class B12B11Signal(Signal):
             b11 = df["B11"].to_numpy().astype("float32")
             valid = good & (b11 != 0)
             out[valid] = b12[valid] / b11[valid]
-        return pl.Series(out)
-
-
-class B11B08Signal(Signal):
-    """SWIR/NIR moisture-structure ratio: B11 / B08.
-
-    B11 (~1610 nm) loads on liquid water content; B08 (~842 nm) tracks canopy
-    structure. The ratio captures moisture loading relative to canopy density,
-    expected to diverge between Parkinsonia's photosynthetic stems (low moisture,
-    high NIR) and surrounding grass (high moisture, moderate NIR).
-    """
-
-    name = "b11_b08"
-
-    def compute(self, df: pl.DataFrame) -> pl.Series:
-        good = self.quality_mask(df).to_numpy()
-        out = np.full(len(df), np.nan, dtype="float32")
-        if good.any():
-            b11 = df["B11"].to_numpy().astype("float32")
-            b08 = df["B08"].to_numpy().astype("float32")
-            valid = good & (b08 != 0)
-            out[valid] = b11[valid] / b08[valid]
         return pl.Series(out)

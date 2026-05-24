@@ -34,7 +34,6 @@ from signals.s2_bands import (
     B11Signal,
     B12Signal,
     B12B11Signal,
-    B11B08Signal,
 )
 from signals.temporal import TemporalVarianceSignal
 
@@ -57,7 +56,6 @@ __all__ = [
     "B11Signal",
     "B12Signal",
     "B12B11Signal",
-    "B11B08Signal",
     "TemporalVarianceSignal",
     "VHSignal",
     "VVSignal",

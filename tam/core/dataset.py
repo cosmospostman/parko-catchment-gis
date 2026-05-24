@@ -115,10 +115,6 @@ def collate_fn(samples: list[TAMSample]) -> dict:
     }
 
 
-def _add_spectral_indices_pl(df: pl.DataFrame) -> pl.DataFrame:
-    return add_spectral_indices(df)
-
-
 class TAMDataset(Dataset):
     """One item = one (pixel, year) annual observation window.
 
@@ -226,7 +222,7 @@ class TAMDataset(Dataset):
 
             _s2_index_cols = [c for c in s2_feature_cols if c in INDEX_COLS]
             if any(c not in s2_rows.columns for c in _s2_index_cols):
-                s2_rows = _add_spectral_indices_pl(s2_rows)
+                s2_rows = add_spectral_indices(s2_rows)
 
             df = pl.concat([s2_rows, s1_rows], how="diagonal_relaxed")
 
@@ -329,7 +325,7 @@ class TAMDataset(Dataset):
                     df = pixel_df
 
             if any(c not in df.columns for c in feature_cols if c in set(INDEX_COLS)):
-                df = _add_spectral_indices_pl(df)
+                df = add_spectral_indices(df)
 
             if pixel_zscore:
                 s2_zscore_cols = [c for c in feature_cols if c in df.columns]
@@ -357,7 +353,7 @@ class TAMDataset(Dataset):
 
         if use_s1 not in ("s1_only", "mixed"):
             if any(c not in df.columns for c in feature_cols if c in set(INDEX_COLS)):
-                df = _add_spectral_indices_pl(df)
+                df = add_spectral_indices(df)
 
             if "scl_purity" in df.columns:
                 df = df.filter(pl.col("scl_purity") >= scl_purity_min)

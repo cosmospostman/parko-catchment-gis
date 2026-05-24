@@ -1,7 +1,7 @@
 """Memory profile test for the TAM training pipeline.
 
 Run:
-    python -m tam.core.test_memory_profile
+    python scripts/profile_memory.py
 
 Probes RSS at every major stage of _cmd_train and train_tam using a small
 synthetic pixel_df (configurable scale). The test:

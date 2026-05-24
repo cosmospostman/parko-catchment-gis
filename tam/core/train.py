@@ -20,10 +20,9 @@ from torch.utils.data import DataLoader
 
 from tam.core.config import TAMConfig
 from tam.core.constants import DRY_DOY_MIN as _DRY_DOY_MIN, DRY_DOY_MAX as _DRY_DOY_MAX
-from tam.core.dataset import BAND_COLS, MAX_SEQ_LEN, S1_FEATURE_COLS, TAMDataset, V9_FEATURE_COLS, V10_FEATURE_COLS, V10_S1_FEATURE_COLS, collate_fn, lin_to_db
+from tam.core.dataset import BAND_COLS, MAX_SEQ_LEN, S1_FEATURE_COLS, TAMDataset, V9_FEATURE_COLS, collate_fn, lin_to_db
 from tam.core.global_features import GLOBAL_FEATURE_NAMES, compute_global_features
 from tam.core.model import TAMClassifier
-from analysis.constants import add_spectral_indices
 
 logger = logging.getLogger(__name__)
 
