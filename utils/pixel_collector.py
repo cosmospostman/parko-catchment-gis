@@ -298,6 +298,7 @@ def collect(
     geometry=None,
     n_workers: int | None = None,
     phases: set[str] | None = None,
+    target_extraction_gb: float = 4.0,
 ) -> list[Path]:
     """Collect S2 observations for bbox_wgs84, writing one parquet per S2 tile.
 
@@ -317,7 +318,12 @@ def collect(
     *n_workers* controls how many items are extracted concurrently during the
     shard write phase.  Each worker holds one item's full band patches in RAM,
     so this is the primary memory knob for large locations.  ``None`` (default)
-    auto-scales based on pixel count, targeting ~4 GB peak usage.
+    auto-scales based on pixel count and *target_extraction_gb*.
+
+    *target_extraction_gb* is the RAM budget passed to _auto_n_workers when
+    *n_workers* is None.  Callers that derive this from a system memory budget
+    (e.g. fetch_spec._budget_params) should pass it here; the default of 4 GB
+    matches the historical behaviour for direct callers.
 
     *phases* selects which pipeline phases to run.  Defaults to both:
       ``{"fetch", "extract"}``
@@ -342,10 +348,10 @@ def collect(
 
     # Resolve n_workers after the pixel grid so the auto-scale sees the real count.
     if n_workers is None:
-        n_workers = _auto_n_workers(len(points))
+        n_workers = _auto_n_workers(len(points), target_gb=target_extraction_gb)
     else:
         n_workers = max(1, n_workers)
-    logger.info("Extraction workers: %d (pixel count %d)", n_workers, len(points))
+    logger.info("Extraction workers: %d (pixel count %d, target %.0f GB)", n_workers, len(points), target_extraction_gb)
 
 
     point_coords = {pid: (lon, lat) for pid, lon, lat in points}
