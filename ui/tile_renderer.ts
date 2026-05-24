@@ -1,13 +1,11 @@
 /**
  * tile_renderer.ts — On-the-fly ranking tile renderer.
  *
- * Binary format (.bin): 32-byte header + N×8-byte records.
+ * Binary format v2 (.bin): 64-byte header + N×8-byte records.
+ * Detected by magic number BLN2 (0x424C4E32) at byte 0.
+ * See HEADER_BYTES_V2 block below for full layout.
  *
- * Header (32 bytes, little-endian):
- *   f64 lonMin, f64 latMax, f64 res, u32 width, u32 height
- *
- * Records (sorted by key ascending):
- *   u32 key (= yi*width + xi), f32 prob
+ * Legacy v1 (40-byte header, no magic): used by S1 tiles from s1_tile_builder.py.
  *
  * The .bin is built transparently from the CSV on first request and cached on
  * disk. In memory only the typed arrays (~17 MB for 2M pixels) are held.
@@ -26,12 +24,18 @@ const SCORES_DIR  = join(OUTPUTS_DIR, "scores");
 interface Grid {
   keys: Uint32Array;  // sorted cell indices (yi*width + xi)
   vals: Float32Array; // corresponding prob values
+  // UTM-based lookup (exact)
+  utmOriginE: number; // easting of xi=0 pixel centre
+  utmOriginN: number; // northing of yi=0 pixel centre (standard UTM, includes false northing)
+  res: number;        // pixel spacing in metres (10.0)
+  utmZone: number;    // positive = north, negative = south
+  width: number;
+  height: number;
+  // WGS84 fallback (kept for S1 grids built without UTM metadata)
   lonMin: number;
   latMax: number;
   resX: number;
   resY: number;
-  width: number;
-  height: number;
 }
 
 const GRID_CACHE_MAX = 3;
@@ -47,10 +51,76 @@ function cacheSet(key: string, grid: Grid): void {
 }
 
 // ---------------------------------------------------------------------------
+// UTM forward projection (WGS84 → UTM)
+// ---------------------------------------------------------------------------
+
+// Returns [easting, northing] in metres (standard UTM with false northing).
+// Southern hemisphere: northing includes the 10,000,000 m false northing
+// so values are large positive numbers (~8,000,000–10,000,000 for Australia).
+function wgs84ToUtm(latDeg: number, lonDeg: number, zone: number, south: boolean): [number, number] {
+  const a  = 6378137.0;
+  const f  = 1 / 298.257223563;
+  const b  = a * (1 - f);
+  const e2 = 1 - (b / a) ** 2;
+  const ep2 = e2 / (1 - e2);
+  const k0 = 0.9996;
+
+  const lat = latDeg  * Math.PI / 180;
+  const lon0 = ((zone - 1) * 6 - 180 + 3) * Math.PI / 180;
+  const lon = lonDeg * Math.PI / 180;
+
+  const N  = a / Math.sqrt(1 - e2 * Math.sin(lat) ** 2);
+  const T  = Math.tan(lat) ** 2;
+  const C  = ep2 * Math.cos(lat) ** 2;
+  const A  = Math.cos(lat) * (lon - lon0);
+  const M  = a * (
+    (1 - e2 / 4 - 3 * e2 ** 2 / 64 - 5 * e2 ** 3 / 256) * lat
+    - (3 * e2 / 8 + 3 * e2 ** 2 / 32 + 45 * e2 ** 3 / 1024) * Math.sin(2 * lat)
+    + (15 * e2 ** 2 / 256 + 45 * e2 ** 3 / 1024) * Math.sin(4 * lat)
+    - (35 * e2 ** 3 / 3072) * Math.sin(6 * lat)
+  );
+
+  const E = k0 * N * (
+    A + (1 - T + C) * A ** 3 / 6
+    + (5 - 18 * T + T ** 2 + 72 * C - 58 * ep2) * A ** 5 / 120
+  ) + 500000;
+
+  let Nval = k0 * (
+    M + N * Math.tan(lat) * (
+      A ** 2 / 2
+      + (5 - T + 9 * C + 4 * C ** 2) * A ** 4 / 24
+      + (61 - 58 * T + T ** 2 + 600 * C - 330 * ep2) * A ** 6 / 720
+    )
+  );
+  if (south) Nval += 10_000_000; // false northing for southern hemisphere
+
+  return [E, Nval];
+}
+
+// ---------------------------------------------------------------------------
 // .bin build + load
 // ---------------------------------------------------------------------------
 
-const HEADER_BYTES = 40; // 4×f64 + 2×u32: lonMin, latMax, resX, resY, width, height
+// New header layout (64 bytes), detected by magic number:
+//   [0]  u32 magic = 0x424C4E32 ("BLN2")
+//   [4]  i32 utmZone  (negative = southern hemisphere; 0 = WGS84 fallback only)
+//   [8]  f64 utmOriginE
+//   [16] f64 utmOriginN
+//   [24] f64 res          (pixel spacing in metres)
+//   [32] u32 width
+//   [36] u32 height
+//   [40] f64 lonMin   (WGS84 fallback / info)
+//   [48] f64 latMin   (WGS84 fallback / info)
+//   [56] f64 latMax   (WGS84 fallback / info)
+// Total: 64 bytes
+//
+// Old format (40 bytes, no magic): f64×4 + u32×2 = lonMin,latMax,resX,resY,width,height
+// Detected by: first 4 bytes reinterpreted as u32 ≠ BLN2_MAGIC.
+const HEADER_BYTES_V2 = 64;
+const HEADER_BYTES_V1 = 40;
+const BLN2_MAGIC = 0x424C4E32;
+// Export for use in loadBin size check
+const HEADER_BYTES = HEADER_BYTES_V2;
 
 function binPath(location: string, stem: string): string {
   return join(SCORES_DIR, location, `${stem}.bin`);
@@ -131,15 +201,29 @@ async function buildBin(csvPath: string, outPath: string): Promise<void> {
 
   // Use point_id grid dimensions when available; fall back to coordinate-derived grid.
   let width: number, height: number, resX: number, resY: number;
+  let utmOriginE = 0, utmOriginN = 0, utmZone = 0, res = 10.0;
   if (iId >= 0 && xiMax > 0 && yiMax > 0 && !isNaN(lonNW) && !isNaN(lonNE) && !isNaN(latSW)) {
     width  = xiMax + 1;
     height = yiMax + 1;
-    // resX from NW→NE lon span; resY from NW→SW lat span
+    // resX/resY kept for WGS84 fallback path only
     resX = (lonNE - lonNW) / xiMax;
     resY = (latNW - latSW) / yiMax;
-    // Use NW corner as origin
+    // Use NW corner as origin for WGS84 fallback
     lonMin = lonNW;
     latMax = latNW;
+    // Compute UTM origin from SW corner pixel (xi=0, yi=0)
+    // and infer zone from grid centre lon.
+    const centreLon = (lonNW + lonNE) / 2;
+    utmZone = Math.floor((centreLon + 180) / 6) + 1;
+    const south = latSW < 0;
+    if (south) utmZone = -utmZone; // negative = southern hemisphere
+    const [swE, swN] = wgs84ToUtm(latSW, lonSW, Math.abs(utmZone), south);
+    utmOriginE = swE;
+    utmOriginN = swN;
+    // Infer res from NW-SW northing span
+    const [nwE, nwN] = wgs84ToUtm(latNW, lonNW, Math.abs(utmZone), south);
+    res = Math.round((nwN - swN) / yiMax);  // should be ~10
+    if (res <= 0) res = 10;
   } else {
     resX = resY = 0.0001;
     width  = Math.round((lonMax - lonMin) / resX) + 1;
@@ -154,6 +238,7 @@ async function buildBin(csvPath: string, outPath: string): Promise<void> {
   });
 
   // Pass 2: fill pre-allocated typed arrays
+  // yi is stored as the raw pixel_collector yi (0 = southernmost, yiMax = northernmost).
   const keys = new Uint32Array(count);
   const vals = new Float32Array(count);
   let idx = 0;
@@ -165,12 +250,12 @@ async function buildBin(csvPath: string, outPath: string): Promise<void> {
     if (iId >= 0 && xiMax > 0) {
       const parts = cols[iId].split("_");
       xi = parseInt(parts[1]);
-      yi = yiMax - parseInt(parts[2]); // yi=0 → northernmost (latMax)
+      yi = parseInt(parts[2]); // raw: 0 = southernmost
     } else {
       const lon = parseFloat(cols[iLon]);
       const lat = parseFloat(cols[iLat]);
       xi = Math.round((lon - lonMin) / resX);
-      yi = Math.round((latMax - lat) / resY);
+      yi = Math.round((lat - latMin) / resY); // latMin = SW lat
     }
     keys[idx] = yi * width + xi;
     vals[idx] = prob;
@@ -189,15 +274,19 @@ async function buildBin(csvPath: string, outPath: string): Promise<void> {
     sortedVals[i] = vals[order[i]];
   }
 
-  // Write binary file
-  const buf = new ArrayBuffer(HEADER_BYTES + count * 8);
+  // Write binary file (64-byte v2 header)
+  const buf = new ArrayBuffer(HEADER_BYTES_V2 + count * 8);
   const dv  = new DataView(buf);
-  dv.setFloat64(0,  lonMin, true);
-  dv.setFloat64(8,  latMax, true);
-  dv.setFloat64(16, resX,   true);
-  dv.setFloat64(24, resY,   true);
-  dv.setUint32(32,  width,  true);
-  dv.setUint32(36,  height, true);
+  dv.setUint32(0,   BLN2_MAGIC,  true);
+  dv.setInt32(4,    utmZone,     true);
+  dv.setFloat64(8,  utmOriginE,  true);
+  dv.setFloat64(16, utmOriginN,  true);
+  dv.setFloat64(24, res,         true);
+  dv.setUint32(32,  width,       true);
+  dv.setUint32(36,  height,      true);
+  dv.setFloat64(40, lonMin,      true);
+  dv.setFloat64(48, latMin,      true);
+  dv.setFloat64(56, latMax,      true);
   let off = HEADER_BYTES;
   for (let i = 0; i < count; i++) {
     dv.setUint32(off,      sortedKeys[i], true);
@@ -213,22 +302,46 @@ async function buildBin(csvPath: string, outPath: string): Promise<void> {
 async function loadBin(path: string): Promise<Grid> {
   const raw = await Deno.readFile(path);
   const dv  = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
-  const lonMin  = dv.getFloat64(0,  true);
-  const latMax  = dv.getFloat64(8,  true);
-  const resX    = dv.getFloat64(16, true);
-  const resY    = dv.getFloat64(24, true);
-  const width   = dv.getUint32(32,  true);
-  const height  = dv.getUint32(36,  true);
-  const n = (raw.byteLength - HEADER_BYTES) / 8;
+
+  const magic = dv.getUint32(0, true);
+  const isV2  = magic === BLN2_MAGIC;
+  const hdrBytes = isV2 ? HEADER_BYTES_V2 : HEADER_BYTES_V1;
+
+  let utmOriginE: number, utmOriginN: number, res: number, utmZone: number;
+  let width: number, height: number, lonMin: number, latMax: number, resX: number, resY: number;
+
+  if (isV2) {
+    utmZone    = dv.getInt32(4,    true);
+    utmOriginE = dv.getFloat64(8,  true);
+    utmOriginN = dv.getFloat64(16, true);
+    res        = dv.getFloat64(24, true);
+    width      = dv.getUint32(32,  true);
+    height     = dv.getUint32(36,  true);
+    lonMin     = dv.getFloat64(40, true);
+    // latMin at [48] not needed at runtime
+    latMax     = dv.getFloat64(56, true);
+    resX = 0; resY = 0;
+  } else {
+    // Legacy v1 (S1 tiles, old score bins)
+    utmOriginE = 0; utmOriginN = 0; res = 10; utmZone = 0;
+    lonMin = dv.getFloat64(0,  true);
+    latMax = dv.getFloat64(8,  true);
+    resX   = dv.getFloat64(16, true);
+    resY   = dv.getFloat64(24, true);
+    width  = dv.getUint32(32,  true);
+    height = dv.getUint32(36,  true);
+  }
+
+  const n = (raw.byteLength - hdrBytes) / 8;
   const keys = new Uint32Array(n);
   const vals = new Float32Array(n);
-  let off = HEADER_BYTES;
+  let off = hdrBytes;
   for (let i = 0; i < n; i++) {
     keys[i] = dv.getUint32(off,     true);
     vals[i] = dv.getFloat32(off + 4, true);
     off += 8;
   }
-  return { keys, vals, lonMin, latMax, resX, resY, width, height };
+  return { keys, vals, utmOriginE, utmOriginN, res, utmZone, lonMin, latMax, resX, resY, width, height };
 }
 
 // ---------------------------------------------------------------------------
@@ -280,7 +393,7 @@ export function loadGrid(location: string, stem: string): Promise<Grid | null> {
       const st = Deno.statSync(bin);
       // A valid .bin has at least the header plus one record; a header-only file
       // means a previous buildBin was interrupted before the atomic rename.
-      binExists = st.size > HEADER_BYTES;
+      binExists = st.size > HEADER_BYTES_V2;
       if (!binExists) Deno.removeSync(bin);
     } catch { /* absent */ }
     if (!binExists) {
@@ -559,20 +672,35 @@ export async function renderTile(
   grid: Grid, z: number, x: number, y: number, cmap = "rdylgn", cutoff = 0,
 ): Promise<Uint8Array> {
   const stops = COLORMAPS[cmap] ?? COLORMAPS.rdylgn;
-  const { lonMin: tLonMin, lonMax: tLonMax, latMax: tLatMax, latMin: tLatMin } = tileBoundsWGS84(z, x, y);
+  const { lonMin: tLonMin, lonMax: tLonMax } = tileBoundsWGS84(z, x, y);
   const rgba = new Uint8ClampedArray(TILE_SIZE * TILE_SIZE * 4);
   const lonStep = (tLonMax - tLonMin) / TILE_SIZE;
-  const latStep = (tLatMax - tLatMin) / TILE_SIZE;
+
+  // Per-row latitude via inverse Mercator (aligns with Mercator-projected basemap).
+  const tn = 2 ** z;
+  const mercYTop  = Math.PI - (2 * Math.PI * y) / tn;
+  const mercYStep = (2 * Math.PI) / tn / TILE_SIZE;
+
+  const useUtm = grid.utmZone !== 0;
+  const utmZoneAbs = Math.abs(grid.utmZone);
+  const utmSouth   = grid.utmZone < 0;
 
   for (let py = 0; py < TILE_SIZE; py++) {
-    const lat = tLatMax - (py + 0.5) * latStep;
-    const yi = Math.round((grid.latMax - lat) / grid.resY);
-    if (yi < 0 || yi >= grid.height) continue;
+    const lat = Math.atan(Math.sinh(mercYTop - (py + 0.5) * mercYStep)) * (180 / Math.PI);
 
     for (let px = 0; px < TILE_SIZE; px++) {
       const lon = tLonMin + (px + 0.5) * lonStep;
-      const xi = Math.round((lon - grid.lonMin) / grid.resX);
-      if (xi < 0 || xi >= grid.width) continue;
+
+      let xi: number, yi: number;
+      if (useUtm) {
+        const [E, N] = wgs84ToUtm(lat, lon, utmZoneAbs, utmSouth);
+        xi = Math.round((E - grid.utmOriginE) / grid.res);
+        yi = Math.round((N - grid.utmOriginN) / grid.res);
+      } else {
+        xi = Math.round((lon - grid.lonMin)  / grid.resX);
+        yi = Math.round((grid.latMax - lat)  / grid.resY);
+      }
+      if (xi < 0 || xi >= grid.width || yi < 0 || yi >= grid.height) continue;
 
       const idx = bsearch(grid.keys, yi * grid.width + xi);
       if (idx < 0) continue;

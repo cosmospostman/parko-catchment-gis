@@ -8,24 +8,27 @@
   }
 
   let { title, onclose, children }: Props = $props();
+
+  let collapsed = $state(false);
 </script>
 
 <div class="map-card">
-  <div class="card-header">
-    <span class="card-title">{title}</span>
+  <div class="card-header" class:collapsed>
+    <button class="title-btn" onclick={() => { collapsed = !collapsed; }} type="button">
+      <span class="chevron" class:open={!collapsed}>&#9658;</span>
+      <span class="card-title">{title}</span>
+    </button>
     <button class="close-btn" onclick={onclose} type="button" aria-label="Close">×</button>
   </div>
-  <div class="card-body">
-    {@render children()}
-  </div>
+  {#if !collapsed}
+    <div class="card-body">
+      {@render children()}
+    </div>
+  {/if}
 </div>
 
 <style>
   .map-card {
-    position: absolute;
-    top: 12px;
-    left: 12px;
-    z-index: 10;
     background: #242424;
     border: 1px solid #333;
     border-radius: 6px;
@@ -37,8 +40,35 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 8px 10px 8px 14px;
+    padding: 8px 10px 8px 10px;
     border-bottom: 1px solid #333;
+  }
+
+  .card-header.collapsed {
+    border-bottom: none;
+  }
+
+  .title-btn {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 0;
+    flex: 1;
+    text-align: left;
+  }
+
+  .chevron {
+    font-size: 9px;
+    color: #555;
+    transition: transform 0.12s;
+    transform: rotate(0deg);
+  }
+
+  .chevron.open {
+    transform: rotate(90deg);
   }
 
   .card-title {
@@ -47,6 +77,10 @@
     color: #c0c0c0;
     letter-spacing: 0.02em;
     user-select: none;
+  }
+
+  .title-btn:hover .card-title {
+    color: #e0e0e0;
   }
 
   .close-btn {

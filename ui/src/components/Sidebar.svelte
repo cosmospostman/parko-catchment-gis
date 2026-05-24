@@ -4,7 +4,6 @@
   import ALASightings from './panels/ALASightings.svelte';
   import S1Renderer from './panels/S1Renderer.svelte';
   import NoiseFilter from './panels/NoiseFilter.svelte';
-  import RankingsOverlay from './panels/RankingsOverlay.svelte';
   import ImageryInfo from './panels/ImageryInfo.svelte';
   import LocationsList from './LocationsList.svelte';
   import { locationsStore } from '../stores/locations.svelte.ts';
@@ -41,7 +40,6 @@
     <LocationsList />
   </div>
   <div class="bottom-panels">
-    <RankingsOverlay />
     <ImageryInfo {onLayerChange} />
   </div>
 </aside>
