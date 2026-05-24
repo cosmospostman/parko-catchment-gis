@@ -203,7 +203,10 @@ def _load_or_compute_global_features(
 
 def _site_class(pid: str) -> tuple[str, str]:
     m = re.match(r"^(.+?)_(presence|absence)", pid)
-    return (m.group(1), m.group(2)) if m else (pid, "unknown")
+    if not m:
+        return (pid, "unknown")
+    site = re.sub(r"_val$", "", m.group(1))
+    return (site, m.group(2))
 
 
 def _cvar_auc(
@@ -292,7 +295,9 @@ def train_tam(
     ----------
     pixel_df:
         Raw observations for labeled pixels (all years). Must contain year column
-        (add via signals._shared.load_and_filter).
+        (add via signals._shared.load_and_filter). Pass via [frame].pop() at the
+        call site so the caller's reference is dropped before Python binds the
+        local name here — otherwise del pixel_df only goes refcount 2→1.
     labels:
         dict mapping point_id → label in {0.0, 1.0}.
     pixel_coords:
@@ -306,6 +311,7 @@ def train_tam(
     -------
     Tuple of (best-val-AUC TAMClassifier with weights loaded from checkpoint, best_val_auc float).
     """
+
     if cfg is None:
         cfg = TAMConfig()
 
@@ -332,6 +338,12 @@ def train_tam(
             pass
 
     _log_rss("after load")
+    logger.info(
+        "pixel_df on entry: %d rows × %d cols  estimated_size=%.1f GB  cols=%s",
+        len(pixel_df), pixel_df.width,
+        pixel_df.estimated_size() / 1e9,
+        pixel_df.columns,
+    )
 
     # --- Early column trim — drop lon/lat/item_id and any unrequired bands now
     # so all subsequent operations (SCL exclusion, presence filter, splits) work
@@ -350,6 +362,7 @@ def train_tam(
     if _str_cols:
         pixel_df = pixel_df.with_columns([pl.col(c).cast(pl.Categorical) for c in _str_cols])
     gc.collect()
+    logger.info("pixel_df after column trim: estimated_size=%.1f GB  cols=%s", pixel_df.estimated_size()/1e9, pixel_df.columns)
     _log_rss("after column trim")
 
     # --- SCL=6 exclusion — strip dark-area misclassifications from S2 rows only ---
@@ -423,6 +436,7 @@ def train_tam(
     if "source" in pixel_df.columns and cfg.use_s1 not in (True, "mixed", "s1_only"):
         pixel_df = pixel_df.filter(pl.col("source") == "S2")
         gc.collect()
+    logger.info("pixel_df after S1 drop: estimated_size=%.1f GB  rows=%d", pixel_df.estimated_size()/1e9, len(pixel_df))
     _log_rss("after S1 drop")
 
     # px_counts: unique pixel count per (site, class)
@@ -554,16 +568,31 @@ def train_tam(
     _log_rss("after presence filter")
 
     # --- Pixel-year summary table --------------------------------------------
-    val_site_set = set(cfg.val_sites) if cfg.val_sites else set()
-    if cfg.val_region_ids:
-        val_site_set |= {_site_class(rid)[0] for rid in cfg.val_region_ids}
+    # Derive train/val membership from the actual split label dicts, not from
+    # config site names. This correctly handles region-level splits where a
+    # single site (e.g. etna, landsend) contributes regions to both sets.
+    train_pids: set[str] = {k[0] for k in train_py_labels}
+    val_pids:   set[str] = {k[0] for k in val_py_labels}
 
-    final_all_py = {**train_py_labels, **val_py_labels}
-    final_counts: dict[tuple[str, str], int] = Counter(pid_to_sc[k[0]] for k in final_all_py)
+    train_px_counts:    dict[tuple[str, str], int] = Counter(pid_to_sc[p] for p in train_pids if p in pid_to_sc)
+    val_px_counts:      dict[tuple[str, str], int] = Counter(pid_to_sc[p] for p in val_pids   if p in pid_to_sc)
+    train_raw_counts:   dict[tuple[str, str], int] = Counter(pid_to_sc[k[0]] for k in train_py_labels)
+    val_raw_counts:     dict[tuple[str, str], int] = Counter(pid_to_sc[k[0]] for k in val_py_labels)
+    train_final_counts: dict[tuple[str, str], int] = Counter(pid_to_sc[k[0]] for k in train_py_labels)
+    val_final_counts:   dict[tuple[str, str], int] = Counter(pid_to_sc[k[0]] for k in val_py_labels)
 
-    all_keys = sorted(raw_counts.keys(), key=lambda k: (k[0] in val_site_set, k[0], k[1]))
+    all_sc_keys = set(train_px_counts) | set(val_px_counts)
+    train_sites    = sorted({s for s, _ in all_sc_keys if (s, "presence") in train_px_counts or (s, "absence") in train_px_counts})
+    val_sites_only = sorted({s for s, _ in all_sc_keys if s not in set(train_sites)
+                              and ((s, "presence") in val_px_counts or (s, "absence") in val_px_counts)})
+    val_sites_also = sorted({s for s, _ in all_sc_keys if s in set(train_sites)
+                              and ((s, "presence") in val_px_counts or (s, "absence") in val_px_counts)})
+    val_sites_sorted = val_sites_only + val_sites_also
 
-    col_w = max((len(f"{s} {c}") for s, c in all_keys), default=20) + 2
+    col_w = max(
+        (len(f"HOLDOUT: {s} {c}") for s in val_sites_sorted for c in ("presence", "absence")),
+        default=20
+    ) + 2
 
     def neg(n: int, w: int) -> str:
         return f"-{n:>{w - 2},}" if n else f"{'':>{w}}"
@@ -574,64 +603,68 @@ def train_tam(
     header = f"{'':>{col_w}}  {'Raw px':>8}  {'Raw py':>8}  {'Noise py':>8}  {'Stride px':>10}  {'Total py':>8}"
     sep    = "-" * len(header)
 
-    train_sites = sorted({s for s, _ in all_keys if s not in val_site_set})
-    val_sites_sorted = sorted({s for s, _ in all_keys if s in val_site_set})
-
-    def site_rows(sites: list[str], prefix: str = "") -> tuple[list[str], int, int, int, int, int]:
+    def site_rows_split(
+        sites: list[str],
+        spx: dict, sraw: dict, snoise: dict, sstride: dict, sfinal: dict,
+        prefix: str = "",
+    ) -> tuple[list[str], int, int, int, int, int]:
         block_lines = []
         b_px = b_raw = b_noise = b_stride = b_final = 0
         for site in sites:
             for cls in ("presence", "absence"):
                 key = (site, cls)
-                if key not in raw_counts:
+                if key not in sraw:
                     continue
-                px     = px_counts.get(key, 0)
-                raw    = raw_counts.get(key, 0)
-                noise  = noise_removed.get(key, 0)
-                stride = stride_removed.get(key, 0)
-                final  = final_counts.get(key, 0)
+                px     = spx.get(key, 0)
+                raw    = sraw.get(key, 0)
+                noise  = snoise.get(key, 0)
+                stride = sstride.get(key, 0)
+                final  = sfinal.get(key, 0)
                 block_lines.append(row(f"{prefix}{site} {cls}", px, raw, noise, stride, final))
                 b_px += px; b_raw += raw; b_noise += noise; b_stride += stride; b_final += final
         return block_lines, b_px, b_raw, b_noise, b_stride, b_final
 
     lines = [sep, header, sep]
 
-    train_rows, train_px, train_raw, train_noise, train_stride, train_final = site_rows(train_sites)
+    train_rows, train_px, train_raw, train_noise, train_stride, train_final = site_rows_split(
+        train_sites, train_px_counts, train_raw_counts, noise_removed, stride_removed, train_final_counts)
     lines.extend(train_rows)
     lines.append("")
     lines.append(row("PRESENCE",
-        sum(px_counts.get((s, "presence"), 0) for s in train_sites),
-        sum(raw_counts.get((s, "presence"), 0) for s in train_sites),
+        sum(train_px_counts.get((s, "presence"), 0) for s in train_sites),
+        sum(train_raw_counts.get((s, "presence"), 0) for s in train_sites),
         sum(noise_removed.get((s, "presence"), 0) for s in train_sites),
         sum(stride_removed.get((s, "presence"), 0) for s in train_sites),
-        sum(final_counts.get((s, "presence"), 0) for s in train_sites),
+        sum(train_final_counts.get((s, "presence"), 0) for s in train_sites),
     ))
     lines.append(row("ABSENCE",
-        sum(px_counts.get((s, "absence"), 0) for s in train_sites),
-        sum(raw_counts.get((s, "absence"), 0) for s in train_sites),
+        sum(train_px_counts.get((s, "absence"), 0) for s in train_sites),
+        sum(train_raw_counts.get((s, "absence"), 0) for s in train_sites),
         sum(noise_removed.get((s, "absence"), 0) for s in train_sites),
         sum(stride_removed.get((s, "absence"), 0) for s in train_sites),
-        sum(final_counts.get((s, "absence"), 0) for s in train_sites),
+        sum(train_final_counts.get((s, "absence"), 0) for s in train_sites),
     ))
     lines.append(row("TRAIN TOTAL", train_px, train_raw, train_noise, train_stride, train_final))
     lines.append(sep)
 
-    val_rows, val_px, val_raw, val_noise, val_stride, val_final = site_rows(val_sites_sorted, prefix="HOLDOUT: ")
+    val_rows, val_px, val_raw, val_noise, val_stride, val_final = site_rows_split(
+        val_sites_sorted, val_px_counts, val_raw_counts, noise_removed, stride_removed, val_final_counts,
+        prefix="HOLDOUT: ")
     lines.extend(val_rows)
     lines.append("")
     lines.append(row("PRESENCE",
-        sum(px_counts.get((s, "presence"), 0) for s in val_sites_sorted),
-        sum(raw_counts.get((s, "presence"), 0) for s in val_sites_sorted),
+        sum(val_px_counts.get((s, "presence"), 0) for s in val_sites_sorted),
+        sum(val_raw_counts.get((s, "presence"), 0) for s in val_sites_sorted),
         sum(noise_removed.get((s, "presence"), 0) for s in val_sites_sorted),
         0,
-        sum(final_counts.get((s, "presence"), 0) for s in val_sites_sorted),
+        sum(val_final_counts.get((s, "presence"), 0) for s in val_sites_sorted),
     ))
     lines.append(row("ABSENCE",
-        sum(px_counts.get((s, "absence"), 0) for s in val_sites_sorted),
-        sum(raw_counts.get((s, "absence"), 0) for s in val_sites_sorted),
+        sum(val_px_counts.get((s, "absence"), 0) for s in val_sites_sorted),
+        sum(val_raw_counts.get((s, "absence"), 0) for s in val_sites_sorted),
         sum(noise_removed.get((s, "absence"), 0) for s in val_sites_sorted),
         0,
-        sum(final_counts.get((s, "absence"), 0) for s in val_sites_sorted),
+        sum(val_final_counts.get((s, "absence"), 0) for s in val_sites_sorted),
     ))
     lines.append(row("VAL TOTAL", val_px, val_raw, val_noise, val_stride, val_final))
     lines.append(sep)
@@ -658,23 +691,21 @@ def train_tam(
         pixel_df = pixel_df.drop("source")
         gc.collect()
 
-    # Spill pixel_df to IPC then free it. Each split is then read back
-    # independently so only one filtered copy exists at a time, avoiding the
-    # 3× peak (pixel_df + train slice + val slice) that occurred previously.
-    import tempfile as _tf
-    _spill_dir = Path("/data") if Path("/data").exists() else Path(_tf.gettempdir())
-    _px_ipc = Path(_tf.NamedTemporaryFile(suffix="_pixel_df.ipc", delete=False, dir=_spill_dir).name)
-    pixel_df.write_ipc(_px_ipc)
-    del pixel_df
-    gc.collect()
-    _log_rss("after IPC spill")
-
     train_pids_ds = set(k[0] for k in train_py_labels)
     val_pids_ds   = set(k[0] for k in val_py_labels)
 
+    # Slice train/val before freeing pixel_df. pixel_df arrives with refcount=1
+    # (caller used [frame].pop()) so del here genuinely frees it.
+    # Build both slices first, then free pixel_df, so peak = pixel_df + train + val
+    # briefly, but pixel_df is freed before TAMDataset construction (the expensive step).
+    train_pixel_df = pixel_df.filter(pl.col("point_id").is_in(train_pids_ds))
+    val_pixel_df   = pixel_df.filter(pl.col("point_id").is_in(val_pids_ds))
+    del pixel_df
+    gc.collect()
+    _log_rss("after split + free pixel_df")
+
     # --- Train dataset -------------------------------------------------------
     _log_rss("before train_ds")
-    train_pixel_df = pl.read_ipc(_px_ipc).filter(pl.col("point_id").is_in(train_pids_ds))
 
     _doy_s2_counts: np.ndarray | None = None
     _doy_s1_counts: np.ndarray | None = None
@@ -711,9 +742,6 @@ def train_tam(
     _log_rss("after train_ds, before val_ds")
 
     # --- Val dataset ---------------------------------------------------------
-    val_pixel_df = pl.read_ipc(_px_ipc).filter(pl.col("point_id").is_in(val_pids_ds))
-    _px_ipc.unlink(missing_ok=True)
-
     val_ds = TAMDataset(
         val_pixel_df, val_py_labels,
         band_mean=band_mean, band_std=band_std,

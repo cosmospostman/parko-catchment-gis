@@ -20,6 +20,7 @@ import os
 import sys
 from pathlib import Path
 
+import numpy as np
 import polars as pl
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -39,9 +40,46 @@ logger = logging.getLogger(__name__)
 # train subcommand
 # ---------------------------------------------------------------------------
 
+def _rss_gb() -> float:
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1e6
+    except Exception:
+        pass
+    return float("nan")
+
+
+def _pixel_df_cache_key(
+    tile_specs: list[tuple[Path, list[str], int]],
+    exp_name: str,
+    feature_cols: list[str],
+    region_ids: list[str],
+    want_pixel_zscore: bool,
+    want_s1_data: bool,
+    load_stride: int,
+) -> str:
+    """Stable hash covering all inputs that determine the content of pixel_df_cache.parquet."""
+    import hashlib as _hl
+    parts: list[str] = [
+        exp_name,
+        ",".join(sorted(feature_cols)),
+        ",".join(sorted(region_ids)),
+        f"zscore={want_pixel_zscore}",
+        f"s1={want_s1_data}",
+        f"stride={load_stride}",
+    ]
+    for path, cols, _ in sorted(tile_specs, key=lambda x: str(x[0])):
+        st = path.stat()
+        parts.append(f"{path}:{st.st_mtime_ns}:{st.st_size}:{','.join(sorted(cols))}")
+    return _hl.md5("\n".join(parts).encode()).hexdigest()
+
+
 def _cmd_train(args: argparse.Namespace) -> None:
     """Train a named experiment, loading pixels from data/training/tiles/."""
     import importlib
+    import subprocess
     import pyarrow.parquet as pq
 
     try:
@@ -61,6 +99,9 @@ def _cmd_train(args: argparse.Namespace) -> None:
     regions = select_regions(exp.region_ids)
     tile_ids = tile_ids_for_regions(exp.region_ids)
     logger.info("Experiment: %s  tiles: %d  regions: %s", exp.name, len(tile_ids), exp.region_ids)
+
+    out_dir = Path(args.output_dir) if args.output_dir else PROJECT_ROOT / "outputs" / "models" / f"tam-{exp.name}"
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     # Load labeled pixels from training tile parquets — row groups read in parallel.
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -90,185 +131,262 @@ def _cmd_train(args: argparse.Namespace) -> None:
         read_cols = base_cols + [c for c in exp.feature_cols if c in available] + s1_cols + s2_global_cols
         tile_specs.append((path, read_cols, pf.metadata.num_row_groups))
 
-    def _read_tile(path: Path, cols: list[str], n_rg: int) -> pl.DataFrame:
-        """Read all row groups of one tile with bounded parallelism."""
-        pf = pq.ParquetFile(path)
-        rg_chunks: list[pl.DataFrame] = []
-        # 4 threads per tile overlaps I/O without blowing memory across tiles.
-        n_workers = min(4, n_rg)
-        with ThreadPoolExecutor(max_workers=n_workers) as ex:
-            futures = {ex.submit(pf.read_row_group, rg, columns=cols): rg for rg in range(n_rg)}
-            for fut in as_completed(futures):
-                rg_chunks.append(pl.from_arrow(fut.result()))
-        return pl.concat(rg_chunks)
-
-    # Filter to known training region point_ids before accumulating tiles.
-    # point_id format is <region_id>_<row>_<col>; strip the trailing two numeric
-    # segments to recover the region prefix and match against the experiment set.
-    # Applying this per-tile keeps each tile's footprint small before concat.
-    import re as _re
-    _suffix_re = _re.compile(r"_\d+_\d+$")
-    known_region_ids = set(exp.region_ids)
-
-    def _filter_to_regions(df: pl.DataFrame) -> pl.DataFrame:
-        return df.filter(
-            df["point_id"].str.replace(_suffix_re.pattern, "", literal=False).is_in(known_region_ids)
-        )
-
-    # Load-time spatial stride: thin unique point_ids per tile before accumulating.
-    # This mirrors the train_tam spatial_stride logic but runs early enough to keep
-    # tile_dfs small — at 100M+ rows the accumulated object arrays OOM before concat.
-    # stride=1 is a no-op. The same stride is re-applied in train_tam to labels only,
-    # which is harmless (the strided pixels are simply absent from pixel_df).
+    _want_pixel_zscore = exp.train_kwargs.get("pixel_zscore", False)
     _load_stride = args.spatial_stride or exp.train_kwargs.get("spatial_stride", 1) or 1
 
-    def _stride_tile(df: pl.DataFrame, stride: int) -> pl.DataFrame:
-        if stride <= 1:
-            return df
-        # Sort by lat/lon for a geographically systematic (reproducible) sample.
-        keep = set(
-            df.select(["point_id", "lat", "lon"])
-            .unique("point_id")
-            .sort(["lat", "lon"])["point_id"]
-            .gather(list(range(0, df["point_id"].n_unique(), stride)))
-            .to_list()
-        )
-        return df.filter(pl.col("point_id").is_in(keep))
-
-    # Read tiles one at a time, filter and thin immediately — peak memory per
-    # iteration is one raw tile, not the accumulation of all tiles.
-    # If band summaries are needed, compute them per tile here so we never need
-    # an S2-only copy of the full pixel_df later (avoids a ~25 GB transient spike).
-    _want_band_summaries = exp.train_kwargs.get("use_band_summaries", True)
-    _bs_feature_cols: list[str] | None = None
-    if _want_band_summaries:
-        from tam.core.train import _compute_band_summaries
-        from tam.core.dataset import V9_FEATURE_COLS as _V9_FEATURE_COLS
-        _bs_feature_cols = _V9_FEATURE_COLS
-
-    _want_pixel_zscore = exp.train_kwargs.get("pixel_zscore", False)
-    _zscore_feature_cols: list[str] | None = (
-        list(exp.train_kwargs["feature_cols_override"]) if "feature_cols_override" in exp.train_kwargs
-        else list(exp.feature_cols)
-    ) if _want_pixel_zscore else None
-
-    def _apply_pixel_zscore(df: pl.DataFrame, feature_cols: list[str]) -> pl.DataFrame:
-        """Z-score each pixel's S2 band values by its own multi-year mean/std.
-
-        All rows for a given point_id reside in the same tile parquet, so
-        per-tile computation is equivalent to computing over the full dataset.
-        Uses group_by on a small tile frame (cheap) rather than over() on the
-        concatenated 137M-row frame (expensive).
-        """
-        s2_cols = [c for c in feature_cols if c in df.columns]
-        if not s2_cols:
-            return df
-        has_source = "source" in df.columns
-        source_filter = (pl.col("source") == "S2") if has_source else pl.lit(True)
-        stats = (
-            df.lazy()
-            .filter(source_filter)
-            .select(["point_id"] + s2_cols)
-            .group_by("point_id")
-            .agg(
-                [pl.col(c).mean().alias(f"{c}__mean") for c in s2_cols] +
-                [pl.col(c).std().alias(f"{c}__std")  for c in s2_cols]
-            )
-        )
-        stat_cols = [f"{c}__mean" for c in s2_cols] + [f"{c}__std" for c in s2_cols]
-        if has_source:
-            s2_mask = pl.col("source") == "S2"
-            normed_exprs = [
-                pl.when(s2_mask)
-                  .then((pl.col(c) - pl.col(f"{c}__mean").fill_null(0.0)) /
-                        pl.col(f"{c}__std").fill_null(1e-6).clip(lower_bound=1e-6))
-                  .otherwise(pl.col(c))
-                  .alias(c)
-                for c in s2_cols
-            ]
-        else:
-            normed_exprs = [
-                ((pl.col(c) - pl.col(f"{c}__mean").fill_null(0.0)) /
-                 pl.col(f"{c}__std").fill_null(1e-6).clip(lower_bound=1e-6)).alias(c)
-                for c in s2_cols
-            ]
-        return (
-            df.lazy()
-            .join(stats, on="point_id", how="left")
-            .with_columns(normed_exprs)
-            .drop(stat_cols)
-            .collect()
-        )
-
-    tile_dfs: list[pl.DataFrame] = []
-    band_summary_dfs: list[pl.DataFrame] = []
-    for path, cols, n_rg in tile_specs:
-        logger.info("Loading tile %s (%d row groups) ...", path.name, n_rg)
-        tile_df = _stride_tile(_filter_to_regions(_read_tile(path, cols, n_rg)), _load_stride)
-        if len(tile_df) > 0:
-            if _want_band_summaries and _bs_feature_cols is not None:
-                band_summary_dfs.append(_compute_band_summaries(tile_df, _bs_feature_cols))
-            if _want_pixel_zscore and _zscore_feature_cols is not None:
-                tile_df = _apply_pixel_zscore(tile_df, _zscore_feature_cols)
-            tile_dfs.append(tile_df)
-        del tile_df
-        gc.collect()
-
-    if not tile_dfs:
-        logger.error("No training data found for experiment %s", exp.name)
-        sys.exit(1)
-
-    band_summaries: pl.DataFrame | None = None
-    if band_summary_dfs:
-        band_summaries = pl.concat(band_summary_dfs)
-        del band_summary_dfs
-        gc.collect()
-        logger.info("Band summaries precomputed per tile: %d pixels", len(band_summaries))
-
-    pixel_df = pl.concat(tile_dfs)
-    del tile_dfs
-    gc.collect()
-    logger.info("After region filter: %d rows", len(pixel_df))
-
-    # Parse date column and derive year/doy.
-    pixel_df = pixel_df.with_columns(
-        pl.col("date").cast(pl.Utf8).str.to_date().alias("_date_parsed")
-    ).with_columns(
-        pl.col("_date_parsed").dt.year().alias("year"),
-        pl.col("_date_parsed").dt.ordinal_day().alias("doy"),
-    ).drop("_date_parsed")
-
-    # Per-region year pinning: drop observations outside [min(years), max(years)]
-    # (guards against post-clearance imagery; window is now explicit in the YAML).
-    drop_mask = pl.lit(False)
-    for region in regions:
-        lon_min, lat_min, lon_max, lat_max = region.bbox
-        in_region = (
-            pl.col("lon").is_between(lon_min, lon_max) &
-            pl.col("lat").is_between(lat_min, lat_max)
-        )
-        out_of_window = in_region & (
-            (pl.col("year") < min(region.years)) |
-            (pl.col("year") > max(region.years))
-        )
-        drop_mask = drop_mask | out_of_window
-    pixel_df = pixel_df.filter(~drop_mask)
-    gc.collect()
-
-    # Build labels from regions
-    pixel_coords = (
-        pixel_df.select(["point_id", "lon", "lat"])
-        .unique("point_id")
+    # --- Cache check: skip tile loading if pixel_df_cache is up to date ------
+    _cache_parquet = out_dir / "pixel_df_cache.parquet"
+    _cache_key_path = out_dir / "pixel_df_cache.key"
+    _cache_key = _pixel_df_cache_key(
+        tile_specs, exp.name, list(exp.feature_cols), list(exp.region_ids),
+        _want_pixel_zscore, _want_s1_data, _load_stride,
     )
-    labelled = label_pixels(pixel_coords, regions)
-    labelled_known = labelled.filter(pl.col("is_presence").is_not_null())
-    labels: dict[str, float] = {
-        row[0]: 1.0 if row[1] else 0.0
-        for row in labelled_known.select(["point_id", "is_presence"]).iter_rows()
-    }
+    _cache_hit = (
+        _cache_parquet.exists()
+        and _cache_key_path.exists()
+        and _cache_key_path.read_text().strip() == _cache_key
+    )
 
-    out_dir = Path(args.output_dir) if args.output_dir else PROJECT_ROOT / "outputs" / "models" / f"tam-{exp.name}"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if _cache_hit:
+        logger.info("pixel_df cache hit — skipping tile load (key=%s)", _cache_key[:12])
+        # Load supporting files written alongside the cache.
+        band_summaries: pl.DataFrame | None = None
+        _bs_cache = out_dir / "pixel_df_band_summaries.parquet"
+        if _bs_cache.exists():
+            band_summaries = pl.from_arrow(pq.read_table(_bs_cache))
+            logger.info("Band summaries from cache: %d pixels", len(band_summaries))
+    else:
+        def _read_tile(path: Path, cols: list[str], n_rg: int) -> pl.DataFrame:
+            """Read all row groups of one tile with bounded parallelism."""
+            pf = pq.ParquetFile(path)
+            rg_chunks: list[pl.DataFrame] = []
+            # 4 threads per tile overlaps I/O without blowing memory across tiles.
+            n_workers = min(4, n_rg)
+            with ThreadPoolExecutor(max_workers=n_workers) as ex:
+                futures = {ex.submit(pf.read_row_group, rg, columns=cols): rg for rg in range(n_rg)}
+                for fut in as_completed(futures):
+                    rg_chunks.append(pl.from_arrow(fut.result()))
+            return pl.concat(rg_chunks)
+
+        # Filter to known training region point_ids before accumulating tiles.
+        # point_id format is <region_id>_<row>_<col>; strip the trailing two numeric
+        # segments to recover the region prefix and match against the experiment set.
+        # Applying this per-tile keeps each tile's footprint small before concat.
+        import re as _re
+        _suffix_re = _re.compile(r"_\d+_\d+$")
+        known_region_ids = set(exp.region_ids)
+
+        def _filter_to_regions(df: pl.DataFrame) -> pl.DataFrame:
+            return df.filter(
+                df["point_id"].str.replace(_suffix_re.pattern, "", literal=False).is_in(known_region_ids)
+            )
+
+        # Load-time spatial stride: thin unique point_ids per tile before accumulating.
+        # This mirrors the train_tam spatial_stride logic but runs early enough to keep
+        # tile_dfs small — at 100M+ rows the accumulated object arrays OOM before concat.
+        # stride=1 is a no-op. The same stride is re-applied in train_tam to labels only,
+        # which is harmless (the strided pixels are simply absent from pixel_df).
+        def _stride_tile(df: pl.DataFrame, stride: int) -> pl.DataFrame:
+            if stride <= 1:
+                return df
+            # Sort by lat/lon for a geographically systematic (reproducible) sample.
+            keep = set(
+                df.select(["point_id", "lat", "lon"])
+                .unique("point_id")
+                .sort(["lat", "lon"])["point_id"]
+                .gather(list(range(0, df["point_id"].n_unique(), stride)))
+                .to_list()
+            )
+            return df.filter(pl.col("point_id").is_in(keep))
+
+        # Read tiles one at a time, filter and thin immediately — peak memory per
+        # iteration is one raw tile, not the accumulation of all tiles.
+        # If band summaries are needed, compute them per tile here so we never need
+        # an S2-only copy of the full pixel_df later (avoids a ~25 GB transient spike).
+        _want_band_summaries = exp.train_kwargs.get("use_band_summaries", True)
+        _bs_feature_cols: list[str] | None = None
+        if _want_band_summaries:
+            from tam.core.train import _compute_band_summaries
+            from tam.core.dataset import V9_FEATURE_COLS as _V9_FEATURE_COLS
+            _bs_feature_cols = _V9_FEATURE_COLS
+
+        _zscore_feature_cols: list[str] | None = (
+            list(exp.train_kwargs["feature_cols_override"]) if "feature_cols_override" in exp.train_kwargs
+            else list(exp.feature_cols)
+        ) if _want_pixel_zscore else None
+
+        def _apply_pixel_zscore(df: pl.DataFrame, feature_cols: list[str]) -> pl.DataFrame:
+            """Z-score each pixel's S2 band values by its own multi-year mean/std.
+
+            All rows for a given point_id reside in the same tile parquet, so
+            computing over the concat'd frame is equivalent to per-tile computation.
+
+            Implementation: sort by point_id codes (int32 when Categorical, avoids
+            string comparison), then use np.add.reduceat for vectorised per-pixel
+            mean/std without a group_by+join (which leaves phantom jemalloc arenas).
+            """
+            s2_cols = [c for c in feature_cols if c in df.columns]
+            if not s2_cols:
+                return df
+
+            has_source = "source" in df.columns
+            if has_source:
+                s2_mask_arr = (df["source"] == "S2").to_numpy()
+            else:
+                s2_mask_arr = np.ones(len(df), dtype=bool)
+
+            # Sort by point_id. If Categorical, sort by int32 codes (faster, avoids
+            # materialising the full string array for argsort).
+            pid_col = df["point_id"]
+            if pid_col.dtype == pl.Categorical:
+                sort_key = pid_col.to_physical().to_numpy()  # int32 codes
+            else:
+                sort_key = pid_col.to_numpy()
+            sort_idx = np.argsort(sort_key, kind="stable")
+            inv_idx = np.empty_like(sort_idx)
+            inv_idx[sort_idx] = np.arange(len(df))
+
+            pid_sorted = sort_key[sort_idx]
+            s2_mask_sorted = s2_mask_arr[sort_idx]
+
+            # S2-only rows in sorted order; compute per-pixel boundaries.
+            s2_idx_sorted = np.where(s2_mask_sorted)[0]
+            s2_pid_sorted = pid_sorted[s2_idx_sorted]
+            s2_bounds = np.nonzero(s2_pid_sorted[1:] != s2_pid_sorted[:-1])[0] + 1 if len(s2_pid_sorted) > 1 else np.array([], dtype=np.int64)
+            s2_starts = np.concatenate([[0], s2_bounds])
+            s2_ns = np.diff(np.concatenate([s2_starts, [len(s2_pid_sorted)]]))
+            del pid_sorted, s2_pid_sorted, s2_bounds  # free before per-col loop
+
+            updated_cols: dict[str, np.ndarray] = {}
+            for c in s2_cols:
+                arr = df[c].to_numpy().astype(np.float32, copy=False)
+                arr_sorted = arr[sort_idx].astype(np.float64)  # float64 for accumulation (ddof=1)
+                s2_vals = arr_sorted[s2_idx_sorted]
+                group_sums = np.add.reduceat(s2_vals, s2_starts)
+                group_means = group_sums / s2_ns
+                mean_per_s2 = np.repeat(group_means, s2_ns)
+                diffs_sq = (s2_vals - mean_per_s2) ** 2
+                group_var_sums = np.add.reduceat(diffs_sq, s2_starts)
+                group_stds = np.maximum(np.sqrt(group_var_sums / np.maximum(s2_ns - 1, 1)), 1e-6)
+                std_per_s2 = np.repeat(group_stds, s2_ns)
+                arr_sorted[s2_idx_sorted] = (s2_vals - mean_per_s2) / std_per_s2
+                updated_cols[c] = arr_sorted[inv_idx].astype(np.float32)
+
+            return df.with_columns([
+                pl.Series(c, updated_cols[c]) for c in s2_cols
+            ])
+
+        tile_dfs: list[pl.DataFrame] = []
+        band_summary_dfs: list[pl.DataFrame] = []
+        for path, cols, n_rg in tile_specs:
+            logger.info("Loading tile %s (%d row groups) ...", path.name, n_rg)
+            tile_df = _stride_tile(_filter_to_regions(_read_tile(path, cols, n_rg)), _load_stride)
+            if len(tile_df) > 0:
+                if _want_band_summaries and _bs_feature_cols is not None:
+                    band_summary_dfs.append(_compute_band_summaries(tile_df, _bs_feature_cols))
+                # Cast point_id to Categorical now so the accumulated tile_dfs use
+                # 4 bytes/row instead of ~29 bytes/row for the string column.
+                if "point_id" in tile_df.columns:
+                    tile_df = tile_df.with_columns(pl.col("point_id").cast(pl.Categorical))
+                tile_dfs.append(tile_df)
+            del tile_df
+            gc.collect()
+            logger.info("  RSS after tile: %.1f GB", _rss_gb())
+
+        if not tile_dfs:
+            logger.error("No training data found for experiment %s", exp.name)
+            sys.exit(1)
+
+        band_summaries = None
+        if band_summary_dfs:
+            band_summaries = pl.concat(band_summary_dfs)
+            del band_summary_dfs
+            gc.collect()
+            logger.info("Band summaries precomputed per tile: %d pixels", len(band_summaries))
+
+        pixel_df = pl.concat(tile_dfs)
+        del tile_dfs
+        gc.collect()
+        logger.info(
+            "After concat: %d rows  estimated_size=%.1f GB  RSS=%.1f GB",
+            len(pixel_df), pixel_df.estimated_size() / 1e9, _rss_gb(),
+        )
+
+        # Apply pixel zscore once on the full frame rather than per-tile.
+        # Per-tile zscore leaves phantom jemalloc arenas after each tile that never
+        # return to the OS; across 15 tiles this accumulates ~15-20 GB of phantom RSS.
+        # A single pass on the concat'd frame incurs the arena cost only once.
+        # point_id is already Categorical from the per-tile cast above, so np.argsort
+        # on the codes (int32) is faster and cheaper than sorting strings.
+        if _want_pixel_zscore and _zscore_feature_cols is not None:
+            logger.info("Applying pixel zscore on full frame (%d rows)  RSS=%.1f GB ...", len(pixel_df), _rss_gb())
+            pixel_df = _apply_pixel_zscore(pixel_df, _zscore_feature_cols)
+            gc.collect()
+            logger.info("After pixel zscore: estimated_size=%.1f GB  RSS=%.1f GB", pixel_df.estimated_size() / 1e9, _rss_gb())
+
+        # Parse date column and derive year/doy.
+        pixel_df = pixel_df.with_columns(
+            pl.col("date").cast(pl.Utf8).str.to_date().alias("_date_parsed")
+        ).with_columns(
+            pl.col("_date_parsed").dt.year().alias("year"),
+            pl.col("_date_parsed").dt.ordinal_day().alias("doy"),
+        ).drop("_date_parsed")
+
+        # Per-region year pinning: drop observations outside [min(years), max(years)]
+        # (guards against post-clearance imagery; window is now explicit in the YAML).
+        drop_mask = pl.lit(False)
+        for region in regions:
+            lon_min, lat_min, lon_max, lat_max = region.bbox
+            in_region = (
+                pl.col("lon").is_between(lon_min, lon_max) &
+                pl.col("lat").is_between(lat_min, lat_max)
+            )
+            out_of_window = in_region & (
+                (pl.col("year") < min(region.years)) |
+                (pl.col("year") > max(region.years))
+            )
+            drop_mask = drop_mask | out_of_window
+        pixel_df = pixel_df.filter(~drop_mask)
+        gc.collect()
+
+        # Build labels and filter pixel_df to labeled pixels only.
+        pixel_coords = (
+            pixel_df.select(["point_id", "lon", "lat"])
+            .unique("point_id")
+        )
+        labelled = label_pixels(pixel_coords, regions)
+        labelled_known = labelled.filter(pl.col("is_presence").is_not_null())
+        labels: dict[str, float] = {
+            row[0]: 1.0 if row[1] else 0.0
+            for row in labelled_known.select(["point_id", "is_presence"]).iter_rows()
+        }
+        labeled_pids = set(labels.keys())
+        pixel_df = pixel_df.filter(pl.col("point_id").is_in(labeled_pids))
+
+        # Write cache — cast Categorical back to String so the worker can reload
+        # without needing to reconstruct the category dictionary.
+        logger.info("Writing pixel_df cache: %d rows  RSS=%.1f GB ...", len(pixel_df), _rss_gb())
+        _str_cols = [c for c in pixel_df.columns if pixel_df[c].dtype == pl.Categorical]
+        _cache_df = pixel_df.with_columns([pl.col(c).cast(pl.String) for c in _str_cols]) if _str_cols else pixel_df
+        _cache_df.write_parquet(_cache_parquet)
+        del _cache_df, pixel_df
+        gc.collect()
+        logger.info("pixel_df cache written: RSS=%.1f GB", _rss_gb())
+
+        _cache_key_path.write_text(_cache_key)
+        logger.info("Cache key written: %s", _cache_key[:12])
+
+        pixel_coords.write_parquet(out_dir / "pixel_df_pixel_coords.parquet")
+        if band_summaries is not None:
+            band_summaries.write_parquet(out_dir / "pixel_df_band_summaries.parquet")
+        with open(out_dir / "pixel_df_labels.json", "w") as _fh:
+            json.dump(labels, _fh)
+
+    # --- Build cfg (needed whether cache hit or miss) -------------------------
+    if _cache_hit:
+        with open(out_dir / "pixel_df_labels.json") as _fh:
+            labels = {k: float(v) for k, v in json.load(_fh).items()}
+        pixel_coords = pl.from_arrow(pq.read_table(out_dir / "pixel_df_pixel_coords.parquet"))
 
     train_kwargs = dict(exp.train_kwargs)
     model_kwargs = dict(exp.model_kwargs)
@@ -324,20 +442,29 @@ def _cmd_train(args: argparse.Namespace) -> None:
         **overrides,
     )
 
-    labeled_pids = set(labels.keys())
-    pixel_df = pixel_df.filter(pl.col("point_id").is_in(labeled_pids))
-    gc.collect()
+    # --- Spawn training subprocess -------------------------------------------
+    # The parent process has ~20 GB of phantom jemalloc arenas from tile loading
+    # and DataFrame operations. These can never be returned to the OS in-process.
+    # The worker starts fresh (zero phantom arenas), reads pixel_df via PyArrow
+    # (not jemalloc), builds TAMDataset, trains, and saves the checkpoint. When
+    # the worker exits the OS unconditionally reclaims all its memory.
+    _worker_args = {
+        "labels":  labels,
+        "cfg":     {k: v for k, v in cfg.__dict__.items() if not k.startswith("_")},
+        "device":  args.device,
+    }
+    with open(out_dir / "worker_args.json", "w") as _fh:
+        json.dump(_worker_args, _fh, default=lambda x: list(x) if isinstance(x, (tuple, set)) else x)
 
-    _, best_val_auc = train_tam(
-        pixel_df=pixel_df,
-        labels=labels,
-        pixel_coords=pixel_coords,
-        out_dir=out_dir,
-        cfg=cfg,
-        device=args.device,
-        precomputed_band_summaries=band_summaries,
+    logger.info("Spawning training worker (fresh process, zero phantom arenas) ...")
+    result = subprocess.run(
+        [sys.executable, "-m", "tam._train_worker",
+         str(out_dir), str(out_dir), args.experiment],
+        check=False,
     )
-    del pixel_df
+    if result.returncode != 0:
+        raise SystemExit(f"Training worker exited with code {result.returncode}")
+
     if _want_pixel_zscore:
         _cfg_path = out_dir / "tam_config.json"
         with open(_cfg_path) as _fh:
@@ -345,6 +472,12 @@ def _cmd_train(args: argparse.Namespace) -> None:
         _saved["inference_pixel_zscore"] = True
         with open(_cfg_path, "w") as _fh:
             json.dump(_saved, _fh, indent=2)
+
+    best_val_auc = 0.0
+    _cfg_path = out_dir / "tam_config.json"
+    if _cfg_path.exists():
+        with open(_cfg_path) as _fh:
+            best_val_auc = json.load(_fh).get("best_val_auc", 0.0)
     logger.info("Checkpoint saved to %s  best_val_auc=%.3f", out_dir, best_val_auc)
 
 

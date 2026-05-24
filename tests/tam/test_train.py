@@ -15,7 +15,7 @@ import torch
 from tam.core.config import TAMConfig
 from tam.core.dataset import ALL_FEATURE_COLS, BAND_COLS, TAMDataset, collate_fn
 from tam.core.model import TAMClassifier
-from tam.core.train import load_tam, spatial_split, train_tam
+from tam.core.train import load_tam, region_holdout_split, spatial_split, train_tam
 
 
 # ---------------------------------------------------------------------------
@@ -289,3 +289,127 @@ class TestTT10S2ColsLoadedForNoiseFilter:
         assert gf["dry_ndvi"].is_null().all(), "dry_ndvi should be NaN when B08/B04 absent"
         assert gf["rec_p"].is_null().all(),    "rec_p should be NaN when B08/B04 absent"
         assert gf["nir_cv"].is_null().all(),   "nir_cv should be NaN when B08/B04 absent"
+
+
+# ---------------------------------------------------------------------------
+# TT-11: region_holdout_split with a site that spans both train and val regions
+# ---------------------------------------------------------------------------
+
+class TestTT11RegionHoldoutSplitSharedSite:
+    """Regression test: when a site has regions in both train and val, only the
+    val-region pixels must be held out — not the entire site."""
+
+    def test_shared_site_pixels_split_by_region(self):
+        # site "alpha": region alpha_presence_1 → train, alpha_presence_2 → val
+        # Point IDs follow the <region_id>_<row>_<col> convention.
+        labels = {
+            "alpha_presence_1_0_0": 1.0,
+            "alpha_presence_1_0_1": 1.0,
+            "alpha_presence_2_0_0": 1.0,
+            "alpha_presence_2_0_1": 1.0,
+            "beta_absence_1_0_0":   0.0,
+        }
+        val_region_ids = ("alpha_presence_2",)
+
+        train, val = region_holdout_split(labels, val_region_ids)
+
+        assert "alpha_presence_1_0_0" in train, "train-region pixel must remain in train"
+        assert "alpha_presence_1_0_1" in train
+        assert "alpha_presence_2_0_0" in val,   "val-region pixel must be held out"
+        assert "alpha_presence_2_0_1" in val
+        assert "beta_absence_1_0_0"   in train, "unrelated site must stay in train"
+        assert set(train.keys()) & set(val.keys()) == set(), "splits must be disjoint"
+
+    def test_no_pixel_lost(self):
+        labels = {
+            "alpha_presence_1_0_0": 1.0,
+            "alpha_presence_2_0_0": 1.0,
+        }
+        train, val = region_holdout_split(labels, ("alpha_presence_2",))
+        assert len(train) + len(val) == len(labels)
+
+
+# ---------------------------------------------------------------------------
+# TT-12: pixel summary table shows shared site in both TRAIN and HOLDOUT
+# ---------------------------------------------------------------------------
+
+class TestTT12SummaryTableSharedSite:
+    """Regression test for the pixel-year summary table bug: a site that
+    contributes regions to both train and val must appear in both the TRAIN
+    and HOLDOUT sections of the logged summary."""
+
+    @pytest.fixture
+    def shared_site_pixel_df(self, band_cols) -> pl.DataFrame:
+        """Two regions of site 'alpha' and one region of site 'beta'.
+        alpha_presence_1 → train, alpha_presence_2 → val."""
+        rng = np.random.default_rng(7)
+        rows = []
+        pids = [
+            "alpha_presence_1_0_0",
+            "alpha_presence_1_0_1",
+            "alpha_presence_2_0_0",
+            "alpha_presence_2_0_1",
+            "beta_absence_1_0_0",
+            "beta_absence_1_0_1",
+            "beta_absence_1_0_2",
+            "beta_absence_1_0_3",
+        ]
+        start = datetime.date(2023, 1, 15)
+        dates = [start + datetime.timedelta(days=15 * i) for i in range(20)]
+        for pid in pids:
+            for d in dates:
+                rows.append({
+                    "point_id": pid, "date": str(d),
+                    "scl_purity": 1.0, "year": 2023,
+                    **{b: float(rng.uniform(0.01, 0.5)) for b in band_cols},
+                })
+        return pl.DataFrame(rows)
+
+    @pytest.fixture
+    def shared_site_labels(self) -> dict[str, float]:
+        return {
+            "alpha_presence_1_0_0": 1.0,
+            "alpha_presence_1_0_1": 1.0,
+            "alpha_presence_2_0_0": 1.0,
+            "alpha_presence_2_0_1": 1.0,
+            "beta_absence_1_0_0":   0.0,
+            "beta_absence_1_0_1":   0.0,
+            "beta_absence_1_0_2":   0.0,
+            "beta_absence_1_0_3":   0.0,
+        }
+
+    @pytest.fixture
+    def shared_site_coords(self, shared_site_labels) -> pl.DataFrame:
+        rows = [{"point_id": pid, "lon": 144.0, "lat": -20.0 - i * 0.5}
+                for i, pid in enumerate(shared_site_labels)]
+        return pl.DataFrame(rows)
+
+    @pytest.fixture
+    def shared_site_cfg(self, band_cols) -> TAMConfig:
+        return TAMConfig(
+            d_model=16, n_heads=2, n_layers=1, d_ff=32,
+            n_bands=len(ALL_FEATURE_COLS),
+            use_s1=False,
+            n_global_features=0,
+            n_epochs=2, patience=2, batch_size=4,
+            val_region_ids=("alpha_presence_2",),
+        )
+
+    def test_shared_site_in_both_summary_sections(
+        self, tmp_path, caplog,
+        shared_site_pixel_df, shared_site_labels, shared_site_coords, shared_site_cfg,
+    ):
+        import logging
+        with caplog.at_level(logging.INFO, logger="tam.core.train"):
+            train_tam(
+                shared_site_pixel_df, shared_site_labels, shared_site_coords,
+                out_dir=tmp_path, cfg=shared_site_cfg, device="cpu",
+            )
+
+        summary = "\n".join(caplog.messages)
+        # alpha must appear in TRAIN (its train-region pixels)
+        assert "alpha presence" in summary, \
+            "alpha must appear in the TRAIN section (has train-region pixels)"
+        # alpha must also appear in HOLDOUT (its val-region pixels)
+        assert "HOLDOUT: alpha presence" in summary, \
+            "alpha must appear in the HOLDOUT section (has val-region pixels)"
