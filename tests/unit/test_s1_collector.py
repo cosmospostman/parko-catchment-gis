@@ -61,7 +61,8 @@ from rasterio.transform import from_origin
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from utils.s1_collector import _reconstruct_affine, _extract_item, collect_s1, _chip_cache_path, _load_chip, _save_chip
+from utils.s1_collector import _reconstruct_affine, _extract_item, collect_s1
+from utils.fetch import _cache_path as _s1_cache_path, _load_patch_cache, _save_patch_cache
 from utils.parquet_utils import _extend_schema, _conform_table, _s1_df_to_arrow
 
 
@@ -107,12 +108,15 @@ def _make_item(
     if vv_arr is None:
         vv_arr = np.full((nrows, ncols), 0.002, dtype=np.float32)
 
-    # Patch rasterio.open so _read_band_array works without real files
+    # Patch rasterio.open so _read_band_array / _read_bbox_patch work without real files
     class _FakeDataset:
-        def __init__(self, arr):
+        def __init__(self, arr, affine=None):
+            from pyproj import CRS
             self._arr = arr
             self.width = arr.shape[1]
             self.height = arr.shape[0]
+            self.transform = affine  # needed by _read_bbox_patch
+            self.crs = CRS.from_epsg(32755)  # needed by _read_bbox_patch
 
         def __enter__(self):
             return self
@@ -134,10 +138,10 @@ def _make_item(
     _arrays = {}
     if vh_arr is not None:
         assets["vh"] = SimpleNamespace(href="fake://vh")
-        _arrays["fake://vh"] = _FakeDataset(vh_arr)
+        _arrays["fake://vh"] = _FakeDataset(vh_arr, affine)
     if vv_arr is not None:
         assets["vv"] = SimpleNamespace(href="fake://vv")
-        _arrays["fake://vv"] = _FakeDataset(vv_arr)
+        _arrays["fake://vv"] = _FakeDataset(vv_arr, affine)
 
     return SimpleNamespace(
         id=item_id,
@@ -414,10 +418,12 @@ class _MockRasterioDataset:
     """Minimal rasterio dataset mock that exercises the real window arithmetic."""
 
     def __init__(self, arr: np.ndarray, affine, width: int, height: int):
+        from pyproj import CRS
         self._arr = arr
-        self.transform = affine   # identity by default (S1 has no embedded transform)
+        self.transform = affine
         self.width = width
         self.height = height
+        self.crs = CRS.from_epsg(32755)
 
     def __enter__(self):
         return self
@@ -551,7 +557,7 @@ def test_read_band_array_returns_none_on_rasterio_exception(monkeypatch):
 # End-to-end tests (E2E-1 to E2E-2) — realistic rasterio mock, no STAC
 # ---------------------------------------------------------------------------
 
-def _make_s1_item_with_mock_open(
+def _make_s1_item(
     item_id: str,
     lon_origin: float,
     lat_origin: float,
@@ -562,153 +568,157 @@ def _make_s1_item_with_mock_open(
     vv_val: float = 0.02,
     dt=None,
 ):
-    """Build a mock S1 STAC item backed by a _MockRasterioDataset."""
-    import rasterio
+    """Build a minimal mock S1 STAC item (no rasterio datasets needed)."""
     from datetime import datetime, timezone
-
     if dt is None:
         dt = datetime(2022, 8, 15, tzinfo=timezone.utc)
-
     affine = _north_up_affine(lon_origin, lat_origin, res)
     pt = [affine.a, affine.b, affine.c, affine.d, affine.e, affine.f]
-
-    vh_arr = np.full((nrows, ncols), vh_val, dtype=np.float32)
-    vv_arr = np.full((nrows, ncols), vv_val, dtype=np.float32)
-
-    datasets = {
-        f"fake://{item_id}/vh": _MockRasterioDataset(vh_arr, affine, ncols, nrows),
-        f"fake://{item_id}/vv": _MockRasterioDataset(vv_arr, affine, ncols, nrows),
-    }
-
     return SimpleNamespace(
         id=item_id,
         datetime=dt,
         bbox=[lon_origin, lat_origin - nrows * res, lon_origin + ncols * res, lat_origin],
-        properties={"proj:transform": pt},
+        properties={"proj:transform": pt, "proj:epsg": 32755, "sat:orbit_state": "ascending"},
         assets={
             "vh": SimpleNamespace(href=f"fake://{item_id}/vh"),
             "vv": SimpleNamespace(href=f"fake://{item_id}/vv"),
         },
-        _datasets=datasets,
+        _vh_val=vh_val,
+        _vv_val=vv_val,
+        _nrows=nrows,
+        _ncols=ncols,
+        _lon_origin=lon_origin,
+        _lat_origin=lat_origin,
+        _res=res,
     )
 
 
-@pytest.fixture()
-def _patch_rasterio_realistic(monkeypatch):
-    """Route rasterio.open to item._datasets for fake:// hrefs."""
-    import rasterio
-    import inspect
+def _make_fake_fetch_patches(items_by_id: dict):
+    """Return a coroutine that populates cache_dir with fake S1 patches instead of fetching.
 
-    original_open = rasterio.open
+    Patches are written in EPSG:4326 so CachedNpzChipStore doesn't need to reproject
+    the test points — it just does a direct degree-space pixel lookup.
 
-    def _smart_open(href, *args, **kwargs):
-        if not str(href).startswith("fake://"):
-            return original_open(href, *args, **kwargs)
-        frame = inspect.currentframe()
-        while frame:
-            for name, val in frame.f_locals.items():
-                if hasattr(val, "_datasets") and href in val._datasets:
-                    return val._datasets[href]
-            frame = frame.f_back
-        raise FileNotFoundError(f"No mock dataset for {href}")
+    items_by_id maps item_id → item SimpleNamespace (with _vh_val, _vv_val, etc.).
+    """
+    async def _fake_fetch_patches(
+        points, items, bands, bbox_wgs84,
+        scl_filter=True, max_concurrent=32, band_alias=None, cache_dir=None, item_signer=None,
+    ):
+        from utils.fetch import _save_patch_cache, _cache_path, _load_patch_cache
+        from pyproj import CRS
+        crs = CRS.from_epsg(4326)
+        if cache_dir is None:
+            return {}
+        for item in items:
+            spec = items_by_id.get(item.id)
+            if spec is None:
+                continue
+            # Use a degree-space affine so (lon, lat) map directly to pixel indices
+            affine = _north_up_affine(spec._lon_origin, spec._lat_origin, spec._res)
+            for band in bands:
+                path = _cache_path(cache_dir, item.id, band)
+                if path.exists() and _load_patch_cache(path) is not None:
+                    continue  # already cached
+                val = spec._vh_val if band == "vh" else spec._vv_val
+                arr = np.full((spec._nrows, spec._ncols), val, dtype=np.float32)
+                _save_patch_cache(path, (arr, affine, crs), fetch_bbox=bbox_wgs84)
+        return {}
+    return _fake_fetch_patches
 
-    monkeypatch.setattr(rasterio, "open", _smart_open)
 
+def test_e2e_collect_s1_returns_rows(monkeypatch, tmp_path):
+    """collect_s1 with mocked fetch_patches returns non-empty DataFrame.
 
-def test_e2e_collect_s1_returns_rows(monkeypatch, _patch_rasterio_realistic):
-    """collect_s1 with a realistic rasterio mock returns non-empty DataFrame.
-
-    This is the end-to-end test that would have caught the production bug:
-    it verifies that S1 rows are actually produced, not just that no exception
-    is raised.
+    This verifies that S1 rows are actually produced end-to-end from cached
+    patches through CachedNpzChipStore extraction.
     """
     import utils.s1_collector as mod
+    import utils.fetch as fetch_mod
 
     res = 10 / 111320
     lon_origin, lat_origin = 145.0, -22.8
     nrows, ncols = 50, 50
-    item = _make_s1_item_with_mock_open(
-        "S1A_test", lon_origin, lat_origin, res, nrows, ncols
-    )
+    item = _make_s1_item("S1A_test", lon_origin, lat_origin, res, nrows, ncols)
+    items_by_id = {item.id: item}
+
     monkeypatch.setattr(mod, "search_sentinel1", lambda **kw: [item])
     monkeypatch.setattr(mod, "filter_items_by_bbox", lambda i, b: i)
     monkeypatch.setattr(mod, "setup_gdal_env", lambda: None)
+    monkeypatch.setattr(fetch_mod, "fetch_patches", _make_fake_fetch_patches(items_by_id))
 
     bbox = [lon_origin, lat_origin - nrows * res, lon_origin + ncols * res, lat_origin]
     points = [
         (f"px_{r:04d}_{c:04d}", lon_origin + (c + 0.5) * res, lat_origin - (r + 0.5) * res)
         for r in range(nrows) for c in range(ncols)
     ]
-    df = mod.collect_s1(bbox, "2022-01-01", "2022-12-31", points)
+    df = mod.collect_s1(bbox, "2022-01-01", "2022-12-31", points, cache_dir=tmp_path / "s1_chips")
 
     assert not df.is_empty(), (
-        "collect_s1 returned empty DataFrame — S1 rows were not produced. "
-        "This reproduces the production bug where _pixel_window raised WindowError."
+        "collect_s1 returned empty DataFrame — S1 rows were not produced."
     )
     assert (df["source"] == "S1").all()
     assert df["vh"].is_not_null().any()
     assert df["vv"].is_not_null().any()
 
 
-def test_e2e_collect_s1_out_of_extent_item_skipped(monkeypatch, _patch_rasterio_realistic):
-    """collect_s1 silently skips items whose raster does not cover the target bbox.
+def test_e2e_collect_s1_out_of_extent_item_skipped(monkeypatch, tmp_path):
+    """collect_s1 returns empty DataFrame when patches don't cover the target points.
 
-    This is the exact production failure mode: filter_items_by_bbox accepts an item
-    because its bounding envelope overlaps, but the actual raster extent does not
-    reach the target. _pixel_window must return None (not raise), and collect_s1
-    must return an empty DataFrame, not crash.
+    Simulates the production failure: item bbox overlaps the target but raster
+    data doesn't reach the exact pixel location.
     """
     import utils.s1_collector as mod
+    import utils.fetch as fetch_mod
 
     res = 10 / 111320
-    # Raster covers 134.86 → ~138.2 lon, -18.0 → ~-19.4 lat
-    # Target bbox is at lon 137.2, lat -19.59 — south of raster bottom edge
-    raster_lon, raster_lat = 134.86, -18.0
-    nrows, ncols = 16843, 26001  # real scene dimensions
+    # Patches cover the raster origin area — points are placed far outside
+    item = _make_s1_item("S1A_out_of_extent", 134.86, -18.0, res, 50, 50)
+    items_by_id = {item.id: item}
 
-    item = _make_s1_item_with_mock_open(
-        "S1A_out_of_extent", raster_lon, raster_lat, res, nrows, ncols
-    )
     monkeypatch.setattr(mod, "search_sentinel1", lambda **kw: [item])
     monkeypatch.setattr(mod, "filter_items_by_bbox", lambda i, b: i)
     monkeypatch.setattr(mod, "setup_gdal_env", lambda: None)
+    monkeypatch.setattr(fetch_mod, "fetch_patches", _make_fake_fetch_patches(items_by_id))
 
     bbox = [137.2, -19.59, 137.22, -19.58]
     points = [("px_0000", 137.21, -19.585)]
 
-    df = mod.collect_s1(bbox, "2022-01-01", "2022-12-31", points)
+    df = mod.collect_s1(bbox, "2022-01-01", "2022-12-31", points, cache_dir=tmp_path / "s1_chips")
     assert df.is_empty(), (
-        "Expected empty DataFrame when item does not cover target bbox — "
-        "collect_s1 must not crash or return phantom rows."
+        "Expected empty DataFrame when patches don't cover target points."
     )
 
 
-# Cache round-trip tests
+# Cache round-trip tests (using fetch.py _save_patch_cache / _load_patch_cache)
 # ---------------------------------------------------------------------------
 
-def test_save_and_load_chip_roundtrip(tmp_path):
+def test_save_and_load_patch_roundtrip(tmp_path):
+    """fetch.py patch cache stores arr, transform, and CRS; round-trips correctly."""
     from affine import Affine
+    from pyproj import CRS
     arr = np.array([[0.001, 0.002], [0.003, 0.004]], dtype=np.float32)
     win_affine = Affine(0.0001, 0, 145.0, 0, -0.0001, -22.9)
+    crs = CRS.from_epsg(32755)
     path = tmp_path / "S1A_item" / "vh.npz"
-    _save_chip(path, arr, win_affine)
+    _save_patch_cache(path, (arr, win_affine, crs))
     assert path.exists()
-    loaded = _load_chip(path)
+    loaded = _load_patch_cache(path)
     assert loaded is not None
-    arr_out, affine_out = loaded
+    arr_out, affine_out, crs_out = loaded
     np.testing.assert_array_almost_equal(arr_out, arr)
     assert abs(affine_out.a - win_affine.a) < 1e-10
     assert abs(affine_out.c - win_affine.c) < 1e-10
 
 
-def test_load_chip_missing_returns_none(tmp_path):
-    assert _load_chip(tmp_path / "nonexistent.npz") is None
+def test_load_patch_missing_returns_none(tmp_path):
+    assert _load_patch_cache(tmp_path / "nonexistent.npz") is None
 
 
-def test_load_chip_corrupt_returns_none(tmp_path):
+def test_load_patch_corrupt_returns_none(tmp_path):
     p = tmp_path / "corrupt.npz"
     p.write_bytes(b"not a valid npz")
-    assert _load_chip(p) is None
+    assert _load_patch_cache(p) is None
 
 
 def test_read_band_array_writes_cache(tmp_path, monkeypatch):
@@ -729,12 +739,14 @@ def test_read_band_array_loads_from_cache(tmp_path, monkeypatch):
     """Second call should load from cache without calling rasterio.open."""
     import utils.s1_collector as mod
     from affine import Affine
+    from pyproj import CRS
 
-    # Pre-populate cache with known values
+    # Pre-populate cache with known values in the new fetch.py format (arr, affine, crs)
     expected_arr = np.array([[0.999]], dtype=np.float32)
     win_affine = Affine(10 / 111320, 0, 145.0, 0, -(10 / 111320), -22.9)
+    crs = CRS.from_epsg(32755)
     cache_path = tmp_path / "item" / "vh.npz"
-    _save_chip(cache_path, expected_arr, win_affine)
+    _save_patch_cache(cache_path, (expected_arr, win_affine, crs))
 
     # rasterio.open should NOT be called
     import rasterio
@@ -751,11 +763,15 @@ def test_read_band_array_loads_from_cache(tmp_path, monkeypatch):
 def test_collect_s1_writes_chip_cache(tmp_path, monkeypatch):
     """collect_s1 should populate cache_dir with per-(item,band) .npz files."""
     import utils.s1_collector as mod
+    import utils.fetch as fetch_mod
+
     res = 10 / 111320
-    item = _make_item(nrows=4, ncols=4, lon_origin=145.0, lat_origin=-22.9, res=res)
+    item = _make_s1_item("S1A_IW_GRDH_20220815", 145.0, -22.9, res, 4, 4)
+    items_by_id = {item.id: item}
     monkeypatch.setattr(mod, "search_sentinel1", lambda **kw: [item])
     monkeypatch.setattr(mod, "filter_items_by_bbox", lambda i, b: i)
     monkeypatch.setattr(mod, "setup_gdal_env", lambda: None)
+    monkeypatch.setattr(fetch_mod, "fetch_patches", _make_fake_fetch_patches(items_by_id))
 
     bbox = [145.0, -22.9 - 4 * res, 145.0 + 4 * res, -22.9]
     points = [("px_0000", 145.0 + 0.5 * res, -22.9 - 0.5 * res)]
@@ -763,16 +779,18 @@ def test_collect_s1_writes_chip_cache(tmp_path, monkeypatch):
 
     collect_s1(bbox, "2022-01-01", "2022-12-31", points, cache_dir=cache_dir)
 
-    assert _chip_cache_path(cache_dir, item.id, "vh", bbox).exists()
-    assert _chip_cache_path(cache_dir, item.id, "vv", bbox).exists()
+    assert _s1_cache_path(cache_dir, item.id, "vh").exists()
+    assert _s1_cache_path(cache_dir, item.id, "vv").exists()
 
 
 def test_collect_s1_uses_cache_on_second_call(tmp_path, monkeypatch):
-    """Second collect_s1 call returns same data from cache; rasterio not called."""
+    """Second collect_s1 call returns same data using the on-disk patch cache."""
     import utils.s1_collector as mod
-    import rasterio
+    import utils.fetch as fetch_mod
+
     res = 10 / 111320
-    item = _make_item(nrows=4, ncols=4, lon_origin=145.0, lat_origin=-22.9, res=res)
+    item = _make_s1_item("S1A_IW_GRDH_20220815", 145.0, -22.9, res, 4, 4)
+    items_by_id = {item.id: item}
     monkeypatch.setattr(mod, "search_sentinel1", lambda **kw: [item])
     monkeypatch.setattr(mod, "filter_items_by_bbox", lambda i, b: i)
     monkeypatch.setattr(mod, "setup_gdal_env", lambda: None)
@@ -781,12 +799,12 @@ def test_collect_s1_uses_cache_on_second_call(tmp_path, monkeypatch):
     points = [("px_0000", 145.0 + 0.5 * res, -22.9 - 0.5 * res)]
     cache_dir = tmp_path / "s1_chips"
 
+    # First call: write cache via fake fetch_patches
+    monkeypatch.setattr(fetch_mod, "fetch_patches", _make_fake_fetch_patches(items_by_id))
     df1 = collect_s1(bbox, "2022-01-01", "2022-12-31", points, cache_dir=cache_dir)
 
-    # Block real rasterio reads — second call must use cache
-    monkeypatch.setattr(rasterio, "open", lambda *a, **kw: (_ for _ in ()).throw(
-        AssertionError("rasterio.open called on second collect_s1 — cache miss")
-    ))
+    # Second call: fetch_patches is called again but sees cached .npz files and
+    # skips network I/O. Results must be identical to the first call.
     df2 = collect_s1(bbox, "2022-01-01", "2022-12-31", points, cache_dir=cache_dir)
 
     assert len(df1) == len(df2)
@@ -803,17 +821,19 @@ def test_collect_s1_empty_when_no_items(monkeypatch):
     assert df.is_empty()
 
 
-def test_collect_s1_columns_and_dtypes(monkeypatch):
+def test_collect_s1_columns_and_dtypes(monkeypatch, tmp_path):
     import utils.s1_collector as mod
+    import utils.fetch as fetch_mod
     res = 10 / 111320
-    item = _make_item(nrows=5, ncols=5, lon_origin=145.0, lat_origin=-22.9, res=res)
-    monkeypatch.setattr(mod, "search_sentinel1", lambda **kw: [item])
-    monkeypatch.setattr(mod, "filter_items_by_bbox", lambda items, bbox: items)
+    item = _make_s1_item("S1A_test", 145.0, -22.9, res, 5, 5)
+    items_by_id = {item.id: item}
+    monkeypatch.setattr(mod, "_resolve_s1_items", lambda *a, **kw: [item])
     monkeypatch.setattr(mod, "setup_gdal_env", lambda: None)
+    monkeypatch.setattr(fetch_mod, "fetch_patches", _make_fake_fetch_patches(items_by_id))
 
     bbox = [145.0, -22.9 - 5 * res, 145.0 + 5 * res, -22.9]
     points = [("px_0000", 145.0 + 0.5 * res, -22.9 - 0.5 * res)]
-    df = collect_s1(bbox, "2022-01-01", "2022-12-31", points)
+    df = collect_s1(bbox, "2022-01-01", "2022-12-31", points, cache_dir=tmp_path / "s1_chips")
 
     assert not df.is_empty()
     for col in ["point_id", "lon", "lat", "date", "source", "vh", "vv"]:
@@ -823,40 +843,40 @@ def test_collect_s1_columns_and_dtypes(monkeypatch):
     assert df["vv"].dtype in (pl.Float32, pl.Float64)
 
 
-def test_collect_s1_source_always_s1(monkeypatch):
+def test_collect_s1_source_always_s1(monkeypatch, tmp_path):
     import utils.s1_collector as mod
+    import utils.fetch as fetch_mod
     res = 10 / 111320
     items = [
-        _make_item(item_id="S1A_1", nrows=5, ncols=5, lon_origin=145.0, lat_origin=-22.9, res=res),
-        _make_item(item_id="S1B_2", dt=datetime(2022, 9, 1, tzinfo=timezone.utc),
-                   nrows=5, ncols=5, lon_origin=145.0, lat_origin=-22.9, res=res),
+        _make_s1_item("S1A_1", 145.0, -22.9, res, 5, 5),
+        _make_s1_item("S1B_2", 145.0, -22.9, res, 5, 5,
+                      dt=datetime(2022, 9, 1, tzinfo=timezone.utc)),
     ]
-    monkeypatch.setattr(mod, "search_sentinel1", lambda **kw: items)
-    monkeypatch.setattr(mod, "filter_items_by_bbox", lambda i, b: i)
+    items_by_id = {it.id: it for it in items}
+    monkeypatch.setattr(mod, "_resolve_s1_items", lambda *a, **kw: items)
     monkeypatch.setattr(mod, "setup_gdal_env", lambda: None)
+    monkeypatch.setattr(fetch_mod, "fetch_patches", _make_fake_fetch_patches(items_by_id))
 
     bbox = [145.0, -22.9 - 5 * res, 145.0 + 5 * res, -22.9]
     points = [("px_0000", 145.0 + 0.5 * res, -22.9 - 0.5 * res)]
-    df = collect_s1(bbox, "2022-01-01", "2022-12-31", points)
+    df = collect_s1(bbox, "2022-01-01", "2022-12-31", points, cache_dir=tmp_path / "s1_chips")
     assert (df["source"] == "S1").all()
 
 
-def test_collect_s1_spatial_alignment(monkeypatch):
+def test_collect_s1_spatial_alignment(monkeypatch, tmp_path):
     """Each output row's (lon, lat) must exactly match a point in the input grid."""
     import utils.s1_collector as mod
+    import utils.fetch as fetch_mod
     res = 10 / 111320
     lon_origin, lat_origin = 145.0, -22.9
     nrows, ncols = 4, 4
 
-    item = _make_item(
-        nrows=nrows, ncols=ncols,
-        lon_origin=lon_origin, lat_origin=lat_origin, res=res,
-    )
-    monkeypatch.setattr(mod, "search_sentinel1", lambda **kw: [item])
-    monkeypatch.setattr(mod, "filter_items_by_bbox", lambda i, b: i)
+    item = _make_s1_item("S1A_align", lon_origin, lat_origin, res, nrows, ncols)
+    items_by_id = {item.id: item}
+    monkeypatch.setattr(mod, "_resolve_s1_items", lambda *a, **kw: [item])
     monkeypatch.setattr(mod, "setup_gdal_env", lambda: None)
+    monkeypatch.setattr(fetch_mod, "fetch_patches", _make_fake_fetch_patches(items_by_id))
 
-    # Build a 4-point grid
     points = [
         (f"px_{r:04d}_{c:04d}", lon_origin + (c + 0.5) * res, lat_origin - (r + 0.5) * res)
         for r in range(nrows) for c in range(ncols)
@@ -864,7 +884,7 @@ def test_collect_s1_spatial_alignment(monkeypatch):
     point_locs = {pid: (lon, lat) for pid, lon, lat in points}
     bbox = [lon_origin, lat_origin - nrows * res, lon_origin + ncols * res, lat_origin]
 
-    df = collect_s1(bbox, "2022-01-01", "2022-12-31", points)
+    df = collect_s1(bbox, "2022-01-01", "2022-12-31", points, cache_dir=tmp_path / "s1_chips")
     assert not df.is_empty()
 
     for pid, lon, lat in df.select(["point_id", "lon", "lat"]).iter_rows():
@@ -1051,8 +1071,11 @@ def _run_ensure(
     region_id: str = "test_region",
     n_pixels: int = 3,
 ):
-    """Run ensure_training_pixels with mocked collect() and collect_s1()."""
+    """Run ensure_training_pixels with a mocked fetch_spec()."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
     import utils.training_collector as tc
+    import utils.fetch_spec as fs_mod
     from utils.regions import TrainingRegion
 
     region = TrainingRegion(
@@ -1074,31 +1097,23 @@ def _run_ensure(
     # Mock tile_chips_path
     monkeypatch.setattr(tc, "tile_chips_path", lambda t: tmp_path / "chips")
 
-    # Mock collect() → writes a fake S2 parquet into collect_dir
-    def _fake_collect(bbox_wgs84, start, end, out_dir, **kw):
-        out_dir.mkdir(parents=True, exist_ok=True)
-        p = out_dir / "55HBU.parquet"
-        _make_s2_parquet(p, region_id=region_id, n_pixels=n_pixels)
-        return [p]
-
-    monkeypatch.setattr(tc, "collect", _fake_collect)
-
-    # Mock append_s1_to_tile_parquet → appends fake S1 rows directly.
-    # collect_s1 is never called by this code path; append_s1_to_tile_parquet
-    # is the real seam that training_collector uses after S2 is written.
     s1_df = _make_s1_df(region_id=region_id, n_pixels=n_pixels)
 
-    def _fake_append_s1(tile_path, **kw):
-        import pyarrow as pa
-        import pyarrow.parquet as _pq
-        existing = _pq.read_table(tile_path)
+    def _fake_fetch_spec(spec, **kw):
+        year_dir = spec.out_dir / "2022"
+        year_dir.mkdir(parents=True, exist_ok=True)
+        # Write s2 intermediate so _collect_one_region can detect actual_tile_id
+        s2_path = year_dir / "55HBU.s2.parquet"
+        merged_path = year_dir / "55HBU.parquet"
+        _make_s2_parquet(s2_path, region_id=region_id, n_pixels=n_pixels)
+        # Merged = S2 rows + S1 rows
+        s2_tbl = pq.read_table(s2_path)
         s1_tbl = s1_df.to_arrow()
-        combined = pa.concat_tables([existing, s1_tbl], promote_options="default")
-        # Cast back to the original schema column types where possible
-        combined = combined.select(existing.schema.names)
-        _pq.write_table(combined, tile_path)
+        combined = pa.concat_tables([s2_tbl, s1_tbl], promote_options="default")
+        pq.write_table(combined, merged_path)
+        return {2022: [merged_path]}
 
-    monkeypatch.setattr(tc, "append_s1_to_tile_parquet", _fake_append_s1)
+    monkeypatch.setattr(fs_mod, "fetch_spec", _fake_fetch_spec)
 
     tc.ensure_training_pixels([region])
 

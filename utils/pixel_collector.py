@@ -59,6 +59,11 @@ from utils.stac import search_sentinel2
 
 logger = logging.getLogger(__name__)
 
+
+class FetchError(RuntimeError):
+    """Raised when a fetch pipeline step fails (replaces sys.exit(1))."""
+
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -292,6 +297,7 @@ def collect(
     calibration_out: Path | None = None,
     geometry=None,
     n_workers: int | None = None,
+    phases: set[str] | None = None,
 ) -> list[Path]:
     """Collect S2 observations for bbox_wgs84, writing one parquet per S2 tile.
 
@@ -312,7 +318,14 @@ def collect(
     shard write phase.  Each worker holds one item's full band patches in RAM,
     so this is the primary memory knob for large locations.  ``None`` (default)
     auto-scales based on pixel count, targeting ~4 GB peak usage.
+
+    *phases* selects which pipeline phases to run.  Defaults to both:
+      ``{"fetch", "extract"}``
+    Pass ``{"fetch"}`` to only populate the .npz patch cache (network I/O, low
+    memory).  Pass ``{"extract"}`` to skip network fetch and only build parquets
+    from an already-populated cache.  Both phases are independently idempotent.
     """
+    _phases = phases if phases is not None else {"fetch", "extract"}
     # --- 1. Generate pixel grid -------------------------------------------
     utm_crs = _utm_crs_for_bbox(bbox_wgs84)
     points = make_pixel_grid(bbox_wgs84, utm_crs=utm_crs, point_id_prefix=point_id_prefix)
@@ -367,14 +380,12 @@ def collect(
                 collection=S2_COLLECTION,
             )
             if not items:
-                logger.error("No STAC items found — check bbox and date range")
-                sys.exit(1)
+                raise FetchError("No STAC items found — check bbox and date range")
             with stac_cache.open("wb") as fh:
                 pickle.dump(items, fh)
             logger.info("%d items found, cached to %s", len(items), stac_cache.name)
         if not items:
-            logger.error("No STAC items found — check bbox and date range")
-            sys.exit(1)
+            raise FetchError("No STAC items found — check bbox and date range")
 
         # Deduplicate items: keep only one granule per (date, satellite, tile).
         # A bbox that straddles two adjacent S2 processing granules (e.g. _0_L2A
@@ -502,54 +513,59 @@ def collect(
                 logger.info("  Deleted stale done file: %s", _dp.name)
         # Also delete any tile parquets built from the stale data
         for _tp in out_dir.iterdir():
-            if _tp.suffix == ".parquet" and not _tp.stem.startswith("_"):
+            if _tp.name.endswith(".s2.parquet") and not _tp.stem.startswith("_"):
                 _tp.unlink()
                 logger.info("  Deleted stale tile parquet: %s", _tp.name)
 
     all_shards_done = all(_shard_complete(i) for i in range(n_shards))
 
-    if all_shards_done:
-        logger.info("All %d shards already complete — skipping fetch", n_shards)
-    else:
-        logger.info(
-            "%d row-coords → %d shards (~%d coords/shard, budget %dM rows/shard)",
-            len(sorted_rcs), n_shards,
-            len(sorted_rcs) // n_shards if n_shards else 0,
-            shard_row_budget // 1_000_000,
-        )
-        # Check how many items are already fully cached on disk.
-        from utils.fetch import _cache_path
-        import os as _os
-        cached_keys: set[tuple[str, str]] = set()
-        try:
-            for _entry in _os.scandir(cache_dir):
-                if _entry.is_dir():
-                    for _f in _os.scandir(_entry.path):
-                        if _f.name.endswith(".npz"):
-                            cached_keys.add((_entry.name, _f.name[:-4]))
-        except FileNotFoundError:
-            pass
-        uncached_items = [
-            item for item in items
-            if any((item.id, band) not in cached_keys for band in FETCH_BANDS)
-        ]
-        if uncached_items:
-            logger.info(
-                "Fetching %d/%d items not yet in cache for bbox %s",
-                len(uncached_items), len(items), bbox_wgs84,
-            )
-            asyncio.run(fetch_patches(
-                points=points,
-                items=uncached_items,
-                bands=FETCH_BANDS,
-                bbox_wgs84=bbox_wgs84,
-                scl_filter=True,
-                band_alias=BAND_ALIAS,
-                max_concurrent=max_concurrent,
-                cache_dir=cache_dir,
-            ))
+    if "fetch" in _phases:
+        if all_shards_done:
+            logger.info("All %d shards already complete — skipping fetch", n_shards)
         else:
-            logger.info("All %d items already in cache — no network fetch needed", len(items))
+            logger.info(
+                "%d row-coords → %d shards (~%d coords/shard, budget %dM rows/shard)",
+                len(sorted_rcs), n_shards,
+                len(sorted_rcs) // n_shards if n_shards else 0,
+                shard_row_budget // 1_000_000,
+            )
+            # Check how many items are already fully cached on disk.
+            from utils.fetch import _cache_path
+            import os as _os
+            cached_keys: set[tuple[str, str]] = set()
+            try:
+                for _entry in _os.scandir(cache_dir):
+                    if _entry.is_dir():
+                        for _f in _os.scandir(_entry.path):
+                            if _f.name.endswith(".npz"):
+                                cached_keys.add((_entry.name, _f.name[:-4]))
+            except FileNotFoundError:
+                pass
+            uncached_items = [
+                item for item in items
+                if any((item.id, band) not in cached_keys for band in FETCH_BANDS)
+            ]
+            if uncached_items:
+                logger.info(
+                    "Fetching %d/%d items not yet in cache for bbox %s",
+                    len(uncached_items), len(items), bbox_wgs84,
+                )
+                asyncio.run(fetch_patches(
+                    points=points,
+                    items=uncached_items,
+                    bands=FETCH_BANDS,
+                    bbox_wgs84=bbox_wgs84,
+                    scl_filter=True,
+                    band_alias=BAND_ALIAS,
+                    max_concurrent=max_concurrent,
+                    cache_dir=cache_dir,
+                ))
+            else:
+                logger.info("All %d items already in cache — no network fetch needed", len(items))
+
+    if "extract" not in _phases:
+        logger.info("collect: fetch-only phase complete for %s %s/%s", bbox_wgs84, start, end)
+        return []
 
     from utils.parquet_utils import sort_parquet_by_pixel, _optimise_schema, _WRITE_OPTS
 
@@ -733,10 +749,9 @@ def collect(
         if all_shards_done:
             existing = sorted(
                 p for p in out_dir.iterdir()
-                if p.suffix == ".parquet"
-                and p.stem
+                if p.name.endswith(".s2.parquet")
                 and not p.stem.startswith("_")
-                and ".tmp" not in p.stem
+                and "_tmp" not in p.stem
             )
             if existing:
                 logger.info(
@@ -746,7 +761,7 @@ def collect(
                 return existing
             logger.warning("All shards completed but produced no rows — returning empty result.")
             return []
-        raise RuntimeError("No data collected: all shards are empty. Check STAC availability and date range.")
+        raise FetchError("No data collected: all shards are empty. Check STAC availability and date range.")
 
     _corrections: dict | None = None
     if calibration_out is not None:
@@ -819,7 +834,7 @@ def collect(
             out = _apply_corrections(out)
         out = _optimise_schema(out)
         if tid not in tile_writers:
-            tile_path = out_dir / f"{tid}.parquet"
+            tile_path = out_dir / f"{tid}.s2.parquet"
             tile_writers[tid] = pq.ParquetWriter(str(tile_path), out.schema, **_WRITE_OPTS)
             tile_rows[tid] = 0
         tile_writers[tid].write_table(out)
@@ -890,7 +905,7 @@ def collect(
             except Exception:
                 pass
         for tid in tile_writers:
-            p = out_dir / f"{tid}.parquet"
+            p = out_dir / f"{tid}.s2.parquet"
             p.unlink(missing_ok=True)
         raise
 
@@ -899,25 +914,22 @@ def collect(
 
     # Verify row count before deleting sorted intermediates.
     if total_rows == 0:
-        logger.error("No usable observations — all pixels clouded or missing?")
-        sys.exit(1)
+        raise FetchError("No usable observations — all pixels clouded or missing?")
 
     written_rows = sum(
-        pq.ParquetFile(out_dir / f"{tid}.parquet").metadata.num_rows
+        pq.ParquetFile(out_dir / f"{tid}.s2.parquet").metadata.num_rows
         for tid in tile_writers
     )
     if written_rows != total_rows:
-        logger.error(
-            "Row count mismatch: counted %d but parquet reports %d — output may be corrupt",
-            total_rows, written_rows,
+        raise FetchError(
+            f"Row count mismatch: counted {total_rows} but parquet reports {written_rows} — output may be corrupt"
         )
-        sys.exit(1)
 
     # Only delete sorted intermediates after successful verification.
     for sorted_sp in sorted_shard_paths:
         sorted_sp.unlink(missing_ok=True)
 
-    written_paths = [out_dir / f"{tid}.parquet" for tid in sorted(tile_writers)]
+    written_paths = [out_dir / f"{tid}.s2.parquet" for tid in sorted(tile_writers)]
     for p in written_paths:
         n = pq.ParquetFile(p).metadata.num_rows
         logger.info("Written: %s  (%d rows)", p.name, n)

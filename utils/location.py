@@ -266,59 +266,30 @@ class Location:
 
         Returns the list of written parquet paths.
         """
-        from utils.pixel_collector import collect  # noqa: PLC0415
-        from utils.parquet_utils import append_s1_to_tile_parquet  # noqa: PLC0415
-        from utils.s1_collector import collect_s1, _DEFAULT_CACHE_DIR as _S1_CACHE_DIR  # noqa: PLC0415
-
-        _cache = cache_dir or self.cache_dir()
+        from utils.fetch_spec import FetchSpec, fetch_spec  # noqa: PLC0415
 
         _cal_out: Path | None = None
         if len(self.tile_ids()) > 1:
             _cal_out = _PROJECT_ROOT / "data" / "calibration" / f"{self.id}.parquet"
             _cal_out.parent.mkdir(parents=True, exist_ok=True)
 
-        written: list[Path] = []
-        for year in sorted(years):
-            _out_dir = self.parquet_year_dir(year)
-            _out_dir.mkdir(parents=True, exist_ok=True)
-            tile_paths = collect(
-                bbox_wgs84=self.bbox,
-                start=f"{year}-01-01",
-                end=f"{year}-12-31",
-                out_dir=_out_dir,
-                cloud_max=cloud_max,
-                cache_dir=_cache,
-                apply_nbar=apply_nbar,
-                calibration_out=_cal_out,
-                geometry=self.geometry,
-                n_workers=n_workers,
-            )
-
-            # collect() returns [] when all shards were already done AND the
-            # sorted shard files have been consumed into tile parquets (deleted
-            # after the concat step).  Fall back to existing tile parquets so
-            # the S1 append step below still runs.
-            if not tile_paths:
-                tile_paths = [
-                    p for p in sorted(_out_dir.glob("*.parquet"))
-                    if not p.name.startswith("_")
-                    and ".coords." not in p.name
-                    and ".tmp" not in p.stem
-                ]
-
-            # Append S1 rows to each tile parquet in-place
-            for tile_path in tile_paths:
-                append_s1_to_tile_parquet(
-                    tile_path=tile_path,
-                    bbox_wgs84=self.bbox,
-                    start=f"{year}-01-01",
-                    end=f"{year}-12-31",
-                    collect_s1_fn=collect_s1,
-                    s1_cache_dir=_S1_CACHE_DIR,
-                )
-
-            written.extend(tile_paths)
-        return written
+        spec = FetchSpec(
+            id=self.id,
+            bbox=self.bbox,
+            years=years,
+            point_id_prefix="px",
+            geometry=self.geometry,
+            out_dir=_PROJECT_ROOT / "data" / "pixels" / self.id,
+            cache_dir=cache_dir or self.cache_dir(),
+        )
+        year_results = fetch_spec(
+            spec,
+            cloud_max=cloud_max,
+            apply_nbar=apply_nbar,
+            n_workers=n_workers,
+            calibration_out=_cal_out,
+        )
+        return [p for paths in year_results.values() for p in paths]
 
 
 # ---------------------------------------------------------------------------

@@ -467,34 +467,28 @@ def _write_minimal_parquet(path, point_ids: list[str], tile_id: str = "55HBU") -
 def test_collect_one_region_returns_actual_tile_when_fallback_fires(
     training_dirs, monkeypatch, tmp_path
 ):
-    """When the primary tile has no STAC items and collect() falls back to
-    cached shards from a neighbouring tile, _collect_one_region() must return
-    the actual tile_id (the shard stem), not the primary tile_id argument.
+    """When fetch produces data from tile 54KZC (not the primary 55KBT),
+    _collect_one_region() must return '54KZC', not '55KBT'.
     """
     import pyarrow.parquet as pq
+    import utils.fetch_spec as fs_mod
 
     tiles_dir  = training_dirs["tiles_dir"]
     region_dir = tiles_dir / "regions"
     region     = _make_region("boundary_region", bbox=[144.0, -21.0, 144.1, -20.9], years=[2024])
 
-    # Simulate a collect dir already populated with a shard from tile 54KZC
-    # (the neighbouring tile that actually has S2 imagery for this bbox).
-    collect_dir = region_dir / "boundary_region.collect"
-    collect_dir.mkdir()
-    shard = collect_dir / "54KZC.parquet"
-    _write_minimal_parquet(shard, ["boundary_region_0000_0000"], tile_id="54KZC")
+    # Pre-populate the s2 intermediate that _collect_one_region inspects to
+    # detect the actual tile.  fetch_spec writes out_dir/<year>/<tile>.s2.parquet.
+    spec_out = region_dir / "boundary_region"
+    year_dir = spec_out / "2024"
+    year_dir.mkdir(parents=True)
+    s2_file = year_dir / "54KZC.s2.parquet"
+    merged  = year_dir / "54KZC.parquet"
+    _write_minimal_parquet(s2_file, ["boundary_region_0000_0000"], tile_id="54KZC")
+    _write_minimal_parquet(merged,  ["boundary_region_0000_0000"], tile_id="54KZC")
 
-    # collect() returns no new paths (no STAC items matched the primary tile).
-    monkeypatch.setattr(tc, "collect", lambda **kw: [])
-    # S1 append is a no-op for this test.
-    monkeypatch.setattr(tc, "append_s1_to_tile_parquet", lambda **kw: None)
-    # make_pixel_grid is imported inside _collect_one_region from utils.pixel_collector.
-    import utils.pixel_collector as pc_mod
-    monkeypatch.setattr(pc_mod, "make_pixel_grid",
-                        lambda **kw: [("boundary_region_0000_0000", 144.05, -20.95)])
-
-    # Patch _fetch_tile_items to return an empty list (no 55KBT items).
-    monkeypatch.setattr(tc, "_fetch_tile_items", lambda *a, **kw: [])
+    # fetch_spec returns the merged parquet for year 2024.
+    monkeypatch.setattr(fs_mod, "fetch_spec", lambda spec, **kw: {2024: [merged]})
 
     actual = tc._collect_one_region(
         region=region,
@@ -508,21 +502,17 @@ def test_collect_one_region_returns_actual_tile_when_fallback_fires(
     )
 
     assert actual == "54KZC", (
-        f"Expected actual_tile_id='54KZC' (the fallback shard), got {actual!r}"
+        f"Expected actual_tile_id='54KZC' (from s2 shard stem), got {actual!r}"
     )
 
 
 def test_collect_one_region_returns_none_when_no_s2_data(training_dirs, monkeypatch):
-    """When collect() returns nothing and the collect dir is empty,
-    _collect_one_region() must return None (not a tile_id string).
-    """
+    """When fetch_spec returns no merged paths, _collect_one_region() must return None."""
+    import utils.fetch_spec as fs_mod
+
     region = _make_region("empty_region", bbox=[144.0, -21.0, 144.1, -20.9], years=[2024])
 
-    monkeypatch.setattr(tc, "collect", lambda **kw: [])
-    monkeypatch.setattr(tc, "append_s1_to_tile_parquet", lambda **kw: None)
-    import utils.pixel_collector as pc_mod  # noqa: PLC0415
-    monkeypatch.setattr(pc_mod, "make_pixel_grid",
-                        lambda **kw: [("empty_region_0000_0000", 144.05, -20.95)])
+    monkeypatch.setattr(fs_mod, "fetch_spec", lambda spec, **kw: {2024: []})
 
     result = tc._collect_one_region(
         region=region,

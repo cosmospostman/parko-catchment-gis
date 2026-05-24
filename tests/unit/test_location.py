@@ -30,7 +30,6 @@ import pytest
 import yaml
 
 from utils.location import Location, SubBbox, _bbox_pixel_count, _load_registry, _PROJECT_ROOT
-from utils.parquet_utils import append_s1_to_tile_parquet
 
 
 # ---------------------------------------------------------------------------
@@ -410,12 +409,13 @@ def test_parquet_tile_paths_ignores_sidecar_files(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Test — _append_s1_to_tile_parquet collects pixel coords from ALL row groups
+# Test — collect_s1_for_tile collects pixel coords from ALL row groups
 #
-# Bug: the original code built points_for_s1 only from the first row group.
-# A pixel-sorted parquet spreads distinct pixels across all row groups, so
-# only the pixels whose first observation falls in rg0 were passed to
-# collect_s1 — producing S1 coverage for ~1 row-strip instead of the full grid.
+# Bug (now fixed via collect_s1_for_tile): the old append_s1_to_tile_parquet
+# built points_for_s1 only from the first row group.  A pixel-sorted parquet
+# spreads distinct pixels across all row groups, so only pixels whose first
+# observation fell in rg0 were passed to _collect_s1_shards.
+# collect_s1_for_tile uses PyArrow group_by across the whole file.
 # ---------------------------------------------------------------------------
 
 def _make_multi_rg_s2_parquet(path: Path, pixel_rows: list[dict]) -> None:
@@ -448,16 +448,17 @@ def _make_multi_rg_s2_parquet(path: Path, pixel_rows: list[dict]) -> None:
     writer.close()
 
 
-def test_append_s1_collects_coords_from_all_row_groups(tmp_path, monkeypatch):
+def test_collect_s1_for_tile_collects_coords_from_all_row_groups(tmp_path, monkeypatch):
     """S1 rows must be generated for every unique pixel, not just those in rg0.
 
     Setup: a parquet with 3 pixels spread across 3 row groups (one per group).
     Mock _collect_s1_shards to capture which point_ids were passed.
-    After append_s1_to_tile_parquet, all 3 pixels must appear.
+    collect_s1_for_tile must pass all 3 pixels to _collect_s1_shards.
     """
     import pyarrow.parquet as pq
+    from utils.s1_collector import collect_s1_for_tile
 
-    tile_path = tmp_path / "55HBU.parquet"
+    s2_path = tmp_path / "55HBU.s2.parquet"
     pixels = [
         {"point_id": "px_0000_0000", "lon": 145.410, "lat": -22.810,
          "date": "2022-08-15", "B02": 0.1, "B08": 0.4, "scl_purity": 1.0, "scl": 4},
@@ -466,30 +467,31 @@ def test_append_s1_collects_coords_from_all_row_groups(tmp_path, monkeypatch):
         {"point_id": "px_0002_0000", "lon": 145.430, "lat": -22.790,
          "date": "2022-08-15", "B02": 0.1, "B08": 0.4, "scl_purity": 1.0, "scl": 4},
     ]
-    _make_multi_rg_s2_parquet(tile_path, pixels)
+    _make_multi_rg_s2_parquet(s2_path, pixels)
 
-    pf = pq.ParquetFile(tile_path)
+    pf = pq.ParquetFile(s2_path)
     assert pf.metadata.num_row_groups == 3, "test requires one row group per pixel"
 
     captured_points: list[list[str]] = []
 
     def mock_resolve_items(bbox_wgs84, start, end, resolved_cache):
-        return ["fake_item"]  # non-empty so _collect_s1_shards is called
+        return ["fake_item"]
 
     def mock_collect_shards(out_dir, items, bbox_wgs84, points, resolved_cache, **kwargs):
         captured_points.append([pid for pid, _, _ in points])
-        return []  # no shard files — no S1 rows appended
+        return []  # no shard files → collect_s1_for_tile returns None
 
     import utils.s1_collector as _s1c
     monkeypatch.setattr(_s1c, "_resolve_s1_items", mock_resolve_items)
     monkeypatch.setattr(_s1c, "_collect_s1_shards", mock_collect_shards)
 
-    append_s1_to_tile_parquet(
-        tile_path=tile_path,
+    out_path = tmp_path / "55HBU.s1.parquet"
+    collect_s1_for_tile(
+        s2_path=s2_path,
         bbox_wgs84=[145.40, -22.82, 145.44, -22.78],
         start="2022-01-01",
         end="2022-12-31",
-        collect_s1_fn=None,
+        out_path=out_path,
     )
 
     assert len(captured_points) == 1, "_collect_s1_shards should be called exactly once"

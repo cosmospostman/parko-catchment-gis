@@ -35,11 +35,8 @@ import re as _re
 
 from utils.regions import TrainingRegion, load_regions, select_regions
 from utils.location import tile_chips_path
-from utils.parquet_utils import append_s1_to_tile_parquet
-from utils.pixel_collector import collect
 from utils.s2_tiles import bbox_to_tile_ids
 from utils.stac import search_sentinel2
-from utils.s1_collector import collect_s1, _DEFAULT_CACHE_DIR as _S1_CHIP_CACHE_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -217,131 +214,81 @@ def _collect_one_region(
     cloud_max: int,
     apply_nbar: bool,
     max_concurrent: int,
+    n_sort_workers: int | None = None,
 ) -> str | None:
-    """Fetch S2 and S1 concurrently for one region, write region parquet.
-
-    S2 and S1 COG fetches are launched in parallel threads since they hit
-    independent endpoints (AWS us-west-2 for S2, Azure West Europe for S1)
-    and share no mutable state.  S1 only needs the pixel grid, which is
-    derived from the bbox without waiting for S2 data.
+    """Fetch S2 and S1 for one region via FetchSpec, write region parquet.
 
     Returns the actual S2 tile_id the data was sourced from (which may differ
     from the ``tile_id`` argument when the region straddles a tile boundary and
     no items matched the primary tile), or None if no data was written.
     """
-    from utils.pixel_collector import make_pixel_grid
+    from utils.fetch_spec import FetchSpec, fetch_spec
 
-    out_path    = _region_parquet_path(region.id)
-    collect_dir = _TILES_DIR / "regions" / f"{region.id}.collect"
-    # Use a per-region chip cache, not the shared per-tile one. Parallel workers
-    # on the same tile would otherwise race — each writing patches for its own
-    # small bbox, then the stale-check deleting the other worker's patches.
-    cache_dir   = tile_chips_path(tile_id) / region.id
-    bbox = list(region.bbox)
+    out_path  = _region_parquet_path(region.id)
+    cache_dir = tile_chips_path(tile_id) / region.id
+    bbox      = list(region.bbox)
 
-    logger.info("Region %s: S2+S1 fetch start  bbox=%s  %s→%s", region.id, bbox, start, end)
+    # Filter tile_items to those from this tile only — mixing items from
+    # adjacent tiles into one cache_dir breaks CachedNpzChipStore.
+    this_tile_items = [it for it in tile_items if tile_id in it.id]
 
-    # Derive the pixel grid immediately — needed by both S2 (point_id_prefix)
-    # and S1 (points list), and costs nothing to compute.
-    points = make_pixel_grid(bbox_wgs84=bbox, point_id_prefix=region.id)
+    all_years = sorted(set(region.years))
+    spec = FetchSpec(
+        id=region.id,
+        bbox=bbox,
+        years=all_years,
+        point_id_prefix=region.id,
+        label=region.label,
+        out_dir=_TILES_DIR / "regions" / region.id,
+        cache_dir=cache_dir,
+    )
 
-    s2_tile_paths: list[Path] = []
-    s2_exc: BaseException | None = None
-    s1_exc: BaseException | None = None
+    logger.info("Region %s: fetch start  bbox=%s  %s→%s", region.id, bbox, start, end)
 
-    def _fetch_s2() -> None:
-        nonlocal s2_tile_paths, s2_exc
-        try:
-            # Filter to items from this tile only. tile_items comes from a STAC
-            # search over the union bbox, which may include adjacent tiles when a
-            # region straddles a tile boundary. Mixing items from different MGRS
-            # tiles into one cache_dir breaks CachedNpzChipStore: each tile has
-            # its own CRS/transform, so point projections from one tile are
-            # invalid for patches fetched for another.
-            this_tile_items = [it for it in tile_items if tile_id in it.id]
-            tile_paths = collect(
-                bbox_wgs84=bbox,
-                start=start,
-                end=end,
-                out_dir=collect_dir,
-                cloud_max=cloud_max,
-                cache_dir=cache_dir,
-                apply_nbar=apply_nbar,
-                max_concurrent=max_concurrent,
-                items=this_tile_items,
-                point_id_prefix=region.id,
-            )
-            if not tile_paths:
-                tile_paths = sorted(collect_dir.glob("*.parquet"))
-                if tile_paths:
-                    logger.info(
-                        "Region %s: collect() returned no paths but found %d existing "
-                        "parquet(s) in collect dir — using those",
-                        region.id, len(tile_paths),
-                    )
-            s2_tile_paths = tile_paths
-        except Exception as exc:
-            s2_exc = exc
+    year_results = fetch_spec(
+        spec,
+        cloud_max=cloud_max,
+        apply_nbar=apply_nbar,
+        max_concurrent=max_concurrent,
+        items=this_tile_items,
+        n_s1_workers=n_sort_workers or 4,
+    )
 
-    def _fetch_s1() -> None:
-        nonlocal s1_exc
-        try:
-            # S1 fetch runs inside append_s1_to_tile_parquet after S2 writes
-            # out_path, so we only pre-warm the S1 STAC cache here.  The actual
-            # band reads happen after S2 completes (they need the parquet schema).
-            # Warming the cache now means the STAC search round-trip to Planetary
-            # Computer overlaps with the S2 COG fetch rather than following it.
-            from utils.s1_collector import _resolve_s1_items
-            _resolve_s1_items(bbox, start, end, _S1_CHIP_CACHE_DIR)
-        except Exception as exc:
-            s1_exc = exc
+    # Collect all merged per-year/per-tile paths
+    merged_paths: list[Path] = [p for paths in year_results.values() for p in paths]
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        s2_future = pool.submit(_fetch_s2)
-        s1_future = pool.submit(_fetch_s1)
-        s2_future.result()  # propagates exception if _fetch_s2 raised
-        s1_future.result()  # propagates exception if _fetch_s1 raised
-
-    if s2_exc:
-        raise s2_exc
-    if s1_exc:
-        logger.warning("Region %s: S1 STAC pre-warm failed: %s", region.id, s1_exc)
-
-    if not s2_tile_paths:
-        logger.warning("Region %s: no S2 data — skipping", region.id)
+    if not merged_paths:
+        logger.warning("Region %s: no data — skipping", region.id)
         return None
 
-    # Detect the actual S2 tile from the first shard filename (e.g. "54KZC.parquet").
-    # This may differ from tile_id when the region straddles a boundary and STAC
-    # had no items for the primary tile — the fallback uses a neighbouring tile's
-    # cached shards.  We index under the actual tile so _rebuild_tile_parquet
-    # finds the region parquet.
-    actual_tile_id = s2_tile_paths[0].stem
+    # Detect the actual tile from the first merged path's grandparent directory
+    # structure: out_dir / year / tile_id.parquet → tile_id is the stem.
+    # For consistency with the old behaviour, derive tile from the s2 intermediate.
+    s2_paths = sorted(
+        p for yr_paths in [spec.out_dir / str(yr) for yr in all_years]
+        if yr_paths.is_dir()
+        for p in yr_paths.glob("*.s2.parquet")
+    )
+    actual_tile_id = s2_paths[0].stem.replace(".s2", "") if s2_paths else tile_id
     if actual_tile_id != tile_id:
         logger.warning(
-            "Region %s: S2 data came from tile %s, not primary tile %s — "
-            "indexing under %s",
+            "Region %s: S2 data from tile %s, not primary tile %s — indexing under %s",
             region.id, actual_tile_id, tile_id, actual_tile_id,
         )
 
-    # Merge S2 shards into region parquet, then append S1 (STAC already cached).
-    writer = pq.ParquetWriter(out_path, pq.ParquetFile(s2_tile_paths[0]).schema_arrow)
-    for tp in s2_tile_paths:
-        pf = pq.ParquetFile(tp)
+    # Concat all merged paths into the single flat region parquet expected by
+    # _rebuild_tile_parquet.  Schema may differ across years (S1 added later).
+    schema = _superset_schema(merged_paths)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    writer = pq.ParquetWriter(out_path, schema)
+    for mp in merged_paths:
+        pf = pq.ParquetFile(mp)
         for rg_idx in range(pf.metadata.num_row_groups):
-            writer.write_table(pf.read_row_group(rg_idx))
+            tbl = _cast_to_schema(_normalise_source(pf.read_row_group(rg_idx)), schema)
+            writer.write_table(tbl)
     writer.close()
 
-    append_s1_to_tile_parquet(
-        tile_path=out_path,
-        bbox_wgs84=bbox,
-        start=start,
-        end=end,
-        collect_s1_fn=collect_s1,
-        s1_cache_dir=_S1_CHIP_CACHE_DIR,
-    )
-
-    logger.info("Region %s: done", region.id)
+    logger.info("Region %s: done (%d source files)", region.id, len(merged_paths))
     return actual_tile_id
 
 
@@ -519,6 +466,11 @@ def ensure_training_pixels(
         tile_id: threading.Lock() for tile_id in tile_to_regions
     }
 
+    import math, os as _os
+    # Divide CPU cores evenly across concurrent region workers so parallel
+    # sort pools don't over-subscribe the machine.
+    _n_sort_workers = max(1, math.ceil((_os.cpu_count() or 4) / max_region_workers))
+
     def _do_region(tile_id, region, tile_regions) -> None:
         start, end = _tile_date_window(tile_regions)
         # STAC search is per-tile and cached; the lock ensures only one worker
@@ -534,6 +486,7 @@ def ensure_training_pixels(
             cloud_max=cloud_max,
             apply_nbar=apply_nbar,
             max_concurrent=max_concurrent,
+            n_sort_workers=_n_sort_workers,
         )
         if actual_tile is not None:
             with tiles_with_new_lock:

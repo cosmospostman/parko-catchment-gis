@@ -182,6 +182,7 @@ async def fetch_patches(
     max_concurrent: int = 32,
     band_alias: dict[str, str] | None = None,
     cache_dir: Path | None = None,
+    item_signer: object | None = None,
 ) -> PatchData:
     """Fetch one bbox-covering patch per (item, band) instead of per-point chips.
 
@@ -203,6 +204,7 @@ async def fetch_patches(
     scl_filter:
         If True, skip all band patches for items where the SCL patch contains
         no clear pixels (wholly-clouded acquisition over the bbox).
+        Set to False for sensors without an SCL band (e.g. Sentinel-1).
     max_concurrent:
         Maximum simultaneous in-flight network requests.
     band_alias:
@@ -211,6 +213,10 @@ async def fetch_patches(
         Optional directory for caching fetched patches as .npz files.
         On re-runs, cached patches are loaded from disk instead of re-fetched.
         Layout: {cache_dir}/{item_id}/{band}.npz
+    item_signer:
+        Optional callable ``(item) -> item`` applied to each item before its
+        asset hrefs are read.  Use this for collections that require per-item
+        authentication (e.g. ``planetary_computer.sign`` for MPC assets).
 
     Returns
     -------
@@ -265,6 +271,11 @@ async def fetch_patches(
     # --- Pre-filter items by bbox, collect hrefs ----------------------------
     item_specs = []
     for item in items:
+        if item_signer is not None:
+            try:
+                item = item_signer(item)
+            except Exception:
+                pass
         if item.bbox:
             ib = item.bbox
             if ib[0] > lon_max or ib[2] < lon_min or ib[1] > lat_max or ib[3] < lat_min:
@@ -284,16 +295,19 @@ async def fetch_patches(
                              band, asset_key, item.id)
         item_specs.append((item, scl_href, band_hrefs))
 
-    # --- Phase 1: fetch all SCL patches concurrently ------------------------
+    # --- Phase 1: fetch SCL patches (skipped when scl_filter=False) ---------
     async def _none() -> None:
         return None
 
-    logger.info("fetch_patches: phase 1 — fetching %d SCL patches", len(item_specs))
-    scl_results = await asyncio.gather(*[
-        fetch_one_patch(item.id, SCL_BAND, href) if href else _none()
-        for (item, href, _) in item_specs
-    ])
-    logger.info("fetch_patches: SCL done, applying cloud filter")
+    if scl_filter:
+        logger.info("fetch_patches: phase 1 — fetching %d SCL patches", len(item_specs))
+        scl_results = await asyncio.gather(*[
+            fetch_one_patch(item.id, SCL_BAND, href) if href else _none()
+            for (item, href, _) in item_specs
+        ])
+        logger.info("fetch_patches: SCL done, applying cloud filter")
+    else:
+        scl_results = [None] * len(item_specs)
 
     # --- Phase 2: apply cloud filter, fetch all spectral bands at once ------
     # When cache_dir is set every fetched patch is written to disk immediately
@@ -305,7 +319,7 @@ async def fetch_patches(
     spectral_tasks: list[tuple[str, str, asyncio.Task]] = []
     for (item, scl_href, band_hrefs), scl_data in zip(item_specs, scl_results):
         item_id = item.id
-        if scl_href is not None:
+        if scl_filter and scl_href is not None:
             if scl_data is None:
                 continue
             scl_arr, _, _ = scl_data

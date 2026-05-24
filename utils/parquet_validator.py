@@ -288,7 +288,7 @@ def check_duplicates(pf: pq.ParquetFile, n_s1_rgs: int) -> CheckResult:
         # check for duplicate (point_id, date) within this row group
         pid_str  = pc.cast(s2.column("point_id"), pa.large_utf8())
         date_str = pc.cast(pc.cast(s2.column("date"), pa.int32()), pa.large_utf8())
-        sep = pa.chunked_array([pa.array(["|"] * len(s2), type=pa.large_utf8())])
+        sep = pa.chunked_array([pa.repeat("|", len(s2)).cast(pa.large_utf8())])
         combined = pc.binary_join_element_wise(pid_str, date_str, sep)
         n_unique = len(pc.unique(combined))
         if n_unique < len(s2):

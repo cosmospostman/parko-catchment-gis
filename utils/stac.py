@@ -4,11 +4,18 @@ All functions are designed to be mockable in tests — no I/O at import time.
 """
 
 import logging
+import threading
 from typing import Any, Dict, List, Optional
 
 import xarray as xr
 
 logger = logging.getLogger(__name__)
+
+# DuckDB's in-process mode shares global state across threads; concurrent
+# calls to _search_sentinel1_geoparquet (each reading 108 remote parquet
+# partitions) deadlock or hang.  Serialize them — the result is cached in
+# _resolve_s1_items anyway, so only the first caller does real I/O.
+_geoparquet_lock = threading.Lock()
 
 
 def search_sentinel2(
@@ -52,13 +59,14 @@ def search_sentinel1(
 
     Falls back to the pystac-client API if the GeoParquet approach fails.
     """
-    try:
-        return _search_sentinel1_geoparquet(bbox, start, end, modifier=modifier)
-    except Exception as exc:
-        logger.warning(
-            "S1 GeoParquet search failed (%s), falling back to STAC API", exc,
-        )
-        return _search_sentinel1_api(bbox, start, end, endpoint, collection, modifier=modifier)
+    with _geoparquet_lock:
+        try:
+            return _search_sentinel1_geoparquet(bbox, start, end, modifier=modifier)
+        except Exception as exc:
+            logger.warning(
+                "S1 GeoParquet search failed (%s), falling back to STAC API", exc,
+            )
+            return _search_sentinel1_api(bbox, start, end, endpoint, collection, modifier=modifier)
 
 
 def _search_sentinel1_geoparquet(
@@ -107,7 +115,7 @@ def _search_sentinel1_geoparquet(
         len(selected), bbox, start, end,
     )
 
-    con = duckdb.connect()
+    con = duckdb.connect(":memory:")
     con.register_filesystem(fs)
     con.execute("INSTALL spatial; LOAD spatial;")
 
@@ -164,8 +172,6 @@ def _search_sentinel1_geoparquet(
             },
         )
         item.assets = signed_assets
-        # Sign the item so asset hrefs get SAS tokens for COG reads
-        planetary_computer.sign_inplace(item)
         items.append(item)
 
     return items

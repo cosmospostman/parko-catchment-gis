@@ -5,10 +5,13 @@ Functions previously in signals/_shared.py that are needed by multiple modules.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import polars as pl
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -50,7 +53,7 @@ def _conform_table(tbl: "pa.Table", schema: "pa.Schema") -> "pa.Table":
         if field.name not in tbl.schema.names:
             tbl = tbl.append_column(
                 field,
-                pa.array([None] * len(tbl), type=field.type),
+                pa.nulls(len(tbl), type=field.type),
             )
     arrays = []
     for field in schema:
@@ -84,7 +87,7 @@ def _s1_df_to_arrow(df_s1: "pl.DataFrame", schema: "pa.Schema") -> "pa.Table":
                 arr = col.to_arrow()
                 arrays.append(arr.cast(field.type) if arr.type != field.type else arr)
             except Exception:
-                arrays.append(pa.array([None] * rows, type=field.type))
+                arrays.append(pa.nulls(rows, type=field.type))
         else:
             arrays.append(pa.array([None] * rows, type=field.type))
     return pa.table(
@@ -97,31 +100,186 @@ def _sort_s1_shards(
     shard_paths: list[Path],
     out_path: Path,
     combined_schema: "pa.Schema",
+    n_workers: int | None = None,
 ) -> None:
     """Merge S1 shards into one pixel-sorted parquet conforming to combined_schema.
 
-    Each shard is small (≤50 k points × items rows) so sorting all shards
-    together via Polars streaming is cheap even for large locations.
+    Strategy: sort each shard independently (each covers ≤50 k points, so small),
+    then k-way merge the sorted shards one row-group at a time.  Peak RAM is
+    O(n_shards × 1 row-group) rather than O(total S1 rows), which matters for
+    large locations (2 M points × 40 items = ~2 GB of shards).
     """
+    import heapq
+    import logging
+    import multiprocessing
+    import os
     import pyarrow as pa
     import pyarrow.parquet as pq
+    from concurrent.futures import ProcessPoolExecutor, as_completed
 
-    # Collect all S1 rows into one unsorted temp, then sort with Polars streaming.
-    # Total S1 volume is small relative to S2 (no NBAR angles, fewer columns).
-    cat_tmp = out_path.with_name(out_path.stem + "_cat.parquet")
-    cat_tmp.unlink(missing_ok=True)
+    _log = logging.getLogger(__name__)
+
+    if len(shard_paths) == 1:
+        _log.info("append_s1: sorting 1 shard (single, no merge needed)")
+        sort_parquet_by_pixel(shard_paths[0], out_path, row_group_size=5_000_000)
+        _log.info("append_s1: shard sort done")
+        return
+
+    # Step 1: sort each shard independently into a sibling .sorted.parquet.
+    # Sorts are CPU-bound and independent — parallelise with processes.
+    # Must use "spawn" not "fork": Polars holds Rayon thread-pool locks that
+    # cause forked children to deadlock immediately on futex_wait.
+    sorted_paths: list[Path] = [sp.with_suffix(".sorted.parquet") for sp in shard_paths]
+    n_workers = min(len(shard_paths), n_workers or os.cpu_count() or 4)
+    _log.info("append_s1: sorting %d shards with %d workers (spawn) ...", len(shard_paths), n_workers)
+
+    ctx = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as pool:
+        futs = {
+            pool.submit(sort_parquet_by_pixel, sp, sp_sorted, 5_000_000): idx
+            for idx, (sp, sp_sorted) in enumerate(zip(shard_paths, sorted_paths))
+        }
+        done = 0
+        for fut in as_completed(futs):
+            fut.result()  # re-raise any worker exception
+            done += 1
+            _log.info("append_s1: shard sort %d/%d done", done, len(shard_paths))
+
+    _log.info("append_s1: all shard sorts done, starting k-way merge ...")
+
+    # Step 2: k-way merge using a min-heap on (_northing, point_id, date).
+    # Each stream keeps one loaded row-group and a row offset into it.
+    import pyarrow.compute as pc
+
+    def _northing(pid_scalar: str) -> int:
+        parts = pid_scalar.rsplit("_", 2)
+        return int(parts[-1]) if len(parts) >= 2 else 0
+
+    FLUSH_ROWS = 5_000_000
+    buf: list[pa.Table] = []
+    buf_rows = 0
+
+    writer = pq.ParquetWriter(
+        out_path, combined_schema, compression="zstd",
+        use_dictionary=[c for c in combined_schema.names if c in {"point_id", "item_id", "tile_id"}],
+        write_statistics=True,
+    )
+
+    def _flush():
+        nonlocal buf_rows
+        if buf:
+            writer.write_table(pa.concat_tables(buf))
+            buf.clear()
+            buf_rows = 0
+
+    def _emit(tbl: pa.Table) -> None:
+        nonlocal buf_rows
+        tbl = _conform_table(tbl, combined_schema)
+        buf.append(tbl)
+        buf_rows += len(tbl)
+        if buf_rows >= FLUSH_ROWS:
+            _flush()
+
     try:
-        writer = pq.ParquetWriter(cat_tmp, combined_schema)
-        for sp in shard_paths:
-            s1_pf = pq.ParquetFile(sp)
-            for rg in range(s1_pf.metadata.num_row_groups):
-                tbl = s1_pf.read_row_group(rg)
-                tbl = _conform_table(tbl, combined_schema)
-                writer.write_table(tbl)
+        pfiles = [pq.ParquetFile(p) for p in sorted_paths]
+        n_rgs  = [pf.metadata.num_row_groups for pf in pfiles]
+        blocks = [pf.read_row_group(0) for pf in pfiles]  # current loaded block per stream
+        rg_idx = [0] * len(pfiles)   # current row-group index per stream
+        pos    = [0] * len(pfiles)   # row offset within current block
+
+        # Heap entries: (northing, point_id, date, stream_idx)
+        # date stored as int for heap comparison (days-since-epoch or ms timestamp)
+        heap: list[tuple] = []
+        for i, blk in enumerate(blocks):
+            if blk is not None and len(blk) > pos[i]:
+                pid = blk.column("point_id")[pos[i]].as_py()
+                dt  = blk.column("date")[pos[i]].as_py()
+                dt_int = dt.toordinal() if hasattr(dt, "toordinal") else int(dt.timestamp()) if dt else 0
+                heapq.heappush(heap, (_northing(pid), pid, dt_int, i))
+
+        def _advance(i: int) -> None:
+            """Move stream i forward one row; push next key onto heap if data remains."""
+            pos[i] += 1
+            blk = blocks[i]
+            if blk is not None and pos[i] < len(blk):
+                pid = blk.column("point_id")[pos[i]].as_py()
+                dt  = blk.column("date")[pos[i]].as_py()
+                dt_int = dt.toordinal() if hasattr(dt, "toordinal") else int(dt.timestamp()) if dt else 0
+                heapq.heappush(heap, (_northing(pid), pid, dt_int, i))
+            else:
+                # Exhausted this block — load next row-group
+                rg_idx[i] += 1
+                if rg_idx[i] < n_rgs[i]:
+                    blocks[i] = pfiles[i].read_row_group(rg_idx[i])
+                    pos[i] = 0
+                    blk = blocks[i]
+                    pid = blk.column("point_id")[0].as_py()
+                    dt  = blk.column("date")[0].as_py()
+                    dt_int = dt.toordinal() if hasattr(dt, "toordinal") else int(dt.timestamp()) if dt else 0
+                    heapq.heappush(heap, (_northing(pid), pid, dt_int, i))
+                else:
+                    blocks[i] = None  # stream exhausted
+
+        # Row-by-row heap merge is correct but slow for 100M rows.
+        # Optimisation: when the current minimum stream's entire remaining block
+        # is <= the next minimum key from all other streams, emit the whole block.
+        while heap:
+            _, _, _, i = heap[0]  # peek: which stream has the minimum key
+            blk = blocks[i]
+
+            if len(heap) == 1:
+                # Only one stream left — drain it entirely block by block.
+                heapq.heappop(heap)
+                _emit(blk.slice(pos[i]))
+                pos[i] = 0
+                rg_idx[i] += 1
+                while rg_idx[i] < n_rgs[i]:
+                    _emit(pfiles[i].read_row_group(rg_idx[i]))
+                    rg_idx[i] += 1
+                break
+
+            # Key of the second-smallest stream (next competitor)
+            next_key = heap[1][:3]  # (northing, pid, dt_int)
+
+            # Last key in current block of stream i
+            last_row = len(blk) - 1
+            last_pid = blk.column("point_id")[last_row].as_py()
+            last_dt  = blk.column("date")[last_row].as_py()
+            last_dt_int = last_dt.toordinal() if hasattr(last_dt, "toordinal") else int(last_dt.timestamp()) if last_dt else 0
+            last_key = (_northing(last_pid), last_pid, last_dt_int)
+
+            if last_key <= next_key:
+                # Whole remaining slice of this block is safe to emit at once.
+                heapq.heappop(heap)
+                _emit(blk.slice(pos[i]))
+                pos[i] = 0
+                rg_idx[i] += 1
+                if rg_idx[i] < n_rgs[i]:
+                    blocks[i] = pfiles[i].read_row_group(rg_idx[i])
+                    blk = blocks[i]
+                    pid = blk.column("point_id")[0].as_py()
+                    dt  = blk.column("date")[0].as_py()
+                    dt_int = dt.toordinal() if hasattr(dt, "toordinal") else int(dt.timestamp()) if dt else 0
+                    heapq.heappush(heap, (_northing(pid), pid, dt_int, i))
+                else:
+                    blocks[i] = None
+            else:
+                # Block straddles the boundary — fall back to row-by-row for this row.
+                heapq.heappop(heap)
+                _emit(blk.slice(pos[i], 1))
+                _advance(i)
+
+        _flush()
         writer.close()
-        sort_parquet_by_pixel(cat_tmp, out_path, row_group_size=5_000_000)
+        _log.info("append_s1: k-way merge done → %s", out_path.name)
+
+    except Exception:
+        writer.close()
+        out_path.unlink(missing_ok=True)
+        raise
     finally:
-        cat_tmp.unlink(missing_ok=True)
+        for p in sorted_paths:
+            p.unlink(missing_ok=True)
 
 
 def _merge_sorted_parquets(
@@ -207,7 +365,7 @@ def _merge_sorted_parquets(
         tbl = pf.read_row_group(rg)
         tbl = _conform_table(tbl, combined_schema)
         if is_s2 and tag_s2_source:
-            src_col = pa.array(["S2"] * len(tbl), type=pa.string())
+            src_col = pa.repeat("S2", len(tbl)).cast(pa.string())
             tbl = tbl.set_column(tbl.schema.get_field_index("source"), "source", src_col)
         tbl = _add_sort_key(tbl)
         # Pre-extract key columns into Python lists once per block load.
@@ -325,117 +483,63 @@ def _merge_sorted_parquets(
     writer.close()
 
 
-def append_s1_to_tile_parquet(
-    tile_path: Path,
-    bbox_wgs84: list[float],
-    start: str,
-    end: str,
-    collect_s1_fn,
-    s1_cache_dir: Path | None = None,
-) -> None:
-    """Append S1 rows to an existing S2-only tile parquet, in-place and atomically.
+def merge_tile(
+    s2_path: Path,
+    s1_path: "Path | None",
+    out_path: Path,
+) -> Path:
+    """Merge an S2 parquet and optional S1 parquet into a combined tile parquet.
 
-    Idempotent: skips the file if it already contains at least one S1 row.
-
-    Strategy for large tiles (avoids sorting the full ~10 GB merged file):
-      1. Collect S1 into per-point-shard parquets (small, already streamed).
-      2. Sort and merge the S1 shards into one sorted S1 parquet (cheap).
-      3. 2-way merge-sort the sorted S2 parquet with the sorted S1 parquet
-         into the final output, reading one row-group at a time from each.
+    No S1: copies s2_path → out_path tagging source="S2".
+    With S1: 2-way pixel-sorted merge via _merge_sorted_parquets.
+    Atomic write via .merge_tmp → rename.  Idempotent: skips if out_path
+    already exists with the correct row count (s2 rows + s1 rows).
     """
-    import tempfile
     import pyarrow as pa
     import pyarrow.parquet as pq
-    from utils.s1_collector import (
-        _resolve_s1_items,
-        _collect_s1_shards,
-        _DEFAULT_CACHE_DIR as _S1_DEFAULT_CACHE_DIR,
-    )
 
-    pf = pq.ParquetFile(tile_path)
+    s2_rows = pq.ParquetFile(s2_path).metadata.num_rows
+    s1_rows = pq.ParquetFile(s1_path).metadata.num_rows if s1_path and s1_path.exists() else 0
+    expected = s2_rows + s1_rows
 
-    if "source" in pf.schema_arrow.names and "vh" in pf.schema_arrow.names:
-        import pyarrow.compute as pc
-        source_col = pf.read(columns=["source"]).column("source").combine_chunks()
-        if pc.any(pc.equal(source_col, "S1")).as_py():
-            return
+    if out_path.exists():
+        existing_rows = pq.ParquetFile(out_path).metadata.num_rows
+        if existing_rows == expected:
+            logger.info("merge_tile: %s already up-to-date (%d rows) — skipping", out_path.name, existing_rows)
+            return out_path
+        logger.info(
+            "merge_tile: %s exists with %d rows but expected %d — rebuilding",
+            out_path.name, existing_rows, expected,
+        )
 
-    combined_schema = _extend_schema(pf.read_row_group(0).schema)
-    n_rg = pf.metadata.num_row_groups
-    # Collect unique (point_id → lon, lat) across all row-groups.  We read every
-    # row-group because small region parquets may have each pixel in a different
-    # row-group.  For large tile parquets (same pixels repeated across many date
-    # row-groups) the `if pid not in seen` guard short-circuits quickly.
-    seen: dict[str, tuple[float, float]] = {}
-    for rg_idx in range(n_rg):
-        coord_tbl = pf.read_row_group(rg_idx, columns=["point_id", "lon", "lat"])
-        for pid, lon, lat in zip(
-            coord_tbl.column("point_id").to_pylist(),
-            coord_tbl.column("lon").to_pylist(),
-            coord_tbl.column("lat").to_pylist(),
-        ):
-            if pid not in seen:
-                seen[pid] = (lon, lat)
+    pf_s2 = pq.ParquetFile(s2_path)
+    combined_schema = _extend_schema(pf_s2.schema_arrow)
+    tmp_path = out_path.with_name(out_path.stem + ".merge_tmp.parquet")
+    tmp_path.unlink(missing_ok=True)
 
-    points_for_s1: list[tuple[str, float, float]] = [
-        (p, lo, la) for p, (lo, la) in seen.items()
-    ]
-
-    resolved_cache = s1_cache_dir if s1_cache_dir is not None else _S1_DEFAULT_CACHE_DIR
-    items = _resolve_s1_items(bbox_wgs84, start, end, resolved_cache)
-
-    out_path = tile_path.with_suffix(".merged_tmp.parquet")
-    out_path.unlink(missing_ok=True)
     try:
-        with tempfile.TemporaryDirectory(prefix="s1_merge_") as _tmp:
-            tmp_dir = Path(_tmp)
-            if items:
-                shard_paths = _collect_s1_shards(
-                    out_dir=tmp_dir,
-                    items=items,
-                    bbox_wgs84=bbox_wgs84,
-                    points=points_for_s1,
-                    resolved_cache=resolved_cache,
-                )
-            else:
-                shard_paths = []
+        if not s1_path or not s1_path.exists() or s1_rows == 0:
+            # No S1 — copy S2 with source="S2" tagged
+            n_rg = pf_s2.metadata.num_row_groups
+            writer = pq.ParquetWriter(tmp_path, combined_schema)
+            for rg_idx in range(n_rg):
+                tbl = pf_s2.read_row_group(rg_idx)
+                tbl = _conform_table(tbl, combined_schema)
+                src_col = pa.repeat("S2", len(tbl)).cast(pa.string())
+                tbl = tbl.set_column(tbl.schema.get_field_index("source"), "source", src_col)
+                writer.write_table(tbl)
+            writer.close()
+        else:
+            _merge_sorted_parquets(s2_path, s1_path, tmp_path, combined_schema, tag_s2_source=True)
 
-            if not shard_paths:
-                # No S1 data — just add source column and write in-place.
-                tmp_nosort = tile_path.with_suffix(".nosort_tmp.parquet")
-                writer = pq.ParquetWriter(tmp_nosort, combined_schema)
-                for rg_idx in range(n_rg):
-                    tbl = pf.read_row_group(rg_idx)
-                    tbl = _conform_table(tbl, combined_schema)
-                    source_col = pa.array(["S2"] * len(tbl), type=pa.string())
-                    tbl = tbl.set_column(tbl.schema.get_field_index("source"), "source", source_col)
-                    writer.write_table(tbl)
-                writer.close()
-                del pf
-                tmp_nosort.replace(tile_path)
-                return
-
-            # Step 1: sort S1 shards → one sorted S1 parquet (small, cheap)
-            s1_sorted = tmp_dir / "s1_sorted.parquet"
-            import logging as _logging
-            _log = _logging.getLogger(__name__)
-            _log.info("append_s1: sorting %d S1 shard(s) ...", len(shard_paths))
-            _sort_s1_shards(shard_paths, s1_sorted, combined_schema)
-            _log.info("append_s1: S1 sort done")
-
-            del pf  # release file handle before the merge reads tile_path directly
-
-            # Step 2: 2-way merge-sort into out_path.
-            # tag_s2_source=True fills source="S2" per row-group during the merge,
-            # avoiding a separate full-file copy just to add that column.
-            _log.info("append_s1: merging S2 (%s) + S1 → %s ...", tile_path.name, out_path.name)
-            _merge_sorted_parquets(tile_path, s1_sorted, out_path, combined_schema, tag_s2_source=True)
-            _log.info("append_s1: merge done")
-
-        out_path.replace(tile_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path.replace(out_path)
     except Exception:
-        out_path.unlink(missing_ok=True)
+        tmp_path.unlink(missing_ok=True)
         raise
+
+    logger.info("merge_tile: wrote %s (%d rows)", out_path.name, expected)
+    return out_path
 
 
 # ---------------------------------------------------------------------------
@@ -486,10 +590,11 @@ def is_pixel_sorted(path: Path, n_check: int = 20) -> bool:
         pair_indices = sorted({0, n_pairs - 1} | {round(i * step) for i in range(n_check)})
         pair_indices = [i for i in pair_indices if i < n_pairs]
 
+    import pyarrow.compute as pc
     for i in pair_indices:
-        ids_a = set(pl.from_arrow(pf.read_row_groups([i],     columns=["point_id"]))["point_id"].to_list())
-        ids_b = set(pl.from_arrow(pf.read_row_groups([i + 1], columns=["point_id"]))["point_id"].to_list())
-        if ids_a & ids_b:
+        ids_a = pc.unique(pf.read_row_group(i,     columns=["point_id"]).column("point_id").combine_chunks())
+        ids_b = pc.unique(pf.read_row_group(i + 1, columns=["point_id"]).column("point_id").combine_chunks())
+        if pc.any(pc.is_in(ids_a, value_set=ids_b)).as_py():
             return False
     return True
 
