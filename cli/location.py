@@ -159,6 +159,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
         years=args.years,
         cloud_max=args.cloud_max,
         apply_nbar=not args.no_nbar,
+        n_workers=args.workers,
     )
     for path in written:
         print(f"Written: {path}")
@@ -422,6 +423,8 @@ def main() -> None:
                     help="Max cloud cover %% (default: 30)")
     pf.add_argument("--no-nbar", action="store_true",
                     help="Disable BRDF NBAR c-factor correction")
+    pf.add_argument("--workers", type=int, default=None, metavar="N",
+                    help="Concurrent item extraction workers (default: auto-scaled by pixel count)")
 
     pv = sub.add_parser("validate", help="Validate parquet data quality for a location")
     pv.add_argument("id", help="Location id (e.g. longreach, flinders0)")

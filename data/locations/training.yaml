@@ -571,65 +571,91 @@ regions:
 
   # ---------------------------------------------------------------------------
   # Quaids — Gulf savanna (monsoonal, open savanna woodland + floodplain)
-  # Added after V2 produced high false-positive rates across Quaids site.
-  # All regions selected from >95% confidence false positive areas.
   # ---------------------------------------------------------------------------
 
-  - id: quaids_absence_sparse_shrub_1
-    name: "Quaids — absence (sparse shrub 1)"
+  - id: quaids_absence_1
+    name: "Quaids — absence 1 (sparse grass)"
     label: absence
-    bbox: [145.255377, -16.807961, 145.258166, -16.806230]
-    years: [2020, 2021, 2022, 2023, 2024, 2025]
-    tags: [monsoonal, savanna, sparse_shrub]
+    bbox: [145.218249, -16.745770, 145.222940, -16.742056]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [monsoonal, savanna, sparse_grass]
 
-  - id: quaids_absence_sparse_shrub_2
-    name: "Quaids — absence (sparse shrub 2)"
+  - id: quaids_absence_3
+    name: "Quaids — absence 3 (open grass)"
     label: absence
-    bbox: [145.252731, -16.801740, 145.258462, -16.799858]
-    years: [2020, 2021, 2022, 2023, 2024, 2025]
-    tags: [monsoonal, savanna, sparse_shrub]
+    bbox: [145.270807, -16.752737, 145.275677, -16.749234]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [monsoonal, savanna, open_grass]
 
-  - id: quaids_absence_sparse_eucalypt_1
-    name: "Quaids — absence (sparse eucalypt)"
+  - id: quaids_absence_5
+    name: "Quaids — absence 5 (open savanna+riparian)"
     label: absence
-    bbox: [145.200864, -16.730436, 145.205123, -16.726404]
-    years: [2020, 2021, 2022, 2023, 2024, 2025]
-    tags: [monsoonal, savanna, sparse_eucalypt]
+    bbox: [145.264474, -16.755027, 145.269032, -16.751268]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [monsoonal, savanna, riparian]
 
-  - id: quaids_absence_shrub_1
-    name: "Quaids — absence (shrub 1)"
+  - id: quaids_absence_7
+    name: "Quaids — absence 7 (savanna)"
     label: absence
-    bbox: [145.217649, -16.734727, 145.220944, -16.732041]
-    years: [2020, 2021, 2022, 2023, 2024, 2025]
-    tags: [monsoonal, savanna, shrub]
+    bbox: [145.197088, -16.795822, 145.201448, -16.791534]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [monsoonal, savanna]
 
-  - id: quaids_absence_shrub_2
-    name: "Quaids — absence (shrub 2)"
+  - id: quaids_absence_9
+    name: "Quaids — absence 9 (woodland)"
     label: absence
-    bbox: [145.259846, -16.783927, 145.263234, -16.782218]
-    years: [2020, 2021, 2022, 2023, 2024, 2025]
-    tags: [monsoonal, savanna, shrub]
+    bbox: [145.280874, -16.776596, 145.287679, -16.773810]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [monsoonal, woodland]
 
-  - id: quaids_absence_shrub_3
-    name: "Quaids — absence (shrub 3)"
+  # Quaids — val
+  - id: quaids_val_absence_2
+    name: "Quaids — absence 2 (sparse grass)"
     label: absence
-    bbox: [145.263449, -16.782414, 145.266436, -16.779541]
-    years: [2020, 2021, 2022, 2023, 2024, 2025]
-    tags: [monsoonal, savanna, shrub]
+    split: val
+    bbox: [145.241061, -16.771976, 145.242977, -16.769671]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [monsoonal, savanna, sparse_grass]
 
-  - id: quaids_absence_very_sparse_1
-    name: "Quaids — absence (very sparse)"
+  - id: quaids_val_absence_4
+    name: "Quaids — absence 4 (open grass)"
     label: absence
-    bbox: [145.227387, -16.798335, 145.233480, -16.795356]
-    years: [2020, 2021, 2022, 2023, 2024, 2025]
-    tags: [monsoonal, savanna, very_sparse]
+    split: val
+    bbox: [145.263322, -16.761350, 145.265307, -16.758795]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [monsoonal, savanna, open_grass]
 
-  - id: quaids_absence_dense_eucalypt_1
-    name: "Quaids — absence (dense eucalypt)"
+  - id: quaids_val_absence_6
+    name: "Quaids — absence 6 (open savanna+riparian)"
     label: absence
-    bbox: [145.206365, -16.794920, 145.209648, -16.791476]
-    years: [2020, 2021, 2022, 2023, 2024, 2025]
-    tags: [monsoonal, savanna, dense_eucalypt]
+    split: val
+    bbox: [145.278518, -16.754677, 145.281560, -16.751704]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [monsoonal, savanna, riparian]
+
+  - id: quaids_val_absence_8a
+    name: "Quaids — absence 8a (savanna)"
+    label: absence
+    split: val
+    bbox: [145.279210, -16.791288, 145.280521, -16.788048]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [monsoonal, savanna]
+
+  - id: quaids_val_absence_8b
+    name: "Quaids — absence 8b (savanna)"
+    label: absence
+    split: val
+    bbox: [145.277097, -16.792999, 145.279643, -16.791164]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [monsoonal, savanna]
+
+  - id: quaids_val_absence_10
+    name: "Quaids — absence 10 (woodland)"
+    label: absence
+    split: val
+    bbox: [145.197076, -16.755761, 145.199773, -16.753854]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [monsoonal, woodland]
 
   # ---------------------------------------------------------------------------
   # Rockhampton
@@ -1162,147 +1188,147 @@ regions:
     name: "Etna Creek — presence 1"
     label: presence
     bbox: [142.248561, -21.667037, 142.249777, -21.664947]
-    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
     tags: [semi-arid]
 
   - id: etna_presence_2
     name: "Etna Creek — presence 2"
     label: presence
     bbox: [142.242799, -21.673102, 142.245353, -21.671612]
-    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
     tags: [semi-arid]
 
   - id: etna_presence_3
     name: "Etna Creek — presence 3"
     label: presence
     bbox: [142.255786, -21.698680, 142.258950, -21.695426]
-    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
     tags: [semi-arid]
 
   - id: etna_presence_4
     name: "Etna Creek — presence 4"
     label: presence
     bbox: [142.133158, -21.589486, 142.137474, -21.585983]
-    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
     tags: [semi-arid]
 
   - id: etna_absence_1
     name: "Etna Creek — absence 1"
     label: absence
     bbox: [142.247766, -21.636182, 142.251024, -21.633042]
-    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
     tags: [semi-arid]
 
   - id: etna_absence_2
     name: "Etna Creek — absence 2"
     label: absence
     bbox: [141.932247, -21.797016, 141.933938, -21.792433]
-    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
     tags: [semi-arid]
 
   - id: etna_absence_3
     name: "Etna Creek — absence 3"
     label: absence
     bbox: [141.940074, -21.862968, 141.945192, -21.858838]
-    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
     tags: [semi-arid]
 
   - id: etna_absence_4
     name: "Etna Creek — absence 4"
     label: absence
     bbox: [142.094102, -21.996812, 142.100772, -21.994215]
-    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
     tags: [semi-arid]
 
   - id: etna_absence_5
     name: "Etna Creek — absence 5"
     label: absence
     bbox: [142.117515, -21.990142, 142.122422, -21.986755]
-    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
     tags: [semi-arid]
 
   - id: etna_presence_5
     name: "Etna Creek — presence 5"
     label: presence
     bbox: [142.251447, -21.716763, 142.260631, -21.706943]
-    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
     tags: [semi-arid]
 
   - id: etna_presence_6
     name: "Etna Creek — presence 6"
     label: presence
     bbox: [142.245951, -21.698666, 142.250815, -21.693360]
-    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
     tags: [semi-arid]
 
   - id: etna_presence_7
     name: "Etna Creek — presence 7"
     label: presence
     bbox: [142.245106, -21.660234, 142.252309, -21.654738]
-    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
     tags: [semi-arid]
 
   - id: etna_presence_8
     name: "Etna Creek — presence 8"
     label: presence
     bbox: [142.164599, -21.686079, 142.167703, -21.679420]
-    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
     tags: [semi-arid]
 
   - id: etna_presence_9
     name: "Etna Creek — presence 9"
     label: presence
     bbox: [142.143401, -21.681782, 142.145517, -21.679462]
-    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
     tags: [semi-arid]
 
   - id: etna_absence_6
     name: "Etna Creek — absence 6"
     label: absence
     bbox: [142.238169, -21.643139, 142.242889, -21.639018]
-    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
     tags: [semi-arid]
 
   - id: etna_absence_7
     name: "Etna Creek — absence 7"
     label: absence
     bbox: [142.112021, -21.672097, 142.122038, -21.669575]
-    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
     tags: [semi-arid]
 
   - id: etna_absence_8
     name: "Etna Creek — absence 8"
     label: absence
     bbox: [142.106564, -21.894497, 142.111656, -21.890628]
-    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
     tags: [semi-arid, woody]
 
   - id: etna_absence_9
     name: "Etna Creek — absence 9"
     label: absence
     bbox: [142.079364, -21.975821, 142.086891, -21.973191]
-    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
     tags: [semi-arid, woody]
 
   - id: etna_absence_10
     name: "Etna Creek — absence 10"
     label: absence
     bbox: [141.955468, -21.822958, 141.961984, -21.820362]
-    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
     tags: [semi-arid, woody]
 
   - id: etna_absence_11
     name: "Etna Creek — absence 11"
     label: absence
     bbox: [141.897353, -21.850127, 141.902225, -21.845548]
-    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
     tags: [semi-arid, woody]
 
   - id: etna_absence_12
     name: "Etna Creek — absence 12"
     label: absence
     bbox: [142.088148, -21.942946, 142.094107, -21.937818]
-    years: [2020, 2021, 2022, 2023, 2024, 2025]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
     tags: [semi-arid, woody]
 
   # ---------------------------------------------------------------------------
@@ -1759,21 +1785,21 @@ regions:
   - id: rupert_ck_presence_1
     name: "Rupert Ck — presence 1"
     label: presence
-    bbox: [142.542424, -21.245974, 142.553180, -21.244081]
+    bbox: [142.542424, -21.245964, 142.553180, -21.244081]
     years: [2016, 2017, 2018, 2019, 2020]
     tags: [semi-arid, riparian]
 
   - id: rupert_ck_presence_2
     name: "Rupert Ck — presence 2"
     label: presence
-    bbox: [142.544944, -21.247657, 142.557825, -21.246044]
+    bbox: [142.544944, -21.247619, 142.557825, -21.246054]
     years: [2016, 2017, 2018, 2019, 2020]
     tags: [semi-arid, riparian]
 
   - id: rupert_ck_presence_3
     name: "Rupert Ck — presence 3"
     label: presence
-    bbox: [142.547609, -21.249422, 142.561003, -21.247672]
+    bbox: [142.547609, -21.249422, 142.561003, -21.247710]
     years: [2016, 2017, 2018, 2019, 2020]
     tags: [semi-arid, riparian]
 

@@ -256,6 +256,7 @@ class Location:
         cloud_max: int = 30,
         cache_dir: Optional[Path] = None,
         apply_nbar: bool = True,
+        n_workers: Optional[int] = None,
     ) -> list[Path]:
         """Fetch Sentinel-2 and Sentinel-1 pixel observations for this location.
 
@@ -290,6 +291,7 @@ class Location:
                 apply_nbar=apply_nbar,
                 calibration_out=_cal_out,
                 geometry=self.geometry,
+                n_workers=n_workers,
             )
 
             # collect() returns [] when all shards were already done AND the

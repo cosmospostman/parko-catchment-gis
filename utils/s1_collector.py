@@ -182,19 +182,47 @@ def _read_band_array(
     return arr, win_affine
 
 
-def _extract_item(
+def _project_points(
+    points: list[tuple[str, float, float]],
+    crs: str | None,
+) -> tuple[list[str], np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Project shard points into native item CRS once, reused across all items.
+
+    Returns (pids, lons, lats, px, py) where px/py are in the item's native CRS
+    (or equal to lons/lats for EPSG:4326 items).  Callers pass px/py directly
+    into _extract_item_projected, avoiding repeated reprojection per item.
+    """
+    pids = [p[0] for p in points]
+    lons = np.array([p[1] for p in points], dtype=np.float64)
+    lats = np.array([p[2] for p in points], dtype=np.float64)
+    if crs and crs != "EPSG:4326":
+        t = _get_transformer("EPSG:4326", crs)
+        px, py = t.transform(lons, lats)
+        px = np.asarray(px, dtype=np.float64)
+        py = np.asarray(py, dtype=np.float64)
+    else:
+        px, py = lons, lats
+    return pids, lons, lats, px, py
+
+
+def _extract_item_projected(
     item,
     affine,
     bbox_wgs84: list[float],
-    points: list[tuple[str, float, float]],
+    pids: list[str],
+    lons: np.ndarray,
+    lats: np.ndarray,
+    px: np.ndarray,
+    py: np.ndarray,
     cache_dir: Path | None = None,
 ) -> tuple[list, list, list, list, list, list, list] | None:
-    """Extract per-pixel VH/VV for one S1 item.
+    """Extract per-pixel VH/VV for one S1 item using pre-projected point coordinates.
 
-    Returns a 7-tuple of per-column lists
-    (point_ids, lons, lats, dates, vh_vals, vv_vals, orbits)
-    for all pixels with at least one valid observation, or None if the item
-    has no overlap with bbox_wgs84.
+    px/py must already be in the item's native CRS — compute them once per shard
+    via _project_points() and pass them in for all items sharing that CRS.
+
+    Returns a 7-tuple (point_ids, lons, lats, dates, vh_vals, vv_vals, orbits)
+    for pixels with at least one valid observation, or None if no overlap.
     """
     _dt = item.datetime
     date = _dt.replace(tzinfo=None) if hasattr(_dt, "replace") else _dt
@@ -209,10 +237,8 @@ def _extract_item(
     crs = _item_crs(item)
     if crs and crs != "EPSG:4326":
         bbox_native = _reproject_bbox(bbox_fetch, crs)
-        pt_transformer = _get_transformer("EPSG:4326", crs)
     else:
         bbox_native = bbox_fetch
-        pt_transformer = None
 
     vh_arr = vv_arr = None
     win_affine = None
@@ -240,15 +266,7 @@ def _extract_item(
     ref_arr = vh_arr if vh_arr is not None else vv_arr
     nrows, ncols = ref_arr.shape
 
-    pids_arr = [p[0] for p in points]
-    lons_arr = np.array([p[1] for p in points], dtype=np.float64)
-    lats_arr = np.array([p[2] for p in points], dtype=np.float64)
-
-    if pt_transformer is not None:
-        px, py = pt_transformer.transform(lons_arr, lats_arr)
-    else:
-        px, py = lons_arr, lats_arr
-
+    # px/py already in native CRS — no reprojection needed here
     cols = np.floor((px - win_affine.c) / win_affine.a).astype(np.int32)
     rows = np.floor((py - win_affine.f) / win_affine.e).astype(np.int32)
 
@@ -273,13 +291,32 @@ def _extract_item(
 
     n = idx.size
     return (
-        [pids_arr[i] for i in idx],
-        lons_arr[idx].tolist(),
-        lats_arr[idx].tolist(),
+        [pids[i] for i in idx],
+        lons[idx].tolist(),
+        lats[idx].tolist(),
         [date] * n,
         vh_vals.tolist(),
         vv_vals.tolist(),
         [orbit_state] * n,
+    )
+
+
+def _extract_item(
+    item,
+    affine,
+    bbox_wgs84: list[float],
+    points: list[tuple[str, float, float]],
+    cache_dir: Path | None = None,
+) -> tuple[list, list, list, list, list, list, list] | None:
+    """Extract per-pixel VH/VV for one S1 item.
+
+    Convenience wrapper around _extract_item_projected for call sites that
+    don't pre-project points (e.g. collect_s1 public API).
+    """
+    crs = _item_crs(item)
+    pids, lons, lats, px, py = _project_points(points, crs)
+    return _extract_item_projected(
+        item, affine, bbox_wgs84, pids, lons, lats, px, py, cache_dir=cache_dir,
     )
 
 
@@ -371,8 +408,6 @@ def _collect_s1_shards(
         pa.field("vv",       pa.float32()),
         pa.field("orbit",    pa.string()),
     ])
-    _FLUSH_ROWS = 500_000
-
     cached_count = sum(
         1 for item in items
         if all(_chip_cache_path(resolved_cache, item.id, b, bbox_wgs84).exists() for b in _S1_BANDS
@@ -383,14 +418,42 @@ def _collect_s1_shards(
         len(items), cached_count, bbox_wgs84,
     )
 
+    # Pre-project points into native item CRS once per unique CRS, per shard.
+    # All S1 RTC items over a bbox share the same UTM zone, so this is effectively
+    # one projection call per shard regardless of item count — O(n_points) instead
+    # of O(n_points × n_items).  For scoring bboxes with millions of pixels this
+    # is the dominant saving; for small training regions it eliminates 150+ redundant
+    # pyproj calls that each touch the full (small) point array.
+    #
+    # We derive the canonical CRS from the first item with a valid proj:code.
+    # If items span multiple CRS zones (rare — only when a bbox straddles a UTM
+    # boundary) we fall back to per-item projection via _extract_item.
+    canonical_crs: str | None = None
+    for _it in items:
+        _c = _item_crs(_it)
+        if _c:
+            canonical_crs = _c
+            break
+
     n_shards = max(1, (len(points) + point_shard_size - 1) // point_shard_size)
     use_sharding = n_shards > 1
+
+    # Flush when the buffer holds ~10 items' worth of rows, bounded to [10k, 200k].
+    # This keeps individual pa.table() calls cheap for small training regions
+    # (few hundred points × 150 items ≈ 30k rows/flush) while staying coarse
+    # enough for large scoring bboxes (500k points → 200k rows/flush, ~few hundred
+    # write_table calls total rather than thousands).
+    _n_points_per_shard = max(1, len(points) // n_shards)
+    _FLUSH_ROWS = max(10_000, min(200_000, _n_points_per_shard * 10))
     shard_paths: list[Path] = []
 
     for shard_idx in range(n_shards):
         shard_points = points[shard_idx * point_shard_size : (shard_idx + 1) * point_shard_size]
         if use_sharding:
             logger.info("S1: shard %d/%d — %d points", shard_idx + 1, n_shards, len(shard_points))
+
+        # Project this shard's points once — reused for every item in the shard.
+        s_pids, s_lons, s_lats, s_px, s_py = _project_points(shard_points, canonical_crs)
 
         shard_path = out_dir / f"shard_{shard_idx:04d}.parquet"
         writer = pq.ParquetWriter(shard_path, _ARROW_SCHEMA)
@@ -434,10 +497,20 @@ def _collect_s1_shards(
             if affine is None:
                 logger.warning("S1 item %s has no proj:transform — skipping", item.id)
                 return 0
-            cols = _extract_item(item, affine, bbox_wgs84, shard_points, cache_dir=resolved_cache)
-            if cols is None:
+            item_crs = _item_crs(item)
+            if item_crs == canonical_crs:
+                # Fast path: use pre-projected coordinates
+                result = _extract_item_projected(
+                    item, affine, bbox_wgs84,
+                    s_pids, s_lons, s_lats, s_px, s_py,
+                    cache_dir=resolved_cache,
+                )
+            else:
+                # Fallback: item is in a different CRS (bbox straddles UTM boundary)
+                result = _extract_item(item, affine, bbox_wgs84, shard_points, cache_dir=resolved_cache)
+            if result is None:
                 return 0
-            pids, lons, lats, dates, vhs, vvs, orbits = cols
+            pids, lons, lats, dates, vhs, vvs, orbits = result
             with write_lock:
                 buf_pid.extend(pids);   buf_lon.extend(lons);   buf_lat.extend(lats)
                 buf_date.extend(dates); buf_vh.extend(vhs);     buf_vv.extend(vvs)
@@ -458,9 +531,13 @@ def _collect_s1_shards(
                         prefix, n_items_done, len(items), total_rows,
                     )
 
+        _shard_label = f"shard {shard_idx + 1}/{n_shards} " if use_sharding else ""
+        logger.info("S1: %sfinal flush (%d buffered rows) ...", _shard_label, len(buf_pid))
         with write_lock:
             _flush_locked()
+        logger.info("S1: %sclosing parquet writer ...", _shard_label)
         writer.close()
+        logger.info("S1: %swriter closed", _shard_label)
 
         if use_sharding:
             logger.info("S1: shard %d/%d complete — %d rows", shard_idx + 1, n_shards, total_rows)

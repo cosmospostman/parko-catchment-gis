@@ -296,6 +296,12 @@ async def fetch_patches(
     logger.info("fetch_patches: SCL done, applying cloud filter")
 
     # --- Phase 2: apply cloud filter, fetch all spectral bands at once ------
+    # When cache_dir is set every fetched patch is written to disk immediately
+    # inside fetch_one_patch.  We skip accumulating into `result` in that case
+    # so the patch arrays are GC'd as soon as the write completes, preventing
+    # the full fetch from materialising all patches in RAM at once.
+    _accumulate = cache_dir is None
+
     spectral_tasks: list[tuple[str, str, asyncio.Task]] = []
     for (item, scl_href, band_hrefs), scl_data in zip(item_specs, scl_results):
         item_id = item.id
@@ -307,7 +313,8 @@ async def fetch_patches(
                 filtered += 1
                 logger.debug("Skipping wholly-clouded item %s", item_id)
                 continue
-            result[(item_id, SCL_BAND)] = scl_data
+            if _accumulate:
+                result[(item_id, SCL_BAND)] = scl_data
 
         for band, href in band_hrefs:
             spectral_tasks.append((item_id, band, asyncio.ensure_future(fetch_one_patch(item_id, band, href))))
@@ -324,7 +331,8 @@ async def fetch_patches(
         data = await task
         completed += 1
         if data is not None:
-            result[(item_id, band)] = data
+            if _accumulate:
+                result[(item_id, band)] = data
             fetched += 1
         if completed % log_every == 0 or completed == n_spectral:
             logger.info("fetch_patches: %d/%d spectral patches done", completed, n_spectral)

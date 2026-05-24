@@ -23,6 +23,7 @@ from pathlib import Path
 
 import polars as pl
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -344,41 +345,123 @@ def _collect_one_region(
     return actual_tile_id
 
 
-def _rebuild_tile_parquet(tile_id: str) -> None:
-    """Concatenate all collected region parquets for tile_id into the tile parquet."""
+def _normalise_source(tbl: pa.Table) -> pa.Table:
+    if "source" in tbl.schema.names:
+        src_idx = tbl.schema.get_field_index("source")
+        if tbl.schema.field("source").type != pa.string():
+            tbl = tbl.set_column(src_idx, "source", tbl.column("source").cast(pa.string()))
+    return tbl
+
+
+def _superset_schema(paths: list[Path]) -> pa.Schema:
+    """Return the union schema across all parquet files (metadata-only reads)."""
+    schema: pa.Schema | None = None
+    for p in paths:
+        s = pq.read_schema(p)
+        # Normalise source field type before merging.
+        if "source" in s.names:
+            idx = s.get_field_index("source")
+            if s.field("source").type != pa.string():
+                s = s.set(idx, pa.field("source", pa.string()))
+        schema = s if schema is None else pa.unify_schemas([schema, s])
+    return schema
+
+
+def _cast_to_schema(tbl: pa.Table, schema: pa.Schema) -> pa.Table:
+    """Add any missing columns (as nulls) so tbl conforms to schema."""
+    for i, field in enumerate(schema):
+        if field.name not in tbl.schema.names:
+            tbl = tbl.append_column(field, pa.nulls(len(tbl), type=field.type))
+    return tbl.cast(schema)
+
+
+def _write_region_rows(writer_ref: list, tile_path: Path, rp: Path, schema: pa.Schema) -> int:
+    """Append all row-groups from a region parquet into writer_ref[0], returning row count."""
+    pf = pq.ParquetFile(rp)
+    rows = 0
+    for rg_idx in range(pf.metadata.num_row_groups):
+        tbl = _cast_to_schema(_normalise_source(pf.read_row_group(rg_idx)), schema)
+        if writer_ref[0] is None:
+            writer_ref[0] = pq.ParquetWriter(tile_path, schema)
+        writer_ref[0].write_table(tbl)
+        rows += len(tbl)
+    return rows
+
+
+def _rebuild_tile_parquet(tile_id: str, new_region_ids: set[str] | None = None) -> None:
+    """Rebuild (or incrementally update) the merged tile parquet for tile_id.
+
+    If new_region_ids is given and the tile parquet already exists, performs an
+    incremental update: streams the existing tile, dropping rows whose point_id
+    prefix matches a changed region, then appends the fresh region parquets.
+    This avoids re-reading the unchanged majority of regions on large tiles.
+
+    Falls back to a full rebuild when the tile parquet is missing or
+    new_region_ids is not supplied.
+    """
     with _index_lock:
         all_indexed = _load_index()
         all_indexed_ids = set(
             all_indexed.filter(pl.col("tile_id") == tile_id)["region_id"].to_list()
         )
 
+    tile_path = tile_parquet_path(tile_id)
+    new_paths = [
+        _region_parquet_path(rid)
+        for rid in sorted(new_region_ids or [])
+        if _region_parquet_path(rid).exists()
+    ] if new_region_ids else []
+
+    # --- Incremental path: tile exists and we know which regions changed ---
+    if new_region_ids and tile_path.exists() and new_paths:
+        tmp_path = tile_path.with_suffix(".tmp.parquet")
+        logger.info(
+            "Updating tile %s: replacing %d region(s) incrementally",
+            tile_id, len(new_paths),
+        )
+        # Derive superset schema from existing tile + new region parquets.
+        schema = _superset_schema([tile_path] + new_paths)
+        writer_ref: list = [None]
+        total_rows = 0
+        prefixes = tuple(f"{rid}_" for rid in new_region_ids)
+        pf = pq.ParquetFile(tile_path)
+        for rg_idx in range(pf.metadata.num_row_groups):
+            tbl = _cast_to_schema(_normalise_source(pf.read_row_group(rg_idx)), schema)
+            pid_col = tbl.column("point_id")
+            drop = pc.starts_with(pid_col, prefixes[0])
+            for p in prefixes[1:]:
+                drop = pc.or_(drop, pc.starts_with(pid_col, p))
+            tbl = tbl.filter(pc.invert(drop))
+            if len(tbl):
+                if writer_ref[0] is None:
+                    writer_ref[0] = pq.ParquetWriter(tmp_path, schema)
+                writer_ref[0].write_table(tbl)
+                total_rows += len(tbl)
+        for rp in new_paths:
+            total_rows += _write_region_rows(writer_ref, tmp_path, rp, schema)
+        if writer_ref[0] is not None:
+            writer_ref[0].close()
+            tmp_path.replace(tile_path)
+        logger.info("Tile %s: %d rows (incremental)", tile_id, total_rows)
+        return
+
+    # --- Full rebuild ---
     region_paths = [
         _region_parquet_path(rid)
         for rid in sorted(all_indexed_ids)
         if _region_parquet_path(rid).exists()
     ]
-    tile_path = tile_parquet_path(tile_id)
     logger.info(
         "Building tile %s from %d region parquets → %s",
         tile_id, len(region_paths), tile_path.name,
     )
-    writer = None
+    schema = _superset_schema(region_paths)
+    writer_ref = [None]
     total_rows = 0
     for rp in region_paths:
-        pf = pq.ParquetFile(rp)
-        for rg_idx in range(pf.metadata.num_row_groups):
-            tbl = pf.read_row_group(rg_idx)
-            # Normalise source to pa.string() regardless of how the region was written
-            if "source" in tbl.schema.names:
-                src_idx = tbl.schema.get_field_index("source")
-                if tbl.schema.field("source").type != pa.string():
-                    tbl = tbl.set_column(src_idx, "source", tbl.column("source").cast(pa.string()))
-            if writer is None:
-                writer = pq.ParquetWriter(tile_path, tbl.schema)
-            writer.write_table(tbl)
-            total_rows += len(tbl)
-    if writer is not None:
-        writer.close()
+        total_rows += _write_region_rows(writer_ref, tile_path, rp, schema)
+    if writer_ref[0] is not None:
+        writer_ref[0].close()
     logger.info("Tile %s: %d rows", tile_id, total_rows)
 
 
@@ -498,7 +581,8 @@ def ensure_training_pixels(
     for tile_id, tile_regions in sorted(tile_to_regions.items()):
         tile_missing = not tile_parquet_path(tile_id).exists()
         if tile_id in tiles_with_new or tile_missing:
-            _rebuild_tile_parquet(tile_id)
+            new_ids = {r.id for r in tile_regions if r.id in submitted_region_ids}
+            _rebuild_tile_parquet(tile_id, new_region_ids=new_ids if not tile_missing else None)
         # Ensure already-complete regions are indexed (idempotent).
         for region in tile_regions:
             if region.id not in submitted_region_ids:

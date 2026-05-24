@@ -428,3 +428,93 @@ def test_sort_does_not_mix_northing_rows(tmp_path):
             assert n not in seen, f"Northing {n!r} reappears — rows are not contiguous by northing"
             seen.add(n)
             prev = n
+
+
+# ---------------------------------------------------------------------------
+# PS-14  _merge_sorted_parquets interleaves S1 rows at the correct northing
+#        position for both plain ("px_") and underscore-prefixed region IDs.
+#
+# Regression: a bug extracted list_element(reverse_split, 1) = easting instead
+# of list_element(reverse_split, 2) = northing, causing the merge to insert S1
+# rows at wrong positions and leaving the output not pixel-sorted.
+# ---------------------------------------------------------------------------
+
+def test_merge_sorted_parquets_northing_key(tmp_path):
+    """S1 rows must be interleaved by northing, not easting.
+
+    Setup: 4 pixels on a 2×2 grid (easting 0/1, northing 0/1), two S2 dates.
+    S1 observations land only on northing-0 pixels.  After the merge the output
+    must be pixel-sorted: all northing-0 rows before all northing-1 rows.
+
+    Tested with both plain IDs ("px_E_N") and underscore-prefixed region IDs
+    ("region_with_underscores_E_N") so the reverse-split sort key is exercised
+    for both cases.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from utils.parquet_utils import _merge_sorted_parquets, sort_parquet_by_pixel, is_pixel_sorted
+
+    for prefix in ["px", "region_with_underscores"]:
+        pids_n0 = [f"{prefix}_0000_0000", f"{prefix}_0001_0000"]  # northing 0
+        pids_n1 = [f"{prefix}_0000_0001", f"{prefix}_0001_0001"]  # northing 1
+
+        s2_schema = pa.schema([
+            pa.field("point_id", pa.string()),
+            pa.field("lon",      pa.float32()),
+            pa.field("lat",      pa.float32()),
+            pa.field("date",     pa.date32()),
+            pa.field("source",   pa.string()),
+            pa.field("vh",       pa.float32()),
+            pa.field("vv",       pa.float32()),
+        ])
+
+        def _make_s2_table(pids, date_val):
+            n = len(pids)
+            return pa.table({
+                "point_id": pa.array(pids, pa.string()),
+                "lon":      pa.array([0.0] * n, pa.float32()),
+                "lat":      pa.array([0.0] * n, pa.float32()),
+                "date":     pa.array([date_val] * n, pa.date32()),
+                "source":   pa.array(["S2"] * n, pa.string()),
+                "vh":       pa.array([None] * n, pa.float32()),
+                "vv":       pa.array([None] * n, pa.float32()),
+            }, schema=s2_schema)
+
+        # Pixel-sorted S2 parquet: northing-0 rows then northing-1 rows
+        s2_path = tmp_path / f"s2_{prefix}.parquet"
+        s2_writer = pq.ParquetWriter(s2_path, s2_schema)
+        for date_val in [datetime.date(2023, 1, 1), datetime.date(2023, 2, 1)]:
+            s2_writer.write_table(_make_s2_table(pids_n0, date_val))
+            s2_writer.write_table(_make_s2_table(pids_n1, date_val))
+        s2_writer.close()
+
+        # S1 rows only for northing-0 pixels
+        s1_rows = pa.table({
+            "point_id": pa.array(pids_n0 * 2, pa.string()),
+            "lon":      pa.array([0.0] * 4, pa.float32()),
+            "lat":      pa.array([0.0] * 4, pa.float32()),
+            "date":     pa.array([datetime.date(2023, 1, 15)] * 4, pa.date32()),
+            "source":   pa.array(["S1"] * 4, pa.string()),
+            "vh":       pa.array([0.01, 0.02, 0.01, 0.02], pa.float32()),
+            "vv":       pa.array([0.03, 0.04, 0.03, 0.04], pa.float32()),
+        }, schema=s2_schema)
+        s1_path = tmp_path / f"s1_{prefix}.parquet"
+        pq.write_table(s1_rows, s1_path)
+        s1_sorted = tmp_path / f"s1_{prefix}_sorted.parquet"
+        sort_parquet_by_pixel(s1_path, s1_sorted)
+
+        out_path = tmp_path / f"merged_{prefix}.parquet"
+        _merge_sorted_parquets(s2_path, s1_sorted, out_path, s2_schema, tag_s2_source=False)
+
+        assert is_pixel_sorted(out_path), (
+            f"Merged output is not pixel-sorted for prefix={prefix!r} — "
+            "S1 rows were interleaved at wrong northing positions (easting/northing key bug)"
+        )
+
+        # S1 rows must only appear for northing-0 pixels
+        result = pl.read_parquet(out_path)
+        s1_rows_out = result.filter(pl.col("source") == "S1")
+        s1_northings = {pid.rsplit("_", 1)[1] for pid in s1_rows_out["point_id"].to_list()}
+        assert s1_northings == {"0000"}, (
+            f"S1 rows appeared at unexpected northings {s1_northings} for prefix={prefix!r}"
+        )

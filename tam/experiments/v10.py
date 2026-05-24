@@ -81,6 +81,9 @@ EXPERIMENT = Experiment(
         "frenchs_absence_riparian_woodland", "frenchs_absence_riparian",
         "frenchs_absence_5", "frenchs_absence_6", "frenchs_absence_7",
         "frenchs_absence_water_1", "frenchs_absence_water_2", "frenchs_absence_water_3",
+        # Quaids — Cape York Peninsula (monsoonal savanna)
+        "quaids_absence_1", "quaids_absence_3", "quaids_absence_5",
+        "quaids_absence_7", "quaids_absence_9",
     ],
     val_region_ids=[
         # Etna Creek
@@ -105,6 +108,9 @@ EXPERIMENT = Experiment(
         # Frenchs — held out for monsoonal generalisation check
         "frenchs_presence_5", "frenchs_presence_6",
         "frenchs_absence_savanna", "frenchs_absence_4", "frenchs_absence_8",
+        # Quaids — held out for monsoonal generalisation check
+        "quaids_val_absence_2", "quaids_val_absence_4", "quaids_val_absence_6",
+        "quaids_val_absence_8a", "quaids_val_absence_8b", "quaids_val_absence_10",
     ],
     feature_cols=V10_FEATURE_COLS,
     model_kwargs={

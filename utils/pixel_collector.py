@@ -264,6 +264,20 @@ def extract_item_to_df(
 # Main pipeline
 # ---------------------------------------------------------------------------
 
+def _auto_n_workers(n_pixels: int, n_bands: int = 12, target_gb: float = 4.0) -> int:
+    """Return a safe worker count for concurrent item extraction.
+
+    Each worker holds one item's full band patches in RAM.  The dominant cost
+    is the numpy arrays produced by extract_item_to_df: n_pixels × n_bands
+    float32 values plus a similar-sized Polars DataFrame copy.  We budget
+    ~2× for the DataFrame overhead.
+    """
+    bytes_per_item = n_pixels * n_bands * 4 * 2  # ×2 for numpy + polars copy
+    target_bytes = int(target_gb * 1024 ** 3)
+    workers = max(1, min(8, target_bytes // max(1, bytes_per_item)))
+    return workers
+
+
 def collect(
     bbox_wgs84: list[float],
     start: str,
@@ -277,6 +291,7 @@ def collect(
     point_id_prefix: str = "px",
     calibration_out: Path | None = None,
     geometry=None,
+    n_workers: int | None = None,
 ) -> list[Path]:
     """Collect S2 observations for bbox_wgs84, writing one parquet per S2 tile.
 
@@ -292,6 +307,11 @@ def collect(
     used for STAC search and COG reads (unavoidable — rasterio reads rectangular
     windows), but the chip cache and parquet output will only contain
     polygon-interior pixels.
+
+    *n_workers* controls how many items are extracted concurrently during the
+    shard write phase.  Each worker holds one item's full band patches in RAM,
+    so this is the primary memory knob for large locations.  ``None`` (default)
+    auto-scales based on pixel count, targeting ~4 GB peak usage.
     """
     # --- 1. Generate pixel grid -------------------------------------------
     utm_crs = _utm_crs_for_bbox(bbox_wgs84)
@@ -306,6 +326,14 @@ def collect(
             "Polygon mask: %d / %d points retained (%.0f%%)",
             len(points), before, 100 * len(points) / before if before else 0,
         )
+
+    # Resolve n_workers after the pixel grid so the auto-scale sees the real count.
+    if n_workers is None:
+        n_workers = _auto_n_workers(len(points))
+    else:
+        n_workers = max(1, n_workers)
+    logger.info("Extraction workers: %d (pixel count %d)", n_workers, len(points))
+
 
     point_coords = {pid: (lon, lat) for pid, lon, lat in points}
 
@@ -582,23 +610,33 @@ def collect(
             writer.write_table(out)
 
         # --- Concurrent item processing --------------------------------------
-        # N_WORKERS threads each process one item at a time: load .npz from
+        # n_workers threads each process one item at a time: load .npz from
         # disk, fetch granule XML (HTTP), run c-factor, build DataFrame.
         # Disk reads and HTTP fetches release the GIL so threads genuinely
         # run in parallel.  Results are placed on an output queue in
         # submission order (via a per-item Future) so the writer stays serial.
         #
-        # Memory bound: at most N_WORKERS items' patches live in RAM at once.
+        # Memory bound: at most n_workers items' patches live in RAM at once.
+        #
+        # One CachedNpzChipStore per thread — stores cache the (lon,lat)→(row,col)
+        # projection for each tile CRS, which is expensive at 2M points.  Creating
+        # a new store per item call throws that cache away every call; thread-local
+        # stores reuse projections across all items a given worker processes.
+        import threading as _threading
+        _thread_local = _threading.local()
 
-        N_WORKERS = 8
+        def _get_thread_store() -> CachedNpzChipStore:
+            if not hasattr(_thread_local, "store"):
+                _thread_local.store = CachedNpzChipStore(
+                    cache_dir=cache_dir,
+                    point_coords=shard_point_coords,
+                    bands=FETCH_BANDS,
+                )
+            return _thread_local.store
 
         def _process_item(_item) -> tuple | None:
             """Run in a worker thread. Returns (item_id, df | None)."""
-            store = CachedNpzChipStore(
-                cache_dir=cache_dir,
-                point_coords=shard_point_coords,
-                bands=FETCH_BANDS,
-            )
+            store = _get_thread_store()
             df = extract_item_to_df(
                 _item, store, shard_point_ids, shard_lons, shard_lats,
                 apply_nbar=apply_nbar, utm_crs=utm_crs,
@@ -610,14 +648,14 @@ def collect(
         # Submitting all items upfront would leave completed DataFrames queued in
         # memory until the writer drains them — fatal for large shards.
         from concurrent.futures import wait, FIRST_COMPLETED
-        with done_path.open("a") as done_fh, ThreadPoolExecutor(max_workers=N_WORKERS) as pool:
+        with done_path.open("a") as done_fh, ThreadPoolExecutor(max_workers=n_workers) as pool:
             pending_queue = list(pending_items)
             in_flight: dict = {}  # future → item
             i = 0
 
             while pending_queue or in_flight:
-                # Fill the window up to N_WORKERS
-                while pending_queue and len(in_flight) < N_WORKERS:
+                # Fill the window up to n_workers
+                while pending_queue and len(in_flight) < n_workers:
                     item = pending_queue.pop(0)
                     in_flight[pool.submit(_process_item, item)] = item
 
