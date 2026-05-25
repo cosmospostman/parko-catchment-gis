@@ -552,8 +552,13 @@ def collect_s1_for_tile(
     from utils.parquet_utils import _extend_schema, _sort_s1_shards
 
     if out_path.exists() and out_path.stat().st_size > 0:
-        logger.info("collect_s1_for_tile: %s already exists — skipping", out_path.name)
-        return out_path
+        try:
+            pq.ParquetFile(out_path).metadata  # validates magic bytes and footer
+            logger.info("collect_s1_for_tile: %s already exists — skipping", out_path.name)
+            return out_path
+        except Exception:
+            logger.warning("collect_s1_for_tile: %s is corrupt — rebuilding", out_path.name)
+            out_path.unlink()
 
     setup_gdal_env()
 

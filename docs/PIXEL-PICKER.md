@@ -339,3 +339,38 @@ function zoomTo(bboxRaw: any, feat?: LocationFeature) {
 6. Click the same pixel again — confirms toggle/remove behaviour.
 7. Copy YAML, verify coordinates round-trip cleanly through 7 d.p. precision.
 8. Confirm BBoxPanel and PixelPickerPanel are mutually exclusive (opening one resets the other's mode).
+
+---
+
+## Using high-quality low-quantity pixels effectively in training
+
+Pixel-list regions are likely to be small and high-quality (e.g. UAV-verified or GPS-logged Parkinsonia canopy). A small cluster gets numerically overwhelmed by bulk training data during model fitting — the model learns to ignore it. The main mitigations:
+
+### Class weighting
+
+Set `class_weight` (sklearn) or `sample_weight` proportional to inverse class frequency. This scales the loss contribution so rare-but-good pixels punch above their count. Simplest to implement and easy to audit.
+
+### Oversampling
+
+Repeat minority-class samples so they appear more often in the training array.
+
+**Simple duplication** — copy the rows until the minority class reaches a target proportion. The model sees them more often and they contribute more gradient updates. Downside: the model can overfit to those exact pixel vectors rather than learning the underlying spectral pattern.
+
+**SMOTE (Synthetic Minority Oversampling Technique)** — instead of copying, interpolates. For each minority sample:
+1. Find its k nearest neighbours in feature space (spectral bands).
+2. Pick one neighbour at random.
+3. Create a new synthetic point somewhere along the line between them.
+
+A pixel at `[0.30, 0.12, 0.45, ...]` and a neighbour at `[0.35, 0.10, 0.48, ...]` might yield a synthetic point at `[0.32, 0.11, 0.46, ...]`. This fills in the spectral neighbourhood rather than repeating known points, which generalises better than duplication.
+
+Risk for Parkinsonia pixels: if the minority class spans heterogeneous canopy densities or illumination conditions, SMOTE can produce spectrally plausible but geographically nonsensical samples. It also cannot know that an interpolated point crosses into a different land cover class in geographic space.
+
+**Recommendation for this project:** oversampling + class weighting together. Oversampling gets the curated pixels into gradient updates regularly; weighting ensures the loss surface rewards getting them right. For tree-based models (random forest, gradient boosting), simple duplication or SMOTE before fitting is sufficient. For iterative models (neural nets), per-batch oversampling or class weighting is more effective than static duplication.
+
+### Two-stage fine-tuning
+
+Pre-train on the full noisy dataset, then fine-tune on the curated subset only. The model starts with broad feature learning and ends tuned to the ground-truth pixels. Useful when the high-quality pixels are a refinement of an existing class rather than a wholly new one.
+
+### Validation
+
+Regardless of approach, hold some curated pixels out as a separate validation fold. This is the only honest signal that the model is learning the right spectral pattern rather than memorising pixel locations.

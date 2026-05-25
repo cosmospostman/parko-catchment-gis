@@ -311,7 +311,7 @@ def fetch_spec(
                 end=f"{year}-12-31",
                 out_path=s1_path,
                 cache_dir=s1_cache,
-                n_workers=_n_s1,
+                max_concurrent=_n_s1,
             )
 
             merge_tile(
@@ -429,7 +429,7 @@ def _fetch_spec_strips(
                 end=f"{year}-12-31",
                 out_path=s1_path,
                 cache_dir=s1_cache_dir,
-                n_workers=n_s1_workers,
+                max_concurrent=n_s1_workers,
             )
 
             merge_tile(
