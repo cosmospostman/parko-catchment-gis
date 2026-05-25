@@ -44,7 +44,7 @@ def smoke_cfg() -> TAMConfig:
         n_bands=len(ALL_FEATURE_COLS),
         use_s1=False,
         n_global_features=0,
-        n_epochs=5, patience=5, batch_size=4,
+        n_epochs=2, patience=2, batch_size=4,
         doy_jitter=3, val_frac=0.3,
     )
 

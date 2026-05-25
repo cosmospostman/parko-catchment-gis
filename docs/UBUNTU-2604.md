@@ -21,7 +21,7 @@ During the Ubuntu installer, recreate the LVM layout:
 
 ```bash
 sudo apt update && sudo apt upgrade -y
-sudo apt install git curl vim rsync
+sudo apt install git curl vim rsync python3.14-venv nload avahi
 ```
 
 Set hostname:
@@ -82,19 +82,12 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### PyTorch — Blackwell GPU requires cu128 + PyTorch 2.7+
+### PyTorch — Blackwell GPU requires cu130 + PyTorch 2.7+
 
-The RTX 5060 Ti (sm_120) requires CUDA 12.8 and PyTorch 2.7+. Also update
-`requirements.txt` to drop the `torch==2.4.0` pin and the cu121 comment.
-
-```bash
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-```
-
-If PyTorch 2.7 stable is not yet available, use the nightly index:
+The RTX 5060 Ti (sm_120) requires CUDA 13.x. Use the cu130 index (latest available):
 
 ```bash
-pip install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu128
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
 ```
 
 Verify:
