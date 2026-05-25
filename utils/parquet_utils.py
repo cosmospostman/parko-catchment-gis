@@ -89,7 +89,7 @@ def _s1_df_to_arrow(df_s1: "pl.DataFrame", schema: "pa.Schema") -> "pa.Table":
             except Exception:
                 arrays.append(pa.nulls(rows, type=field.type))
         else:
-            arrays.append(pa.array([None] * rows, type=field.type))
+            arrays.append(pa.nulls(rows, type=field.type))
     return pa.table(
         {field.name: arrays[i] for i, field in enumerate(schema)},
         schema=schema,
@@ -134,7 +134,7 @@ def _sort_s1_shards(
     ctx = multiprocessing.get_context("spawn")
     with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as pool:
         futs = {
-            pool.submit(sort_parquet_by_pixel, sp, sp_sorted, 5_000_000): idx
+            pool.submit(sort_parquet_by_pixel, sp, sp_sorted, 5_000_000, _skip_dict_rewrite=True): idx
             for idx, (sp, sp_sorted) in enumerate(zip(shard_paths, sorted_paths))
         }
         done = 0
@@ -183,217 +183,86 @@ def _merge_sorted_parquets(
     out_path: Path,
     combined_schema: "pa.Schema",
     tag_s2_source: bool = False,
+    memory_limit_gb: int = 8,
 ) -> None:
-    """Streaming 2-way merge of two pixel-sorted parquets into out_path.
+    """2-way sort-merge of S2 and S1 parquets into out_path via DuckDB.
 
-    Both inputs must be sorted by (_northing, point_id, date) — the key
-    produced by sort_parquet_by_pixel.  This merge reads one row-group at a
-    time from each source and only requires O(2 row-groups) of RAM, making it
-    safe for S2 tile parquets of any size.
-
-    S2 rows take priority over S1 rows with the same (point_id, date) key
-    (S2 is is_s2=True, so its tiebreak digit is 0 vs 1 for S1).
-
-    tag_s2_source:
-        If True, fill source="S2" on each S2 row-group as it is loaded,
-        eliminating the need for a separate pre-tagging copy of the S2 file.
+    DuckDB reads both files, tags S2 rows with source='S2', unions them, sorts
+    by (northing, date), and writes to parquet — spilling to disk if needed so
+    peak RAM stays bounded regardless of file size.
     """
-    import pyarrow as pa
+    import duckdb
+    import os
     import pyarrow.parquet as pq
-    import pyarrow.compute as pc
 
-    def _add_sort_key(tbl: pa.Table) -> pa.Table:
-        """Add integer _northing column extracted from point_id strings."""
-        pid = tbl.column("point_id").combine_chunks()
-        # point_id: "{prefix}_{easting}_{northing}" — northing is the last segment.
-        # Reverse split with max_splits=2 absorbs any underscores in the prefix into
-        # index 0, leaving [prefix, easting, northing] at indices 0/1/2.
-        # pc.list_element stays in Arrow kernels; avoids the to_pylist() + list-comprehension.
-        parts = pc.split_pattern(pid, "_", max_splits=2, reverse=True)
-        northings = pc.list_element(parts, 2).cast(pa.int32())
-        return tbl.append_column(pa.field("_northing", pa.int32()), northings)
+    s2_p = str(s2_path)
+    s1_p = str(s1_path)
+    dst  = str(out_path)
+    tmp_dir = str(out_path.parent)
 
-    # Pre-extracted key arrays per loaded block — populated in _read_block, used in
-    # _row_key.  Avoids per-probe random-access PyArrow column lookups inside binary search.
-    _key_arrays: dict[str, tuple] = {}  # block id → (northings[], pids[], dates[], tiebreak)
+    # Determine S2 and S1 column sets to build safe SELECT clauses.
+    # S2 may not have 'source'; S1 always has it (set to "S1").
+    s2_cols = set(pq.ParquetFile(s2_path).schema_arrow.names)
+    s1_cols = set(pq.ParquetFile(s1_path).schema_arrow.names)
+    out_names = combined_schema.names  # ordered output columns
 
-    pf_s2 = pq.ParquetFile(s2_path)
-    pf_s1 = pq.ParquetFile(s1_path)
-    n_rg_s2 = pf_s2.metadata.num_row_groups
-    n_rg_s1 = pf_s1.metadata.num_row_groups
+    def _select_clause(file_cols: set[str], override_source: str | None) -> str:
+        parts = []
+        for name in out_names:
+            if name == "source" and override_source is not None:
+                parts.append(f"'{override_source}' AS source")
+            elif name in file_cols:
+                parts.append(f'"{name}"')
+            else:
+                parts.append(f"NULL AS \"{name}\"")
+        return ", ".join(parts)
 
-    dict_cols = {"point_id", "item_id", "tile_id"}
-    writer = pq.ParquetWriter(
-        out_path, combined_schema, compression="zstd",
-        use_dictionary=[c for c in combined_schema.names if c in dict_cols],
-        write_statistics=True,
-    )
+    s2_src_override = "S2" if tag_s2_source else None
+    s2_select = _select_clause(s2_cols, s2_src_override)
+    s1_select = _select_clause(s1_cols, None)
 
-    FLUSH_ROWS = 5_000_000
-    buf: list[pa.Table] = []
-    buf_rows = 0
+    col_list = ", ".join(f'"{c}"' for c in out_names)
 
-    def _flush():
-        nonlocal buf_rows
-        if not buf:
-            return
-        writer.write_table(pa.concat_tables(buf))
-        buf.clear()
-        buf_rows = 0
-
-    def _emit(tbl: pa.Table) -> None:
-        nonlocal buf_rows
-        # Drop _northing before writing
-        if "_northing" in tbl.schema.names:
-            tbl = tbl.remove_column(tbl.schema.get_field_index("_northing"))
-        tbl = _conform_table(tbl, combined_schema)
-        buf.append(tbl)
-        buf_rows += len(tbl)
-        if buf_rows >= FLUSH_ROWS:
-            _flush()
-
-    # State for each stream: current block (Table with _northing) and row offset
-    def _read_block(pf: pq.ParquetFile, rg: int, is_s2: bool) -> pa.Table | None:
-        if rg >= (n_rg_s2 if is_s2 else n_rg_s1):
-            _key_arrays.pop(("s2" if is_s2 else "s1"), None)
-            return None
-        tbl = pf.read_row_group(rg)
-        tbl = _conform_table(tbl, combined_schema)
-        if is_s2 and tag_s2_source:
-            src_col = pa.repeat("S2", len(tbl)).cast(pa.string())
-            tbl = tbl.set_column(tbl.schema.get_field_index("source"), "source", src_col)
-        tbl = _add_sort_key(tbl)
-        # Pre-extract key columns into Python lists once per block load.
-        # Binary search probes these lists with O(1) index — no Arrow overhead per probe.
-        key = "s2" if is_s2 else "s1"
-        _key_arrays[key] = (
-            tbl.column("_northing").to_pylist(),
-            tbl.column("point_id").to_pylist(),
-            tbl.column("date").to_pylist(),
-            0 if is_s2 else 1,
+    sql = f"""
+        COPY (
+            SELECT {col_list}
+            FROM (
+                SELECT {s2_select} FROM read_parquet('{s2_p}')
+                UNION ALL
+                SELECT {s1_select} FROM read_parquet('{s1_p}')
+            ) t
+            ORDER BY regexp_extract(point_id, '_([0-9]+)$', 1)::INTEGER, date
+        ) TO '{dst}' (
+            FORMAT PARQUET, COMPRESSION ZSTD,
+            ROW_GROUP_SIZE 5000000
         )
-        return tbl
+    """
 
-    def _row_key(tbl: pa.Table, row: int, is_s2: bool) -> tuple:
-        northings, pids, dates, tb = _key_arrays["s2" if is_s2 else "s1"]
-        return (northings[row], pids[row], dates[row], tb)
-
-    rg_s2 = rg_s1 = 0
-    pos_s2 = pos_s1 = 0
-    blk_s2 = _read_block(pf_s2, rg_s2, True)
-    blk_s1 = _read_block(pf_s1, rg_s1, False)
-
-    # Row-by-row merge is too slow for 200M rows. Instead: find the boundary
-    # in the current S1 block that falls before the start of the next S2 block,
-    # and emit entire S2 row-groups at a time (the common case is S2 rows are
-    # much more dense and already sorted — we only need to interleave S1).
-    #
-    # Algorithm:
-    #   While both streams have data:
-    #     key_s1_start = first row key in current S1 block
-    #     Emit all S2 rows with key < key_s1_start (entire row-groups at a time)
-    #     Emit all S1 rows with key <= next S2 row key (or all remaining S1 if S2 exhausted)
-    #   Drain whichever stream remains.
-
-    while blk_s2 is not None and blk_s1 is not None:
-        # Key of first S1 row in current block
-        k_s1 = _row_key(blk_s1, pos_s1, False)
-
-        # Emit S2 rows that are strictly before the first S1 row.
-        # Optimisation: if the entire current S2 block ends before k_s1,
-        # emit the whole block without row-by-row comparison.
-        while blk_s2 is not None:
-            last_s2_key = _row_key(blk_s2, len(blk_s2) - 1, True)
-            if last_s2_key < k_s1:
-                # Whole S2 block goes before any S1 row — emit it in one shot
-                _emit(blk_s2.slice(pos_s2))
-                pos_s2 = 0
-                rg_s2 += 1
-                blk_s2 = _read_block(pf_s2, rg_s2, True)
-            else:
-                break
-
-        if blk_s2 is None:
-            break
-
-        # Find cut point in S2 block: first row with key >= k_s1
-        # Binary search on the sorted block
-        lo, hi = pos_s2, len(blk_s2)
-        while lo < hi:
-            mid = (lo + hi) // 2
-            if _row_key(blk_s2, mid, True) < k_s1:
-                lo = mid + 1
-            else:
-                hi = mid
-        cut = lo  # rows [pos_s2, cut) go before S1
-
-        if cut > pos_s2:
-            _emit(blk_s2.slice(pos_s2, cut - pos_s2))
-            pos_s2 = cut
-            if pos_s2 >= len(blk_s2):
-                rg_s2 += 1
-                pos_s2 = 0
-                blk_s2 = _read_block(pf_s2, rg_s2, True)
-
-        # Now emit S1 rows up to the current S2 row's key
-        k_s2 = _row_key(blk_s2, pos_s2, True) if blk_s2 is not None else None
-        while blk_s1 is not None:
-            k_s1_cur = _row_key(blk_s1, pos_s1, False)
-            if k_s2 is not None and k_s1_cur >= k_s2:
-                break
-            # Find cut in S1 block
-            lo, hi = pos_s1, len(blk_s1)
-            while lo < hi:
-                mid = (lo + hi) // 2
-                if _row_key(blk_s1, mid, False) < k_s2:
-                    lo = mid + 1
-                else:
-                    hi = mid
-            cut_s1 = lo
-            if cut_s1 > pos_s1:
-                _emit(blk_s1.slice(pos_s1, cut_s1 - pos_s1))
-                pos_s1 = cut_s1
-            if pos_s1 >= len(blk_s1):
-                rg_s1 += 1
-                pos_s1 = 0
-                blk_s1 = _read_block(pf_s1, rg_s1, False)
-            else:
-                break
-
-    # Drain remaining S2
-    while blk_s2 is not None:
-        _emit(blk_s2.slice(pos_s2))
-        pos_s2 = 0
-        rg_s2 += 1
-        blk_s2 = _read_block(pf_s2, rg_s2, True)
-
-    # Drain remaining S1
-    while blk_s1 is not None:
-        _emit(blk_s1.slice(pos_s1))
-        pos_s1 = 0
-        rg_s1 += 1
-        blk_s1 = _read_block(pf_s1, rg_s1, False)
-
-    _flush()
-    writer.close()
+    con = duckdb.connect()
+    try:
+        con.execute(f"SET memory_limit = '{memory_limit_gb}GB'")
+        con.execute(f"SET temp_directory = '{tmp_dir}'")
+        con.execute(f"SET threads = {max(1, (os.cpu_count() or 4) // 2)}")
+        con.execute(sql)
+    finally:
+        con.close()
 
 
 def merge_strips(
     strip_paths: "list[Path]",
     out_path: Path,
 ) -> Path:
-    """N-way merge of already-sorted strip parquets into a single output parquet.
+    """Concatenate already-sorted strip parquets into a single output parquet.
 
-    Each strip must already be pixel-sorted (as produced by merge_tile or
-    sort_parquet_by_pixel).  Strips are assumed to cover non-overlapping northing
-    bands (south-to-north order), so this is primarily a concatenation with a
-    final sort pass to handle any overlap at strip boundaries.
+    Strips cover non-overlapping northing bands in south-to-north order, so
+    concatenation preserves pixel-sort order.  Row groups are copied verbatim
+    — no re-sort, O(1 row group) peak RAM.
 
     Idempotent: skips if out_path already exists with the correct total row count.
     Atomic write via .strips_tmp suffix → rename.
     """
+    import pyarrow as pa
     import pyarrow.parquet as pq
-    import polars as pl
 
     if not strip_paths:
         raise ValueError("merge_strips: strip_paths is empty")
@@ -415,19 +284,19 @@ def merge_strips(
 
     try:
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        (
-            pl.scan_parquet([str(p) for p in strip_paths], missing_columns="insert")
-            .with_columns(
-                pl.col("point_id").str.extract(r"_(\d+)$", 1).cast(pl.Int32).alias("_northing")
-            )
-            .sort(["_northing", "date"])
-            .drop("_northing")
-            .sink_parquet(
-                str(tmp_path),
-                compression="zstd",
-                row_group_size=5_000_000,
-            )
+        # Determine schema from first strip (all strips share identical schema)
+        first_pf = pq.ParquetFile(strip_paths[0])
+        schema = first_pf.schema_arrow
+        writer = pq.ParquetWriter(
+            tmp_path, schema, compression="zstd",
+            use_dictionary=["point_id", "item_id", "tile_id"],
+            write_statistics=True,
         )
+        for p in strip_paths:
+            pf = pq.ParquetFile(p)
+            for rg in range(pf.metadata.num_row_groups):
+                writer.write_table(pf.read_row_group(rg))
+        writer.close()
         tmp_path.replace(out_path)
     except Exception:
         tmp_path.unlink(missing_ok=True)
@@ -449,7 +318,6 @@ def merge_tile(
     Atomic write via .merge_tmp → rename.  Idempotent: skips if out_path
     already exists with the correct row count (s2 rows + s1 rows).
     """
-    import pyarrow as pa
     import pyarrow.parquet as pq
 
     s2_rows = pq.ParquetFile(s2_path).metadata.num_rows
@@ -466,24 +334,34 @@ def merge_tile(
             out_path.name, existing_rows, expected,
         )
 
-    pf_s2 = pq.ParquetFile(s2_path)
-    combined_schema = _extend_schema(pf_s2.schema_arrow)
+    import pyarrow as pa
+
     tmp_path = out_path.with_name(out_path.stem + ".merge_tmp.parquet")
     tmp_path.unlink(missing_ok=True)
 
     try:
         if not s1_path or not s1_path.exists() or s1_rows == 0:
-            # No S1 — copy S2 with source="S2" tagged
-            n_rg = pf_s2.metadata.num_row_groups
-            writer = pq.ParquetWriter(tmp_path, combined_schema)
-            for rg_idx in range(n_rg):
-                tbl = pf_s2.read_row_group(rg_idx)
-                tbl = _conform_table(tbl, combined_schema)
-                src_col = pa.repeat("S2", len(tbl)).cast(pa.string())
-                tbl = tbl.set_column(tbl.schema.get_field_index("source"), "source", src_col)
-                writer.write_table(tbl)
-            writer.close()
+            # No S1 — copy S2 row-groups verbatim, tagging source="S2"
+            s2_pf = pq.ParquetFile(s2_path)
+            out_schema = _extend_schema(s2_pf.schema_arrow)
+            writer = pq.ParquetWriter(
+                tmp_path, out_schema, compression="zstd",
+                use_dictionary=["point_id", "item_id", "tile_id"],
+                write_statistics=True,
+            )
+            try:
+                for rg in range(s2_pf.metadata.num_row_groups):
+                    blk = s2_pf.read_row_group(rg)
+                    src_col = pa.repeat("S2", len(blk))
+                    if "source" in blk.schema.names:
+                        blk = blk.set_column(blk.schema.get_field_index("source"), "source", src_col)
+                    else:
+                        blk = blk.append_column(pa.field("source", pa.string()), src_col)
+                    writer.write_table(_conform_table(blk, out_schema))
+            finally:
+                writer.close()
         else:
+            combined_schema = _extend_schema(pq.ParquetFile(s2_path).schema_arrow)
             _merge_sorted_parquets(s2_path, s1_path, tmp_path, combined_schema, tag_s2_source=True)
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -590,6 +468,7 @@ def sort_parquet_by_pixel(
     row_group_size: int = 5_000_000,
     ram_budget_gb: float = 8.0,  # kept for call-site compatibility, unused
     read_workers: int = 6,       # kept for call-site compatibility, unused
+    _skip_dict_rewrite: bool = False,
 ) -> None:
     """Write a copy of ``src`` sorted by ``(point_id, date, scl_purity desc)``.
 
@@ -597,6 +476,10 @@ def sort_parquet_by_pixel(
     and spills to disk only if the sort exceeds available RAM — no manual multi-pass
     bucketing required.  A PyArrow rewrite pass is applied afterwards to restore
     dictionary encoding on string columns and the float32/date32 schema optimisations.
+
+    _skip_dict_rewrite: skip the second-pass PyArrow rewrite.  Use this when dst
+    is a transient intermediate file that will be immediately consumed and deleted
+    (e.g. shard pre-sort before a Polars merge), saving ~1 s/shard.
     """
     import pyarrow.parquet as pq
 
@@ -623,13 +506,15 @@ def sort_parquet_by_pixel(
         sort_cols = ["_northing", "point_id", "date", "scl_purity"] if "scl_purity" in schema_cols \
             else ["_northing", "point_id", "date"]
         sort_desc = [False] * (len(sort_cols) - 1) + ([True] if "scl_purity" in schema_cols else [False])
+
+        sort_dst = dst if _skip_dict_rewrite else tmp
         (
             pl.scan_parquet(src)
             .with_columns(cast_exprs)
             .sort(sort_cols, descending=sort_desc)
             .drop("_northing")
             .sink_parquet(
-                tmp,
+                sort_dst,
                 compression="zstd",
                 compression_level=3,
                 row_group_size=row_group_size,
@@ -637,20 +522,21 @@ def sort_parquet_by_pixel(
             )
         )
 
-        # Rewrite with dictionary encoding on string columns — sink_parquet doesn't
-        # expose this, but it meaningfully reduces file size for point_id/item_id/tile_id.
-        dict_cols = {"point_id", "item_id", "tile_id"}
-        pf = pq.ParquetFile(tmp)
-        schema = pf.schema_arrow
-        writer = pq.ParquetWriter(
-            dst, schema, compression="zstd",
-            use_dictionary=[c for c in schema.names if c in dict_cols],
-            write_statistics=True,
-        )
-        for i in range(pf.metadata.num_row_groups):
-            writer.write_table(pf.read_row_group(i))
-        writer.close()
-        tmp.unlink(missing_ok=True)
+        if not _skip_dict_rewrite:
+            # Rewrite with dictionary encoding on string columns — sink_parquet doesn't
+            # expose this, but it meaningfully reduces file size for point_id/item_id/tile_id.
+            dict_cols = {"point_id", "item_id", "tile_id"}
+            pf = pq.ParquetFile(tmp)
+            schema = pf.schema_arrow
+            writer = pq.ParquetWriter(
+                dst, schema, compression="zstd",
+                use_dictionary=[c for c in schema.names if c in dict_cols],
+                write_statistics=True,
+            )
+            for i in range(pf.metadata.num_row_groups):
+                writer.write_table(pf.read_row_group(i))
+            writer.close()
+            tmp.unlink(missing_ok=True)
 
     except Exception:
         tmp.unlink(missing_ok=True)
