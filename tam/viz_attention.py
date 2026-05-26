@@ -163,7 +163,8 @@ def main() -> None:
     with open(ckpt_dir / "tam_config.json") as fh:
         cfg_dict = json.load(fh)
     cfg = TAMConfig.from_dict(cfg_dict)
-    saved_feature_cols = cfg_dict.get("feature_cols") or (list(cfg.feature_cols_override) if cfg.feature_cols_override else None)
+    saved_feature_cols   = cfg_dict.get("feature_cols") or (list(cfg.feature_cols_override) if cfg.feature_cols_override else None)
+    saved_s1_feature_cols = cfg_dict.get("s1_feature_cols") or None
 
     global_feat_df: pl.DataFrame | None = None
     cache_path = ckpt_dir / "global_features_cache.parquet"
@@ -228,8 +229,9 @@ def main() -> None:
             min_obs_per_year=cfg.min_obs_per_year,
             doy_jitter=0,
             global_features_df=global_feat_df,
-            use_s1={4: "s1_only", 17: True}.get(cfg.n_bands, False),
+            use_s1=cfg_dict.get("use_s1", False),
             feature_cols_override=saved_feature_cols,
+            s1_feature_cols_override=saved_s1_feature_cols,
         )
         del pixel_df
 

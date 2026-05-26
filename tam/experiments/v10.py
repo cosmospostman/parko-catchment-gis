@@ -2,11 +2,12 @@
 
 S1+S2 joint leg of the three-way comparison (S2-only / S1-only / joint S1+S2).
 Feature set: B02 B03 B04 B05 B07 B08 B8A B11 B12 + NDVI + NDWI + MAVI + NDRE + CI_RE (14 S2)
-             + s1_vh + s1_vv (2 S1) = 16 bands total.
-S1 restricted to VH and VV; derived cols (vh_vv ratio, RVI) deferred until sweep confirms value.
+             + s1_vh + s1_vv + s1_vh_vv + s1_rvi (4 S1) = 18 bands total.
 """
 
-from tam.core.dataset import V10_FEATURE_COLS, V10_S1_FEATURE_COLS
+from tam.core.dataset import V10_FEATURE_COLS
+
+V10_S1_FEATURE_COLS = ["s1_vh", "s1_vv", "s1_vh_vv", "s1_rvi"]
 from tam.core.experiment import Experiment
 
 EXPERIMENT = Experiment(
@@ -118,7 +119,7 @@ EXPERIMENT = Experiment(
         "d_ff":     1024,
         "n_layers": 3,
         "dropout":  0.5,
-        "n_bands":  len(V10_FEATURE_COLS) + len(V10_S1_FEATURE_COLS),  # 16
+        "n_bands":  len(V10_FEATURE_COLS) + len(V10_S1_FEATURE_COLS),  # 18
         "n_global_features": 0,            # overridden at runtime by use_band_summaries
     },
     train_kwargs={
@@ -136,6 +137,6 @@ EXPERIMENT = Experiment(
         "use_band_summaries":    True,
         "max_seq_len":           64,
         "feature_cols_override": tuple(V10_FEATURE_COLS),
-        "s1_feature_cols":       tuple(V10_S1_FEATURE_COLS),
+        "s1_feature_cols":       tuple(V10_S1_FEATURE_COLS),  # s1_vh, s1_vv, s1_vh_vv, s1_rvi
     },
 )

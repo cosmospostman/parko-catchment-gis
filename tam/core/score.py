@@ -85,6 +85,8 @@ def _compute_pixel_s1_stats_mixed(
     for _, path in sorted(year_parquets):
         pf = pq.ParquetFile(path)
         available = set(pf.schema_arrow.names)
+        if "vh" not in available or "vv" not in available:
+            continue  # S2-only shard — no S1 columns
         read_cols = [c for c in ["point_id", "source", "vh", "vv"] if c in available]
         for rg in range(pf.metadata.num_row_groups):
             chunk = pl.from_arrow(pf.read_row_group(rg, columns=read_cols))
@@ -502,6 +504,8 @@ def _compute_s2_pixel_zscore_stats(
     for _, path in sorted(year_parquets):
         pf = pq.ParquetFile(path)
         available = set(pf.schema_arrow.names)
+        if not any(c in available for c in raw_band_cols):
+            continue  # S1-only shard — no S2 bands to zscore
         cols = [c for c in read_cols if c in available]
         for rg in range(pf.metadata.num_row_groups):
             chunk = pl.from_arrow(pf.read_row_group(rg, columns=cols))
@@ -571,6 +575,8 @@ def _compute_band_summaries_from_parquets(
     for _, path in sorted(year_parquets):
         pf = pq.ParquetFile(path)
         available = set(pf.schema_arrow.names)
+        if not any(c in available for c in raw_band_cols):
+            continue  # S1-only shard — no S2 bands
         cols = [c for c in read_cols if c in available]
         for rg in range(pf.metadata.num_row_groups):
             chunk = pl.from_arrow(pf.read_row_group(rg, columns=cols))
