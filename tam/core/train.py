@@ -593,17 +593,19 @@ def _build_dataset_sharded(
                         band_mean=band_mean, band_std=band_std,
                         global_feat_mean=global_feat_mean,
                         global_feat_std=global_feat_std)
-    shards: list[TAMDataset] = []
-    for i, pid_group_pa in enumerate(pid_groups_pa):
-        shard_name = f"{name}_shard{i}"
-        # to_pylist() here is fine: ~n_unique/n_shards entries, not 260M rows.
-        pid_set_s = set(pid_group_pa.to_pylist())
-        shard_labels = {k: v for k, v in labels.items()
-                        if (k[0] if isinstance(k, tuple) else k) in pid_set_s}
 
+    shard_label_sets: list[dict] = []
+    for pid_group_pa in pid_groups_pa:
+        pid_set_s = set(pid_group_pa.to_pylist())
+        shard_label_sets.append({k: v for k, v in labels.items()
+                                  if (k[0] if isinstance(k, tuple) else k) in pid_set_s})
+
+    ctx = multiprocessing.get_context("spawn")
+    shards: list[TAMDataset] = []
+    for i, shard_labels in enumerate(shard_label_sets):
+        shard_name = f"{name}_shard{i}"
         logger.info("Building TAMDataset(%s shard %d/%d, %d pixels) in subprocess",
-                    name, i + 1, n_shards, len(pid_group_pa))
-        ctx = multiprocessing.get_context("spawn")
+                    name, i + 1, n_shards, len(pid_groups_pa[i]))
         p = ctx.Process(
             target=_build_dataset_worker,
             args=(str(shard_parquets[i]), shard_labels, str(shard_dirs[i]), shard_kwargs),
@@ -614,7 +616,6 @@ def _build_dataset_sharded(
             raise RuntimeError(
                 f"TAMDataset shard subprocess '{shard_name}' exited with code {p.exitcode}"
             )
-
         shards.append(TAMDataset.from_files(shard_dirs[i], shard_labels, **train_augment_kwargs))
         gc.collect()
 

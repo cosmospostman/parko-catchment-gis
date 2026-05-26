@@ -115,7 +115,7 @@ EXPERIMENT = Experiment(
     feature_cols=V10_FEATURE_COLS,
     model_kwargs={
         "d_model":  256,
-        "d_ff":     512,
+        "d_ff":     1024,
         "n_layers": 3,
         "dropout":  0.5,
         "n_bands":  len(V10_FEATURE_COLS) + len(V10_S1_FEATURE_COLS),  # 16
@@ -124,6 +124,7 @@ EXPERIMENT = Experiment(
     train_kwargs={
         "lr":                    5e-5,
         "weight_decay":          0.1,
+        "batch_size":            4096,
         "n_epochs":              60,
         "patience":              15,
         "band_noise_std":        0.05,

@@ -257,20 +257,28 @@ def _cmd_train(args: argparse.Namespace) -> None:
             s2_ns = np.diff(np.concatenate([s2_starts, [len(s2_pid_sorted)]]))
             del pid_sorted, s2_pid_sorted, s2_bounds  # free before per-col loop
 
+            # Compute group means/stds in float64 (group arrays are ~n_pixels entries,
+            # not 145M rows), then apply normalisation in float32 to halve memory bandwidth.
+            s2_ns_f64 = s2_ns.astype(np.float64)
             updated_cols: dict[str, np.ndarray] = {}
             for c in s2_cols:
-                arr = df[c].to_numpy().astype(np.float32, copy=False)
-                arr_sorted = arr[sort_idx].astype(np.float64)  # float64 for accumulation (ddof=1)
-                s2_vals = arr_sorted[s2_idx_sorted]
-                group_sums = np.add.reduceat(s2_vals, s2_starts)
-                group_means = group_sums / s2_ns
-                mean_per_s2 = np.repeat(group_means, s2_ns)
-                diffs_sq = (s2_vals - mean_per_s2) ** 2
-                group_var_sums = np.add.reduceat(diffs_sq, s2_starts)
-                group_stds = np.maximum(np.sqrt(group_var_sums / np.maximum(s2_ns - 1, 1)), 1e-6)
+                arr_sorted = df[c].to_numpy().astype(np.float32, copy=False)[sort_idx]
+                s2_vals = arr_sorted[s2_idx_sorted]  # float32, ~n_S2_obs entries
+                # Group stats in float64 — reduceat inputs are float32 but accumulators
+                # widen to float64 when output dtype is float64.
+                s2_vals_f64 = s2_vals.astype(np.float64)
+                group_means = np.add.reduceat(s2_vals_f64, s2_starts) / s2_ns_f64
+                mean_per_s2 = np.repeat(group_means, s2_ns).astype(np.float32)
+                diffs_sq = (s2_vals - mean_per_s2) ** 2  # float32 — groups are small
+                group_stds = np.maximum(
+                    np.sqrt(np.add.reduceat(diffs_sq.astype(np.float64), s2_starts)
+                            / np.maximum(s2_ns_f64 - 1, 1)),
+                    1e-6,
+                ).astype(np.float32)
                 std_per_s2 = np.repeat(group_stds, s2_ns)
                 arr_sorted[s2_idx_sorted] = (s2_vals - mean_per_s2) / std_per_s2
-                updated_cols[c] = arr_sorted[inv_idx].astype(np.float32)
+                updated_cols[c] = arr_sorted[inv_idx]
+            del s2_ns_f64
 
             return df.with_columns([
                 pl.Series(c, updated_cols[c]) for c in s2_cols
@@ -372,11 +380,6 @@ def _cmd_train(args: argparse.Namespace) -> None:
         _cache_df = pixel_df.drop(_drop_cols) if _drop_cols else pixel_df
         if _str_cols:
             _cache_df = _cache_df.with_columns([pl.col(c).cast(pl.String) for c in _str_cols])
-        # Pre-sort by (point_id, date) so TAMDataset's sort() is a no-op on load.
-        # TAMDataset sorts by (point_id, year, date); since year derives from date
-        # these orderings are equivalent.
-        logger.info("Sorting pixel_df cache by (point_id, date) ...")
-        _cache_df = _cache_df.sort(["point_id", "date"])
         _cache_df.write_parquet(_cache_parquet)
         del _cache_df, pixel_df
         gc.collect()
