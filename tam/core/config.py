@@ -47,6 +47,7 @@ class TAMConfig:
     min_delta:       float = 1e-4
     cvar_alpha:      float = 0.25  # tail fraction for CVaR val metric (bottom alpha of site AUCs)
     obs_dropout_min: int   = 0   # if >0, subsample each window to Uniform(obs_dropout_min, n) during training
+    dataloader_workers: int = -1  # -1 = auto (RAM-scaled); 0 = in-process; N = exactly N workers
     warmup_freeze_epochs: int = 0  # if >0, freeze temporal stream for first N epochs (head-only warmup)
     doy_density_norm: bool = False  # if True, weight mean pool by inverse DOY observation frequency
     spatial_stride:       int   = 1   # if >1, thin training pixels spatially (every Nth pixel per region)
@@ -59,7 +60,7 @@ class TAMConfig:
     # 1/N of the pixels at a time (peak child RSS ≈ full_peak / N).
     # 1 = no sharding (single subprocess, original behaviour).
     # Normalisation stats are computed in a separate lightweight subprocess first.
-    n_dataset_shards: int = 4
+    n_dataset_shards: int = 2
 
     # Presence pixel filter: drop presence pixel-years with low dry-season VH unless rescued by NDVI.
     # Logic: drop if mean_vh_dry < presence_min_vh_dry_db

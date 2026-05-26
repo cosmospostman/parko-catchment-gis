@@ -14,6 +14,11 @@ Writes:
   <work_dir>/prep_val_pixel_df.parquet
   <work_dir>/prep_results.json  — train_py_labels, val_py_labels, global_feat_df path
 
+Design: the full pixel_df_cache.parquet (~5 GB compressed, ~20 GB in RAM) is
+never loaded as a single DataFrame. Instead all operations are done via
+scan_parquet with column/row pushdown, and the train/val slices are written in
+two separate passes so peak RSS stays well under the full-frame size.
+
 On exit all jemalloc arenas are reclaimed by the OS. The training worker
 (_train_worker.py) then loads only the sliced parquets and builds datasets
 from a clean ~0 GB baseline.
@@ -38,7 +43,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S,%f",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
 
@@ -79,21 +84,8 @@ def main(work_dir: Path, out_dir: Path, experiment: str) -> None:
 
     logger.info("Prep worker start: RSS=%.1f GB", _rss_gb())
 
-    # --- Load pixel_df -------------------------------------------------------
     _cache_path = work_dir / "pixel_df_cache.parquet"
     _cache_schema = pq.ParquetFile(_cache_path).schema_arrow.names
-    _read_cols = [c for c in _cache_schema if c not in {"lon", "lat"}] or None
-    _arrow_tbl = pq.read_table(_cache_path, columns=_read_cols)
-    pixel_df = pl.from_arrow(_arrow_tbl)
-    del _arrow_tbl
-    gc.collect()
-    _str_cols = [c for c in ("point_id", "source") if c in pixel_df.columns
-                 and pixel_df[c].dtype == pl.String]
-    if _str_cols:
-        pixel_df = pixel_df.with_columns([pl.col(c).cast(pl.Categorical) for c in _str_cols])
-        gc.collect()
-    logger.info("pixel_df loaded: %d rows × %d cols  estimated_size=%.1f GB  RSS=%.1f GB",
-                len(pixel_df), pixel_df.width, pixel_df.estimated_size() / 1e9, _rss_gb())
 
     labels: dict[str, float] = {k: float(v) for k, v in worker_args["labels"].items()}
     pixel_coords = pl.from_arrow(pq.read_table(work_dir / "pixel_df_pixel_coords.parquet"))
@@ -111,15 +103,7 @@ def main(work_dir: Path, out_dir: Path, experiment: str) -> None:
             cfg_dict[_f] = tuple(cfg_dict[_f])
     cfg = TAMConfig(**{k: v for k, v in cfg_dict.items() if k in TAMConfig.__dataclass_fields__})
 
-    # --- Label split ---------------------------------------------------------
-    if cfg.val_region_ids:
-        train_labels, val_labels = region_holdout_split(labels, cfg.val_region_ids)
-    elif cfg.val_sites:
-        train_labels, val_labels = site_holdout_split(labels, cfg.val_sites)
-    else:
-        train_labels, val_labels = spatial_split(labels, pixel_coords, cfg.val_frac)
-
-    # --- Column trim ---------------------------------------------------------
+    # --- Column selection for lazy scans -------------------------------------
     _feature_cols_override = list(cfg.feature_cols_override) if cfg.feature_cols_override else None
     _s1_feature_cols_override = list(cfg.s1_feature_cols) if cfg.s1_feature_cols else None
     _active_s1_cols = _s1_feature_cols_override or S1_FEATURE_COLS
@@ -127,79 +111,19 @@ def main(work_dir: Path, out_dir: Path, experiment: str) -> None:
     _feature_cols_base = set(_feature_cols_override) if _feature_cols_override else set(BAND_COLS)
     _keep_cols = {"point_id", "date", "year", "doy", "scl_purity", "scl", "source"} | \
                  _feature_cols_base | set(_active_s1_cols) | set(_s1_raw)
-    _trim_cols = [c for c in pixel_df.columns if c in _keep_cols]
-    if len(_trim_cols) < pixel_df.width:
-        pixel_df = pixel_df.select(_trim_cols)
-    gc.collect()
-    _log_rss("after column trim")
+    _scan_cols = [c for c in _cache_schema if c in _keep_cols and c not in {"lon", "lat"}]
+    _has_source = "source" in _cache_schema
+    _has_scl    = "scl"    in _cache_schema
 
-    # --- SCL=6 exclusion -----------------------------------------------------
-    if "scl" in pixel_df.columns and "source" in pixel_df.columns:
-        n_before = len(pixel_df)
-        pixel_df = pixel_df.filter(
-            ~((pl.col("source") == "S2") & (pl.col("scl") == 6))
-        )
-        logger.info("SCL=6 exclusion: removed %d observations", n_before - len(pixel_df))
-    if "scl" in pixel_df.columns:
-        pixel_df = pixel_df.drop("scl")
-    _log_rss("after SCL exclusion")
+    # --- Label split (needs only pixel_coords — tiny) ------------------------
+    if cfg.val_region_ids:
+        train_labels, val_labels = region_holdout_split(labels, cfg.val_region_ids)
+    elif cfg.val_sites:
+        train_labels, val_labels = site_holdout_split(labels, cfg.val_sites)
+    else:
+        train_labels, val_labels = spatial_split(labels, pixel_coords, cfg.val_frac)
 
-    # --- Global features -----------------------------------------------------
-    _has_source = "source" in pixel_df.columns
-    global_feat_df: pl.DataFrame | None = None
-    if cfg.use_band_summaries:
-        if band_summaries is not None:
-            global_feat_df = band_summaries
-            logger.info("Using precomputed band summaries: %d pixels, %d features",
-                        len(global_feat_df), global_feat_df.width - 1)
-        else:
-            _s2_n = int((pixel_df["source"] == "S2").sum()) if _has_source else len(pixel_df)
-            logger.info("Computing band summaries (%d rows) ...", _s2_n)
-            global_feat_df = _compute_band_summaries(pixel_df, V9_FEATURE_COLS)
-    elif cfg.n_global_features > 0:
-        global_feat_df = _load_or_compute_global_features(pixel_df, out_dir, GLOBAL_FEATURE_NAMES)
-    _log_rss("after global features")
-
-    # --- Presence filter slim extracts ---------------------------------------
-    _presence_filter_s1_slim: pl.DataFrame | None = None
-    _presence_filter_s2_slim: pl.DataFrame | None = None
-    if cfg.presence_min_vh_dry_db > -99 and _has_source and "vh" in pixel_df.columns:
-        _doy_col = "doy" if "doy" in pixel_df.columns else None
-        _date_col = "doy" if _doy_col else "date"
-        _presence_pids = {pid for pid, lbl in labels.items() if lbl == 1.0}
-        _presence_filter_s1_slim = (
-            pixel_df.lazy()
-            .filter(
-                (pl.col("source") == "S1") &
-                pl.col("point_id").is_in(_presence_pids) &
-                pl.col(_date_col).is_between(_DRY_DOY_MIN, _DRY_DOY_MAX)
-            )
-            .select(["point_id", "year", "vh", _date_col])
-            .collect()
-        )
-        _has_scl = "scl" in pixel_df.columns
-        _s2_ndvi_cols = ["point_id", "year", _date_col] + (["scl"] if _has_scl else [])
-        _ndvi_expr = (pl.col("B08") - pl.col("B04")) / (pl.col("B08") + pl.col("B04"))
-        _presence_filter_s2_slim = (
-            pixel_df.lazy()
-            .filter(
-                (pl.col("source") == "S2") &
-                pl.col("point_id").is_in(_presence_pids) &
-                pl.col(_date_col).is_between(_DRY_DOY_MIN, _DRY_DOY_MAX)
-            )
-            .with_columns(_ndvi_expr.alias("NDVI"))
-            .select(_s2_ndvi_cols + ["NDVI"])
-            .collect()
-        )
-
-    # --- Drop S1 rows if not needed by TAMDataset ----------------------------
-    if "source" in pixel_df.columns and cfg.use_s1 not in (True, "mixed", "s1_only"):
-        pixel_df = pixel_df.filter(pl.col("source") == "S2")
-        gc.collect()
-    logger.info("pixel_df after S1 drop: %d rows  estimated_size=%.1f GB",
-                len(pixel_df), pixel_df.estimated_size() / 1e9)
-
-    # --- Spatial stride ------------------------------------------------------
+    # --- Spatial stride (needs only pixel_coords — tiny) --------------------
     noise_removed: dict[tuple[str, str], int] = {}
     stride_removed: dict[tuple[str, str], int] = {}
     if cfg.spatial_stride > 1:
@@ -225,18 +149,88 @@ def main(work_dir: Path, out_dir: Path, experiment: str) -> None:
             stride_removed[key] = stride_removed.get(key, 0) + 1
         train_labels = {k: v for k, v in train_labels.items() if k in strided_pids}
 
-    # --- Broadcast pixel labels → pixel-year labels --------------------------
+    del pixel_coords
+    gc.collect()
+    _log_rss("after label split")
+
+    # --- Presence filter slim extracts via scan_parquet ----------------------
+    # Only reads the few columns needed; Polars pushes the point_id filter into
+    # the parquet reader so we never materialise the full frame.
+    _presence_filter_s1_slim: pl.DataFrame | None = None
+    _presence_filter_s2_slim: pl.DataFrame | None = None
+    _doy_col = "doy" if "doy" in _cache_schema else None
+    _date_col = "doy" if _doy_col else "date"
+
+    if cfg.presence_min_vh_dry_db > -99 and _has_source and "vh" in _cache_schema:
+        _presence_pids = {pid for pid, lbl in labels.items() if lbl == 1.0}
+        _presence_filter_s1_slim = (
+            pl.scan_parquet(str(_cache_path))
+            .filter(
+                (pl.col("source") == "S1") &
+                pl.col("point_id").is_in(_presence_pids) &
+                pl.col(_date_col).is_between(_DRY_DOY_MIN, _DRY_DOY_MAX)
+            )
+            .select(["point_id", "year", "vh", _date_col])
+            .collect()
+        )
+        _ndvi_expr = (pl.col("B08") - pl.col("B04")) / (pl.col("B08") + pl.col("B04"))
+        _s2_ndvi_cols = ["point_id", "year", _date_col] + (["scl"] if _has_scl else [])
+        _presence_filter_s2_slim = (
+            pl.scan_parquet(str(_cache_path))
+            .filter(
+                (pl.col("source") == "S2") &
+                pl.col("point_id").is_in(_presence_pids) &
+                pl.col(_date_col).is_between(_DRY_DOY_MIN, _DRY_DOY_MAX)
+            )
+            .with_columns(_ndvi_expr.alias("NDVI"))
+            .select(_s2_ndvi_cols + ["NDVI"])
+            .collect()
+        )
+        _log_rss("after presence slim extracts")
+
+    # --- Global features via slim scan ---------------------------------------
+    # Pass a slim DataFrame (only columns needed for cache key + computation).
+    global_feat_df: pl.DataFrame | None = None
+    _global_scan_cols = [c for c in ("point_id", "date", "B08", "B04", "vh", "vv", "source")
+                         if c in _cache_schema]
+    if cfg.use_band_summaries:
+        if band_summaries is not None:
+            global_feat_df = band_summaries
+            logger.info("Using precomputed band summaries: %d pixels, %d features",
+                        len(global_feat_df), global_feat_df.width - 1)
+        else:
+            _slim_df = pl.scan_parquet(str(_cache_path), n_rows=None).select(
+                [c for c in _scan_cols if c in _cache_schema]
+            ).collect()
+            logger.info("Computing band summaries (%d rows) ...", len(_slim_df))
+            global_feat_df = _compute_band_summaries(_slim_df, V9_FEATURE_COLS)
+            del _slim_df
+            gc.collect()
+    elif cfg.n_global_features > 0:
+        _slim_df = (
+            pl.scan_parquet(str(_cache_path))
+            .select(_global_scan_cols)
+            .collect()
+        )
+        logger.info("Global features slim scan: %d rows  RSS=%.1f GB", len(_slim_df), _rss_gb())
+        global_feat_df = _load_or_compute_global_features(_slim_df, out_dir, GLOBAL_FEATURE_NAMES)
+        del _slim_df
+        gc.collect()
+    _log_rss("after global features")
+
+    # --- Broadcast pixel labels → pixel-year labels via scan -----------------
+    # Collect just (point_id, year) unique pairs without loading all columns.
     labeled_pids = set(labels.keys())
     pixel_years = (
-        pixel_df.filter(pl.col("point_id").is_in(labeled_pids))
+        pl.scan_parquet(str(_cache_path))
+        .filter(pl.col("point_id").is_in(labeled_pids))
         .select(["point_id", "year"])
         .unique()
+        .collect()
     )
 
     def _broadcast(lbl: dict[str, float]) -> dict[tuple[str, int], float]:
-        lbl_df = pl.DataFrame({"point_id": list(lbl.keys()), "_label": list(lbl.values())}).with_columns(
-            pl.col("point_id").cast(pl.Categorical)
-        )
+        lbl_df = pl.DataFrame({"point_id": list(lbl.keys()), "_label": list(lbl.values())})
         joined = pixel_years.join(lbl_df, on="point_id", how="inner")
         return {
             (pid, yr): label
@@ -249,6 +243,8 @@ def main(work_dir: Path, out_dir: Path, experiment: str) -> None:
 
     train_py_labels = _broadcast(train_labels)
     val_py_labels   = _broadcast(val_labels)
+    del pixel_years
+    gc.collect()
 
     # --- Presence filter -----------------------------------------------------
     all_py = {**train_py_labels, **val_py_labels}
@@ -258,8 +254,6 @@ def main(work_dir: Path, out_dir: Path, experiment: str) -> None:
     if _presence_filter_s1_slim is not None:
         s1_slim = _presence_filter_s1_slim
         s2_slim = _presence_filter_s2_slim
-        _doy_col = "doy" if "doy" in s1_slim.columns else None
-        _date_col = "doy" if _doy_col else "date"
         _has_scl_slim = s2_slim is not None and "scl" in s2_slim.columns
 
         if len(s1_slim) > 0:
@@ -313,7 +307,7 @@ def main(work_dir: Path, out_dir: Path, experiment: str) -> None:
         gc.collect()
     _log_rss("after presence filter")
 
-    # --- Slice and write train/val pixel_dfs ---------------------------------
+    # --- Final PID sets -------------------------------------------------------
     train_pids_ds = set(k[0] for k in train_py_labels)
     val_pids_ds   = set(k[0] for k in val_py_labels)
 
@@ -323,42 +317,38 @@ def main(work_dir: Path, out_dir: Path, experiment: str) -> None:
             ["point_id"] + global_feat_df.columns[1:cfg.n_global_features + 1]
         )
 
-    if "source" in pixel_df.columns and cfg.use_s1 not in (True, "mixed", "s1_only"):
-        pixel_df = pixel_df.drop("source")
-        gc.collect()
+    # --- Build lazy scan with all column/row transforms applied --------------
+    # SCL=6 rows are dropped; scl column is dropped after; S1 dropped if unused.
+    def _base_lf(pids: set[str]) -> pl.LazyFrame:
+        lf = (
+            pl.scan_parquet(str(_cache_path))
+            .select(_scan_cols)
+            .filter(pl.col("point_id").is_in(pids))
+        )
+        if _has_scl and _has_source:
+            lf = lf.filter(~((pl.col("source") == "S2") & (pl.col("scl") == 6)))
+        if _has_scl:
+            lf = lf.drop("scl")
+        if _has_source and cfg.use_s1 not in (True, "mixed", "s1_only"):
+            lf = lf.filter(pl.col("source") == "S2").drop("source")
+        return lf
 
-    train_pixel_df = pixel_df.filter(pl.col("point_id").is_in(train_pids_ds))
-    val_pixel_df   = pixel_df.filter(pl.col("point_id").is_in(val_pids_ds))
-    del pixel_df
-    gc.collect()
-    _log_rss("after split + free pixel_df")
-
-    # Write sliced parquets — sorted by (point_id, year, date) so TAMDataset
-    # can skip its internal sort (saves ~10 GB peak RSS at dataset construction).
-    # Cast Categorical back to String for parquet portability.
-    def _write_df(df: pl.DataFrame, path: Path) -> None:
-        cat_cols = [c for c in df.columns if df[c].dtype == pl.Categorical]
-        out = df.with_columns([pl.col(c).cast(pl.String) for c in cat_cols]) if cat_cols else df
-        sort_cols = [c for c in ("point_id", "year", "date") if c in out.columns]
-        if sort_cols:
-            out = out.sort(sort_cols)
-        out.write_parquet(path)
-
+    # --- Write train parquet (one scan, never materialised in full) ----------
     train_path = work_dir / "prep_train_pixel_df.parquet"
     val_path   = work_dir / "prep_val_pixel_df.parquet"
-    _write_df(train_pixel_df, train_path)
-    logger.info("Wrote train_pixel_df: %d rows  %.1f GB  RSS=%.1f GB",
-                len(train_pixel_df), train_pixel_df.estimated_size() / 1e9, _rss_gb())
-    del train_pixel_df
-    gc.collect()
 
-    _write_df(val_pixel_df, val_path)
-    logger.info("Wrote val_pixel_df: %d rows  %.1f GB  RSS=%.1f GB",
-                len(val_pixel_df), val_pixel_df.estimated_size() / 1e9, _rss_gb())
-    del val_pixel_df
-    gc.collect()
+    def _write_scan(pids: set[str], path: Path, tag: str) -> None:
+        # sink_parquet streams without materialising the full slice in RAM.
+        # No sort here: TAMDataset sorts each shard internally in its subprocess,
+        # so pre-sorting would be wasted work and costs ~20 GB peak RSS.
+        _base_lf(pids).sink_parquet(str(path))
+        gc.collect()
+        logger.info("Wrote %s  RSS=%.1f GB", tag, _rss_gb())
 
-    # Write global features if present
+    _write_scan(train_pids_ds, train_path, "train_pixel_df")
+    _write_scan(val_pids_ds,   val_path,   "val_pixel_df")
+
+    # --- Write global features if present ------------------------------------
     global_feat_path: str | None = None
     if global_feat_df is not None:
         global_feat_path = str(work_dir / "prep_global_feat_df.parquet")

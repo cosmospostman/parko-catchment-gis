@@ -405,6 +405,7 @@ def _cmd_train(args: argparse.Namespace) -> None:
         "dropout":               args.dropout,
         "n_layers":              args.n_layers,
         "d_model":               args.d_model,
+        "d_ff":                  args.d_ff,
         "obs_dropout_min":       args.obs_dropout_min,
         "spatial_stride":        args.spatial_stride,
         "band_noise_std":        args.band_noise_std,
@@ -724,6 +725,7 @@ if __name__ == "__main__":
                          help="Subsample each training window to Uniform(N, n) obs (default: off)")
     p_train.add_argument("--n-layers",        type=int,   default=None)
     p_train.add_argument("--d-model",         type=int,   default=None)
+    p_train.add_argument("--d-ff",            type=int,   default=None)
     p_train.add_argument("--spatial-stride",        type=int,  default=None,
                          help="Thin training pixels spatially — use every Nth pixel per region (default: 1, no thinning)")
     p_train.add_argument("--stride-exclude-sites",  nargs="+", default=None,
