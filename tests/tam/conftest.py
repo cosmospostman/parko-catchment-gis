@@ -16,6 +16,11 @@ def band_cols() -> list[str]:
     return list(BAND_COLS)
 
 
+@pytest.fixture(scope="session")
+def band_cols_session() -> list[str]:
+    return list(BAND_COLS)
+
+
 @pytest.fixture
 def pixel_df(band_cols) -> pl.DataFrame:
     """30 observations for two pixels across one year.

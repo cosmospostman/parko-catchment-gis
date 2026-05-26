@@ -4,14 +4,14 @@ All tests are self-contained and require no pre-staged data.
 
 Tests
 -----
- 1. pixel_count rounds fractional pixel dimensions (Bug L1 — FAILS on current code).
+ 1. pixel_count rounds fractional pixel dimensions.
  2. pixel_count exact integer boundary returns the correct count (regression).
- 3. pixel_count and _bbox_pixel_count agree for the same bbox (both share the bug).
- 4. _bbox_pixel_count rounds fractional dimensions (Bug L4 — FAILS on current code).
+ 3. pixel_count and _bbox_pixel_count agree for the same bbox.
+ 4. _bbox_pixel_count rounds fractional dimensions.
  5. _load_registry: valid YAML with all required fields loads a Location correctly.
- 6. _load_registry: YAML missing the "name" key is silently skipped (Bug L3 — documents).
+ 6. _load_registry: YAML missing the "name" key is silently skipped.
  7. _load_registry: YAML where data is not a dict (None) is silently skipped.
- 8. _load_registry: string centroid coerces to wrong tuple shape (Bug L2 — FAILS).
+ 8. _load_registry: string centroid raises ValueError.
  9. _load_registry: valid [lat, lon] centroid stored as two-element float tuple.
 10. bbox_cli produces the correct comma-separated string without spaces.
 11. area_km2 is consistent with width_km × height_km.
@@ -74,11 +74,11 @@ _VALID_YAML_DATA: dict = {
 
 def test_pixel_count_rounds_fractional_dimensions():
     # A bbox whose UTM width and height are ~19 m each.
-    # int(19/10) = 1, so int() gives 1×1 = 1.  round(1.9) = 2, so correct is 2×2 = 4.
+    # round(1.9) = 2, so correct pixel count is 2×2 = 4.
     delta = 19.0 / 111_320  # at equator cos≈1 so lon_m ≈ lat_m ≈ 19 m
     bbox = [0.0, 0.0, delta, delta]
     loc = _make_location(bbox)
-    assert loc.pixel_count == 4  # BUG L1: currently returns 1
+    assert loc.pixel_count == 4
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +110,7 @@ def test_pixel_count_matches_bbox_pixel_count_helper():
 def test_bbox_pixel_count_rounds_fractional_dimensions():
     delta = 19.0 / 111_320
     bbox = [0.0, 0.0, delta, delta]
-    assert _bbox_pixel_count(bbox) == 4  # BUG L4: currently returns 1
+    assert _bbox_pixel_count(bbox) == 4
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +129,7 @@ def test_load_registry_valid_yaml(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Test 6 — missing "name" key is silently skipped (documents Bug L3)
+# Test 6 — missing "name" key is silently skipped
 # ---------------------------------------------------------------------------
 
 def test_load_registry_skips_yaml_without_name(tmp_path):
@@ -151,7 +151,7 @@ def test_load_registry_skips_non_dict_yaml(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Test 8 — string centroid coerces to wrong shape (Bug L2, FAILS)
+# Test 8 — string centroid raises ValueError
 # ---------------------------------------------------------------------------
 
 def test_load_registry_string_centroid_coerces_to_wrong_shape(tmp_path):
@@ -388,6 +388,114 @@ def test_mitchell_tile_ids():
         "55KCB",
         "55LBC",
     ]
+
+
+# ---------------------------------------------------------------------------
+# Tests — geometry_to_tile_ids() drop algorithm (synthetic tile grid, no network)
+#
+# These tests inject a small synthetic tile grid via monkeypatch so the algorithm
+# can be verified without touching the real AU S2 tile cache.
+#
+# GT-1. Tiles with no catchment intersection are dropped.
+# GT-2. A tile whose catchment lies entirely in its overlap zone with a neighbour
+#       is dropped; the neighbour (which has unique catchment) is kept.
+# GT-3. Sorted-order cascade: four tiles in a chain A-B-C-D; catchment sits in the
+#       B∩C zone only.  A and D are dropped (empty catchment).  B is dropped in the
+#       sorted scan (B < C) because its catchment is covered by B∩C.  C is then
+#       re-evaluated without B — its coverage loses B∩C — so C is kept.  The kept
+#       set is ['C'], not ['B'], demonstrating that sorted iteration order determines
+#       which of two mutually-droppable tiles survives.
+# ---------------------------------------------------------------------------
+
+def _make_synthetic_grid(tile_boxes: dict):
+    """Return a list of (name, shapely_geometry) pairs for monkeypatching get_au_tile_grid."""
+    return list(tile_boxes.items())
+
+
+def test_geometry_to_tile_ids_drops_non_intersecting(monkeypatch):
+    """Tiles that don't intersect the catchment at all are excluded."""
+    from shapely.geometry import box
+    from utils.s2_tiles import geometry_to_tile_ids
+    import utils.s2_tiles as _s2t
+
+    tiles = {
+        "NEAR": box(0, 0, 2, 2),
+        "FAR":  box(10, 10, 12, 12),
+    }
+    monkeypatch.setattr(_s2t, "get_au_tile_grid", lambda: _make_synthetic_grid(tiles))
+
+    catchment = box(0.5, 0.5, 1.5, 1.5)
+    result = geometry_to_tile_ids(catchment, (0.5, 0.5, 1.5, 1.5))
+    assert result == ["NEAR"]
+
+
+def test_geometry_to_tile_ids_drops_overlap_only_tile(monkeypatch):
+    """A tile whose entire catchment lies in the overlap zone with a neighbour is dropped.
+
+    Setup: two tiles LEFT and RIGHT with a shared overlap band.
+    The catchment sits entirely inside that overlap band.
+    LEFT is dropped (sorted first, catchment covered by LEFT∩RIGHT).
+    RIGHT is kept (after LEFT is dropped, RIGHT's coverage loses LEFT∩RIGHT, so RIGHT
+    has unique catchment and must be retained).
+    """
+    from shapely.geometry import box
+    from utils.s2_tiles import geometry_to_tile_ids
+    import utils.s2_tiles as _s2t
+
+    tiles = {
+        "LEFT":  box(0, 0, 3, 2),
+        "RIGHT": box(2, 0, 5, 2),
+    }
+    monkeypatch.setattr(_s2t, "get_au_tile_grid", lambda: _make_synthetic_grid(tiles))
+
+    # Catchment sits in the LEFT∩RIGHT overlap zone [2,3]×[0,2]
+    catchment = box(2.1, 0.3, 2.9, 1.7)
+    result = geometry_to_tile_ids(catchment, (2.1, 0.3, 2.9, 1.7))
+
+    # LEFT is checked first (sorted), its catchment is covered by LEFT∩RIGHT → LEFT dropped.
+    # RIGHT is then checked without LEFT; its coverage is empty → RIGHT kept.
+    assert result == ["RIGHT"]
+
+
+def test_geometry_to_tile_ids_sorted_order_cascade(monkeypatch):
+    """Four-tile chain where sorted iteration order determines which tile survives.
+
+    Topology: A-B-C-D in a row with overlaps AB, BC, CD.
+    Catchment sits in the B∩C overlap zone only.
+
+    Pass 1 (sorted A→B→C→D):
+      A: empty catchment → dropped immediately.
+      B: catchment covered by B∩C (C still in kept) → B dropped.
+      C: checked with A and B already dropped; coverage = C∩D only.
+         Catchment is NOT in C∩D → C kept.
+      D: empty catchment → dropped immediately.
+
+    Result: ['C'].
+
+    If iteration order were reversed (D→C→B→A) the symmetric result would be ['B'].
+    The test pins the sorted-order outcome and verifies the algorithm is stable on a
+    second pass (the while loop's pass 2 finds nothing new to drop).
+    """
+    from shapely.geometry import box
+    from utils.s2_tiles import geometry_to_tile_ids
+    import utils.s2_tiles as _s2t
+
+    tiles = {
+        "A": box(0, 0, 2, 1),
+        "B": box(1, 0, 3, 1),
+        "C": box(2, 0, 4, 1),
+        "D": box(3, 0, 5, 1),
+    }
+    monkeypatch.setattr(_s2t, "get_au_tile_grid", lambda: _make_synthetic_grid(tiles))
+
+    # Catchment inside B∩C overlap zone ([2,3]×[0,1])
+    catchment = box(2.1, 0.2, 2.9, 0.8)
+    result = geometry_to_tile_ids(catchment, (2.1, 0.2, 2.9, 0.8))
+
+    assert result == ["C"], (
+        f"Expected ['C'] (sorted-order cascade: A and D empty, B dropped before C is "
+        f"checked, C kept because B∩C coverage is gone), got {result}"
+    )
 
 
 def test_parquet_tile_paths_ignores_sidecar_files(tmp_path, monkeypatch):

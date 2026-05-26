@@ -22,12 +22,16 @@ scikit-learn>=1.4,<2
 # Blackwell GPU (RTX 5060 Ti, sm_120) requires cu130 — install separately:
 #   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
 torch>=2.7
+# Flash attention for varlen inference (no padding waste). Pre-built wheel for CUDA 13 / Python 3.14:
+#   pip install "https://github.com/Dao-AILab/flash-attention/releases/download/fa4-v4.0.0.beta4/flash_attn_4-4.0.0b4-py3-none-any.whl"
+flash-attn-4
 
 # Parallel computation
 dask[array,distributed]>=2024.1,<2024.10
 polars>=1.0,<2
 pyarrow>=15,<25
 duckdb>=1.0,<2
+adlfs>=2024.2
 
 # setuptools is required at runtime by stackstac (pkg_resources)
 setuptools>=69,<81

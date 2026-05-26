@@ -109,8 +109,10 @@ def _strip_bboxes(bbox_wgs84: list[float], strip_height_px: int, resolution_m: f
     to_utm = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
     to_wgs = Transformer.from_crs(utm_crs, "EPSG:4326", always_xy=True)
 
-    _, y_min = to_utm.transform(lon_min, lat_min)
-    _, y_max = to_utm.transform(lon_min, lat_max)
+    # Use centre longitude for the UTM transforms to minimise round-trip distortion.
+    # Edge-of-zone distortion causes y → WGS84 lat to overshoot by ~0.1° at lon_min/max.
+    _, y_min = to_utm.transform(lon_c, lat_min)
+    _, y_max = to_utm.transform(lon_c, lat_max)
 
     strip_m = strip_height_px * resolution_m
     y_edges = np.arange(y_min, y_max, strip_m).tolist()
@@ -119,10 +121,20 @@ def _strip_bboxes(bbox_wgs84: list[float], strip_height_px: int, resolution_m: f
     strips: list[list[float]] = []
     for i in range(len(y_edges) - 1):
         y0, y1 = y_edges[i], y_edges[i + 1]
-        # Convert strip y-edges back to WGS84 lat (use lon_min column for the transform)
-        _, slat_min = to_wgs.transform(lon_min, y0)
-        _, slat_max = to_wgs.transform(lon_min, y1)
+        _, slat_min = to_wgs.transform(lon_c, y0)
+        _, slat_max = to_wgs.transform(lon_c, y1)
         strips.append([lon_min, slat_min, lon_max, slat_max])
+
+    # Clamp boundary edges so coverage exactly matches the original bbox.
+    # UTM round-trip distortion (edge-of-zone) can shift outer strip lats by ~0.1°;
+    # clamping ensures no coverage is dropped at bbox_wgs84's southern/northern edges.
+    # Strips whose clamped extent collapses (lat_min ≥ lat_max) are dropped — this
+    # only happens when the second-to-last strip's WGS84 lat already overshoots lat_max,
+    # meaning coverage is already complete.
+    if strips:
+        strips[0][1] = lat_min
+        strips[-1][3] = lat_max
+    strips = [s for s in strips if s[1] < s[3]]
 
     return strips
 
@@ -298,15 +310,36 @@ def fetch_spec(
             return year, []
 
         merged_paths: list[Path] = []
-        for s2_path in s2_paths:
+        n_tiles = len(s2_paths)
+        for tile_idx, s2_path in enumerate(s2_paths, 1):
             tile_id = s2_path.name.replace(".s2.parquet", "")
             s1_path = year_dir / f"{tile_id}.s1.parquet"
             out_path = year_dir / f"{tile_id}.parquet"
 
+            logger.info(
+                "fetch_spec %s year %d: tile %d/%d — %s",
+                spec.id, year, tile_idx, n_tiles, tile_id,
+            )
+
+            # Use per-tile bbox so S1 COG reads only cover this tile's pixel extent,
+            # not the full catchment.  Derived from actual pixel coords in the parquet.
+            import pyarrow.compute as _pc
+            import pyarrow.parquet as _pq
+            _coords = _pq.ParquetFile(s2_path).read(columns=["lon", "lat"])
+            _lon_col = _coords.column("lon").combine_chunks()
+            _lat_col = _coords.column("lat").combine_chunks()
+            _tile_bbox = [
+                float(_pc.min(_lon_col).as_py()),
+                float(_pc.min(_lat_col).as_py()),
+                float(_pc.max(_lon_col).as_py()),
+                float(_pc.max(_lat_col).as_py()),
+            ]
+            del _coords, _lon_col, _lat_col
+
             s1_cache = spec.cache_dir if spec.cache_dir is not None else _S1_CACHE_DIR
             collect_s1_for_tile(
                 s2_path=s2_path,
-                bbox_wgs84=spec.bbox,
+                bbox_wgs84=_tile_bbox,
                 start=f"{year}-01-01",
                 end=f"{year}-12-31",
                 out_path=s1_path,
@@ -323,6 +356,7 @@ def fetch_spec(
 
         return year, merged_paths
 
+    _phase_a_done: set[int] = set()
     extract_futs: dict = {}
     with ThreadPoolExecutor(max_workers=len(years)) as fetch_pool, \
          ThreadPoolExecutor(max_workers=_max_extract) as extract_pool:
@@ -333,6 +367,9 @@ def fetch_spec(
             yr = fetch_futs[fut]
             try:
                 fut.result()
+                _phase_a_done.add(yr)
+                if len(_phase_a_done) == len(years):
+                    logger.info("fetch_spec %s: Phase A complete — starting extraction", spec.id)
                 logger.info("fetch_spec %s year %d: patches ready, queuing extract", spec.id, yr)
             except Exception as exc:
                 logger.error("fetch_spec %s year %d fetch failed: %s", spec.id, yr, exc, exc_info=exc)
@@ -445,13 +482,16 @@ def _fetch_spec_strips(
         year_dir = spec.out_dir / str(year)
         year_dir.mkdir(parents=True, exist_ok=True)
 
+        _phase_a_workers = min(n_strips, 8)
         logger.info(
-            "fetch_spec %s year %d: Phase A — fetching %d strips in parallel",
-            spec.id, year, n_strips,
+            "fetch_spec %s year %d: Phase A — fetching %d strips (%d concurrent threads)",
+            spec.id, year, n_strips, _phase_a_workers,
         )
 
-        # Phase A: fetch all strips in parallel (shared cache_dir — COG reads happen once)
-        with ThreadPoolExecutor(max_workers=n_strips) as fetch_pool:
+        # Phase A: fetch all strips in parallel (shared cache_dir — COG reads happen once).
+        # Cap at 8 threads: each thread runs asyncio.run(fetch_patches(..., max_concurrent=32)),
+        # so 8 threads already saturates a typical link (8 × 32 = 256 concurrent requests).
+        with ThreadPoolExecutor(max_workers=_phase_a_workers) as fetch_pool:
             fetch_futs = [
                 fetch_pool.submit(_fetch_patches_strip, year, i, bbox)
                 for i, bbox in enumerate(strips)
@@ -459,6 +499,7 @@ def _fetch_spec_strips(
             for fut in as_completed(fetch_futs):
                 fut.result()  # re-raise network errors
 
+        logger.info("fetch_spec %s year %d: Phase A complete — starting extraction", spec.id, year)
         logger.info(
             "fetch_spec %s year %d: Phase B — extracting %d strips (%d concurrent)",
             spec.id, year, n_strips, max_concurrent_strips,
@@ -492,8 +533,13 @@ def _fetch_spec_strips(
 
         # Final merge: N-way merge of sorted strips → one parquet per tile
         merged_paths: list[Path] = []
-        for tile_id, strip_parquets in sorted(tile_strip_paths.items()):
+        n_tiles = len(tile_strip_paths)
+        for tile_idx, (tile_id, strip_parquets) in enumerate(sorted(tile_strip_paths.items()), 1):
             out_path = year_dir / f"{tile_id}.parquet"
+            logger.info(
+                "fetch_spec %s year %d: tile %d/%d — %s",
+                spec.id, year, tile_idx, n_tiles, tile_id,
+            )
             if len(strip_parquets) == 1:
                 # Only one strip produced data for this tile — rename, no merge needed
                 import shutil

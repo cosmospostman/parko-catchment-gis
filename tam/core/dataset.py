@@ -115,6 +115,33 @@ def collate_fn(samples: list[TAMSample]) -> dict:
     }
 
 
+def subsample_obs_indices(local_idx: np.ndarray, doy: np.ndarray, n_keep: int) -> np.ndarray:
+    """Greedy farthest-point subsampling in DOY space.
+
+    Keeps `n_keep` observations maximally spread across the year.  Anchors at
+    the first and last acquisition, then iteratively picks the obs farthest from
+    the already-selected set.  O(n²), but n ≤ max_seq_len so it is fast on CPU.
+
+    Returns sorted indices into local_idx of the selected observations.
+    """
+    n = len(local_idx)
+    if n_keep >= n:
+        return np.arange(n)
+    if n_keep <= 0:
+        return np.array([], dtype=np.intp)
+    doy_f = doy.astype(np.float32)
+    selected = [0, n - 1]
+    while len(selected) < n_keep:
+        sel_doy = doy_f[selected]
+        dists = np.min(np.abs(doy_f[:, None] - sel_doy[None, :]), axis=1)
+        dists[selected] = -1
+        selected.append(int(np.argmax(dists)))
+    return np.sort(selected)
+
+
+subsample_s1_indices = subsample_obs_indices  # legacy alias
+
+
 class TAMDataset(Dataset):
     """One item = one (pixel, year) annual observation window.
 
@@ -160,6 +187,8 @@ class TAMDataset(Dataset):
         s1_feature_cols_override: list[str] | None = None,
         max_seq_len: int = MAX_SEQ_LEN,
         presorted: bool = False,
+        p_gate: float = 0.0,
+        T_gate: int = 8,
         _log_rss: "Callable[[str], None] | None" = None,
     ) -> None:
         _probe = _log_rss if _log_rss is not None else (lambda _tag: None)
@@ -610,6 +639,8 @@ class TAMDataset(Dataset):
         self._band_noise_std = band_noise_std
         self._obs_dropout_min = obs_dropout_min
         self._max_seq_len = max_seq_len
+        self._p_gate = p_gate
+        self._T_gate = T_gate
 
         # Global features: per-pixel scalars z-scored and stored as float32 arrays
         if global_features_df is not None and len(global_features_df) > 0:
@@ -667,11 +698,29 @@ class TAMDataset(Dataset):
             lo = min(lo, seq_cap)
             hi = min(n, seq_cap)
             keep = np.random.randint(lo, hi + 1) if lo < hi else hi
-            idx_keep = np.sort(np.random.choice(n, keep, replace=False))
+            is_mixed = src_np.any() and not src_np.all()
+            if is_mixed and keep < n:
+                # Smart sampling: keep all S2, thin S1 via temporally-stratified
+                # farthest-point sampling so seasonal coverage is preserved.
+                s2_idx = np.where(src_np == 0)[0]
+                s1_idx = np.where(src_np != 0)[0]
+                n_s2 = len(s2_idx)
+                s1_budget = keep - n_s2
+                kept_s1 = subsample_s1_indices(s1_idx, doy_np[s1_idx], s1_budget)
+                idx_keep = np.sort(np.concatenate([s2_idx, s1_idx[kept_s1]]))
+            else:
+                idx_keep = np.sort(np.random.choice(n, keep, replace=False))
             bands_np = bands_np[idx_keep]
             doy_np   = doy_np[idx_keep]
             src_np   = src_np[idx_keep]
-            n        = keep
+            n        = len(idx_keep)
+
+        if self._p_gate > 0.0 and n > self._T_gate and np.random.random() < self._p_gate:
+            gate_keep = subsample_obs_indices(np.arange(n), doy_np, self._T_gate)
+            bands_np = bands_np[gate_keep]
+            doy_np   = doy_np[gate_keep]
+            src_np   = src_np[gate_keep]
+            n        = len(gate_keep)
 
         if self._band_noise_std > 0.0:
             n_s2 = min(len(ALL_FEATURE_COLS), self._n_features)
@@ -766,6 +815,8 @@ class TAMDataset(Dataset):
             "band_noise_std":  self._band_noise_std,
             "obs_dropout_min": self._obs_dropout_min,
             "max_seq_len":     self._max_seq_len,
+            "p_gate":          self._p_gate,
+            "T_gate":          self._T_gate,
             "labels_are_pixel_year": self._labels_are_pixel_year,
         }
         with open(path / "meta.json", "w") as f:
@@ -780,6 +831,8 @@ class TAMDataset(Dataset):
         doy_phase_shift: bool = False,
         band_noise_std: float = 0.0,
         obs_dropout_min: int = 0,
+        p_gate: float = 0.0,
+        T_gate: int = 8,
     ) -> "TAMDataset":
         """Reconstruct a TAMDataset from files written by to_files.
 
@@ -812,6 +865,8 @@ class TAMDataset(Dataset):
         obj._band_noise_std  = band_noise_std
         obj._obs_dropout_min = obs_dropout_min
         obj._max_seq_len     = meta["max_seq_len"]
+        obj._p_gate          = p_gate
+        obj._T_gate          = T_gate
         obj._labels_are_pixel_year = meta["labels_are_pixel_year"]
         obj._labels = labels
 
@@ -836,6 +891,8 @@ class TAMDataset(Dataset):
         doy_phase_shift: bool = False,
         band_noise_std: float = 0.0,
         obs_dropout_min: int = 0,
+        p_gate: float = 0.0,
+        T_gate: int = 8,
     ) -> "TAMDataset":
         """Merge a list of TAMDataset shards into a single dataset.
 
@@ -888,6 +945,8 @@ class TAMDataset(Dataset):
         obj._band_noise_std  = band_noise_std
         obj._obs_dropout_min = obs_dropout_min
         obj._max_seq_len     = shards[0]._max_seq_len
+        obj._p_gate          = p_gate
+        obj._T_gate          = T_gate
         obj._labels_are_pixel_year = shards[0]._labels_are_pixel_year
         obj._labels          = labels
 

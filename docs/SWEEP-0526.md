@@ -68,12 +68,38 @@ Baseline: v10 with 18 bands (s1_vh s1_vv s1_vh_vv s1_rvi), d_ff=1024, batch_size
 
 ---
 
+## 5. Gate-augmented training (cascade prerequisite)
+
+**Motivation:** The cascade gate runs V10 at T=8 (farthest-point DOY sampling) to discard high-confidence negatives before the full T=128 pass. The current checkpoint was trained only on full-length sequences — at T=8 it achieves only ~40% recall on presence pixels (r=0.39 correlation with full-T scores, presence p50=0.005). Gate-augmented training adds a stochastic short-sequence view during training so the model is discriminative at both T=128 and T=8.
+
+**Mechanism:** `p_gate=0.3` in `TAMDataset.__getitem__` — 30% of items are subsampled to `T_gate=8` observations via farthest-point DOY sampling before the loss is computed. Every pixel is still seen at full length every epoch; the short view is an additional augmentation, not a held-out split.
+
+**Expected outcome:** recall@gate ≥ 0.99 on presence pixels at T=8, discarding 70–80% of absence pixels → ~3.8× cascade speedup → ~12 hrs/yr on A10G (vs 46 hrs without cascade).
+
+**Risk:** the gate augmentation fires on 30% of items, reducing the effective number of full-length training examples. If val CVaR25 drops, reduce `p_gate` to 0.2 or try `T_gate=16`.
+
+**Sweep:**
+
+| run | p_gate | T_gate | command |
+|-----|--------|--------|---------|
+| gate_aug | 0.3 | 8 | `python -m tam.pipeline train --experiment v10 --output-dir outputs/sweep-0526/gate_aug` |
+| gate_aug_t16 | 0.3 | 16 | `python -m tam.pipeline train --experiment v10 --p-gate 0.3 --t-gate 16 --output-dir outputs/sweep-0526/gate_aug_t16` |
+
+After each run, evaluate cascade quality:
+```
+python scripts/bench_cascade.py --checkpoint outputs/sweep-0526/gate_aug --device cuda
+```
+Target: recall@gate ≥ 0.99 at some threshold with ≥ 70% absence discarded.
+
+---
+
 ## Priority order
 
 1. **Dropout** — cheapest, most likely to move the needle given current convergence behaviour
 2. **n_layers** — second cheapest, tests depth now that FFN is no longer the bottleneck
 3. **lr** — quick sanity check, low expected gain
 4. **max_seq_len** — most expensive per run, save for last
+5. **Gate augmentation** — run in parallel with seq_128; both use T=128 and are the most expensive
 
 ---
 

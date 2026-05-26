@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import datetime
+import tempfile
 
 import numpy as np
 import polars as pl
@@ -80,6 +81,54 @@ def smoke_coords(smoke_labels) -> pl.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Session-scoped fixture: train once, share across TT-6/7/8/9
+# ---------------------------------------------------------------------------
+
+def _make_smoke_pixel_df(band_cols: list[str]) -> pl.DataFrame:
+    rng = np.random.default_rng(42)
+    rows = []
+    for pid in [f"p{i}" for i in range(10)] + [f"a{i}" for i in range(10)]:
+        start = datetime.date(2023, 1, 15)
+        dates = [start + datetime.timedelta(days=15 * i) for i in range(20)]
+        for d in dates:
+            rows.append({
+                "point_id": pid, "date": str(d),
+                "scl_purity": 1.0, "year": 2023,
+                **{b: float(rng.uniform(0.01, 0.5)) for b in band_cols},
+            })
+    return pl.DataFrame(rows)
+
+
+@pytest.fixture(scope="session")
+def trained_smoke(band_cols_session):
+    """Train once with smoke inputs; shared by TT-6, TT-7, TT-8, TT-9.
+
+    Yields (out_dir, model, best_val_auc, pixel_df, labels).
+    """
+    labels = {f"p{i}": 1.0 for i in range(10)} | {f"a{i}": 0.0 for i in range(10)}
+    pixel_df = _make_smoke_pixel_df(band_cols_session)
+    coords = pl.DataFrame([
+        {"point_id": pid, "lon": 144.0, "lat": -20.0 - i * 0.5}
+        for i, pid in enumerate(labels)
+    ])
+    cfg = TAMConfig(
+        d_model=16, n_heads=2, n_layers=1, d_ff=32,
+        n_bands=len(ALL_FEATURE_COLS),
+        use_s1=False,
+        n_global_features=0,
+        n_epochs=2, patience=2, batch_size=4,
+        doy_jitter=3, val_frac=0.3,
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        out_dir = Path(tmp)
+        model, best_val_auc = train_tam(
+            pixel_df, labels, coords,
+            out_dir=out_dir, cfg=cfg, device="cpu",
+        )
+        yield out_dir, model, best_val_auc, pixel_df, labels
+
+
+# ---------------------------------------------------------------------------
 # TT-1
 # ---------------------------------------------------------------------------
 
@@ -150,28 +199,23 @@ class TestTT5SinglePixelPerClassDoesNotCrash:
 # ---------------------------------------------------------------------------
 
 class TestTT6TrainTamSmokeCheckpoints:
-    def test_checkpoints_written_and_model_finite(self, tmp_path, smoke_pixel_df, smoke_labels, smoke_coords, smoke_cfg):
-        model, best_val_auc = train_tam(
-            smoke_pixel_df, smoke_labels, smoke_coords,
-            out_dir=tmp_path, cfg=smoke_cfg, device="cpu",
-        )
-        assert (tmp_path / "tam_model.pt").exists()
-        assert (tmp_path / "tam_config.json").exists()
-        assert (tmp_path / "tam_band_stats.npz").exists()
+    def test_checkpoints_written_and_model_finite(self, trained_smoke):
+        out_dir, model, best_val_auc, pixel_df, labels = trained_smoke
 
-        with open(tmp_path / "tam_config.json") as fh:
+        assert (out_dir / "tam_model.pt").exists()
+        assert (out_dir / "tam_config.json").exists()
+        assert (out_dir / "tam_band_stats.npz").exists()
+
+        with open(out_dir / "tam_config.json") as fh:
             cfg_dict = json.load(fh)
         assert "best_val_auc" in cfg_dict
         assert cfg_dict["best_val_auc"] == pytest.approx(best_val_auc, abs=1e-5)
 
-        stats = np.load(tmp_path / "tam_band_stats.npz")
+        stats = np.load(out_dir / "tam_band_stats.npz")
         assert "mean" in stats
         assert "std" in stats
 
-        ds = TAMDataset(
-            smoke_pixel_df, smoke_labels,
-            band_mean=stats["mean"], band_std=stats["std"],
-        )
+        ds = TAMDataset(pixel_df, labels, band_mean=stats["mean"], band_std=stats["std"])
         samples = [ds[i] for i in range(len(ds))]
         batch = collate_fn(samples)
         model.eval()
@@ -185,12 +229,9 @@ class TestTT6TrainTamSmokeCheckpoints:
 # ---------------------------------------------------------------------------
 
 class TestTT7LoadTamReconstructsArchitecture:
-    def test_config_matches(self, tmp_path, smoke_pixel_df, smoke_labels, smoke_coords, smoke_cfg):
-        trained, _ = train_tam(
-            smoke_pixel_df, smoke_labels, smoke_coords,
-            out_dir=tmp_path, cfg=smoke_cfg, device="cpu",
-        )
-        loaded, *_ = load_tam(tmp_path, device="cpu")
+    def test_config_matches(self, trained_smoke):
+        out_dir, trained, *_ = trained_smoke
+        loaded, *_ = load_tam(out_dir, device="cpu")
         assert loaded.config() == trained.config()
 
 
@@ -199,17 +240,11 @@ class TestTT7LoadTamReconstructsArchitecture:
 # ---------------------------------------------------------------------------
 
 class TestTT8LoadTamIdenticalPredictions:
-    def test_predictions_match(self, tmp_path, smoke_pixel_df, smoke_labels, smoke_coords, smoke_cfg):
-        trained, _ = train_tam(
-            smoke_pixel_df, smoke_labels, smoke_coords,
-            out_dir=tmp_path, cfg=smoke_cfg, device="cpu",
-        )
-        loaded, band_mean, band_std, *_ = load_tam(tmp_path, device="cpu")
+    def test_predictions_match(self, trained_smoke):
+        out_dir, trained, _, pixel_df, labels = trained_smoke
+        loaded, band_mean, band_std, *_ = load_tam(out_dir, device="cpu")
 
-        ds = TAMDataset(
-            smoke_pixel_df, smoke_labels,
-            band_mean=band_mean, band_std=band_std,
-        )
+        ds = TAMDataset(pixel_df, labels, band_mean=band_mean, band_std=band_std)
         samples = [ds[i] for i in range(len(ds))]
         batch = collate_fn(samples)
 
@@ -227,13 +262,10 @@ class TestTT8LoadTamIdenticalPredictions:
 # ---------------------------------------------------------------------------
 
 class TestTT9BestValAucPersisted:
-    def test_best_val_auc_returned_and_saved(self, tmp_path, smoke_pixel_df, smoke_labels, smoke_coords, smoke_cfg):
-        _, best_val_auc = train_tam(
-            smoke_pixel_df, smoke_labels, smoke_coords,
-            out_dir=tmp_path, cfg=smoke_cfg, device="cpu",
-        )
+    def test_best_val_auc_returned_and_saved(self, trained_smoke):
+        out_dir, _, best_val_auc, *__ = trained_smoke
         assert isinstance(best_val_auc, float)
-        cfg_dict = json.loads((tmp_path / "tam_config.json").read_text())
+        cfg_dict = json.loads((out_dir / "tam_config.json").read_text())
         assert "best_val_auc" in cfg_dict
         assert cfg_dict["best_val_auc"] == pytest.approx(best_val_auc, abs=1e-5)
 

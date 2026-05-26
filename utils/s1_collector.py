@@ -410,11 +410,8 @@ def _collect_s1_shards(
     from utils.fetch import fetch_patches
     from utils.chip_store import CachedNpzChipStore
 
-    try:
-        import planetary_computer as pc
-        _sign = pc.sign
-    except ImportError:
-        _sign = None
+    from utils.signing import make_mpc_signer
+    _sign = make_mpc_signer()
 
     _ARROW_SCHEMA = pa.schema([
         pa.field("point_id", pa.string()),
@@ -511,11 +508,13 @@ def _collect_s1_shards(
             if len(buf_pid) >= _FLUSH_ROWS:
                 _flush()
             if (i + 1) % log_interval == 0 or (i + 1) == len(items):
-                prefix = f"shard {shard_idx + 1}/{n_shards}  " if use_sharding else ""
-                logger.info(
-                    "S1: %sitem %d/%d  %d rows so far",
-                    prefix, i + 1, len(items), total_rows,
-                )
+                if use_sharding:
+                    logger.info(
+                        "S1 scenes  shard %d/%d  item %d/%d  %d rows",
+                        shard_idx + 1, n_shards, i + 1, len(items), total_rows,
+                    )
+                else:
+                    logger.info("S1: item %d/%d  %d rows so far", i + 1, len(items), total_rows)
 
         _flush()
         writer.close()
@@ -554,10 +553,10 @@ def collect_s1_for_tile(
     if out_path.exists() and out_path.stat().st_size > 0:
         try:
             pq.ParquetFile(out_path).metadata  # validates magic bytes and footer
-            logger.info("collect_s1_for_tile: %s already exists — skipping", out_path.name)
+            logger.info("%s already exists — skipping", out_path.name)
             return out_path
         except Exception:
-            logger.warning("collect_s1_for_tile: %s is corrupt — rebuilding", out_path.name)
+            logger.warning("%s is corrupt — rebuilding", out_path.name)
             out_path.unlink()
 
     setup_gdal_env()
@@ -576,7 +575,7 @@ def collect_s1_for_tile(
 
     items = _resolve_s1_items(bbox_wgs84, start, end, resolved_cache)
     if not items:
-        logger.info("collect_s1_for_tile: no S1 items for bbox %s %s/%s", bbox_wgs84, start, end)
+        logger.info("no items for bbox %s %s/%s", bbox_wgs84, start, end)
         return None
 
     combined_schema = _extend_schema(pq.ParquetFile(s2_path).schema_arrow)
@@ -592,13 +591,13 @@ def collect_s1_for_tile(
         )
 
         if not shard_paths:
-            logger.info("collect_s1_for_tile: no usable S1 observations")
+            logger.info("no usable observations")
             return None
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
         _sort_s1_shards(shard_paths, out_path, combined_schema)
 
-    logger.info("collect_s1_for_tile: wrote %s", out_path.name)
+    logger.info("wrote %s", out_path.name)
     return out_path
 
 

@@ -198,6 +198,106 @@ class TAMClassifier(nn.Module):
         return prob, logit
 
     # ------------------------------------------------------------------
+    def forward_varlen(
+        self,
+        bands_flat:   torch.Tensor,   # (total_tokens, N_BANDS)  float32
+        doy_flat:     torch.Tensor,   # (total_tokens,)           int64
+        cu_seqlens:   torch.Tensor,   # (B+1,)                    int32, cumulative token counts
+        max_seqlen:   int,            # longest sequence in batch
+        n_obs:        torch.Tensor,   # (B,)                      float32
+        global_feats: torch.Tensor | None = None,
+        is_s1_flat:   torch.Tensor | None = None,   # (total_tokens,) bool
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Varlen forward using flash-attn — no padding, O(sum T_i²) attention.
+
+        Requires flash_attn to be installed.  Falls back to the padded forward()
+        if flash_attn is not available (raises ImportError upstream).
+
+        Input is a concatenated flat token tensor (no padding); cu_seqlens marks
+        where each sequence starts/ends (same convention as flash_attn_varlen_func).
+        """
+        from flash_attn.cute.interface import flash_attn_varlen_func
+        import torch.nn.functional as F
+
+        d_model  = self.d_model
+        n_heads  = self.n_heads
+        head_dim = d_model // n_heads
+        B = cu_seqlens.shape[0] - 1
+
+        # Project bands + add DOY encoding (flat — no batch dim)
+        # _doy_encoding expects (B, T) but we have (1, total_tokens)
+        doy_2d = doy_flat.unsqueeze(0)                                # (1, total_tokens)
+        doy_enc = _doy_encoding(doy_2d, d_model).squeeze(0)          # (total_tokens, d_model)
+        # band_proj and layer norms run in float32 (model weights are float32).
+        # flash_attn requires float16 or bfloat16 for Q/K/V; we cast only for that kernel.
+        x = self.band_proj(bands_flat.float()) + doy_enc              # (total_tokens, d_model) fp32
+
+        # Run each encoder layer with flash varlen attention
+        for layer in self.encoder.layers:
+            # Extract Q/K/V weight/bias from the layer's MultiheadAttention
+            mha = layer.self_attn
+            # in_proj_weight: (3*d_model, d_model); in_proj_bias: (3*d_model,)
+            qkv = F.linear(x, mha.in_proj_weight, mha.in_proj_bias)  # (total, 3*d_model) fp32
+            q, k, v = qkv.chunk(3, dim=-1)
+
+            # Reshape to (total_tokens, n_heads, head_dim) and cast to bf16 for flash_attn
+            q = q.view(-1, n_heads, head_dim).to(torch.bfloat16)
+            k = k.view(-1, n_heads, head_dim).to(torch.bfloat16)
+            v = v.view(-1, n_heads, head_dim).to(torch.bfloat16)
+
+            softmax_scale = head_dim ** -0.5
+            attn_out = flash_attn_varlen_func(
+                q, k, v,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+                softmax_scale=softmax_scale,
+                causal=False,
+            )  # (total_tokens, n_heads, head_dim) bf16
+            attn_out = attn_out.view(-1, d_model).float()             # back to fp32
+
+            # Output projection + residual + norm1 + FFN + residual + norm2
+            attn_out = F.linear(attn_out, mha.out_proj.weight, mha.out_proj.bias)
+            x2 = layer.norm1(x + layer.dropout1(attn_out))
+            ffn_out = layer.linear2(layer.dropout(layer.activation(layer.linear1(x2))))
+            x = layer.norm2(x2 + layer.dropout2(ffn_out))
+
+        # Pool each sequence: mean over its tokens (with optional DOY density weighting)
+        x_pool = torch.zeros(B, d_model, dtype=x.dtype, device=x.device)
+        for i in range(B):
+            s, e = int(cu_seqlens[i]), int(cu_seqlens[i + 1])
+            if e <= s:
+                continue
+            tok = x[s:e]                                              # (T_i, d_model)
+            if self.doy_density_norm:
+                doy_i = doy_flat[s:e].clamp(0, 365)
+                s2_w = self.doy_inv_freq[doy_i]                      # (T_i,)
+                if is_s1_flat is not None:
+                    is1 = is_s1_flat[s:e]
+                    s1_w = self.doy_inv_freq_s1[doy_i]
+                    w = torch.where(is1, s1_w, s2_w)
+                else:
+                    w = s2_w
+                w = w.unsqueeze(-1)                                   # (T_i, 1)
+                x_pool[i] = (tok * w).sum(0) / w.sum().clamp(min=1)
+            else:
+                x_pool[i] = tok.mean(0)
+
+        if self.use_n_obs:
+            x_pool = torch.cat([x_pool, n_obs.unsqueeze(-1)], dim=-1)
+
+        if self.n_global_features > 0:
+            if global_feats is None:
+                global_feats = torch.zeros(B, self.n_global_features,
+                                           dtype=x_pool.dtype, device=x_pool.device)
+            x_pool = torch.cat([x_pool, global_feats], dim=-1)
+
+        logit = self.head(self.pre_head_dropout(x_pool)).squeeze(-1)  # (B,)
+        prob  = torch.sigmoid(logit)
+        return prob, logit
+
+    # ------------------------------------------------------------------
     def get_attention_weights(
         self,
         bands: torch.Tensor,            # (1, T, N_BANDS)

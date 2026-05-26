@@ -13,7 +13,7 @@ import numpy as np
 import polars as pl
 import torch
 
-from tam.core.dataset import ALL_FEATURE_COLS, BAND_COLS, MAX_SEQ_LEN, S1_FEATURE_COLS, despeckle_s1, lin_to_db
+from tam.core.dataset import ALL_FEATURE_COLS, BAND_COLS, MAX_SEQ_LEN, S1_FEATURE_COLS, despeckle_s1, lin_to_db, subsample_obs_indices
 from tam.core.model import TAMClassifier
 
 logger = logging.getLogger(__name__)
@@ -227,6 +227,7 @@ def _extract_year_doy(ts_us: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return year, doy
 
 
+
 class _PreparedBatch(NamedTuple):
     bands: torch.Tensor            # (W, MAX_SEQ_LEN, N_FEATURES) float32
     doy:   torch.Tensor            # (W, MAX_SEQ_LEN) int64
@@ -237,6 +238,47 @@ class _PreparedBatch(NamedTuple):
     is_s1: torch.Tensor | None     # (W, MAX_SEQ_LEN) bool, True=S1 obs; None for S2-only models
 
 
+class _ZscoreArrays:
+    """Vectorised per-pixel z-score lookup built once per pre-pass result.
+
+    Converts a {pid: float32_array} dict into parallel numpy arrays so that
+    batch lookups for an entire chunk reduce to one list comprehension over
+    integer indices rather than repeated numpy-array dict fetches.
+    """
+
+    __slots__ = ("_pid_to_idx", "_means", "_stds", "_n_feat", "_fallback_idx")
+
+    def __init__(
+        self,
+        pid_mean: dict[str, np.ndarray],
+        pid_std:  dict[str, np.ndarray],
+        n_feat: int,
+    ) -> None:
+        if not pid_mean:
+            self._pid_to_idx: dict[str, int] = {}
+            self._means = np.zeros((1, n_feat), dtype=np.float32)
+            self._stds  = np.ones( (1, n_feat), dtype=np.float32)
+        else:
+            pids = list(pid_mean.keys())
+            self._pid_to_idx = {p: i for i, p in enumerate(pids)}
+            self._means = np.stack([pid_mean[p] for p in pids]).astype(np.float32)
+            self._stds  = np.stack([pid_std[p]  for p in pids]).astype(np.float32)
+        self._n_feat = n_feat
+        # Row 0 of an empty lookup is zeros/ones (safe default).
+        # For non-empty lookups, append a fallback row at index len(pids).
+        self._means = np.vstack([self._means, np.zeros((1, n_feat), np.float32)])
+        self._stds  = np.vstack([self._stds,  np.ones( (1, n_feat), np.float32)])
+        self._fallback_idx = len(self._means) - 1
+
+    def batch_lookup(self, pids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Return (means, stds) arrays of shape (len(pids), n_feat) in one numpy op."""
+        idx = np.fromiter(
+            (self._pid_to_idx.get(p, self._fallback_idx) for p in pids),
+            dtype=np.intp, count=len(pids),
+        )
+        return self._means[idx], self._stds[idx]
+
+
 def _preprocess(
     chunk: pl.DataFrame,
     band_mean: np.ndarray,
@@ -245,7 +287,7 @@ def _preprocess(
     min_obs_per_year: int,
     pin: bool = False,
     s1_only: bool = False,
-    mixed: bool = False,
+    mixed: bool = True,
     pixel_zscore: bool = False,
     vh_mean: dict | None = None,
     vh_std:  dict | None = None,
@@ -253,8 +295,8 @@ def _preprocess(
     vv_std:  dict | None = None,
     despeckle_lookup: pl.DataFrame | None = None,
     feature_cols: list[str] | None = None,
-    pixel_zscore_stats: tuple[dict, dict] | None = None,
-    s1_zscore_stats: tuple[dict, dict] | None = None,
+    pixel_zscore_stats: _ZscoreArrays | tuple[dict, dict] | None = None,
+    s1_zscore_stats: _ZscoreArrays | tuple[dict, dict] | None = None,
     s2_feature_cols: list[str] | None = None,
     s1_feature_cols: list[str] | None = None,
     max_seq_len: int = MAX_SEQ_LEN,
@@ -409,53 +451,72 @@ def _preprocess(
     pids_at_starts = pid_arr[valid_starts]
 
     if mixed:
-        # Per-pixel z-score applied separately to S2 and S1 slots
-        _s2_zero = np.zeros(n_s2, np.float32)
-        _s2_one  = np.ones(n_s2,  np.float32)
-        _s1_zero = np.zeros(n_s1, np.float32)
-        _s1_one  = np.ones(n_s1,  np.float32)
-        p_s2_mean = p_s2_std = p_s1_mean = p_s1_std = None
-        if pixel_zscore_stats is not None:
-            p_s2_mean, p_s2_std = pixel_zscore_stats
-        if s1_zscore_stats is not None:
-            p_s1_mean, p_s1_std = s1_zscore_stats
+        # Batch-fetch per-pixel z-score stats for all W windows at once.
+        _s2za = pixel_zscore_stats if isinstance(pixel_zscore_stats, _ZscoreArrays) else None
+        _s1za = s1_zscore_stats    if isinstance(s1_zscore_stats,    _ZscoreArrays) else None
+        if _s2za is not None:
+            all_s2_pm, all_s2_ps = _s2za.batch_lookup(pids_at_starts)  # (W, n_s2)
+        if _s1za is not None:
+            all_s1_pm, all_s1_ps = _s1za.batch_lookup(pids_at_starts)  # (W, n_s1)
 
         for k in range(W):
             s = valid_starts[k]
-            c = capped[k]
-            win_feat = feat[s:s+c].copy()
-            win_src  = is_s1_np[s:s+c]
-            s2_rows  = ~win_src
-            s1_rows  = win_src
+            length = lengths[valid][k]
+            win_feat_full = feat[s:s+length]
+            win_src_full  = is_s1_np[s:s+length]
+            win_doy_full  = doy_arr[s:s+length]
 
-            if p_s2_mean is not None and s2_rows.any():
-                pid = pids_at_starts[k]
-                pm = p_s2_mean.get(pid, _s2_zero)
-                ps = p_s2_std.get(pid,  _s2_one)
-                win_feat[s2_rows, :n_s2] = (win_feat[s2_rows, :n_s2] - pm) / ps
+            # Smart subsampling: keep all S2 (up to max_seq_len), thin S1 to fill
+            # remaining budget. If S2 alone exceeds the cap, truncate S2 tail too.
+            if length > max_seq_len:
+                s2_idx = np.where(~win_src_full)[0]
+                s1_idx = np.where( win_src_full)[0]
+                n_s2_win = min(len(s2_idx), max_seq_len)
+                s2_idx   = s2_idx[:n_s2_win]          # keep earliest S2 obs if overflow
+                s1_budget = max_seq_len - n_s2_win
+                kept_s1 = subsample_obs_indices(s1_idx, win_doy_full[s1_idx], s1_budget)
+                kept_s1_abs = s1_idx[kept_s1]
+                keep_idx = np.sort(np.concatenate([s2_idx, kept_s1_abs]))[:max_seq_len]
+                win_feat = win_feat_full[keep_idx]
+                win_src  = win_src_full[keep_idx]
+                win_doy  = win_doy_full[keep_idx]
+            else:
+                win_feat = win_feat_full.copy()
+                win_src  = win_src_full
+                win_doy  = win_doy_full
 
-            if p_s1_mean is not None and s1_rows.any():
-                pid = pids_at_starts[k]
-                pm1 = p_s1_mean.get(pid, _s1_zero)
-                ps1 = p_s1_std.get(pid,  _s1_one)
-                win_feat[s1_rows, n_s2:] = (win_feat[s1_rows, n_s2:] - pm1) / ps1
+            s2_rows = ~win_src
+            s1_rows =  win_src
+
+            if _s2za is not None and s2_rows.any():
+                win_feat[s2_rows, :n_s2] = (win_feat[s2_rows, :n_s2] - all_s2_pm[k]) / all_s2_ps[k]
+
+            if _s1za is not None and s1_rows.any():
+                win_feat[s1_rows, n_s2:] = (win_feat[s1_rows, n_s2:] - all_s1_pm[k]) / all_s1_ps[k]
 
             normed = np.where(np.isnan(win_feat), 0.0, win_feat).astype(np.float32)
-            n = min(c, max_seq_len)
-            bands_np[k, :n]  = normed[:n]
-            doy_np[k,  :n]   = doy_arr[s:s+n]
+            n = len(normed)
+            bands_np[k, :n]  = normed
+            doy_np[k,  :n]   = win_doy
             mask_np[k, :n]   = False
-            is_s1_out[k, :n] = win_src[:n]
+            is_s1_out[k, :n] = win_src
 
     elif pixel_zscore_stats is not None and not s1_only:
-        pid_mean_lookup, pid_std_lookup = pixel_zscore_stats
-        _zero = np.zeros(n_feat, dtype=np.float32)
-        _one  = np.ones(n_feat,  dtype=np.float32)
+        _za = pixel_zscore_stats if isinstance(pixel_zscore_stats, _ZscoreArrays) else None
+        if _za is not None:
+            all_pm, all_ps = _za.batch_lookup(pids_at_starts)  # (W, n_feat)
+        else:
+            pid_mean_lookup, pid_std_lookup = pixel_zscore_stats
+            _zero = np.zeros(n_feat, dtype=np.float32)
+            _one  = np.ones(n_feat,  dtype=np.float32)
         for k in range(W):
             s = valid_starts[k]
             c = capped[k]
-            pm = pid_mean_lookup.get(pids_at_starts[k], _zero)
-            ps = pid_std_lookup.get(pids_at_starts[k],  _one)
+            if _za is not None:
+                pm, ps = all_pm[k], all_ps[k]
+            else:
+                pm = pid_mean_lookup.get(pids_at_starts[k], _zero)
+                ps = pid_std_lookup.get(pids_at_starts[k],  _one)
             window = (feat[s:s+c] - pm) / ps
             normed = np.where(np.isnan(window), 0.0, window).astype(np.float32)
             n = min(c, max_seq_len)
@@ -626,19 +687,41 @@ def _compute_band_summaries_from_parquets(
     return {pid: summary_matrix[i].astype(np.float32) for i, pid in enumerate(pids)}
 
 
+def _has_flash_attn() -> bool:
+    """True if flash_attn varlen kernel is importable AND supports the current GPU."""
+    try:
+        from flash_attn.cute.interface import flash_attn_varlen_func  # noqa: F401
+        import torch
+        if not torch.cuda.is_available():
+            return False
+        # flash-attn v4 beta requires sm_9x/10x/11x; sm_12x (Blackwell) not yet supported
+        major, _ = torch.cuda.get_device_capability()
+        return major in (9, 10, 11)
+    except (ImportError, AssertionError):
+        return False
+
+
 def _gpu_score(
     prepared: _PreparedBatch,
     model: TAMClassifier,
-    all_pids: list,
-    all_years: list,
-    all_probs: list,
     batch_size: int,
     device: str,
     band_summaries: dict | None = None,
-) -> None:
-    """GPU-side: transfer tensors, run inference, append (pid, year, prob) to lists."""
+    gate_threshold: float = 0.0,
+    T_gate: int = 8,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """GPU-side: transfer tensors, run inference, return (pids, years, probs) arrays.
+
+    Uses flash-attn varlen forward (no padding waste) when flash_attn is installed,
+    falling back to the standard padded forward otherwise.
+
+    When gate_threshold > 0, runs a cheap T_gate-token forward pass first and skips
+    the full forward for pixels scoring below gate_threshold. Rejected pixels are
+    returned with prob=0.0. Requires a gate-augmented checkpoint to be reliable.
+    """
     bands_th, doy_th, mask_th, n_obs_th, pids, years, is_s1_th = prepared
     W = len(pids)
+    use_varlen = device.startswith("cuda") and _has_flash_attn()
 
     global_feats_th: torch.Tensor | None = None
     if band_summaries and model.n_global_features > 0:
@@ -649,23 +732,155 @@ def _gpu_score(
         ])
         global_feats_th = torch.from_numpy(gf_np)
 
+    local_pids:  list[np.ndarray] = []
+    local_years: list[np.ndarray] = []
+    local_probs: list[np.ndarray] = []
+
+    use_gate = gate_threshold > 0.0
+
     with torch.inference_mode():
         for start in range(0, W, batch_size):
             end = min(start + batch_size, W)
+            B = end - start
             gf_batch = global_feats_th[start:end].to(device, non_blocking=True) if global_feats_th is not None else None
-            is_s1_batch = is_s1_th[start:end].to(device, non_blocking=True) if is_s1_th is not None else None
-            prob, _ = model(
-                bands_th[start:end].to(device, non_blocking=True),
-                doy_th[start:end].to(device, non_blocking=True),
-                mask_th[start:end].to(device, non_blocking=True),
-                n_obs_th[start:end].to(device, non_blocking=True),
-                global_feats=gf_batch,
-                is_s1=is_s1_batch,
-            )
-            prob_np = prob.cpu().numpy()
-            all_pids.append(pids[start:end])
-            all_years.append(years[start:end])
-            all_probs.append(prob_np)
+
+            if use_gate:
+                # Gate pass: farthest-point DOY sampling → T_gate-token forward.
+                # Matches the training augmentation: T_gate tokens spread maximally
+                # across the annual arc, not a chronological prefix.
+                # n_obs_gate uses the full max_seq_len denominator so the model's
+                # sparsity scalar (n/T) reads the same value it saw during training.
+                T_full = bands_th.shape[1]
+                gate_t = min(T_gate, T_full)
+                doy_batch_np = doy_th[start:end].numpy()     # (B, T_full) CPU
+                mask_batch_np = mask_th[start:end].numpy()   # (B, T_full) bool
+
+                gate_bands = np.zeros((B, gate_t, bands_th.shape[2]), dtype=np.float32)
+                gate_doy   = np.zeros((B, gate_t), dtype=np.int64)
+                gate_is_s1 = np.zeros((B, gate_t), dtype=bool)
+                gate_mask_np = np.ones((B, gate_t), dtype=bool)   # True=padding
+
+                for bi in range(B):
+                    real_idx = np.where(~mask_batch_np[bi])[0]   # non-padding positions
+                    n_real = len(real_idx)
+                    if n_real == 0:
+                        continue
+                    sel = subsample_obs_indices(real_idx, doy_batch_np[bi, real_idx], gate_t)
+                    sel_pos = real_idx[sel]
+                    k = len(sel_pos)
+                    gate_bands[bi, :k]   = bands_th[start + bi, sel_pos].numpy()
+                    gate_doy[bi, :k]     = doy_batch_np[bi, sel_pos]
+                    if is_s1_th is not None:
+                        gate_is_s1[bi, :k] = is_s1_th[start + bi, sel_pos].numpy().astype(bool)
+                    gate_mask_np[bi, :k] = False
+
+                gate_n_obs = np.clip((~gate_mask_np).sum(axis=1), 1, None).astype(np.float32) / T_full
+
+                gate_prob, _ = model(
+                    torch.from_numpy(gate_bands).to(device, non_blocking=True),
+                    torch.from_numpy(gate_doy).to(device, non_blocking=True),
+                    torch.from_numpy(gate_mask_np).to(device, non_blocking=True),
+                    torch.from_numpy(gate_n_obs).to(device, non_blocking=True),
+                    global_feats=gf_batch,
+                    is_s1=torch.from_numpy(gate_is_s1).to(device, non_blocking=True) if is_s1_th is not None else None,
+                )
+                gate_prob_np = gate_prob.cpu().float().numpy()
+                survivor_mask = gate_prob_np >= gate_threshold
+                survivor_idx  = np.where(survivor_mask)[0]
+
+                # Pixels that failed the gate get prob=0.0 immediately.
+                probs_out = np.zeros(B, dtype=np.float32)
+
+                if len(survivor_idx) > 0:
+                    # Full forward on survivors only (index into the batch slice).
+                    s_idx_th = torch.from_numpy(survivor_idx).to(device)
+                    if use_varlen:
+                        mask_surv = mask_th[start:end][survivor_idx]
+                        seq_lens  = (~mask_surv).sum(dim=1).to(torch.int32)
+                        cu_seqlens = torch.zeros(len(survivor_idx) + 1, dtype=torch.int32, device=device)
+                        cu_seqlens[1:] = seq_lens.to(device).cumsum(0)
+                        max_seqlen = int(seq_lens.max().item())
+                        bands_surv = bands_th[start:end][survivor_idx].to(device, non_blocking=True)
+                        doy_surv   = doy_th[start:end][survivor_idx].to(device, non_blocking=True)
+                        n_obs_surv = n_obs_th[start:end][survivor_idx].to(device, non_blocking=True)
+                        is_s1_surv = is_s1_th[start:end][survivor_idx].to(device, non_blocking=True) if is_s1_th is not None else None
+                        valid_mask = ~mask_surv.to(device)
+                        bands_flat = bands_surv[valid_mask]
+                        doy_flat   = doy_surv[valid_mask]
+                        is_s1_flat = is_s1_surv[valid_mask] if is_s1_surv is not None else None
+                        gf_surv    = gf_batch[s_idx_th] if gf_batch is not None else None
+                        prob, _ = model.forward_varlen(
+                            bands_flat=bands_flat, doy_flat=doy_flat,
+                            cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+                            n_obs=n_obs_surv, global_feats=gf_surv, is_s1_flat=is_s1_flat,
+                        )
+                    else:
+                        is_s1_surv = is_s1_th[start:end][survivor_idx].to(device, non_blocking=True) if is_s1_th is not None else None
+                        gf_surv    = gf_batch[s_idx_th] if gf_batch is not None else None
+                        prob, _ = model(
+                            bands_th[start:end][survivor_idx].to(device, non_blocking=True),
+                            doy_th[start:end][survivor_idx].to(device, non_blocking=True),
+                            mask_th[start:end][survivor_idx].to(device, non_blocking=True),
+                            n_obs_th[start:end][survivor_idx].to(device, non_blocking=True),
+                            global_feats=gf_surv,
+                            is_s1=is_s1_surv,
+                        )
+                    probs_out[survivor_idx] = prob.cpu().float().numpy()
+
+                local_pids.append(pids[start:end])
+                local_years.append(years[start:end])
+                local_probs.append(probs_out)
+
+            else:
+                if use_varlen:
+                    # Pack the batch into flat (no-padding) tensors for flash_attn varlen.
+                    # mask_th: True = padding; valid token count per row = (~mask).sum(dim=1)
+                    mask_batch = mask_th[start:end]                       # (B, T) bool
+                    seq_lens = (~mask_batch).sum(dim=1).to(torch.int32)   # (B,) actual lengths
+                    cu_seqlens = torch.zeros(end - start + 1, dtype=torch.int32, device=device)
+                    cu_seqlens[1:] = seq_lens.to(device).cumsum(0)
+                    max_seqlen = int(seq_lens.max().item())
+
+                    bands_batch = bands_th[start:end].to(device, non_blocking=True)
+                    doy_batch   = doy_th[start:end].to(device, non_blocking=True)
+                    n_obs_batch = n_obs_th[start:end].to(device, non_blocking=True)
+                    is_s1_batch = is_s1_th[start:end].to(device, non_blocking=True) if is_s1_th is not None else None
+
+                    # Flatten only real tokens (exclude padding positions)
+                    valid_mask = ~mask_batch.to(device)                   # (B, T) True=real
+                    bands_flat  = bands_batch[valid_mask]                 # (total_tokens, N_BANDS)
+                    doy_flat    = doy_batch[valid_mask]                   # (total_tokens,)
+                    is_s1_flat  = is_s1_batch[valid_mask] if is_s1_batch is not None else None
+
+                    prob, _ = model.forward_varlen(
+                        bands_flat=bands_flat,
+                        doy_flat=doy_flat,
+                        cu_seqlens=cu_seqlens,
+                        max_seqlen=max_seqlen,
+                        n_obs=n_obs_batch,
+                        global_feats=gf_batch,
+                        is_s1_flat=is_s1_flat,
+                    )
+                else:
+                    is_s1_batch = is_s1_th[start:end].to(device, non_blocking=True) if is_s1_th is not None else None
+                    prob, _ = model(
+                        bands_th[start:end].to(device, non_blocking=True),
+                        doy_th[start:end].to(device, non_blocking=True),
+                        mask_th[start:end].to(device, non_blocking=True),
+                        n_obs_th[start:end].to(device, non_blocking=True),
+                        global_feats=gf_batch,
+                        is_s1=is_s1_batch,
+                    )
+
+                local_pids.append(pids[start:end])
+                local_years.append(years[start:end])
+                local_probs.append(prob.cpu().float().numpy())
+
+    return (
+        np.concatenate(local_pids),
+        np.concatenate(local_years),
+        np.concatenate(local_probs),
+    )
 
 
 def aggregate_year_probs(
@@ -705,6 +920,17 @@ def aggregate_year_probs(
     return agg
 
 
+def _flush_to_writer(writer: "pq.ParquetWriter", pids_list: list, years_list: list, probs_list: list) -> None:
+    """Write one row group to a streaming ParquetWriter and clear the buffers."""
+    import pyarrow as pa
+    tbl = pa.table({
+        "point_id":     pa.array(np.concatenate(pids_list),                    type=pa.large_utf8()),
+        "year":         pa.array(np.concatenate(years_list).astype("int16"),   type=pa.int16()),
+        "prob_tam_raw": pa.array(np.concatenate(probs_list).astype("float32"), type=pa.float32()),
+    })
+    writer.write_table(tbl)
+
+
 def score_pixels_chunked(
     parquet: Path,
     model: TAMClassifier,
@@ -721,19 +947,26 @@ def score_pixels_chunked(
     decay: float = 0.7,
     n_total_pixels: int | None = None,
     s1_only: bool = False,
-    mixed: bool = False,
+    mixed: bool = True,
     pixel_zscore: bool = False,
     s1_despeckle_window: int = 0,
     feature_cols: list[str] | None = None,
     s2_feature_cols: list[str] | None = None,
     s1_feature_cols: list[str] | None = None,
     band_summaries: dict | None = None,
-    pixel_zscore_stats: tuple[dict, dict] | None = None,
-    s1_zscore_stats: tuple[dict, dict] | None = None,
+    pixel_zscore_stats: _ZscoreArrays | tuple[dict, dict] | None = None,
+    s1_zscore_stats: _ZscoreArrays | tuple[dict, dict] | None = None,
     # accumulators — pass across years to merge results before final aggregation
     _all_pids:  list | None = None,
     _all_years: list | None = None,
     _all_probs: list | None = None,
+    # streaming output — when set, scores are written to this writer instead of
+    # accumulated in memory; caller owns the writer lifecycle
+    out_writer: "pq.ParquetWriter | None" = None,
+    write_flush_rows: int = 500_000,
+    progress_log_interval: int = 200_000,
+    gate_threshold: float = 0.0,
+    T_gate: int = 8,
 ) -> pl.DataFrame:
     """Score all pixels in a single-year parquet with a three-stage concurrent pipeline.
 
@@ -753,6 +986,8 @@ def score_pixels_chunked(
 
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     pin = device.startswith("cuda") and torch.cuda.is_available()
+    if pin:
+        torch.set_float32_matmul_precision("high")  # TF32: ~2× attention throughput on Ampere+
     model.to(device)
     model.eval()
 
@@ -802,10 +1037,14 @@ def score_pixels_chunked(
     available = set(pf.schema_arrow.names)
     read_cols = [c for c in read_cols if c in available]
 
+    # Deeper queues so prep workers can buffer ahead when GPU drains fast.
+    _q_depth = n_prep_workers * 4
     # Stage 1→2: raw DataFrames
-    raw_q: Queue = Queue(maxsize=n_prep_workers * 2)
+    raw_q: Queue = Queue(maxsize=_q_depth)
     # Stage 2→3: prepared batches
-    prep_q: Queue = Queue(maxsize=n_prep_workers * 2)
+    prep_q: Queue = Queue(maxsize=_q_depth)
+    # Stage 3→4: scored chunks (only used when out_writer is set)
+    out_q: Queue = Queue(maxsize=8)
 
     # --- Stage 1: reader ---
     def _reader() -> None:
@@ -887,35 +1126,97 @@ def score_pixels_chunked(
         finally:
             prep_q.put(_SENTINEL)
 
+    # Convert stats dicts → vectorised _ZscoreArrays for O(1) batch lookups in preprocessors.
+    if isinstance(pixel_zscore_stats, tuple):
+        _s2_cols_n = len(next(iter(pixel_zscore_stats[0].values()))) if pixel_zscore_stats[0] else 1
+        pixel_zscore_stats = _ZscoreArrays(*pixel_zscore_stats, n_feat=_s2_cols_n)
+    if isinstance(s1_zscore_stats, tuple):
+        _s1_cols_n = len(next(iter(s1_zscore_stats[0].values()))) if s1_zscore_stats[0] else 1
+        s1_zscore_stats = _ZscoreArrays(*s1_zscore_stats, n_feat=_s1_cols_n)
+
+    # --- Stage 4: writer thread (streaming path only) ---
+    def _writer() -> None:
+        buf_pids:  list[np.ndarray] = []
+        buf_years: list[np.ndarray] = []
+        buf_probs: list[np.ndarray] = []
+        buf_rows = 0
+        try:
+            while True:
+                item = out_q.get()
+                if item is _SENTINEL:
+                    break
+                p, y, pr = item
+                buf_pids.append(p)
+                buf_years.append(y)
+                buf_probs.append(pr)
+                buf_rows += len(p)
+                if buf_rows >= write_flush_rows:
+                    _flush_to_writer(out_writer, buf_pids, buf_years, buf_probs)
+                    buf_pids, buf_years, buf_probs, buf_rows = [], [], [], 0
+            if buf_rows:
+                _flush_to_writer(out_writer, buf_pids, buf_years, buf_probs)
+        except Exception:
+            logger.exception("Writer thread crashed")
+
     reader_thread = Thread(target=_reader, daemon=True)
     reader_thread.start()
 
     prep_pool = ThreadPoolExecutor(max_workers=n_prep_workers)
     prep_futures = [prep_pool.submit(_preprocessor) for _ in range(n_prep_workers)]
 
+    writer_thread: Thread | None = None
+    if out_writer is not None:
+        writer_thread = Thread(target=_writer, daemon=True)
+        writer_thread.start()
+
     all_pids:  list[np.ndarray] = _all_pids  if _all_pids  is not None else []
     all_years: list[np.ndarray] = _all_years if _all_years is not None else []
     all_probs: list[np.ndarray] = _all_probs if _all_probs is not None else []
-    n_scored = 0
     sentinels_seen = 0
+    n_scored = 0
+    n_last_logged = 0
+    import time as _time
+    _t0 = _time.monotonic()
 
     while sentinels_seen < n_prep_workers:
         item = prep_q.get()
         if item is _SENTINEL:
             sentinels_seen += 1
             continue
-        _gpu_score(item, model, all_pids, all_years, all_probs, batch_size, device,
-                   band_summaries=band_summaries)
-        n_scored += len(np.unique(item.pids))
-        if n_total_pixels:
-            logger.info("Scored %.1f%% (%d / %d pixels)", 100 * n_scored / n_total_pixels, n_scored, n_total_pixels)
+        chunk = _gpu_score(item, model, batch_size, device, band_summaries=band_summaries,
+                           gate_threshold=gate_threshold, T_gate=T_gate)
+        if out_writer is not None:
+            out_q.put(chunk)
         else:
-            logger.info("Scored %d windows so far", n_scored)
+            all_pids.append(chunk[0])
+            all_years.append(chunk[1])
+            all_probs.append(chunk[2])
+        n_scored += len(np.unique(item.pids))
+        if n_scored - n_last_logged >= progress_log_interval:
+            elapsed = _time.monotonic() - _t0
+            rate = n_scored / elapsed if elapsed > 0 else 0.0
+            if n_total_pixels:
+                logger.info(
+                    "[%s yr=%s] %.1f%% (%d/%d px) @ %.0f px/s",
+                    tile_id or "?", end_year or "?",
+                    100.0 * n_scored / n_total_pixels, n_scored, n_total_pixels, rate,
+                )
+            else:
+                logger.info(
+                    "[%s yr=%s] %d px scored @ %.0f px/s",
+                    tile_id or "?", end_year or "?", n_scored, rate,
+                )
+            n_last_logged = n_scored
 
     reader_thread.join()
     for f in prep_futures:
         f.result()
     prep_pool.shutdown(wait=False)
+
+    if writer_thread is not None:
+        out_q.put(_SENTINEL)
+        writer_thread.join()
+        return pl.DataFrame()   # caller owns the writer; return value is not used
 
     logger.info("Aggregating scores ...")
     if not end_year:
@@ -938,7 +1239,7 @@ def score_location_years(
     decay: float = 0.7,
     n_total_pixels: int | None = None,
     s1_only: bool = False,
-    mixed: bool = False,
+    mixed: bool = True,
     pixel_zscore: bool = False,
     s1_despeckle_window: int = 0,
     feature_cols: list[str] | None = None,
@@ -972,23 +1273,8 @@ def score_location_years(
     band_summaries: dict | None = None
 
     if pixel_zscore and not s1_only:
-        logger.info("Pre-pass: computing per-pixel S2 z-score stats (%d feature cols) ...", len(_s2_cols))
-        pixel_zscore_stats = _compute_s2_pixel_zscore_stats(
-            year_parquets=year_parquets,
-            feature_cols=_s2_cols,
-            scl_purity_min=scl_purity_min,
-        )
-        logger.info("Z-score stats computed for %d pixels", len(pixel_zscore_stats[0]))
-
-        if mixed:
-            logger.info("Pre-pass: computing per-pixel S1 z-score stats (%s) ...", _s1_cols)
-            s1_zscore_stats = _compute_pixel_s1_stats_mixed(
-                year_parquets=year_parquets,
-                s1_feature_cols=_s1_cols,
-            )
-            logger.info("S1 z-score stats computed for %d pixels", len(s1_zscore_stats[0]))
-
-        if model.n_global_features > 0:
+        _has_global = model.n_global_features > 0
+        if _has_global:
             if global_feat_mean is None or global_feat_std is None:
                 raise ValueError(
                     "Model has global features but tam_global_feat_stats.npz was not found. "
@@ -999,14 +1285,42 @@ def score_location_years(
                     "Model has global features but summary_feature_cols is unknown. "
                     "Pass feature_cols or summary_feature_cols matching global_feat_mean shape."
                 )
-            logger.info("Pre-pass: computing per-pixel band summaries (%d feature cols) ...", len(_summary_cols))
-            band_summaries = _compute_band_summaries_from_parquets(
+
+        from concurrent.futures import ThreadPoolExecutor as _TPE
+        _max_workers = (3 if mixed else 2) if _has_global else (2 if mixed else 1)
+        with _TPE(max_workers=_max_workers) as _pre_ex:
+            logger.info("Pre-pass: launching parallel pre-passes (workers=%d) ...", _max_workers)
+            _f_s2 = _pre_ex.submit(
+                _compute_s2_pixel_zscore_stats,
+                year_parquets=year_parquets,
+                feature_cols=_s2_cols,
+                scl_purity_min=scl_purity_min,
+            )
+            _f_s1 = _pre_ex.submit(
+                _compute_pixel_s1_stats_mixed,
+                year_parquets=year_parquets,
+                s1_feature_cols=_s1_cols,
+            ) if mixed else None
+            _f_bs = _pre_ex.submit(
+                _compute_band_summaries_from_parquets,
                 year_parquets=year_parquets,
                 feature_cols=_summary_cols,
                 scl_purity_min=scl_purity_min,
                 global_feat_mean=global_feat_mean,
                 global_feat_std=global_feat_std,
-            )
+            ) if _has_global else None
+
+        _raw_s2 = _f_s2.result()
+        logger.info("Z-score stats computed for %d pixels", len(_raw_s2[0]))
+        _s2_n = len(next(iter(_raw_s2[0].values()))) if _raw_s2[0] else 1
+        pixel_zscore_stats = _ZscoreArrays(*_raw_s2, n_feat=_s2_n)
+        if _f_s1 is not None:
+            _raw_s1 = _f_s1.result()
+            logger.info("S1 z-score stats computed for %d pixels", len(_raw_s1[0]))
+            _s1_n = len(next(iter(_raw_s1[0].values()))) if _raw_s1[0] else 1
+            s1_zscore_stats = _ZscoreArrays(*_raw_s1, n_feat=_s1_n)
+        if _f_bs is not None:
+            band_summaries = _f_bs.result()
             logger.info("Band summaries computed for %d pixels", len(band_summaries))
 
     _eff_end_year = end_year or max(y for y, _ in year_parquets)
@@ -1057,6 +1371,18 @@ _STAGING_WRITE_OPTS = dict(
 )
 
 
+_STAGING_SCHEMA = None  # initialised lazily to avoid top-level pyarrow import
+
+
+def _get_staging_schema() -> "pa.Schema":
+    import pyarrow as pa
+    return pa.schema([
+        pa.field("point_id",     pa.large_utf8()),
+        pa.field("year",         pa.int16()),
+        pa.field("prob_tam_raw", pa.float32()),
+    ])
+
+
 def score_tile_year(
     parquet: Path,
     tile_id: str,
@@ -1071,17 +1397,30 @@ def score_tile_year(
     n_prep_workers: int = 4,
     device: str | None = None,
     s1_only: bool = False,
+    mixed: bool = True,
     s1_despeckle_window: int = 0,
+    n_total_pixels: int | None = None,
+    s2_feature_cols: list[str] | None = None,
+    s1_feature_cols: list[str] | None = None,
 ) -> Path:
     """Score a single (tile_id, year) parquet and write a staging parquet.
+
+    Runs parallel pre-passes (S2 z-score + S1 z-score) before opening the
+    ParquetWriter, then streams inference results directly to disk so memory
+    is bounded regardless of tile size (~100M pixels on full catchment tiles).
+
+    Pre-passes read the parquet concurrently (I/O-bound); scoring starts only
+    after both complete. The writer thread flushes to disk every 500K rows
+    while inference runs, so the output is partially written throughout.
 
     The staging parquet has columns: point_id (str), year (int16), prob_tam_raw (float32).
     If the staging file already exists it is returned immediately (idempotent / crash-safe).
 
     Returns the staging parquet path.
     """
-    import pyarrow as pa
     import pyarrow.parquet as pq
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+    from tam.core.dataset import ALL_FEATURE_COLS, V10_S1_FEATURE_COLS
 
     staging_dir.mkdir(parents=True, exist_ok=True)
     out_path = staging_dir / f"{tile_id}_{year}.parquet"
@@ -1089,34 +1428,76 @@ def score_tile_year(
         logger.info("Staging file exists, skipping %s year=%d", tile_id, year)
         return out_path
 
-    logger.info("Scoring tile=%s year=%d ...", tile_id, year)
-    scores = score_pixels_chunked(
-        parquet=parquet,
-        model=model,
-        band_mean=band_mean,
-        band_std=band_std,
-        scl_purity_min=scl_purity_min,
-        min_obs_per_year=min_obs_per_year,
-        batch_size=batch_size,
-        n_prep_workers=n_prep_workers,
-        device=device,
-        tile_id=tile_id,
-        end_year=year,
-        decay=0.0,   # no decay here — aggregation happens in phase 2
-        s1_only=s1_only,
-        s1_despeckle_window=s1_despeckle_window,
-    )
-
-    scores = scores.with_columns(pl.lit(np.int16(year)).alias("year"))
-    tbl = scores.select([
-        "point_id",
-        "year",
-        pl.col("prob_tam").alias("prob_tam_raw"),
-    ]).to_arrow()
     tmp_path = out_path.with_suffix(".tmp.parquet")
-    pq.write_table(tbl, tmp_path, **_STAGING_WRITE_OPTS)
-    tmp_path.rename(out_path)  # atomic on POSIX; only visible once complete
-    logger.info("Wrote staging %s (%d pixels)", out_path.name, len(scores))
+    tmp_path.unlink(missing_ok=True)   # clean up any stale crash remnant
+
+    _s2_cols = s2_feature_cols or list(ALL_FEATURE_COLS)
+    _s1_cols = s1_feature_cols or list(V10_S1_FEATURE_COLS)
+    year_parquets = [(year, parquet)]
+
+    # --- Parallel pre-passes (must complete before scoring starts) ---
+    # Both are full sequential reads of the parquet, so they run concurrently
+    # to hide I/O latency. At ~100M pixels this takes ~20-60s; at that scale
+    # it's a small fraction of the ~14h scoring pass.
+    logger.info("[%s yr=%d] Running pre-passes ...", tile_id, year)
+    _n_workers = 2 if (mixed and not s1_only) else 1
+    with _TPE(max_workers=_n_workers) as _pre_ex:
+        _f_s2 = _pre_ex.submit(
+            _compute_s2_pixel_zscore_stats,
+            year_parquets=year_parquets,
+            feature_cols=_s2_cols,
+            scl_purity_min=scl_purity_min,
+        ) if not s1_only else None
+        _f_s1 = _pre_ex.submit(
+            _compute_pixel_s1_stats_mixed,
+            year_parquets=year_parquets,
+            s1_feature_cols=_s1_cols,
+        ) if (mixed and not s1_only) else None
+
+    pixel_zscore_stats: _ZscoreArrays | None = None
+    if _f_s2 is not None:
+        _raw_s2 = _f_s2.result()
+        _s2_n = len(next(iter(_raw_s2[0].values()))) if _raw_s2[0] else 1
+        pixel_zscore_stats = _ZscoreArrays(*_raw_s2, n_feat=_s2_n)
+        logger.info("[%s yr=%d] S2 z-score: %d pixels", tile_id, year, len(_raw_s2[0]))
+
+    s1_zscore_stats: _ZscoreArrays | None = None
+    if _f_s1 is not None:
+        _raw_s1 = _f_s1.result()
+        _s1_n = len(next(iter(_raw_s1[0].values()))) if _raw_s1[0] else 1
+        s1_zscore_stats = _ZscoreArrays(*_raw_s1, n_feat=_s1_n)
+        logger.info("[%s yr=%d] S1 z-score: %d pixels", tile_id, year, len(_raw_s1[0]))
+
+    # --- Stream inference → disk ---
+    logger.info("[%s yr=%d] Scoring ...", tile_id, year)
+    with pq.ParquetWriter(tmp_path, schema=_get_staging_schema(), **_STAGING_WRITE_OPTS) as staging_writer:
+        score_pixels_chunked(
+            parquet=parquet,
+            model=model,
+            band_mean=band_mean,
+            band_std=band_std,
+            scl_purity_min=scl_purity_min,
+            min_obs_per_year=min_obs_per_year,
+            batch_size=batch_size,
+            n_prep_workers=n_prep_workers,
+            device=device,
+            tile_id=tile_id,
+            end_year=year,
+            decay=0.0,   # no decay here — aggregation happens in phase 2
+            s1_only=s1_only,
+            mixed=mixed,
+            pixel_zscore=pixel_zscore_stats is not None,
+            pixel_zscore_stats=pixel_zscore_stats,
+            s1_zscore_stats=s1_zscore_stats,
+            s2_feature_cols=_s2_cols,
+            s1_feature_cols=_s1_cols,
+            s1_despeckle_window=s1_despeckle_window,
+            n_total_pixels=n_total_pixels,
+            out_writer=staging_writer,
+        )
+
+    tmp_path.rename(out_path)   # atomic on POSIX; only visible once complete
+    logger.info("[%s yr=%d] Wrote staging %s", tile_id, year, out_path.name)
     return out_path
 
 
@@ -1128,8 +1509,8 @@ def _score_tile_worker(args: tuple) -> tuple[str, list[Path]]:
     (
         tile_id, year_parquets, model, band_mean, band_std,
         staging_dir, scl_purity_min, min_obs_per_year,
-        batch_size, n_prep_workers, device, n_tile_workers, s1_only,
-        s1_despeckle_window,
+        batch_size, n_prep_workers, device, n_tile_workers, s1_only, mixed,
+        s1_despeckle_window, s2_feature_cols, s1_feature_cols,
     ) = args
 
     torch.set_num_threads(max(1, (os.cpu_count() or 1) // n_tile_workers))
@@ -1150,7 +1531,10 @@ def _score_tile_worker(args: tuple) -> tuple[str, list[Path]]:
             n_prep_workers=n_prep_workers,
             device=device,
             s1_only=s1_only,
+            mixed=mixed,
             s1_despeckle_window=s1_despeckle_window,
+            s2_feature_cols=s2_feature_cols,
+            s1_feature_cols=s1_feature_cols,
         )
         paths.append(p)
     return tile_id, paths
@@ -1171,7 +1555,10 @@ def score_tiles_chunked(
     end_year: int | None = None,
     decay: float = 0.7,
     s1_only: bool = False,
+    mixed: bool = True,
     s1_despeckle_window: int = 0,
+    s2_feature_cols: list[str] | None = None,
+    s1_feature_cols: list[str] | None = None,
 ) -> list[Path]:
     """Score each S2 tile independently, writing one parquet per tile.
 
@@ -1202,13 +1589,24 @@ def score_tiles_chunked(
         for tid, yps in tile_year_parquets.items()
     }
 
+    already_staged = sum(
+        1 for tid, yps in tile_year_parquets.items()
+        for y, _ in yps
+        if (staging_dir / f"{tid}_{y}.parquet").exists()
+    )
+    total_pairs = sum(len(yps) for yps in tile_year_parquets.values())
+    logger.info(
+        "Catchment score: %d tiles, %d tile-year pairs (%d already staged, %d to run)",
+        len(tile_year_parquets), total_pairs, already_staged, total_pairs - already_staged,
+    )
+
     # --- Phase 1: score each (tile, year) ---
     worker_args = [
         (
             tile_id, year_parquets, model, band_mean, band_std,
             staging_dir, scl_purity_min, min_obs_per_year,
-            batch_size, n_prep_workers, device, n_tile_workers, s1_only,
-            s1_despeckle_window,
+            batch_size, n_prep_workers, device, n_tile_workers, s1_only, mixed,
+            s1_despeckle_window, s2_feature_cols, s1_feature_cols,
         )
         for tile_id, year_parquets in tile_year_parquets.items()
     ]
@@ -1241,11 +1639,12 @@ def score_tiles_chunked(
     for tile_id, s_paths in staging_by_tile.items():
         logger.info("Aggregating tile %s across %d years ...", tile_id, len(s_paths))
 
-        # Read all staging parquets for this tile
+        # Read all staging parquets for this tile (lazy scan avoids materialising all
+        # years simultaneously before the group-by)
         raw = pl.concat([
-            pl.read_parquet(p, columns=["point_id", "year", "prob_tam_raw"])
+            pl.scan_parquet(p, hive_partitioning=False)
             for p in s_paths
-        ])
+        ]).select(["point_id", "year", "prob_tam_raw"]).collect()
 
         all_pids  = [raw["point_id"].to_numpy()]
         all_years = [raw["year"].to_numpy().astype(np.int32)]

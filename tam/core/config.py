@@ -47,6 +47,8 @@ class TAMConfig:
     min_delta:       float = 1e-4
     cvar_alpha:      float = 0.25  # tail fraction for CVaR val metric (bottom alpha of site AUCs)
     obs_dropout_min: int   = 0   # if >0, subsample each window to Uniform(obs_dropout_min, n) during training
+    p_gate:          float = 0.0 # probability of applying short-sequence gate augmentation each item
+    T_gate:          int   = 8   # target sequence length for gate augmentation (farthest-point DOY sampling)
     dataloader_workers: int = -1  # -1 = auto (RAM-scaled); 0 = in-process; N = exactly N workers
     warmup_freeze_epochs: int = 0  # if >0, freeze temporal stream for first N epochs (head-only warmup)
     doy_density_norm: bool = False  # if True, weight mean pool by inverse DOY observation frequency

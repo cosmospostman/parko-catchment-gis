@@ -118,9 +118,9 @@ def _sort_s1_shards(
     _log = logging.getLogger(__name__)
 
     if len(shard_paths) == 1:
-        _log.info("append_s1: sorting 1 shard (single, no merge needed)")
+        _log.info("sorting 1 shard ...")
         sort_parquet_by_pixel(shard_paths[0], out_path, row_group_size=5_000_000)
-        _log.info("append_s1: shard sort done")
+        _log.info("sort done → %s", out_path.name)
         return
 
     # Step 1: sort each shard independently into a sibling .sorted.parquet.
@@ -129,7 +129,7 @@ def _sort_s1_shards(
     # cause forked children to deadlock immediately on futex_wait.
     sorted_paths: list[Path] = [sp.with_suffix(".sorted.parquet") for sp in shard_paths]
     n_workers = min(len(shard_paths), n_workers or os.cpu_count() or 4)
-    _log.info("append_s1: sorting %d shards with %d workers (spawn) ...", len(shard_paths), n_workers)
+    _log.info("sorting %d shards (%d workers) ...", len(shard_paths), n_workers)
 
     ctx = multiprocessing.get_context("spawn")
     with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as pool:
@@ -141,9 +141,9 @@ def _sort_s1_shards(
         for fut in as_completed(futs):
             fut.result()  # re-raise any worker exception
             done += 1
-            _log.info("append_s1: shard sort %d/%d done", done, len(shard_paths))
+            _log.info("shard sort %d/%d done", done, len(shard_paths))
 
-    _log.info("append_s1: all shard sorts done, starting k-way merge ...")
+    _log.info("merging %d sorted shards → %s ...", len(shard_paths), out_path.name)
 
     # Step 2: merge-sort all sorted shards via Polars scan → sort → sink.
     # Polars pushes the sort into its Rust engine (~2.4 M rows/s vs ~200 K rows/s
@@ -168,7 +168,7 @@ def _sort_s1_shards(
             )
         )
         tmp_path.replace(out_path)
-        _log.info("append_s1: k-way merge done → %s", out_path.name)
+        _log.info("merge done → %s", out_path.name)
     except Exception:
         tmp_path.unlink(missing_ok=True)
         raise
@@ -183,7 +183,7 @@ def _merge_sorted_parquets(
     out_path: Path,
     combined_schema: "pa.Schema",
     tag_s2_source: bool = False,
-    memory_limit_gb: int = 8,
+    memory_limit_gb: int = 16,
 ) -> None:
     """2-way sort-merge of S2 and S1 parquets into out_path via DuckDB.
 
@@ -238,11 +238,19 @@ def _merge_sorted_parquets(
         )
     """
 
+    s2_rows = pq.ParquetFile(s2_path).metadata.num_rows
+    s1_rows = pq.ParquetFile(s1_path).metadata.num_rows
+    n_threads = max(1, (os.cpu_count() or 4) // 2)
+    logger.info(
+        "merge_tile: sort-merging %s (%s S2 rows + %s S1 rows) via DuckDB (%d threads, %d GB limit) ...",
+        out_path.name, f"{s2_rows:,}", f"{s1_rows:,}", n_threads, memory_limit_gb,
+    )
+
     con = duckdb.connect()
     try:
         con.execute(f"SET memory_limit = '{memory_limit_gb}GB'")
         con.execute(f"SET temp_directory = '{tmp_dir}'")
-        con.execute(f"SET threads = {max(1, (os.cpu_count() or 4) // 2)}")
+        con.execute(f"SET threads = {n_threads}")
         con.execute(sql)
     finally:
         con.close()

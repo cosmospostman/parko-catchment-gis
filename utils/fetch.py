@@ -73,13 +73,20 @@ def _read_bbox_patch(
                 patch_transform = rasterio.windows.transform(win, src.transform)
                 return arr, patch_transform, src.crs
         except Exception as exc:
+            msg = str(exc)
+            # 409 Conflict is non-transient (GDAL/S3 multipart conflict or
+            # expired SAS token that signing won't fix here); don't retry.
+            if "409" in msg:
+                logger.warning("fetch 409 (non-retryable): %s  url=%s", msg, href)
+                return None
             if attempt < max_retries:
                 wait = 2 ** attempt  # 1, 2, 4, 8 seconds
                 logger.debug("Retry %d/%d for %s after error: %s (waiting %ds)",
                              attempt + 1, max_retries, href, exc, wait)
                 time.sleep(wait)
             else:
-                logger.debug("Giving up on %s after %d retries: %s", href, max_retries, exc)
+                logger.warning("fetch failed after %d retries (%s): %s  url=%s",
+                               max_retries, exc.__class__.__name__, exc, href)
                 return None
 
 
@@ -225,10 +232,13 @@ async def fetch_patches(
         Cloud-filtered items and missing bands are absent from the dict.
     """
     import os
-    os.environ.setdefault("GDAL_HTTP_MAX_RETRY", "4")
-    os.environ.setdefault("GDAL_HTTP_RETRY_DELAY", "1")
+    # Let Python-level retry logic (in _read_bbox_patch) own all retries.
+    # GDAL's internal curl retry duplicates that and hides transient errors.
+    # Hard-set (not setdefault) so setup_gdal_env()'s "5" can't override us.
+    os.environ["GDAL_HTTP_MAX_RETRY"] = "0"
     os.environ.setdefault("GDAL_DISABLE_READDIR_ON_OPEN", "EMPTY_DIR")
-    os.environ.setdefault("CPL_VSIL_CURL_CACHE_SIZE", "128000000")  # 128MB header cache
+    # Do not set CPL_VSIL_CURL_CACHE_SIZE — the header cache can replay stale
+    # multipart upload IDs under high concurrency, producing spurious 409s.
 
     loop = asyncio.get_running_loop()
     sem = asyncio.Semaphore(max_concurrent)
@@ -238,8 +248,18 @@ async def fetch_patches(
     fetched = cached = filtered = errors = 0
     lon_min, lat_min, lon_max, lat_max = bbox_wgs84
 
-    async def fetch_one_patch(item_id: str, band: str, href: str) -> tuple[np.ndarray, object, object] | None:
+    def _get_href(item, asset_key: str) -> str:
+        """Sign item at call time (not upfront) so SAS tokens are fresh."""
+        if item_signer is not None:
+            try:
+                item = item_signer(item)
+            except Exception:
+                pass
+        return item.assets[asset_key].href
+
+    async def fetch_one_patch(item, band: str, asset_key: str) -> tuple[np.ndarray, object, object] | None:
         nonlocal fetched, cached, errors
+        item_id = item.id
         if cache_dir is not None:
             path = _cache_path(cache_dir, item_id, band)
             if path.exists():
@@ -256,6 +276,7 @@ async def fetch_patches(
                         item_id, band,
                     )
         async with sem:
+            href = await loop.run_in_executor(executor, _get_href, item, asset_key)
             data = await loop.run_in_executor(executor, _read_bbox_patch, href, bbox_wgs84)
         if data is None:
             errors += 1
@@ -268,42 +289,47 @@ async def fetch_patches(
         fetched += 1
         return data
 
-    # --- Pre-filter items by bbox, collect hrefs ----------------------------
+    # --- Pre-filter items by bbox, collect asset keys (no signing yet) -------
     item_specs = []
     for item in items:
-        if item_signer is not None:
-            try:
-                item = item_signer(item)
-            except Exception:
-                pass
         if item.bbox:
             ib = item.bbox
             if ib[0] > lon_max or ib[2] < lon_min or ib[1] > lat_max or ib[3] < lat_min:
                 continue
         assets = item.assets
         scl_asset_key = _alias.get(SCL_BAND, SCL_BAND)
-        scl_href = assets[scl_asset_key].href if (scl_filter and scl_asset_key in assets) else None
-        band_hrefs = []
+        has_scl = scl_filter and scl_asset_key in assets
+        band_asset_keys = []
         for band in bands:
             if band == SCL_BAND:
                 continue
             asset_key = _alias.get(band, band)
             if asset_key in assets:
-                band_hrefs.append((band, assets[asset_key].href))
+                band_asset_keys.append((band, asset_key))
             else:
                 logger.debug("Band %s (asset key %s) not in item %s assets",
                              band, asset_key, item.id)
-        item_specs.append((item, scl_href, band_hrefs))
+        item_specs.append((item, scl_asset_key if has_scl else None, band_asset_keys))
 
     # --- Phase 1: fetch SCL patches (skipped when scl_filter=False) ---------
     async def _none() -> None:
         return None
 
     if scl_filter:
-        logger.info("fetch_patches: phase 1 — fetching %d SCL patches", len(item_specs))
+        n_scl = len(item_specs)
+        logger.info("fetch_patches: phase 1 — fetching %d SCL patches", n_scl)
+        scl_done = 0
+
+        async def fetch_scl_tracked(item, scl_asset_key):
+            nonlocal scl_done
+            result = await (fetch_one_patch(item, SCL_BAND, scl_asset_key) if scl_asset_key else _none())
+            scl_done += 1
+            logger.info("  S2 chips  fetch %d/%d patches done", scl_done, n_scl)
+            return result
+
         scl_results = await asyncio.gather(*[
-            fetch_one_patch(item.id, SCL_BAND, href) if href else _none()
-            for (item, href, _) in item_specs
+            fetch_scl_tracked(item, scl_asset_key)
+            for (item, scl_asset_key, _) in item_specs
         ])
         logger.info("fetch_patches: SCL done, applying cloud filter")
     else:
@@ -317,9 +343,9 @@ async def fetch_patches(
     _accumulate = cache_dir is None
 
     spectral_tasks: list[tuple[str, str, asyncio.Task]] = []
-    for (item, scl_href, band_hrefs), scl_data in zip(item_specs, scl_results):
+    for (item, scl_asset_key, band_asset_keys), scl_data in zip(item_specs, scl_results):
         item_id = item.id
-        if scl_filter and scl_href is not None:
+        if scl_filter and scl_asset_key is not None:
             if scl_data is None:
                 continue
             scl_arr, _, _ = scl_data
@@ -330,31 +356,28 @@ async def fetch_patches(
             if _accumulate:
                 result[(item_id, SCL_BAND)] = scl_data
 
-        for band, href in band_hrefs:
-            spectral_tasks.append((item_id, band, asyncio.ensure_future(fetch_one_patch(item_id, band, href))))
+        for band, asset_key in band_asset_keys:
+            spectral_tasks.append((item_id, band, asyncio.ensure_future(fetch_one_patch(item, band, asset_key))))
 
     n_spectral = len(spectral_tasks)
     logger.info("fetch_patches: phase 2 — fetching %d spectral patches (%d items cloud-filtered)",
                 n_spectral, filtered)
 
     completed = 0
-    log_every = max(1, n_spectral // 10)
 
     async def tracked(item_id: str, band: str, task: asyncio.Task):
-        nonlocal completed, fetched
+        nonlocal completed
         data = await task
         completed += 1
-        if data is not None:
-            if _accumulate:
-                result[(item_id, band)] = data
-            fetched += 1
-        if completed % log_every == 0 or completed == n_spectral:
-            logger.info("fetch_patches: %d/%d spectral patches done", completed, n_spectral)
+        if data is not None and _accumulate:
+            result[(item_id, band)] = data
+        logger.info("  S2 chips  fetch %d/%d patches done", completed, n_spectral)
 
     await asyncio.gather(*[tracked(item_id, band, t) for item_id, band, t in spectral_tasks])
 
     executor.shutdown(wait=False)
-    logger.info(
+    _log = logger.warning if errors > 0 and fetched == 0 and cached == 0 else logger.info
+    _log(
         "fetch_patches complete: %d fetched, %d from cache, "
         "%d items cloud-filtered, %d errors",
         fetched, cached, filtered, errors,

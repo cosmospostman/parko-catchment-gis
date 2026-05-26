@@ -420,6 +420,8 @@ def _cmd_train(args: argparse.Namespace) -> None:
         "batch_size":            args.batch_size,
         "doy_phase_shift":       args.doy_phase_shift,
         "use_s1":                args.use_s1,
+        "p_gate":                args.p_gate,
+        "T_gate":                args.t_gate,
     }.items() if v is not None}
     if args.val_sites:
         overrides["val_sites"] = tuple(args.val_sites)
@@ -648,7 +650,10 @@ def _cmd_score(args: argparse.Namespace) -> None:
             batch_size=args.batch_size,
             n_tile_workers=getattr(args, "n_tile_workers", 1),
             s1_only=s1_only,
+            mixed=mixed,
             s1_despeckle_window=s1_despeckle_window,
+            s2_feature_cols=s2_feature_cols_cfg if mixed else None,
+            s1_feature_cols=s1_feature_cols_cfg if mixed else None,
         )
         logger.info("Done — %d tile parquets in %s", len(final_paths), parquet_out_dir)
         return
@@ -755,6 +760,10 @@ if __name__ == "__main__":
                          default=None, help="Enable S1: true/false or 's1_only'")
     p_train.add_argument("--s1-features", nargs="+", default=None,
                          metavar="COL", help="S1 feature cols to use (default: all 4). E.g. --s1-features s1_vh s1_vv")
+    p_train.add_argument("--p-gate", type=float, default=None,
+                         help="Gate augmentation probability (0=disabled, 0.3=recommended)")
+    p_train.add_argument("--t-gate", type=int, default=None,
+                         help="Gate sequence length for augmentation (default: 8)")
     p_train.add_argument("--device", default=None)
 
     # --- score ---

@@ -504,7 +504,7 @@ def _build_dataset_subprocess(
         raise RuntimeError(f"TAMDataset subprocess for '{name}' exited with code {p.exitcode}")
 
     train_augment_kwargs = {
-        k: kwargs[k] for k in ("doy_jitter", "doy_phase_shift", "band_noise_std", "obs_dropout_min")
+        k: kwargs[k] for k in ("doy_jitter", "doy_phase_shift", "band_noise_std", "obs_dropout_min", "p_gate", "T_gate")
         if k in kwargs
     }
     return TAMDataset.from_files(ds_dir, labels, **train_augment_kwargs)
@@ -554,7 +554,7 @@ def _build_dataset_sharded(
         pid_groups_pa.append(unique_pids_pa.slice(start, end - start).combine_chunks())
 
     train_augment_kwargs = {
-        k: kwargs[k] for k in ("doy_jitter", "doy_phase_shift", "band_noise_std", "obs_dropout_min")
+        k: kwargs[k] for k in ("doy_jitter", "doy_phase_shift", "band_noise_std", "obs_dropout_min", "p_gate", "T_gate")
         if k in kwargs
     }
 
@@ -579,13 +579,15 @@ def _build_dataset_sharded(
     })
     _full = pl.read_parquet(str(parquet_path)).join(_shard_map, on="point_id", how="left")
     del _shard_map
-    # partition_by splits into N parts; pop+write+del each in turn so
-    # peak RAM = _full + one shard rather than _full + all shards simultaneously.
-    _parts = _full.partition_by("_shard", maintain_order=False, include_key=False)
+    # Write each shard parquet by filtering on the shard index so the i-th
+    # shard parquet always contains exactly the rows assigned to shard i.
+    # partition_by(..., maintain_order=False) returns partitions in an undefined
+    # order, which causes shard data/label mismatches when popped sequentially.
+    for i, _path in enumerate(shard_parquets):
+        _full.filter(pl.col("_shard") == i).drop("_shard").write_parquet(
+            str(_path), compression="uncompressed"
+        )
     del _full
-    for _path in shard_parquets:
-        _parts.pop(0).write_parquet(str(_path), compression="uncompressed")
-    del _parts
     gc.collect()
 
     # Launch one subprocess per shard sequentially; each reads its pre-written parquet.
@@ -1100,7 +1102,9 @@ def train_tam(
                              doy_jitter=cfg.doy_jitter,
                              doy_phase_shift=cfg.doy_phase_shift,
                              band_noise_std=cfg.band_noise_std,
-                             obs_dropout_min=cfg.obs_dropout_min)
+                             obs_dropout_min=cfg.obs_dropout_min,
+                             p_gate=cfg.p_gate,
+                             T_gate=cfg.T_gate)
 
         if cfg.n_dataset_shards > 1:
             # Step 1: compute normalisation stats in a lightweight subprocess.
@@ -1164,6 +1168,8 @@ def train_tam(
             doy_phase_shift=cfg.doy_phase_shift,
             band_noise_std=cfg.band_noise_std,
             obs_dropout_min=cfg.obs_dropout_min,
+            p_gate=cfg.p_gate,
+            T_gate=cfg.T_gate,
             _log_rss=_log_rss,
             **_ds_common_kwargs,
         )

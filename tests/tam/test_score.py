@@ -126,7 +126,7 @@ class TestTS1EndYearFiltersObservations:
         model, band_mean, band_std = _stub_model()
         result = score_pixels_chunked(
             path, model, band_mean, band_std,
-            end_year=2021, decay=0.0, device="cpu",
+            end_year=2021, decay=0.0, device="cpu", mixed=False,
         )
 
         assert set(result["point_id"]) == {"px_a", "px_b"}
@@ -159,7 +159,7 @@ class TestTS1EndYearFiltersObservations:
         model, band_mean, band_std = _stub_model()
         result = score_pixels_chunked(
             path, model, band_mean, band_std,
-            end_year=2022, decay=0.0, device="cpu",
+            end_year=2022, decay=0.0, device="cpu", mixed=False,
         )
 
         score_a = result.filter(pl.col("point_id") == "px_a")["prob_tam"][0]
@@ -172,7 +172,7 @@ class TestTS1EndYearFiltersObservations:
         model, band_mean, band_std = _stub_model()
         result = score_pixels_chunked(
             path, model, band_mean, band_std,
-            end_year=None, device="cpu",
+            end_year=None, device="cpu", mixed=False,
         )
         assert set(result["point_id"]) == {"px1", "px2"}
 
@@ -205,7 +205,7 @@ class TestTS2SclPurityThreshold:
         model, band_mean, band_std = _stub_model()
         result = score_pixels_chunked(
             path, model, band_mean, band_std,
-            scl_purity_min=0.5, device="cpu",
+            scl_purity_min=0.5, device="cpu", mixed=False,
         )
 
         assert "px_clean" in result["point_id"].to_list()
@@ -217,7 +217,7 @@ class TestTS2SclPurityThreshold:
         model, band_mean, band_std = _stub_model()
         result = score_pixels_chunked(
             path, model, band_mean, band_std,
-            scl_purity_min=0.0, device="cpu",
+            scl_purity_min=0.0, device="cpu", mixed=False,
         )
         assert "px1" in result["point_id"].to_list()
 
@@ -289,9 +289,9 @@ class TestTS3DecayWeighting:
 
         model, band_mean, band_std = _stub_model()
         r0 = score_pixels_chunked(path, model, band_mean, band_std,
-                                  end_year=2024, decay=0.0, device="cpu")
+                                  end_year=2024, decay=0.0, device="cpu", mixed=False)
         r5 = score_pixels_chunked(path, model, band_mean, band_std,
-                                  end_year=2024, decay=5.0, device="cpu")
+                                  end_year=2024, decay=5.0, device="cpu", mixed=False)
 
         s0 = r0.filter(pl.col("point_id") == "px1")["prob_tam"][0]
         s5 = r5.filter(pl.col("point_id") == "px1")["prob_tam"][0]
@@ -326,7 +326,7 @@ class TestTS4TileIdFilter:
         model, band_mean, band_std = _stub_model()
         result = score_pixels_chunked(
             path, model, band_mean, band_std,
-            tile_id="55HBU", device="cpu",
+            tile_id="55HBU", device="cpu", mixed=False,
         )
 
         assert "px_tile_a" in result["point_id"].to_list()
@@ -351,7 +351,7 @@ class TestTS4TileIdFilter:
         model, band_mean, band_std = _stub_model()
         result = score_pixels_chunked(
             path, model, band_mean, band_std,
-            tile_id=None, device="cpu",
+            tile_id=None, device="cpu", mixed=False,
         )
         assert set(result["point_id"]) == {"px_a", "px_b"}
 
@@ -366,14 +366,14 @@ class TestTS5OutputSchema:
     def test_columns_present(self, tmp_path):
         path = _make_parquet(tmp_path, pixels=["px1"], years=[2023])
         model, band_mean, band_std = _stub_model()
-        result = score_pixels_chunked(path, model, band_mean, band_std, device="cpu")
+        result = score_pixels_chunked(path, model, band_mean, band_std, device="cpu", mixed=False)
         assert "point_id" in result.columns
         assert "prob_tam" in result.columns
 
     def test_probs_in_unit_interval(self, tmp_path):
         path = _make_parquet(tmp_path, pixels=["px1", "px2", "px3"], years=[2022, 2023])
         model, band_mean, band_std = _stub_model()
-        result = score_pixels_chunked(path, model, band_mean, band_std, device="cpu")
+        result = score_pixels_chunked(path, model, band_mean, band_std, device="cpu", mixed=False)
         assert (result["prob_tam"] >= 0.0).all()
         assert (result["prob_tam"] <= 1.0).all()
 
@@ -381,7 +381,7 @@ class TestTS5OutputSchema:
         pixels = ["px1", "px2", "px3"]
         path = _make_parquet(tmp_path, pixels=pixels, years=[2021, 2022, 2023])
         model, band_mean, band_std = _stub_model()
-        result = score_pixels_chunked(path, model, band_mean, band_std, device="cpu")
+        result = score_pixels_chunked(path, model, band_mean, band_std, device="cpu", mixed=False)
         assert len(result) == len(pixels)
         assert result["point_id"].n_unique() == len(pixels)
 
@@ -409,6 +409,7 @@ class TestMultiTileScoring:
             band_std=band_std,
             device="cpu",
             end_year=2022,
+            mixed=False,
         )
         all_pixels = pixels_a + pixels_b
         assert set(result["point_id"]) == set(all_pixels)
@@ -433,13 +434,13 @@ class TestMultiTileScoring:
         result_tiled = score_location_years(
             year_parquets=[(y, p) for y in years for p in [path_a, path_b]],
             model=model, band_mean=band_mean, band_std=band_std,
-            device="cpu", end_year=max(years),
+            device="cpu", end_year=max(years), mixed=False,
         ).sort("point_id")
 
         result_merged = score_location_years(
             year_parquets=[(y, merged_path) for y in years],
             model=model, band_mean=band_mean, band_std=band_std,
-            device="cpu", end_year=max(years),
+            device="cpu", end_year=max(years), mixed=False,
         ).sort("point_id")
 
         assert result_tiled["point_id"].to_list() == result_merged["point_id"].to_list()
@@ -475,6 +476,7 @@ class TestTileShardedOutput:
             out_dir=out_dir,
             device="cpu",
             end_year=2023,
+            mixed=False,
         )
 
         assert len(final_paths) == 2
@@ -491,7 +493,7 @@ class TestTileShardedOutput:
         final_paths = score_tiles_chunked(
             tile_year_parquets={"54LWH": [(2022, path)]},
             model=model, band_mean=band_mean, band_std=band_std,
-            out_dir=out_dir, device="cpu", end_year=2022,
+            out_dir=out_dir, device="cpu", end_year=2022, mixed=False,
         )
 
         import pyarrow.parquet as pq
@@ -517,7 +519,7 @@ class TestTileShardedOutput:
                 "54LWJ": [(2022, path_b)],
             },
             model=model, band_mean=band_mean, band_std=band_std,
-            out_dir=out_dir, device="cpu", end_year=2022,
+            out_dir=out_dir, device="cpu", end_year=2022, mixed=False,
         )
 
         by_name = {p.name: pl.read_parquet(p) for p in final_paths}
@@ -536,7 +538,7 @@ class TestTileShardedOutput:
         score_tiles_chunked(
             tile_year_parquets={"54LWH": [(2022, path)]},
             model=model, band_mean=band_mean, band_std=band_std,
-            out_dir=out_dir, device="cpu", end_year=2022,
+            out_dir=out_dir, device="cpu", end_year=2022, mixed=False,
         )
         assert not (out_dir / "staging").exists()
 
@@ -551,7 +553,7 @@ class TestTileShardedOutput:
         kwargs = dict(
             tile_year_parquets={"54LWH": [(2022, path)]},
             model=model, band_mean=band_mean, band_std=band_std,
-            out_dir=out_dir, device="cpu", end_year=2022,
+            out_dir=out_dir, device="cpu", end_year=2022, mixed=False,
         )
 
         paths1 = score_tiles_chunked(**kwargs)
@@ -622,11 +624,11 @@ class TestReaderBufferSplit:
 
         r_split = score_pixels_chunked(
             path, model, band_mean, band_std,
-            device="cpu", buffer_row_groups=1,
+            device="cpu", buffer_row_groups=1, mixed=False,
         )
         r_bulk = score_pixels_chunked(
             path, model, band_mean, band_std,
-            device="cpu", buffer_row_groups=999,
+            device="cpu", buffer_row_groups=999, mixed=False,
         )
 
         assert set(r_split["point_id"]) == {"px1"}
@@ -642,12 +644,12 @@ class TestReaderBufferSplit:
 
         r_split = score_pixels_chunked(
             path, model, band_mean, band_std,
-            device="cpu", buffer_row_groups=1,
+            device="cpu", buffer_row_groups=1, mixed=False,
         ).sort("point_id")
 
         r_bulk = score_pixels_chunked(
             path, model, band_mean, band_std,
-            device="cpu", buffer_row_groups=999,
+            device="cpu", buffer_row_groups=999, mixed=False,
         ).sort("point_id")
 
         assert set(r_split["point_id"]) == set(pixels)
@@ -663,7 +665,7 @@ class TestReaderBufferSplit:
 
         result = score_pixels_chunked(
             path, model, band_mean, band_std,
-            device="cpu", buffer_row_groups=1,
+            device="cpu", buffer_row_groups=1, mixed=False,
         )
 
         assert result["point_id"].n_unique() == len(pixels)
@@ -693,7 +695,7 @@ class TestReaderBufferSplit:
         model, band_mean, band_std = _stub_model()
         result = score_pixels_chunked(
             path, model, band_mean, band_std,
-            device="cpu", buffer_row_groups=1,
+            device="cpu", buffer_row_groups=1, mixed=False,
         )
 
         assert "px_last" in result["point_id"].to_list()
@@ -719,7 +721,7 @@ class TestReaderBufferSplit:
         model, band_mean, band_std = _stub_model()
         result = score_pixels_chunked(
             path, model, band_mean, band_std,
-            device="cpu", buffer_row_groups=1,
+            device="cpu", buffer_row_groups=1, mixed=False,
         )
 
         assert set(result["point_id"]) == {"px_a", "px_b"}
@@ -815,7 +817,7 @@ class TestTSDS2ScorePixelsChunkedS1Despeckle:
         model, band_mean, band_std = _stub_s1_model()
         result = score_pixels_chunked(
             path, model, band_mean, band_std,
-            device="cpu", s1_only=True, s1_despeckle_window=3,
+            device="cpu", s1_only=True, mixed=False, s1_despeckle_window=3,
         )
         assert set(result["point_id"]) == {"px1", "px2"}
         assert result["prob_tam"].is_between(0, 1).all()
@@ -825,11 +827,11 @@ class TestTSDS2ScorePixelsChunkedS1Despeckle:
         model, band_mean, band_std = _stub_s1_model()
         r_raw   = score_pixels_chunked(
             path, model, band_mean, band_std,
-            device="cpu", s1_only=True, s1_despeckle_window=0,
+            device="cpu", s1_only=True, mixed=False, s1_despeckle_window=0,
         ).sort("point_id")
         r_clean = score_pixels_chunked(
             path, model, band_mean, band_std,
-            device="cpu", s1_only=True, s1_despeckle_window=5,
+            device="cpu", s1_only=True, mixed=False, s1_despeckle_window=5,
         ).sort("point_id")
         # At least one pixel's score should differ after smoothing
         diffs = (r_raw["prob_tam"] - r_clean["prob_tam"]).abs()
@@ -840,7 +842,7 @@ class TestTSDS2ScorePixelsChunkedS1Despeckle:
         model, band_mean, band_std = _stub_s1_model()
         result = score_pixels_chunked(
             path, model, band_mean, band_std,
-            device="cpu", s1_only=True, s1_despeckle_window=3,
+            device="cpu", s1_only=True, mixed=False, s1_despeckle_window=3,
         )
         assert list(result.columns) == ["point_id", "prob_tam"]
 
@@ -849,11 +851,11 @@ class TestTSDS2ScorePixelsChunkedS1Despeckle:
         model, band_mean, band_std = _stub_s1_model()
         r_default = score_pixels_chunked(
             path, model, band_mean, band_std,
-            device="cpu", s1_only=True,
+            device="cpu", s1_only=True, mixed=False,
         ).sort("point_id")
         r_zero = score_pixels_chunked(
             path, model, band_mean, band_std,
-            device="cpu", s1_only=True, s1_despeckle_window=0,
+            device="cpu", s1_only=True, mixed=False, s1_despeckle_window=0,
         ).sort("point_id")
         assert r_default["point_id"].to_list() == r_zero["point_id"].to_list()
         for a, b in zip(r_default["prob_tam"].to_list(), r_zero["prob_tam"].to_list()):

@@ -63,7 +63,8 @@ def setup_gdal_env() -> None:
         "GDAL_HTTP_PERSISTENT": "YES",
         "GDAL_HTTP_VERSION": "2",
         "GDAL_HTTP_MULTIPLEX": "YES",
-        "CPL_VSIL_CURL_CACHE_SIZE": "67108864",  # 64 MB connection cache
+        # Do not set CPL_VSIL_CURL_CACHE_SIZE — the header cache replays stale
+        # multipart upload IDs under high concurrency, producing spurious 409s.
         "CPL_VSIL_CURL_CHUNK_SIZE": "262144",  # 256 KB — sufficient for a 5×5 chip window
         "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
     }

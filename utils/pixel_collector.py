@@ -703,8 +703,9 @@ def collect(
                     i += 1
                     if i % 50 == 0 or i == len(pending_items):
                         logger.info(
-                            "  shard %d/%d  item %d/%d  %d rows",
+                            "  S2 scenes  shard %d/%d  item %d/%d  %d rows  workers %d/%d",
                             shard_idx + 1, n_shards, i, len(pending_items), shard_rows,
+                            len(in_flight), n_workers,
                         )
 
         _flush_shard_buf()
@@ -893,7 +894,7 @@ def collect(
                 rgs_done += 1
                 if rgs_done % 50 == 0 or rgs_done == total_rgs:
                     logger.info(
-                        "  concat %d/%d row groups (%.0f%%)  %d rows written",
+                        "  S2 merge  concat %d/%d row groups (%.0f%%)  %d rows written",
                         rgs_done, total_rgs, 100 * rgs_done / total_rgs, total_rows,
                     )
             del pf
