@@ -115,6 +115,7 @@ EXPERIMENT = Experiment(
     feature_cols=V10_FEATURE_COLS,
     model_kwargs={
         "d_model":  256,
+        "d_ff":     512,
         "n_layers": 3,
         "dropout":  0.5,
         "n_bands":  len(V10_FEATURE_COLS) + len(V10_S1_FEATURE_COLS),  # 16

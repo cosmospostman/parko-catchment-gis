@@ -37,7 +37,7 @@ class TAMConfig:
 
     # Training
     n_epochs:        int   = 30
-    batch_size:      int   = 1024
+    batch_size:      int   = 8192
     lr:              float = 1e-4
     weight_decay:    float = 1e-3
     val_frac:        float = 0.2
@@ -51,6 +51,15 @@ class TAMConfig:
     doy_density_norm: bool = False  # if True, weight mean pool by inverse DOY observation frequency
     spatial_stride:       int   = 1   # if >1, thin training pixels spatially (every Nth pixel per region)
     stride_exclude_sites: tuple = ()  # site prefixes exempt from spatial stride (e.g. small/sparse sites)
+
+    # Build TAMDataset in a subprocess so jemalloc arenas from Polars operations
+    # are unconditionally reclaimed when the child exits (~50 GB → ~6 GB RSS drop).
+    dataset_subprocess: bool = True
+    # Split train dataset into N sequential shards so each child only processes
+    # 1/N of the pixels at a time (peak child RSS ≈ full_peak / N).
+    # 1 = no sharding (single subprocess, original behaviour).
+    # Normalisation stats are computed in a separate lightweight subprocess first.
+    n_dataset_shards: int = 4
 
     # Presence pixel filter: drop presence pixel-years with low dry-season VH unless rescued by NDVI.
     # Logic: drop if mean_vh_dry < presence_min_vh_dry_db

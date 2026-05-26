@@ -72,22 +72,46 @@ def add_spectral_indices(df):
     Accepts both polars.DataFrame and pandas.DataFrame.
     """
     import polars as pl
+
+    if isinstance(df, pl.DataFrame):
+        # Build a single quality guard expression (source==S2 and scl_purity>=0.5).
+        # All six index formulas share it so Polars fuses them into one scan instead
+        # of recomputing the mask six times via the Signal.quality_mask() path.
+        good = pl.lit(True)
+        if "source" in df.columns:
+            good = good & (pl.col("source") == "S2")
+        if "scl_purity" in df.columns:
+            good = good & (pl.col("scl_purity") >= 0.5)
+
+        def _safe(expr: pl.Expr, denom: pl.Expr) -> pl.Expr:
+            return pl.when(good & (denom != 0)).then(expr).otherwise(pl.lit(None).cast(pl.Float32))
+
+        b02, b03, b04 = pl.col("B02"), pl.col("B03"), pl.col("B04")
+        b05, b08      = pl.col("B05"), pl.col("B08")
+        b8a, b11      = pl.col("B8A"), pl.col("B11")
+
+        ndvi  = _safe((b08 - b04) / (b08 + b04),          b08 + b04)
+        ndwi  = _safe((b03 - b08) / (b03 + b08),          b03 + b08)
+        evi_d = b08 + 6 * b04 - 7.5 * b02 + 1
+        evi   = _safe(2.5 * (b08 - b04) / evi_d,          evi_d)
+        mavi  = _safe((b8a - b11) / (b8a + b11),          b8a + b11)
+        ndre  = _safe((b8a - b05) / (b8a + b05),          b8a + b05)
+        cire  = _safe(b8a / b05 - 1,                      b05)
+
+        return df.with_columns([
+            ndvi.alias("NDVI"),
+            ndwi.alias("NDWI"),
+            evi.alias("EVI"),
+            mavi.alias("MAVI"),
+            ndre.alias("NDRE"),
+            cire.alias("CI_RE"),
+        ])
+
+    # pandas path — for analysis/ scripts that are out of migration scope.
     from signals.ndvi import NDVISignal, NDWISignal, EVISignal
     from signals.mavi import MAVISignal
     from signals.ndre import NDRESignal, CIRESignal
 
-    if isinstance(df, pl.DataFrame):
-        return df.with_columns([
-            NDVISignal().compute(df).alias("NDVI"),
-            NDWISignal().compute(df).alias("NDWI"),
-            EVISignal().compute(df).alias("EVI"),
-            MAVISignal().compute(df).alias("MAVI"),
-            NDRESignal().compute(df).alias("NDRE"),
-            CIRESignal().compute(df).alias("CI_RE"),
-        ])
-
-    # pandas path — for analysis/ scripts that are out of migration scope.
-    # Signals return pl.Series; .to_numpy() gives a numpy array pandas accepts.
     df = df.copy()
     _pl_df = pl.from_pandas(df)
     df["NDVI"]  = NDVISignal().compute(_pl_df).to_numpy()

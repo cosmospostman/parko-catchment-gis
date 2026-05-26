@@ -21,7 +21,7 @@ During the Ubuntu installer, recreate the LVM layout:
 
 ```bash
 sudo apt update && sudo apt upgrade -y
-sudo apt install git curl vim rsync python3.14-venv nload avahi
+sudo apt install git curl vim rsync python3.14-venv python3.14-dev nload avahi
 ```
 
 Set hostname:

@@ -363,11 +363,20 @@ def _cmd_train(args: argparse.Namespace) -> None:
         labeled_pids = set(labels.keys())
         pixel_df = pixel_df.filter(pl.col("point_id").is_in(labeled_pids))
 
-        # Write cache — cast Categorical back to String so the worker can reload
-        # without needing to reconstruct the category dictionary.
+        # Write cache — drop lon/lat (already saved to pixel_df_pixel_coords.parquet)
+        # and cast Categorical back to String so the worker can reload without
+        # needing to reconstruct the category dictionary.
         logger.info("Writing pixel_df cache: %d rows  RSS=%.1f GB ...", len(pixel_df), _rss_gb())
-        _str_cols = [c for c in pixel_df.columns if pixel_df[c].dtype == pl.Categorical]
-        _cache_df = pixel_df.with_columns([pl.col(c).cast(pl.String) for c in _str_cols]) if _str_cols else pixel_df
+        _drop_cols = [c for c in ("lon", "lat") if c in pixel_df.columns]
+        _str_cols = [c for c in pixel_df.columns if pixel_df[c].dtype == pl.Categorical and c not in _drop_cols]
+        _cache_df = pixel_df.drop(_drop_cols) if _drop_cols else pixel_df
+        if _str_cols:
+            _cache_df = _cache_df.with_columns([pl.col(c).cast(pl.String) for c in _str_cols])
+        # Pre-sort by (point_id, date) so TAMDataset's sort() is a no-op on load.
+        # TAMDataset sorts by (point_id, year, date); since year derives from date
+        # these orderings are equivalent.
+        logger.info("Sorting pixel_df cache by (point_id, date) ...")
+        _cache_df = _cache_df.sort(["point_id", "date"])
         _cache_df.write_parquet(_cache_parquet)
         del _cache_df, pixel_df
         gc.collect()
