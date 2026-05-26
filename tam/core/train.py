@@ -1212,7 +1212,7 @@ def train_tam(
         n_workers = cfg.dataloader_workers
         _avail_gb = float("nan")
     else:
-        n_workers = min(max(2, n_cpu - 2), 4)  # GPU-bound; cap keeps GPU fed without forking excess RAM
+        n_workers = min(max(2, n_cpu - 2), 8)  # GPU-bound; cap keeps GPU fed without forking excess RAM
 
         # Scale workers down when RSS is high: each worker spawns a new process that
         # receives a pickled copy of the dataset over a pipe. At >40 GB RSS the OOM
@@ -1241,27 +1241,25 @@ def train_tam(
 
         if _avail_gb < 20:
             n_workers = 0
-        elif _rss_gb == _rss_gb:  # not nan
-            # Each worker forks the full process; leave 10 GB headroom.
-            _max_by_rss = max(0, int((_avail_gb - 10) / _rss_gb))
-            n_workers = min(n_workers, _max_by_rss)
-        elif _avail_gb < 40:
-            n_workers = min(n_workers, 2)
 
     _pin = n_workers > 0  # pin_memory requires worker processes; useless at 0
     _persist = n_workers > 0
     _prefetch = 4 if n_workers > 0 else None
+    # DataLoader is created before model.to(device) so no CUDA context exists yet.
+    # fork workers share dataset memory via copy-on-write — negligible extra RSS
+    # vs spawn which re-pickles the full dataset into each worker.
+    _mp_ctx = "fork" if n_workers > 0 else None
 
     torch.set_num_threads(1)
     train_loader = DataLoader(
         train_ds, batch_size=cfg.batch_size, shuffle=True,
         collate_fn=collate_fn, num_workers=n_workers, persistent_workers=_persist,
-        pin_memory=_pin, prefetch_factor=_prefetch,
+        pin_memory=_pin, prefetch_factor=_prefetch, multiprocessing_context=_mp_ctx,
     )
     val_loader = DataLoader(
         val_ds, batch_size=cfg.batch_size, shuffle=False,
         collate_fn=collate_fn, num_workers=n_workers, persistent_workers=_persist,
-        pin_memory=_pin, prefetch_factor=_prefetch,
+        pin_memory=_pin, prefetch_factor=_prefetch, multiprocessing_context=_mp_ctx,
     )
     _log_rss("after DataLoader creation")
     logger.info(
