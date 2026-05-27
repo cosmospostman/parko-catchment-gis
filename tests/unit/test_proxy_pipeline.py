@@ -194,28 +194,26 @@ def test_collect_per_scene_point_id_sorted(tmp_path):
 def test_collect_per_scene_polygon_mask():
     """Pixels outside a supplied Shapely geometry are absent from per-scene output."""
     from shapely.geometry import box
-    from utils.pixel_collector import make_pixel_grid, _utm_crs_for_bbox
+    from utils.pixel_collector import make_pixel_grid
 
-    bbox = [145.41, -22.81, 145.44, -22.74]
+    # Tiny bbox (~500 m × 550 m) — the filter logic is scale-invariant.
+    bbox = [145.40, -22.845, 145.405, -22.840]
     all_pts = make_pixel_grid(bbox)
     assert len(all_pts) > 0
 
     # Clip polygon to lower half of bbox
-    lat_mid = (-22.81 + -22.74) / 2
-    clip_geom = box(145.41, -22.81, 145.44, lat_mid)
+    lat_mid = (bbox[1] + bbox[3]) / 2
+    clip_geom = box(bbox[0], bbox[1], bbox[2], lat_mid)
 
     from shapely.geometry import MultiPoint
     mp = MultiPoint([(lon, lat) for _, lon, lat in all_pts])
-    inside = [pt for pt, c in zip(all_pts, [clip_geom.contains(p) for p in mp.geoms]) if c]
+    inside  = [pt for pt, c in zip(all_pts, [clip_geom.contains(p) for p in mp.geoms]) if c]
     outside = [pt for pt, c in zip(all_pts, [clip_geom.contains(p) for p in mp.geoms]) if not c]
 
     assert len(inside) > 0, "clip geometry too tight"
     assert len(outside) > 0, "clip geometry too loose"
 
-    # Verify that collect()'s polygon filtering agrees
-    from utils.pixel_collector import collect
-    # We can't call collect() without S3, so test the filter logic directly
-    inside_ids = {pid for pid, _, _ in inside}
+    inside_ids  = {pid for pid, _, _ in inside}
     outside_ids = {pid for pid, _, _ in outside}
     assert inside_ids.isdisjoint(outside_ids)
 
@@ -618,13 +616,25 @@ def test_combined_pixel_schema_types():
 # CS-10 Strips are contiguous: lat_max of strip N == lat_min of strip N+1 (approx)
 # ---------------------------------------------------------------------------
 
-def _make_synthetic_points(
-    bbox_wgs84: list[float],
-    utm_crs: str,
-) -> list[tuple[str, float, float]]:
-    """Return a make_pixel_grid result for bbox_wgs84 in utm_crs."""
+# Use a tiny real-ish bbox (NQ Australia, zone 55S) — ~500 m × 550 m, ~3 k points.
+# The strip-alignment invariants are geometric and hold at any scale; a large bbox
+# (the former 10 km × 11 km, 1.1 M points) made each CS test take 5–30 s for no
+# additional coverage.
+_CS_BBOX = [145.40, -22.845, 145.405, -22.840]
+_CS_CRS  = "EPSG:32755"
+_CS_BLOCK_M = 1024 * 10.0  # 10240 m per 1024-px block at 10 m/px
+
+# Build the pixel grid and its UTM northings once at module load — all CS tests
+# share these objects read-only, so there is no per-test grid construction cost.
+def _build_cs_grid():
     from utils.pixel_collector import make_pixel_grid
-    return make_pixel_grid(bbox_wgs84, utm_crs=utm_crs)
+    from pyproj import Transformer
+    pts = make_pixel_grid(_CS_BBOX, utm_crs=_CS_CRS)
+    to_utm = Transformer.from_crs("EPSG:4326", _CS_CRS, always_xy=True)
+    northings = [to_utm.transform(lon, lat)[1] for _, lon, lat in pts]
+    return pts, northings
+
+_CS_POINTS, _CS_NORTHINGS = _build_cs_grid()
 
 
 def _utm_northings(
@@ -632,19 +642,11 @@ def _utm_northings(
     utm_crs: str,
 ) -> list[float]:
     """Return UTM northings for each (pid, lon, lat) triple."""
+    if points is _CS_POINTS and utm_crs == _CS_CRS:
+        return _CS_NORTHINGS
     from pyproj import Transformer
     to_utm = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
     return [to_utm.transform(lon, lat)[1] for _, lon, lat in points]
-
-
-# Use a small real-ish bbox (NQ Australia, zone 55) so the UTM projection is
-# realistic.  The exact coordinates do not matter — any 10-km-ish bbox works.
-_CS_BBOX = [145.40, -22.85, 145.50, -22.75]  # ~10 km × 11 km, zone 55S
-_CS_CRS  = "EPSG:32755"
-# Simulate a COG whose top edge is 100 m above the bbox top, at a block boundary.
-# We pick cog_y_top so that (cog_y_top - y_bottom) is NOT a multiple of block_m —
-# this stresses the floor() snapping logic in _compute_strips_utm.
-_CS_BLOCK_M = 1024 * 10.0  # 10240 m per 1024-px block at 10 m/px
 
 
 def _reference_y_top(bbox_wgs84: list[float], utm_crs: str, extra_m: float = 0.0) -> float:
@@ -688,9 +690,7 @@ def test_cs1_strip_boundaries_on_block_grid():
 def test_cs2_all_points_in_exactly_one_strip():
     """No point is missing from or duplicated across strips."""
     from proxy._pipeline import compute_strips
-    from utils.pixel_collector import make_pixel_grid
 
-    all_pts = make_pixel_grid(_CS_BBOX, utm_crs=_CS_CRS)
     cog_y_top = _reference_y_top(_CS_BBOX, _CS_CRS)
     strips = compute_strips(
         _CS_BBOX, 1024, None,
@@ -702,7 +702,7 @@ def test_cs2_all_points_in_exactly_one_strip():
         for pid, _, _ in s["points"]:
             seen[pid] = seen.get(pid, 0) + 1
 
-    all_ids = {pid for pid, _, _ in all_pts}
+    all_ids = {pid for pid, _, _ in _CS_POINTS}
     missing = all_ids - seen.keys()
     dups = {pid for pid, cnt in seen.items() if cnt > 1}
     assert not missing, f"{len(missing)} points missing from strips: {list(missing)[:5]}"
@@ -718,9 +718,7 @@ def test_cs3_utm_and_geographic_assign_same_points():
     all strips must be the same.
     """
     from proxy._pipeline import compute_strips
-    from utils.pixel_collector import make_pixel_grid
 
-    all_pts = make_pixel_grid(_CS_BBOX, utm_crs=_CS_CRS)
     cog_y_top = _reference_y_top(_CS_BBOX, _CS_CRS)
 
     strips_utm  = compute_strips(_CS_BBOX, 1024, None,
@@ -729,7 +727,7 @@ def test_cs3_utm_and_geographic_assign_same_points():
 
     utm_ids = {pid for s in strips_utm for pid, _, _ in s["points"]}
     geo_ids = {pid for s in strips_geo for pid, _, _ in s["points"]}
-    all_ids = {pid for pid, _, _ in all_pts}
+    all_ids = {pid for pid, _, _ in _CS_POINTS}
 
     assert utm_ids == all_ids, "UTM path lost some points"
     assert geo_ids == all_ids, "geographic path lost some points"
@@ -860,17 +858,22 @@ def test_cs10_strips_contiguous():
 
     For the UTM path, strip N's max northing + 10 m = strip N+1's min northing.
     We verify that no point's northing falls between two consecutive strips.
+
+    Uses strip_height_px=32 (block_m=320 m) so the ~550 m tall tiny bbox produces
+    multiple strips without enlarging the pixel grid.
     """
     from proxy._pipeline import compute_strips
-    from utils.pixel_collector import make_pixel_grid
 
-    cog_y_top = _reference_y_top(_CS_BBOX, _CS_CRS)
+    strip_px = 32
+    block_m  = strip_px * 10.0  # 320 m
+    cog_y_top_small = math.ceil(max(_CS_NORTHINGS) / block_m) * block_m + block_m
     strips = compute_strips(
-        _CS_BBOX, 1024, None,
-        cog_utm_crs=_CS_CRS, cog_y_top=cog_y_top,
+        _CS_BBOX, strip_px, None,
+        cog_utm_crs=_CS_CRS, cog_y_top=cog_y_top_small,
     )
-    if len(strips) < 2:
-        pytest.skip("need at least 2 strips to test contiguity")
+    assert len(strips) >= 2, (
+        f"expected ≥2 strips with strip_height_px={strip_px} over {_CS_BBOX}, got {len(strips)}"
+    )
 
     # Collect per-strip northing ranges
     ranges: list[tuple[float, float]] = []
@@ -878,9 +881,6 @@ def test_cs10_strips_contiguous():
         ys = _utm_northings(s["points"], _CS_CRS)
         ranges.append((min(ys), max(ys)))
 
-    # Verify: max of strip i < min of strip i+1 (non-overlapping)
-    # and: min of strip i+1 - max of strip i <= block_m (no gap larger than one step)
-    block_m = 1024 * 10.0
     for i in range(len(ranges) - 1):
         y_max_i   = ranges[i][1]
         y_min_i1  = ranges[i + 1][0]

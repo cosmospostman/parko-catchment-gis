@@ -116,8 +116,9 @@ def trained_smoke(band_cols_session):
         n_bands=len(ALL_FEATURE_COLS),
         use_s1=False,
         n_global_features=0,
-        n_epochs=2, patience=2, batch_size=4,
+        n_epochs=1, patience=1, batch_size=4,
         doy_jitter=3, val_frac=0.3,
+        dataset_subprocess=False,
     )
     with tempfile.TemporaryDirectory() as tmp:
         out_dir = Path(tmp)
@@ -423,8 +424,9 @@ class TestTT12SummaryTableSharedSite:
             n_bands=len(ALL_FEATURE_COLS),
             use_s1=False,
             n_global_features=0,
-            n_epochs=2, patience=2, batch_size=4,
+            n_epochs=1, patience=1, batch_size=4,
             val_region_ids=("alpha_presence_2",),
+            dataset_subprocess=False,
         )
 
     def test_shared_site_in_both_summary_sections(

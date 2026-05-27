@@ -20,6 +20,22 @@ from typing import Iterator
 logger = logging.getLogger("proxy.pipeline")
 
 
+def _system_memory_gb() -> float:
+    try:
+        import psutil
+        return psutil.virtual_memory().total / (1024 ** 3)
+    except Exception:
+        pass
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) / (1024 ** 2)
+    except Exception:
+        pass
+    return 8.0
+
+
 # ---------------------------------------------------------------------------
 # Frame encode / decode
 # ---------------------------------------------------------------------------
@@ -122,7 +138,12 @@ def merge_scenes(
     tmp_dir = str(out_path.parent)
 
     n_threads = max(1, (os.cpu_count() or 4) // 2)
-    mem_gb = int(os.environ.get("PROXY_MERGE_MEM_GB", "2"))
+    # Default: 75% of system RAM so DuckDB can sort large strips without OOM.
+    # It will spill to temp_directory when the limit is hit, so setting it high
+    # just avoids unnecessary spill — it does not prevent spill when needed.
+    # Override with PROXY_MERGE_MEM_GB for constrained environments.
+    _default_mem_gb = max(4, int(_system_memory_gb() * 0.75))
+    mem_gb = int(os.environ.get("PROXY_MERGE_MEM_GB", str(_default_mem_gb)))
 
     sql = f"""
         COPY (
