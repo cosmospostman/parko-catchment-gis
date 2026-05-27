@@ -425,6 +425,7 @@ def _cmd_train(args: argparse.Namespace) -> None:
         "p_gate":                args.p_gate,
         "T_gate":                args.t_gate,
         "max_seq_len":           args.max_seq_len,
+        "dataloader_workers":    args.dataloader_workers,
     }.items() if v is not None}
     if args.val_sites:
         overrides["val_sites"] = tuple(args.val_sites)
@@ -683,6 +684,8 @@ def _cmd_score(args: argparse.Namespace) -> None:
         summary_feature_cols=summary_feature_cols,
         global_feat_mean=global_feat_mean,
         global_feat_std=global_feat_std,
+        gate_threshold=args.gate_threshold,
+        T_gate=args.t_gate,
     )
     scored = (
         pixel_coords
@@ -707,11 +710,15 @@ def _cmd_score(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def _add_common_score_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--scl-purity",  type=float, default=0.5)
-    p.add_argument("--device",      default=None, help="cpu / cuda (auto-detect if omitted)")
-    p.add_argument("--years",       type=int, nargs="+", default=None, metavar="YEAR")
-    p.add_argument("--decay",       type=float, default=0.7)
-    p.add_argument("--batch-size",  type=int, default=4096)
+    p.add_argument("--scl-purity",      type=float, default=0.5)
+    p.add_argument("--device",          default=None, help="cpu / cuda (auto-detect if omitted)")
+    p.add_argument("--years",           type=int, nargs="+", default=None, metavar="YEAR")
+    p.add_argument("--decay",           type=float, default=0.7)
+    p.add_argument("--batch-size",      type=int, default=4096)
+    p.add_argument("--gate-threshold",  type=float, default=0.0,
+                   help="Fast-path gate: skip full T=128 pass for pixels scoring below this at T=8 (0=disabled, e.g. 0.5)")
+    p.add_argument("--t-gate",          type=int, default=8,
+                   help="Gate sequence length for fast-path (default: 8)")
 
 
 if __name__ == "__main__":
@@ -769,6 +776,8 @@ if __name__ == "__main__":
                          help="Gate augmentation probability (0=disabled, 0.3=recommended)")
     p_train.add_argument("--t-gate", type=int, default=None,
                          help="Gate sequence length for augmentation (default: 8)")
+    p_train.add_argument("--dataloader-workers", type=int, default=None,
+                         help="DataLoader worker processes (0=in-process, -1=auto)")
     p_train.add_argument("--device", default=None)
 
     # --- score ---

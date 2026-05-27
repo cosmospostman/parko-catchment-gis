@@ -190,6 +190,7 @@ async def fetch_patches(
     band_alias: dict[str, str] | None = None,
     cache_dir: Path | None = None,
     item_signer: object | None = None,
+    sensor_label: str = "S2",
 ) -> PatchData:
     """Fetch one bbox-covering patch per (item, band) instead of per-point chips.
 
@@ -275,8 +276,10 @@ async def fetch_patches(
                         "Cached patch for %s/%s does not cover bbox — re-fetching",
                         item_id, band,
                     )
+        # Sign outside the semaphore: signing may block on the MPC token API
+        # and should not hold a fetch concurrency slot while waiting.
+        href = await loop.run_in_executor(executor, _get_href, item, asset_key)
         async with sem:
-            href = await loop.run_in_executor(executor, _get_href, item, asset_key)
             data = await loop.run_in_executor(executor, _read_bbox_patch, href, bbox_wgs84)
         if data is None:
             errors += 1
@@ -324,7 +327,7 @@ async def fetch_patches(
             nonlocal scl_done
             result = await (fetch_one_patch(item, SCL_BAND, scl_asset_key) if scl_asset_key else _none())
             scl_done += 1
-            logger.info("  S2 chips  fetch %d/%d patches done", scl_done, n_scl)
+            logger.info("  %s chips  fetch %d/%d patches done", sensor_label, scl_done, n_scl)
             return result
 
         scl_results = await asyncio.gather(*[
@@ -371,7 +374,7 @@ async def fetch_patches(
         completed += 1
         if data is not None and _accumulate:
             result[(item_id, band)] = data
-        logger.info("  S2 chips  fetch %d/%d patches done", completed, n_spectral)
+        logger.info("  %s chips  fetch %d/%d patches done", sensor_label, completed, n_spectral)
 
     await asyncio.gather(*[tracked(item_id, band, t) for item_id, band, t in spectral_tasks])
 

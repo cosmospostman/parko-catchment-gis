@@ -419,61 +419,121 @@ def run_tile_pipeline(
     if not strips:
         return
 
-    for strip in strips:
-        strip_idx  = strip["strip_idx"]
-        strip_bbox = strip["bbox"]
-        strip_pts  = strip["points"]
+    # Prefetch pipeline: run each strip's network fetch in a background thread
+    # so the next strip's .npz cache is warm before the current strip's
+    # CPU-bound extract → S1 → merge_scenes finishes.  A depth-1 look-ahead
+    # keeps at most one strip prefetching at a time (bounded cache growth).
+    from concurrent.futures import ThreadPoolExecutor as _TPE
 
-        if strip_idx < resume_from_strip:
+    def _fetch_strip(strip: dict) -> dict:
+        """Run the fetch-only phase for one strip (S2 + S1); returns the strip dict."""
+        s_dir = tmp / f"strip_{strip['strip_idx']:04d}_scenes"
+        s_dir.mkdir(parents=True, exist_ok=True)
+        s_cache = s_dir / "cache"
+        logger.info("[tile %s %d] [strip %04d] prefetch %d items ...",
+                    tile_id, year, strip["strip_idx"], len(items))
+        list(collect(
+            bbox_wgs84=strip["bbox"],
+            start=start_date,
+            end=end_date,
+            out_dir=s_dir,
+            cloud_max=cloud_max,
+            apply_nbar=apply_nbar,
+            max_concurrent=max_concurrent,
+            items=items,
+            geometry=polygon_geometry,
+            n_workers=n_workers,
+            per_scene=True,
+            cache_dir=s_cache,
+            phases={"fetch"},
+            calibration_out=calibration_out,
+        ))
+        collect_s1_for_tile(
+            s2_path=None,
+            bbox_wgs84=strip["bbox"],
+            start=start_date,
+            end=end_date,
+            out_path=s_dir / "s1_strip.parquet",
+            cache_dir=s_cache,
+            max_concurrent=max_concurrent,
+            points=strip["points"],
+            phases={"fetch"},
+        )
+        return strip
+
+    # Strips to actually process (after resume skip).
+    active_strips = [s for s in strips if s["strip_idx"] >= resume_from_strip]
+
+    for s in strips:
+        if s["strip_idx"] < resume_from_strip:
             logger.info("[tile %s %d] [strip %04d] skipping (resume_from_strip=%d)",
-                        tile_id, year, strip_idx, resume_from_strip)
-            continue
+                        tile_id, year, s["strip_idx"], resume_from_strip)
 
-        scene_dir = tmp / f"strip_{strip_idx:04d}_scenes"
-        scene_dir.mkdir(parents=True, exist_ok=True)
-        strip_cache = scene_dir / "cache"
+    if not active_strips:
+        return
 
-        logger.info("[tile %s %d] [strip %04d] collect %d pts, %d items ...",
-                    tile_id, year, strip_idx, len(strip_pts), len(items))
+    with _TPE(max_workers=1) as prefetch_pool:
+        # Kick off the first strip's fetch immediately.
+        fetch_fut = prefetch_pool.submit(_fetch_strip, active_strips[0])
 
-        scene_paths = [
-            path for _, path in list(collect(
+        for i, strip in enumerate(active_strips):
+            strip_idx = strip["strip_idx"]
+            strip_bbox = strip["bbox"]
+            strip_pts  = strip["points"]
+
+            # Wait for this strip's fetch to complete.
+            fetch_fut.result()
+            logger.info("[tile %s %d] [strip %04d] fetch done; starting extract (%d pts, %d items)",
+                        tile_id, year, strip_idx, len(strip_pts), len(items))
+
+            # Immediately queue the next strip's fetch before we do CPU work.
+            next_i = i + 1
+            if next_i < len(active_strips):
+                fetch_fut = prefetch_pool.submit(_fetch_strip, active_strips[next_i])
+
+            scene_dir   = tmp / f"strip_{strip_idx:04d}_scenes"
+            strip_cache = scene_dir / "cache"
+
+            scene_paths = [
+                path for _, path in list(collect(
+                    bbox_wgs84=strip_bbox,
+                    start=start_date,
+                    end=end_date,
+                    out_dir=scene_dir,
+                    cloud_max=cloud_max,
+                    apply_nbar=apply_nbar,
+                    max_concurrent=max_concurrent,
+                    items=items,
+                    geometry=polygon_geometry,
+                    n_workers=n_workers,
+                    per_scene=True,
+                    cache_dir=strip_cache,
+                    phases={"extract"},
+                    calibration_out=calibration_out,
+                ))
+            ]
+
+            if not scene_paths:
+                logger.info("[tile %s %d] [strip %04d] no scene data — skipping", tile_id, year, strip_idx)
+                shutil.rmtree(scene_dir, ignore_errors=True)
+                continue
+
+            s1_path = collect_s1_for_tile(
+                s2_path=None,
                 bbox_wgs84=strip_bbox,
                 start=start_date,
                 end=end_date,
-                out_dir=scene_dir,
-                cloud_max=cloud_max,
-                apply_nbar=apply_nbar,
-                max_concurrent=max_concurrent,
-                items=items,
-                geometry=polygon_geometry,
-                n_workers=n_workers,
-                per_scene=True,
+                out_path=scene_dir / "s1_strip.parquet",
                 cache_dir=strip_cache,
-                calibration_out=calibration_out,
-            ))
-        ]
+                max_concurrent=max_concurrent,
+                points=strip_pts,
+                phases={"extract"},
+            )
 
-        if not scene_paths:
-            logger.info("[tile %s %d] [strip %04d] no scene data — skipping", tile_id, year, strip_idx)
+            strip_out = tmp / f"strip_{strip_idx:04d}_sorted.parquet"
+            merge_scenes(scene_paths, s1_path, strip_out)
+
             shutil.rmtree(scene_dir, ignore_errors=True)
-            continue
 
-        s1_path = collect_s1_for_tile(
-            s2_path=None,
-            bbox_wgs84=strip_bbox,
-            start=start_date,
-            end=end_date,
-            out_path=scene_dir / "s1_strip.parquet",
-            cache_dir=strip_cache,
-            max_concurrent=max_concurrent,
-            points=strip_pts,
-        )
-
-        strip_out = tmp / f"strip_{strip_idx:04d}_sorted.parquet"
-        merge_scenes(scene_paths, s1_path, strip_out)
-
-        shutil.rmtree(scene_dir, ignore_errors=True)
-
-        logger.info("[tile %s %d] [strip %04d] ready → %s", tile_id, year, strip_idx, strip_out.name)
-        yield strip_idx, strip_out
+            logger.info("[tile %s %d] [strip %04d] ready → %s", tile_id, year, strip_idx, strip_out.name)
+            yield strip_idx, strip_out

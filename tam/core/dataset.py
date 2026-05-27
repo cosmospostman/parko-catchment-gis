@@ -49,7 +49,7 @@ N_BANDS: int = len(ALL_FEATURE_COLS)          # 13: S2 only
 N_BANDS_S1: int = len(ALL_FEATURE_COLS) + len(S1_FEATURE_COLS)  # 17: mixed/s1_only S1+S2
 N_BANDS_MIXED: int = N_BANDS_S1               # 17: mixed S1+S2 native rows (same width)
 MAX_SEQ_LEN: int = 256
-MIN_OBS_PER_YEAR: int = 8
+MIN_OBS_PER_YEAR: int = 10
 MIN_S1_OBS_PER_YEAR: int = 4
 
 

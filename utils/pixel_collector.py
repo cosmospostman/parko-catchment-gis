@@ -369,8 +369,9 @@ def _collect_per_scene(
     if "extract" not in _phases:
         return
 
-    # --- Extract phase: one parquet per item, sorted by point_id ------------
+    # --- Extract phase: one parquet per item, parallelised over n_workers ----
     import threading as _threading
+    from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _as_completed
     _thread_local = _threading.local()
 
     def _get_store() -> CachedNpzChipStore:
@@ -382,16 +383,17 @@ def _collect_per_scene(
             )
         return _thread_local.store
 
-    n_items = len(items)
-    for item_idx, item in enumerate(items):
+    def _extract_one(item_idx: int, item) -> tuple[str, Path] | None:
+        """Extract one scene to parquet. Returns (scene_id, path) or None."""
         scene_id = item.id
+        n_items = len(items)
         out_path = out_dir / f"scene_{item_idx:04d}.parquet"
         if out_path.exists() and out_path.stat().st_size > 0:
             try:
                 pq.ParquetFile(out_path).metadata
-                logger.info("per_scene: scene %d/%d %s already extracted — skipping", item_idx + 1, n_items, scene_id)
-                yield (scene_id, out_path)
-                continue
+                logger.info("per_scene: scene %d/%d %s already extracted — skipping",
+                            item_idx + 1, n_items, scene_id)
+                return (scene_id, out_path)
             except Exception:
                 out_path.unlink(missing_ok=True)
 
@@ -403,12 +405,12 @@ def _collect_per_scene(
         store.release_item(item.id)
 
         if df is None or len(df) == 0:
-            logger.info("per_scene: scene %d/%d %s — no clear pixels, skipping", item_idx + 1, n_items, scene_id)
-            continue
+            logger.info("per_scene: scene %d/%d %s — no clear pixels, skipping",
+                        item_idx + 1, n_items, scene_id)
+            return None
 
         tbl = df.select(col_order).to_arrow()
         tbl = _optimise_schema(tbl)
-        # Sort by point_id (northing integer extracted from suffix)
         tbl_pl = pl.from_arrow(tbl).with_columns(
             pl.col("point_id").str.extract(r"_(\d+)$", 1).cast(pl.Int32).alias("_northing")
         ).sort("_northing").drop("_northing")
@@ -425,7 +427,15 @@ def _collect_per_scene(
             "per_scene: scene %d/%d %s — %d rows → %s",
             item_idx + 1, n_items, scene_id, len(tbl_sorted), out_path.name,
         )
-        yield (scene_id, out_path)
+        return (scene_id, out_path)
+
+    _n_extract = max(1, n_workers) if n_workers else 1
+    with _TPE(max_workers=_n_extract) as pool:
+        futs = {pool.submit(_extract_one, idx, item): idx for idx, item in enumerate(items)}
+        for fut in _as_completed(futs):
+            result = fut.result()
+            if result is not None:
+                yield result
 
 
 def collect(

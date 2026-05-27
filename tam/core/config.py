@@ -24,7 +24,7 @@ class TAMConfig:
     # 13 S2 features + 4 S1 features (s1_vh, s1_vv, s1_vh_vv, s1_rvi) when use_s1=True or "mixed"
     n_bands:          int   = 17
     max_seq_len:      int   = 128
-    min_obs_per_year: int   = 8
+    min_obs_per_year: int   = 10
     scl_purity_min:   float = 0.5
     doy_jitter:       int   = 7   # ±days of DOY shift applied per window during training
     doy_phase_shift:  bool  = False  # if True, random full-year phase shift with wraparound (overrides doy_jitter)

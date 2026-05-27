@@ -1199,7 +1199,7 @@ def train_tam(
         n_workers = cfg.dataloader_workers
         _avail_gb = float("nan")
     else:
-        n_workers = min(max(2, n_cpu - 2), 8)  # GPU-bound; cap keeps GPU fed without forking excess RAM
+        n_workers = min(max(2, n_cpu - 2), 4)  # GPU-bound; cap keeps GPU fed without forking excess RAM
 
         # Scale workers down when RSS is high: each worker spawns a new process that
         # receives a pickled copy of the dataset over a pipe. At >40 GB RSS the OOM
@@ -1439,6 +1439,7 @@ def train_tam(
         # Gate val pass: T_gate-truncated sequences, measure TNR on absence pixels.
         # Logged as supplementary info; does not affect early stopping.
         gate_tnr = float("nan")
+        gate_fnr = float("nan")
         if _gate_val_loader is not None:
             model.eval()
             gate_probs, gate_labels = [], []
@@ -1456,9 +1457,18 @@ def train_tam(
                     gate_labels.extend(batch["label"].float().numpy())
             gate_probs_arr  = np.array(gate_probs)
             gate_labels_arr = np.array(gate_labels)
-            absence_mask = gate_labels_arr == 0
+            absence_mask  = gate_labels_arr == 0
+            presence_mask = gate_labels_arr == 1
             if absence_mask.any():
                 gate_tnr = float((gate_probs_arr[absence_mask] < 0.5).mean())
+            if presence_mask.any():
+                gate_fnr = float((gate_probs_arr[presence_mask] < 0.5).mean())
+
+        gate_suffix = ""
+        if not np.isnan(gate_tnr):
+            gate_suffix += f"  gate_tnr={gate_tnr:.3f}"
+        if not np.isnan(gate_fnr):
+            gate_suffix += f"  gate_fnr={gate_fnr:.3f}"
 
         logger.info(
             "epoch %3d/%d  loss=%.4f  train_auc=%.3f  val_cvar%.0f=%.3f%s%s",
@@ -1467,7 +1477,7 @@ def train_tam(
             train_auc,
             cfg.cvar_alpha * 100, val_cvar,
             "  *" if (not np.isnan(val_cvar) and val_cvar >= best_val_auc) else "",
-            f"  gate_tnr={gate_tnr:.3f}" if not np.isnan(gate_tnr) else "",
+            gate_suffix,
         )
 
         if logger.isEnabledFor(logging.DEBUG) and site_records:

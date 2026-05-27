@@ -156,11 +156,15 @@ def test_run_tile_pipeline_resume_skips_strips(tmp_path):
             tmp=tmp_path / "work", items=items, resume_from_strip=1,
         ))
 
-    # Only strip 1 should have been processed
+    # Only strip 1 should have been processed (strip 0 skipped entirely).
+    # collect() is now called twice per active strip (fetch phase + extract phase),
+    # so expect 2 calls, both with strip 1's bbox — strip 0's bbox must never appear.
     assert len(results) == 1
     assert results[0][0] == 1
-    assert len(collect_bboxes) == 1
-    assert collect_bboxes[0] == strips[1]["bbox"]
+    assert all(bbox == strips[1]["bbox"] for bbox in collect_bboxes), (
+        f"strip 0 bbox leaked into collect calls: {collect_bboxes}"
+    )
+    assert strips[0]["bbox"] not in collect_bboxes
 
 
 # ---------------------------------------------------------------------------
@@ -199,8 +203,11 @@ def test_run_tile_pipeline_uses_strip_bbox(tmp_path):
             tmp=tmp_path / "work", items=items,
         ))
 
-    assert s2_bbox_seen == [strip_bbox]
-    assert s1_bbox_seen == [strip_bbox]
+    # collect() is called twice per strip (fetch phase + extract phase); both
+    # calls must use the strip sub-bbox, not the full catchment bbox.
+    assert all(b == strip_bbox for b in s2_bbox_seen), f"unexpected bboxes: {s2_bbox_seen}"
+    # collect_s1_for_tile is called twice per strip (fetch + extract phases)
+    assert all(b == strip_bbox for b in s1_bbox_seen), f"unexpected S1 bboxes: {s1_bbox_seen}"
 
 
 # ---------------------------------------------------------------------------
@@ -235,11 +242,12 @@ def test_run_tile_pipeline_per_strip_cache(tmp_path):
             tmp=tmp_path / "work", items=items,
         ))
 
-    assert len(cache_dirs_seen) == 2
-    # Each strip must have a distinct cache dir
-    assert cache_dirs_seen[0] != cache_dirs_seen[1]
-    # Each must be nested under the strip's scene_dir
-    for cd in cache_dirs_seen:
+    # collect() is called twice per strip (fetch + extract), so 4 total for 2 strips.
+    # The two unique cache dirs must be distinct (one per strip) and correctly nested.
+    unique_cache_dirs = list(dict.fromkeys(cache_dirs_seen))  # preserves order, dedupes
+    assert len(unique_cache_dirs) == 2, f"expected 2 distinct cache dirs, got: {unique_cache_dirs}"
+    assert unique_cache_dirs[0] != unique_cache_dirs[1]
+    for cd in unique_cache_dirs:
         assert cd is not None
         assert "strip_" in str(cd)
         assert str(cd).endswith("cache")

@@ -604,6 +604,7 @@ def _make_fake_fetch_patches(items_by_id: dict):
     async def _fake_fetch_patches(
         points, items, bands, bbox_wgs84,
         scl_filter=True, max_concurrent=32, band_alias=None, cache_dir=None, item_signer=None,
+        **kwargs,
     ):
         from utils.fetch import _save_patch_cache, _cache_path, _load_patch_cache
         from pyproj import CRS

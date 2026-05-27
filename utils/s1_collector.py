@@ -396,6 +396,7 @@ def _collect_s1_shards(
     resolved_cache: Path,
     point_shard_size: int = 50_000,
     max_concurrent: int = 32,
+    phases: "set[str] | None" = None,
 ) -> list[Path]:
     """Fetch S1 patches via fetch_patches (async, semaphore-bounded) then extract.
 
@@ -424,6 +425,9 @@ def _collect_s1_shards(
         pa.field("orbit",    pa.string()),
     ])
 
+    _do_fetch   = phases is None or "fetch"   in phases
+    _do_extract = phases is None or "extract" in phases
+
     n_shards = max(1, (len(points) + point_shard_size - 1) // point_shard_size)
     use_sharding = n_shards > 1
     shard_paths: list[Path] = []
@@ -438,24 +442,29 @@ def _collect_s1_shards(
         lats = np.array([p[2] for p in shard_points], dtype=np.float64)
         point_coords = {pid: (lon, lat) for pid, lon, lat in shard_points}
 
-        # Phase 1: fetch all S1 patches for this shard (async, semaphore-bounded).
-        # scl_filter=False — S1 has no SCL band.
-        # item_signer=_sign — MPC assets need per-item SAS tokens at read time.
-        logger.info(
-            "S1: shard %d/%d — fetching patches for %d items (%d concurrent)",
-            shard_idx + 1, n_shards, len(items), max_concurrent,
-        )
-        asyncio.run(fetch_patches(
-            points=shard_points,
-            items=items,
-            bands=_S1_BANDS,
-            bbox_wgs84=bbox_wgs84,
-            scl_filter=False,
-            max_concurrent=max_concurrent,
-            band_alias=None,
-            cache_dir=resolved_cache,
-            item_signer=_sign,
-        ))
+        if _do_fetch:
+            # Fetch all S1 patches for this shard (async, semaphore-bounded).
+            # scl_filter=False — S1 has no SCL band.
+            # item_signer=_sign — MPC assets need per-item SAS tokens at read time.
+            logger.info(
+                "S1: shard %d/%d — fetching patches for %d items (%d concurrent)",
+                shard_idx + 1, n_shards, len(items), max_concurrent,
+            )
+            asyncio.run(fetch_patches(
+                points=shard_points,
+                items=items,
+                bands=_S1_BANDS,
+                bbox_wgs84=bbox_wgs84,
+                scl_filter=False,
+                max_concurrent=max_concurrent,
+                band_alias=None,
+                cache_dir=resolved_cache,
+                item_signer=_sign,
+                sensor_label="S1",
+            ))
+
+        if not _do_extract:
+            continue
 
         # Phase 2: extract pixel values from the on-disk patch cache.
         store = CachedNpzChipStore(
@@ -538,6 +547,7 @@ def collect_s1_for_tile(
     cache_dir: "Path | None" = None,
     max_concurrent: int = 32,
     points: "list[tuple[str, float, float]] | None" = None,
+    phases: "set[str] | None" = None,
 ) -> "Path | None":
     """Fetch S1 for a tile's pixel grid and write a sorted S1 parquet to out_path.
 
@@ -553,7 +563,9 @@ def collect_s1_for_tile(
     import pyarrow.parquet as pq
     from utils.parquet_utils import _extend_schema, _sort_s1_shards, COMBINED_PIXEL_SCHEMA
 
-    if out_path.exists() and out_path.stat().st_size > 0:
+    _fetch_only = phases is not None and phases == {"fetch"}
+
+    if not _fetch_only and out_path.exists() and out_path.stat().st_size > 0:
         try:
             pq.ParquetFile(out_path).metadata  # validates magic bytes and footer
             logger.info("%s already exists — skipping", out_path.name)
@@ -596,7 +608,11 @@ def collect_s1_for_tile(
             points=points,
             resolved_cache=resolved_cache,
             max_concurrent=max_concurrent,
+            phases=phases,
         )
+
+        if _fetch_only:
+            return None
 
         if not shard_paths:
             logger.info("no usable observations")
