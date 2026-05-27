@@ -31,10 +31,11 @@ import matplotlib.pyplot as plt
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from analysis.constants import add_spectral_indices, ensure_float32_bands
 from utils.regions import load_regions
 from utils.training_collector import tile_ids_for_regions, tile_parquet_path
 
-LOAD_COLS = ["point_id", "lon", "lat", "date", "scl_purity", "B04", "B08", "B11", "NDVI", "vh", "source"]
+LOAD_COLS = ["point_id", "lon", "lat", "date", "scl_purity", "B04", "B08", "B11", "vh", "source"]
 
 # Woody filter thresholds (matches TAMConfig defaults)
 PRESENCE_MIN_VH_DRY_DB     = -21.0
@@ -333,7 +334,7 @@ def main() -> None:
         print("No parquet data found for the selected regions.", file=sys.stderr)
         sys.exit(1)
 
-    pixel_df = pl.concat(chunks).with_columns(
+    pixel_df = pl.concat(chunks).pipe(ensure_float32_bands).pipe(add_spectral_indices).with_columns(
         pl.col("date").cast(pl.Date).dt.ordinal_day().alias("doy")
     )
     # SCL filter applies to S2 rows only; S1 rows have NaN scl_purity — keep them for woody filter

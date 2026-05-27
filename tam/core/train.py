@@ -303,38 +303,21 @@ def _compute_band_stats_worker(
     import numpy as _np
     import polars as _pl
     import pyarrow.parquet as _pq
-    from analysis.constants import add_spectral_indices
-    from tam.core.dataset import INDEX_COLS, S1_FEATURE_COLS as _S1_COLS, lin_to_db as _lin_to_db
+    from analysis.constants import ensure_float32_bands
+    from tam.core.dataset import S1_FEATURE_COLS as _S1_COLS, despeckle_s1 as _despeckle, prepare_s1_frame as _prep_s1, prepare_s2_frame as _prep_s2
 
-    df = _pl.from_arrow(_pq.read_table(pixel_df_path))
+    df = ensure_float32_bands(_pl.from_arrow(_pq.read_table(pixel_df_path)))
     _gc.collect()
 
     _s1_col_set = set(s1_feature_cols)
 
     if use_s1 == "mixed" or use_s1 is True:
-        s2 = df.filter(_pl.col("source") == "S2")
-        s1 = df.filter(_pl.col("source") == "S1")
-        if "scl_purity" in s2.columns:
-            s2 = s2.filter(_pl.col("scl_purity") >= scl_purity_min)
-        from tam.core.dataset import despeckle_s1 as _despeckle
-        s1 = _despeckle(s1, s1_despeckle_window)
-        vh_lin = s1["vh"].cast(_pl.Float32).to_numpy() if "vh" in s1.columns else _np.full(len(s1), _np.nan, dtype=_np.float32)
-        vv_lin = s1["vv"].cast(_pl.Float32).to_numpy() if "vv" in s1.columns else _np.full(len(s1), _np.nan, dtype=_np.float32)
-        s1_vh  = _lin_to_db(vh_lin).astype(_np.float32)
-        s1_vv  = _lin_to_db(vv_lin).astype(_np.float32)
-        s1 = s1.with_columns([
-            _pl.Series("s1_vh",    s1_vh),
-            _pl.Series("s1_vv",    s1_vv),
-            _pl.Series("s1_vh_vv", (s1_vh - s1_vv).astype(_np.float32)),
-            _pl.Series("s1_rvi",   _np.where(vh_lin + vv_lin > 0, 4 * vh_lin / (vh_lin + vv_lin), _np.nan).astype(_np.float32)),
-        ])
+        s2 = _prep_s2(df.filter(_pl.col("source") == "S2"), scl_purity_min, feature_cols)
+        s1 = _prep_s1(_despeckle(df.filter(_pl.col("source") == "S1"), s1_despeckle_window))
         # Add missing feature cols as nulls so we can stack
         for c in feature_cols:
             if c not in s2.columns: s2 = s2.with_columns(_pl.lit(None).cast(_pl.Float32).alias(c))
             if c not in s1.columns: s1 = s1.with_columns(_pl.lit(None).cast(_pl.Float32).alias(c))
-        _idx_cols = [c for c in feature_cols if c in INDEX_COLS and c not in df.columns]
-        if _idx_cols:
-            s2 = add_spectral_indices(s2)
         df = _pl.concat([s2.select(feature_cols + ["source"]), s1.select(feature_cols + ["source"])], how="diagonal_relaxed")
         del s2, s1
         _gc.collect()
@@ -362,11 +345,7 @@ def _compute_band_stats_worker(
     else:
         if "source" in df.columns:
             df = df.filter(_pl.col("source") == "S2")
-        if "scl_purity" in df.columns:
-            df = df.filter(_pl.col("scl_purity") >= scl_purity_min)
-        _idx_cols = [c for c in feature_cols if c in INDEX_COLS and c not in df.columns]
-        if _idx_cols:
-            df = add_spectral_indices(df)
+        df = _prep_s2(df, scl_purity_min, feature_cols)
         _col_stats = (
             df.lazy()
             .select(
@@ -441,9 +420,10 @@ def _build_dataset_worker(
     import gc as _gc
     import pyarrow.parquet as _pq
     import polars as _pl
+    from analysis.constants import ensure_float32_bands
     from tam.core.dataset import TAMDataset
 
-    pixel_df = _pl.from_arrow(_pq.read_table(pixel_df_path))
+    pixel_df = ensure_float32_bands(_pl.from_arrow(_pq.read_table(pixel_df_path)))
     _gc.collect()
 
     ds = TAMDataset(pixel_df, labels, **kwargs)

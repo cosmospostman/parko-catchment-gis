@@ -19,7 +19,7 @@ from torch.utils.data import Dataset
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from analysis.constants import BANDS, SPECTRAL_INDEX_COLS, add_spectral_indices
+from analysis.constants import BANDS, SPECTRAL_INDEX_COLS
 
 BAND_COLS: list[str] = list(BANDS)   # B02 B03 B04 B05 B06 B07 B08 B8A B11 B12
 INDEX_COLS: list[str] = SPECTRAL_INDEX_COLS
@@ -69,6 +69,37 @@ class TAMSample(NamedTuple):
     is_s1:        torch.Tensor   # (MAX_SEQ_LEN,)           bool, True=S1 observation
     point_id: str
     year:     int
+
+
+def prepare_s2_frame(
+    df: pl.DataFrame,
+    scl_purity_min: float,
+    feature_cols: list[str],
+) -> pl.DataFrame:
+    """Filter S2 rows by scl_purity and add spectral indices if needed."""
+    from analysis.constants import add_spectral_indices, ensure_float32_bands
+    df = ensure_float32_bands(df)
+    if "scl_purity" in df.columns:
+        df = df.filter(pl.col("scl_purity") >= scl_purity_min)
+    missing_index_cols = [c for c in feature_cols if c in INDEX_COLS and c not in df.columns]
+    if missing_index_cols:
+        df = add_spectral_indices(df)
+    return df
+
+
+def prepare_s1_frame(df: pl.DataFrame) -> pl.DataFrame:
+    """Derive dB and ratio features from raw linear vh/vv backscatter columns."""
+    vh_lin = df["vh"].cast(pl.Float32).to_numpy() if "vh" in df.columns else np.full(len(df), np.nan, dtype=np.float32)
+    vv_lin = df["vv"].cast(pl.Float32).to_numpy() if "vv" in df.columns else np.full(len(df), np.nan, dtype=np.float32)
+    s1_vh  = lin_to_db(vh_lin).astype(np.float32)
+    s1_vv  = lin_to_db(vv_lin).astype(np.float32)
+    denom  = vh_lin + vv_lin
+    return df.with_columns([
+        pl.Series("s1_vh",    s1_vh),
+        pl.Series("s1_vv",    s1_vv),
+        pl.Series("s1_vh_vv", (s1_vh - s1_vv).astype(np.float32)),
+        pl.Series("s1_rvi",   np.where(denom > 0, 4 * vh_lin / denom, np.nan).astype(np.float32)),
+    ])
 
 
 def despeckle_s1(s1: pl.DataFrame, window: int) -> pl.DataFrame:
@@ -218,33 +249,16 @@ class TAMDataset(Dataset):
             if "source" not in pixel_df.columns or "S1" not in pixel_df["source"].unique().to_list():
                 raise ValueError("mixed mode requires S1 rows in pixel_df (source='S1')")
 
-            s2_rows = pixel_df.filter(pl.col("source") == "S2")
-            s1_rows = pixel_df.filter(pl.col("source") == "S1")
-
-            if "scl_purity" in s2_rows.columns:
-                s2_rows = s2_rows.filter(pl.col("scl_purity") >= scl_purity_min)
-
-            s1_rows = despeckle_s1(s1_rows, s1_despeckle_window)
-            vh_lin = s1_rows["vh"].cast(pl.Float32).to_numpy() if "vh" in s1_rows.columns else np.full(len(s1_rows), np.nan, dtype=np.float32)
-            vv_lin = s1_rows["vv"].cast(pl.Float32).to_numpy() if "vv" in s1_rows.columns else np.full(len(s1_rows), np.nan, dtype=np.float32)
-            s1_vh    = lin_to_db(vh_lin).astype(np.float32)
-            s1_vv    = lin_to_db(vv_lin).astype(np.float32)
-            s1_vh_vv = s1_vh - s1_vv
-            denom = vh_lin + vv_lin
-            s1_rvi = np.where(denom > 0, 4 * vh_lin / denom, np.nan).astype(np.float32)
-            s1_rows = s1_rows.with_columns([
-                pl.Series("s1_vh",    s1_vh),
-                pl.Series("s1_vv",    s1_vv),
-                pl.Series("s1_vh_vv", s1_vh_vv),
-                pl.Series("s1_rvi",   s1_rvi),
-            ])
+            s2_feature_cols = list(feature_cols_override) if feature_cols_override is not None else ALL_FEATURE_COLS
+            s2_rows = prepare_s2_frame(pixel_df.filter(pl.col("source") == "S2"), scl_purity_min, s2_feature_cols)
+            s1_rows = despeckle_s1(pixel_df.filter(pl.col("source") == "S1"), s1_despeckle_window)
+            s1_rows = prepare_s1_frame(s1_rows)
             _active_s1_cols = list(s1_feature_cols_override) if s1_feature_cols_override is not None else S1_FEATURE_COLS
             # Drop S1 rows where all active S1 bands are null
             s1_rows = s1_rows.filter(
                 pl.any_horizontal([pl.col(c).is_not_null() for c in _active_s1_cols])
             )
 
-            s2_feature_cols = list(feature_cols_override) if feature_cols_override is not None else ALL_FEATURE_COLS
             feature_cols = s2_feature_cols + _active_s1_cols
             for col in s2_feature_cols:
                 if col not in s1_rows.columns:
@@ -252,10 +266,6 @@ class TAMDataset(Dataset):
             for col in _active_s1_cols:
                 if col not in s2_rows.columns:
                     s2_rows = s2_rows.with_columns(pl.lit(None).cast(pl.Float32).alias(col))
-
-            _s2_index_cols = [c for c in s2_feature_cols if c in INDEX_COLS]
-            if any(c not in s2_rows.columns for c in _s2_index_cols):
-                s2_rows = add_spectral_indices(s2_rows)
 
             # Slim to only the columns needed downstream before concat:
             # sort keys (point_id, year, date, doy, source) + feature_cols.
@@ -368,8 +378,7 @@ class TAMDataset(Dataset):
                 else:
                     df = pixel_df
 
-            if any(c not in df.columns for c in feature_cols if c in set(INDEX_COLS)):
-                df = add_spectral_indices(df)
+            df = prepare_s2_frame(df, scl_purity_min, feature_cols)
 
             if pixel_zscore:
                 s2_zscore_cols = [c for c in feature_cols if c in df.columns]
@@ -396,12 +405,6 @@ class TAMDataset(Dataset):
                     )
 
         if use_s1 not in ("s1_only", "mixed"):
-            if any(c not in df.columns for c in feature_cols if c in set(INDEX_COLS)):
-                df = add_spectral_indices(df)
-
-            if "scl_purity" in df.columns:
-                df = df.filter(pl.col("scl_purity") >= scl_purity_min)
-
             _band_check = [c for c in feature_cols if c in df.columns]
             null_mask = pl.any_horizontal([pl.col(c).is_null() for c in _band_check])
             if df.filter(null_mask).height > 0:

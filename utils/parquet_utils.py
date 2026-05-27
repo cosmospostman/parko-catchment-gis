@@ -27,6 +27,47 @@ _WRITE_OPTS = dict(
 
 
 # ---------------------------------------------------------------------------
+# Canonical combined S2+S1 schema for VM-facing code paths.
+# Hardcoded so proxy/server.py and collect_s1_for_tile(points=...) have no
+# dependency on a live parquet file for schema derivation.
+# Matches the output of _extend_schema() applied to a pixel_collector output.
+# ---------------------------------------------------------------------------
+
+def _make_combined_pixel_schema() -> "pa.Schema":
+    import pyarrow as pa
+    return pa.schema([
+        pa.field("point_id",    pa.string()),
+        pa.field("lon",         pa.float32()),
+        pa.field("lat",         pa.float32()),
+        pa.field("date",        pa.date32()),
+        pa.field("item_id",     pa.string()),
+        pa.field("tile_id",     pa.string()),
+        pa.field("B02",         pa.uint16()),
+        pa.field("B03",         pa.uint16()),
+        pa.field("B04",         pa.uint16()),
+        pa.field("B05",         pa.uint16()),
+        pa.field("B06",         pa.uint16()),
+        pa.field("B07",         pa.uint16()),
+        pa.field("B08",         pa.uint16()),
+        pa.field("B8A",         pa.uint16()),
+        pa.field("B11",         pa.uint16()),
+        pa.field("B12",         pa.uint16()),
+        pa.field("scl_purity",  pa.int8()),
+        pa.field("scl",         pa.int8()),
+        pa.field("aot",         pa.uint8()),
+        pa.field("view_zenith", pa.uint8()),
+        pa.field("sun_zenith",  pa.uint8()),
+        pa.field("source",      pa.string()),
+        pa.field("vh",          pa.float32()),
+        pa.field("vv",          pa.float32()),
+        pa.field("orbit",       pa.string()),
+    ])
+
+
+COMBINED_PIXEL_SCHEMA: "pa.Schema" = _make_combined_pixel_schema()
+
+
+# ---------------------------------------------------------------------------
 # S1/S2 schema helpers — shared by training_collector and location pipelines
 # ---------------------------------------------------------------------------
 

@@ -34,6 +34,8 @@ import pyarrow.parquet as pq
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from analysis.constants import add_spectral_indices, ensure_float32_bands
+
 
 def _read_pixels_for_band(
     lat_lo: float,
@@ -72,7 +74,7 @@ def _read_pixels_for_band(
     if not chunks:
         raise ValueError(f"No data found for lat bands {lat_lo}/{lat_hi}")
 
-    df = pl.concat(chunks)
+    df = add_spectral_indices(ensure_float32_bands(pl.concat(chunks)))
 
     # derive tile_id from item_id where blank
     if "item_id" in df.columns and "tile_id" in df.columns:

@@ -13,7 +13,7 @@ import numpy as np
 import polars as pl
 import torch
 
-from tam.core.dataset import ALL_FEATURE_COLS, BAND_COLS, MAX_SEQ_LEN, S1_FEATURE_COLS, despeckle_s1, lin_to_db, subsample_obs_indices
+from tam.core.dataset import ALL_FEATURE_COLS, BAND_COLS, MAX_SEQ_LEN, S1_FEATURE_COLS, despeckle_s1, lin_to_db, prepare_s1_frame, prepare_s2_frame, subsample_obs_indices
 from tam.core.model import TAMClassifier
 
 logger = logging.getLogger(__name__)
@@ -349,27 +349,15 @@ def _preprocess(
 
         # S2 features
         if len(s2_idx) > 0:
-            s2_chunk = chunk[s2_idx.tolist()]
-            from analysis.constants import add_spectral_indices
-            _need = [c for c in _s2_cols if c not in s2_chunk.columns]
-            if _need:
-                s2_chunk = add_spectral_indices(s2_chunk)
+            s2_chunk = prepare_s2_frame(chunk[s2_idx.tolist()], scl_purity_min=0.0, feature_cols=_s2_cols)
             s2_vals = s2_chunk.select(_s2_cols).to_numpy().astype(np.float32)
             feat[s2_idx, :n_s2] = s2_vals
 
         # S1 features (compute dB from linear vh/vv)
         if len(s1_idx) > 0:
-            s1_chunk = chunk[s1_idx.tolist()]
-            vh_lin = s1_chunk["vh"].to_numpy().astype(np.float32) if "vh" in s1_chunk.columns else np.full(len(s1_chunk), np.nan, np.float32)
-            vv_lin = s1_chunk["vv"].to_numpy().astype(np.float32) if "vv" in s1_chunk.columns else np.full(len(s1_chunk), np.nan, np.float32)
-            s1_db_map = {
-                "s1_vh":    lin_to_db(vh_lin),
-                "s1_vv":    lin_to_db(vv_lin),
-                "s1_vh_vv": lin_to_db(vh_lin) - lin_to_db(vv_lin),
-                "s1_rvi":   np.where(vh_lin + vv_lin > 0, 4 * vh_lin / (vh_lin + vv_lin), np.nan).astype(np.float32),
-            }
+            s1_chunk = prepare_s1_frame(chunk[s1_idx.tolist()])
             for j, col in enumerate(_s1_cols):
-                feat[s1_idx, n_s2 + j] = s1_db_map.get(col, np.zeros(len(s1_idx), np.float32))
+                feat[s1_idx, n_s2 + j] = s1_chunk[col].to_numpy().astype(np.float32) if col in s1_chunk.columns else np.zeros(len(s1_idx), np.float32)
 
         is_s1_np = is_s1_bool
 
@@ -403,10 +391,7 @@ def _preprocess(
                 feat,
             )
         else:
-            from analysis.constants import add_spectral_indices
-            _cols_needed = set(feature_cols) - set(chunk.columns)
-            if _cols_needed:
-                chunk = add_spectral_indices(chunk)
+            chunk = prepare_s2_frame(chunk, scl_purity_min=0.0, feature_cols=feature_cols)
             n_feat = len(feature_cols)
             feat = chunk.select(feature_cols).to_numpy().astype(np.float32)
 
@@ -556,7 +541,6 @@ def _compute_s2_pixel_zscore_stats(
     Used to apply pixel z-scoring at inference time, matching the training normalisation.
     """
     import pyarrow.parquet as pq
-    from analysis.constants import add_spectral_indices
 
     raw_band_cols = [c for c in feature_cols if c not in ("NDVI", "NDWI", "EVI")]
     read_cols = ["point_id", "scl_purity"] + raw_band_cols
@@ -569,18 +553,12 @@ def _compute_s2_pixel_zscore_stats(
             continue  # S1-only shard — no S2 bands to zscore
         cols = [c for c in read_cols if c in available]
         for rg in range(pf.metadata.num_row_groups):
-            chunk = pl.from_arrow(pf.read_row_group(rg, columns=cols))
-            if "scl_purity" in chunk.columns:
-                chunk = chunk.filter(pl.col("scl_purity") >= scl_purity_min)
-            chunks.append(chunk)
+            chunks.append(pl.from_arrow(pf.read_row_group(rg, columns=cols)))
 
     if not chunks:
         return {}, {}
 
-    df = pl.concat(chunks)
-    index_cols = [c for c in feature_cols if c in ("NDVI", "NDWI", "EVI")]
-    if index_cols:
-        df = add_spectral_indices(df)
+    df = prepare_s2_frame(pl.concat(chunks), scl_purity_min, feature_cols)
 
     agg_exprs = [pl.col("point_id")]
     for col in feature_cols:
@@ -627,7 +605,6 @@ def _compute_band_summaries_from_parquets(
     [col0_p5, col0_p95, col0_std, col1_p5, ...] (3 stats × n_feature_cols).
     """
     import pyarrow.parquet as pq
-    from analysis.constants import add_spectral_indices
 
     raw_band_cols = [c for c in feature_cols if c not in ("NDVI", "NDWI", "EVI")]
     read_cols = ["point_id", "scl_purity"] + raw_band_cols
@@ -640,20 +617,12 @@ def _compute_band_summaries_from_parquets(
             continue  # S1-only shard — no S2 bands
         cols = [c for c in read_cols if c in available]
         for rg in range(pf.metadata.num_row_groups):
-            chunk = pl.from_arrow(pf.read_row_group(rg, columns=cols))
-            if "scl_purity" in chunk.columns:
-                chunk = chunk.filter(pl.col("scl_purity") >= scl_purity_min)
-            chunks.append(chunk)
+            chunks.append(pl.from_arrow(pf.read_row_group(rg, columns=cols)))
 
     if not chunks:
         return {}
 
-    df = pl.concat(chunks)
-
-    # Compute spectral indices if needed
-    index_cols = [c for c in feature_cols if c in ("NDVI", "NDWI", "EVI")]
-    if index_cols:
-        df = add_spectral_indices(df)
+    df = prepare_s2_frame(pl.concat(chunks), scl_purity_min, feature_cols)
 
     # Compute raw p5/p95/std per pixel for each feature col (no normalisation yet)
     # NOTE: pixel z-score is intentionally NOT applied here — training computes band

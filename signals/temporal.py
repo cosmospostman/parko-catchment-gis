@@ -19,7 +19,7 @@ AUROC convention (higher score = presence) means direction may flip — check
 whether presence AUROC < 0.5 and consider 1 - AUROC as the discriminability
 score if so.
 
-Bands required: NDVI column — pre-computed in all training tile parquets.
+Bands required: B08, B04 — NDVI is computed inline from bands.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ from signals.base import Signal
 class TemporalVarianceSignal(Signal):
     """Per-pixel-year NDVI standard deviation as a stability signal.
 
-    Passes the pre-computed NDVI column through the quality mask unchanged.
+    Computes NDVI inline from B08/B04, then passes it through the quality mask.
     The discriminative summary is std (lower = more stable = more likely
     Parkinsonia). Use rank_key="std" with evaluate().
     """
@@ -44,5 +44,10 @@ class TemporalVarianceSignal(Signal):
         good = self.quality_mask(df).to_numpy()
         out = np.full(len(df), np.nan, dtype="float32")
         if good.any():
-            out[good] = df["NDVI"].to_numpy().astype("float32")[good]
+            b08 = df["B08"].to_numpy().astype("float32")
+            b04 = df["B04"].to_numpy().astype("float32")
+            denom = b08 + b04
+            with np.errstate(invalid="ignore"):
+                ndvi = np.where(denom != 0, (b08 - b04) / denom, np.nan)
+            out[good] = ndvi[good]
         return pl.Series(out)

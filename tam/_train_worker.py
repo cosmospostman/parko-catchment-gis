@@ -3,12 +3,13 @@
 Run as:
     python -m tam._train_worker <work_dir> <out_dir> <experiment>
 
-work_dir and out_dir are the same directory (the model output dir).
+work_dir is the pixel cache directory (shared across sweep runs).
+out_dir is the per-run checkpoint directory.
 Reads:
   <work_dir>/pixel_df_cache.parquet  — full pixel_df, already filtered+zscored
   <work_dir>/pixel_df_pixel_coords.parquet
   <work_dir>/pixel_df_band_summaries.parquet  (optional)
-  <work_dir>/worker_args.json        — labels, cfg dict, device
+  <out_dir>/worker_args.json        — labels, cfg dict, device
 
 The parent process spawns this as a subprocess so that all Polars/jemalloc
 allocations (TAMDataset construction, training loop) are freed when this
@@ -54,7 +55,7 @@ def _rss_gb() -> float:
 
 
 def main(work_dir: Path, out_dir: Path, experiment: str) -> None:
-    args_path = work_dir / "worker_args.json"
+    args_path = out_dir / "worker_args.json"
     with open(args_path) as f:
         worker_args = json.load(f)
 
@@ -64,7 +65,7 @@ def main(work_dir: Path, out_dir: Path, experiment: str) -> None:
     # Spawn _prep_worker as a separate process so that all Polars/jemalloc arenas
     # from preprocessing (column trim, SCL filter, presence filter, split) are
     # reclaimed by the OS on exit before dataset construction begins here.
-    prep_results_path = work_dir / "prep_results.json"
+    prep_results_path = out_dir / "prep_results.json"
     logger.info("Spawning prep worker ...")
     _prep_proc = subprocess.run(
         [sys.executable, "-m", "tam._prep_worker",
@@ -110,8 +111,8 @@ def main(work_dir: Path, out_dir: Path, experiment: str) -> None:
     logger.info("Calling train_tam (precomputed_split paths): RSS=%.1f GB", _rss_gb())
 
     precomputed_split = {
-        "train_pixel_df": work_dir / "prep_train_pixel_df.parquet",
-        "val_pixel_df":   work_dir / "prep_val_pixel_df.parquet",
+        "train_pixel_df": out_dir / "prep_train_pixel_df.parquet",
+        "val_pixel_df":   out_dir / "prep_val_pixel_df.parquet",
         "train_py_labels": train_py_labels,
         "val_py_labels":   val_py_labels,
         "global_feat_df":  global_feat_df,
@@ -133,6 +134,17 @@ def main(work_dir: Path, out_dir: Path, experiment: str) -> None:
 
     _, best_val_auc = _call()
     logger.info("Worker done: best_val_auc=%.4f  RSS=%.1f GB", best_val_auc, _rss_gb())
+
+    # Remove prep parquets — large intermediate files, not needed after training.
+    for _p in (
+        out_dir / "prep_train_pixel_df.parquet",
+        out_dir / "prep_val_pixel_df.parquet",
+        out_dir / "prep_global_feat_df.parquet",
+    ):
+        try:
+            _p.unlink()
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":

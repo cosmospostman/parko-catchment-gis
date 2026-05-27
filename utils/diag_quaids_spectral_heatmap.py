@@ -26,6 +26,8 @@ from sklearn.preprocessing import StandardScaler
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from analysis.constants import add_spectral_indices, ensure_float32_bands
+
 DRY_DOY_MIN = 121   # May 1
 DRY_DOY_MAX = 304   # Oct 31
 
@@ -43,10 +45,10 @@ def cluster_prob_values(k: int) -> list[float]:
 
 
 def load_pixels() -> pl.DataFrame:
-    return pl.concat(
+    return add_spectral_indices(ensure_float32_bands(pl.concat(
         [pl.read_parquet(p) for p in PIXEL_PARQUETS],
         how="diagonal_relaxed",
-    )
+    )))
 
 
 def dry_season_means(df: pl.DataFrame) -> pl.DataFrame:

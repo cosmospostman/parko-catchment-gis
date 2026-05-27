@@ -530,25 +530,28 @@ def _collect_s1_shards(
 
 
 def collect_s1_for_tile(
-    s2_path: Path,
+    s2_path: "Path | None",
     bbox_wgs84: list[float],
     start: str,
     end: str,
     out_path: Path,
     cache_dir: "Path | None" = None,
     max_concurrent: int = 32,
+    points: "list[tuple[str, float, float]] | None" = None,
 ) -> "Path | None":
-    """Fetch S1 for the pixels in s2_path and write a sorted S1 parquet to out_path.
+    """Fetch S1 for a tile's pixel grid and write a sorted S1 parquet to out_path.
 
-    Reads (point_id, lon, lat) from s2_path via PyArrow group_by (thread-safe,
-    avoids Polars Rayon deadlock in concurrent callers).  Idempotent: returns
-    out_path immediately if it already exists and is non-empty.
+    When *points* is supplied, coord reading from *s2_path* is skipped entirely
+    and *s2_path* may be None.  Schema is taken from COMBINED_PIXEL_SCHEMA.
+    When *points* is absent, coords are read from *s2_path* and schema is
+    derived from that file via _extend_schema() — existing callers unchanged.
 
+    Idempotent: returns out_path immediately if it already exists and is non-empty.
     Returns out_path on success, or None if no S1 data is available.
     """
     import tempfile
     import pyarrow.parquet as pq
-    from utils.parquet_utils import _extend_schema, _sort_s1_shards
+    from utils.parquet_utils import _extend_schema, _sort_s1_shards, COMBINED_PIXEL_SCHEMA
 
     if out_path.exists() and out_path.stat().st_size > 0:
         try:
@@ -563,22 +566,27 @@ def collect_s1_for_tile(
 
     resolved_cache = cache_dir if cache_dir is not None else _DEFAULT_CACHE_DIR
 
-    # Read points from s2 parquet using PyArrow (thread-safe)
-    _coords_tbl = pq.ParquetFile(s2_path).read(columns=["point_id", "lon", "lat"])
-    _coords_tbl = _coords_tbl.group_by("point_id").aggregate([("lon", "min"), ("lat", "min")])
-    points: list[tuple[str, float, float]] = list(zip(
-        _coords_tbl.column("point_id").to_pylist(),
-        _coords_tbl.column("lon_min").to_pylist(),
-        _coords_tbl.column("lat_min").to_pylist(),
-    ))
-    del _coords_tbl
+    if points is not None:
+        # Proxy path: caller supplies the pixel grid directly; no s2 file needed.
+        combined_schema = COMBINED_PIXEL_SCHEMA
+    else:
+        # Local path: read points from s2 parquet (thread-safe via PyArrow group_by).
+        if s2_path is None:
+            raise ValueError("collect_s1_for_tile: s2_path required when points is not supplied")
+        _coords_tbl = pq.ParquetFile(s2_path).read(columns=["point_id", "lon", "lat"])
+        _coords_tbl = _coords_tbl.group_by("point_id").aggregate([("lon", "min"), ("lat", "min")])
+        points = list(zip(
+            _coords_tbl.column("point_id").to_pylist(),
+            _coords_tbl.column("lon_min").to_pylist(),
+            _coords_tbl.column("lat_min").to_pylist(),
+        ))
+        del _coords_tbl
+        combined_schema = _extend_schema(pq.ParquetFile(s2_path).schema_arrow)
 
     items = _resolve_s1_items(bbox_wgs84, start, end, resolved_cache)
     if not items:
         logger.info("no items for bbox %s %s/%s", bbox_wgs84, start, end)
         return None
-
-    combined_schema = _extend_schema(pq.ParquetFile(s2_path).schema_arrow)
 
     with tempfile.TemporaryDirectory(prefix="s1_tile_") as _tmp:
         shard_paths = _collect_s1_shards(

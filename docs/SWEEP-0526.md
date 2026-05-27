@@ -54,57 +54,66 @@ Baseline: v10 with 18 bands (s1_vh s1_vv s1_vh_vv s1_rvi), d_ff=1024, batch_size
 
 ## 4. max_seq_len
 
-**Motivation:** 64 timesteps may truncate useful temporal context, particularly for S1+S2 interleaved sequences where each source contributes ~32 observations. Extending to 96 or 128 gives the attention mechanism more temporal range.
+**Note:** The experiment default is now `max_seq_len=128`. The 0.860 result was trained at `max_seq_len=64` (before this was updated). The sweep baseline run below re-runs at current defaults to establish the new reference.
 
-**Risk:** memory scales with seq_len (attention is O(n²)). At 128, batch_size=4096 may OOM — may need to drop to 2048. Also, longer sequences mean more padding for short-history pixels, which could hurt rather than help.
+**Motivation:** 64 timesteps was too tight for high-S1-cadence sites (Kowanyama reaches 106 obs/px/yr). 128 covers 100% of single-year pixels. The sweep baseline and seq_128 runs both include `p_gate=0.3` (the current experiment default).
+
+**Risk:** longer sequences mean more padding for short-history pixels, which adds noise. At batch_size=4096 with seq=128 and p_gate, watch for OOM — may need to drop to 2048.
 
 **Sweep:**
 
-| run | max_seq_len | command |
-|-----|-------------|---------|
-| seq_64 | 64 | *(baseline — already run)* |
-| seq_96 | 96 | `python -m tam.pipeline train --experiment v10 --max-seq-len 96 --output-dir outputs/sweep-0526/seq_96` |
-| seq_128 | 128 | `python -m tam.pipeline train --experiment v10 --max-seq-len 128 --batch-size 2048 --output-dir outputs/sweep-0526/seq_128` |
+| run | max_seq_len | p_gate | command |
+|-----|-------------|--------|---------|
+| baseline | 128 | 0.3 | `python -m tam.pipeline train --experiment v10 --output-dir outputs/sweep-0526/baseline` |
 
 ---
 
-## 5. Gate-augmented training (cascade prerequisite)
+## 5. Gate augmentation (cascade prerequisite)
 
-**Motivation:** The cascade gate runs V10 at T=8 (farthest-point DOY sampling) to discard high-confidence negatives before the full T=128 pass. The current checkpoint was trained only on full-length sequences — at T=8 it achieves only ~40% recall on presence pixels (r=0.39 correlation with full-T scores, presence p50=0.005). Gate-augmented training adds a stochastic short-sequence view during training so the model is discriminative at both T=128 and T=8.
+**Motivation:** Gate augmentation (`p_gate=0.3, T_gate=8`) is already in the experiment default. The `baseline` run above tests this combined with seq=128. A separate T_gate=16 variant checks whether T=8 is too tight.
 
-**Mechanism:** `p_gate=0.3` in `TAMDataset.__getitem__` — 30% of items are subsampled to `T_gate=8` observations via farthest-point DOY sampling before the loss is computed. Every pixel is still seen at full length every epoch; the short view is an additional augmentation, not a held-out split.
+**Expected outcome (gate_aug_t16):** recall@gate ≥ 0.99 on presence pixels at T=16, discarding 70–80% of absence pixels.
 
-**Expected outcome:** recall@gate ≥ 0.99 on presence pixels at T=8, discarding 70–80% of absence pixels → ~3.8× cascade speedup → ~12 hrs/yr on A10G (vs 46 hrs without cascade).
-
-**Risk:** the gate augmentation fires on 30% of items, reducing the effective number of full-length training examples. If val CVaR25 drops, reduce `p_gate` to 0.2 or try `T_gate=16`.
+**Risk:** `p_gate=0.3` fires on 30% of items, reducing effective full-length examples per epoch. If val CVaR25 drops vs 0.860, reduce `p_gate` to 0.2.
 
 **Sweep:**
 
 | run | p_gate | T_gate | command |
 |-----|--------|--------|---------|
-| gate_aug | 0.3 | 8 | `python -m tam.pipeline train --experiment v10 --output-dir outputs/sweep-0526/gate_aug` |
-| gate_aug_t16 | 0.3 | 16 | `python -m tam.pipeline train --experiment v10 --p-gate 0.3 --t-gate 16 --output-dir outputs/sweep-0526/gate_aug_t16` |
+| gate_aug_t16 | 0.3 | 16 | `python -m tam.pipeline train --experiment v10 --t-gate 16 --output-dir outputs/sweep-0526/gate_aug_t16` |
 
 After each run, evaluate cascade quality:
 ```
-python scripts/bench_cascade.py --checkpoint outputs/sweep-0526/gate_aug --device cuda
+python scripts/bench_cascade.py --checkpoint outputs/sweep-0526/baseline --device cuda
 ```
 Target: recall@gate ≥ 0.99 at some threshold with ≥ 70% absence discarded.
 
 ---
 
-## Priority order
+## Run order (overnight script)
 
-1. **Dropout** — cheapest, most likely to move the needle given current convergence behaviour
-2. **n_layers** — second cheapest, tests depth now that FFN is no longer the bottleneck
-3. **lr** — quick sanity check, low expected gain
-4. **max_seq_len** — most expensive per run, save for last
-5. **Gate augmentation** — run in parallel with seq_128; both use T=128 and are the most expensive
+All 8 runs in sequence. The `baseline` run (seq=128 + gate) goes first to establish the new reference; dropout and layers follow as the cheapest single-variable tests.
+
+1. `baseline` — seq=128, p_gate=0.3, all other defaults (new reference point)
+2. `dropout_0.4`
+3. `dropout_0.3`
+4. `layers_4`
+5. `lr_1e4`
+6. `lr_2e5`
+7. `gate_aug_t16`
+8. `max_seq_len` sweep not included — baseline already runs at seq=128; add seq_64 and seq_96 as follow-up if needed
 
 ---
 
 ## Results
 
-| sweep | value | CVaR25 | macro AUC | notes |
-|-------|-------|--------|-----------|-------|
-| baseline | d=0.5, L=3, lr=5e-5, seq=64 | 0.860 | 0.944 | — |
+| run | dropout | n_layers | lr | seq | p_gate | CVaR25 | macro AUC | notes |
+|-----|---------|----------|----|-----|--------|--------|-----------|-------|
+| prev best (seq=64, no gate) | 0.5 | 3 | 5e-5 | 64 | 0 | 0.860 | 0.944 | trained before seq/gate changes |
+| baseline | 0.5 | 3 | 5e-5 | 128 | 0.3 | | | new reference |
+| dropout_0.4 | 0.4 | 3 | 5e-5 | 128 | 0.3 | | | |
+| dropout_0.3 | 0.3 | 3 | 5e-5 | 128 | 0.3 | | | |
+| layers_4 | 0.5 | 4 | 5e-5 | 128 | 0.3 | | | |
+| lr_1e4 | 0.5 | 3 | 1e-4 | 128 | 0.3 | | | |
+| lr_2e5 | 0.5 | 3 | 2e-5 | 128 | 0.3 | | | |
+| gate_aug_t16 | 0.5 | 3 | 5e-5 | 128 | 0.3 (T=16) | | | |

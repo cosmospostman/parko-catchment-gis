@@ -257,6 +257,7 @@ class Location:
         cache_dir: Optional[Path] = None,
         apply_nbar: bool = True,
         n_workers: Optional[int] = None,
+        proxy_url: Optional[str] = None,
     ) -> list[Path]:
         """Fetch Sentinel-2 and Sentinel-1 pixel observations for this location.
 
@@ -264,8 +265,21 @@ class Location:
         Each parquet contains S2 rows (source="S2") interleaved with S1 rows (source="S1",
         vh, vv columns populated, S2 band columns null).
 
+        If *proxy_url* is set (e.g. "http://localhost:8765"), the fetch runs on
+        the remote proxy VM via proxy/client.fetch_tiles() — the WAN link sees
+        only compressed sorted parquet instead of raw COG traffic.
+
         Returns the list of written parquet paths.
         """
+        if proxy_url is not None:
+            return self._fetch_via_proxy(
+                proxy_url=proxy_url,
+                years=years,
+                cloud_max=cloud_max,
+                apply_nbar=apply_nbar,
+                n_workers=n_workers,
+            )
+
         from utils.fetch_spec import FetchSpec, fetch_spec  # noqa: PLC0415
 
         _cal_out: Path | None = None
@@ -290,6 +304,42 @@ class Location:
             calibration_out=_cal_out,
         )
         return [p for paths in year_results.values() for p in paths]
+
+    def _fetch_via_proxy(
+        self,
+        proxy_url: str,
+        years: list[int],
+        cloud_max: int,
+        apply_nbar: bool,
+        n_workers: Optional[int],
+    ) -> list[Path]:
+        import base64
+        from shapely import wkb as shapely_wkb
+        from proxy.client import fetch_tiles  # noqa: PLC0415
+
+        geom = self.geometry
+        if geom is not None:
+            polygon_wkb_b64 = base64.b64encode(shapely_wkb.dumps(geom)).decode()
+        else:
+            from shapely.geometry import box
+            polygon_wkb_b64 = base64.b64encode(
+                shapely_wkb.dumps(box(*self.bbox))
+            ).decode()
+
+        out_dir = _PROJECT_ROOT / "data" / "pixels" / self.id
+        tmp_dir = _PROJECT_ROOT / "data" / "pixels" / self.id / "_proxy_tmp"
+
+        return fetch_tiles(
+            proxy_url=proxy_url,
+            tile_ids=self.tile_ids(),
+            years=years,
+            polygon_wkb_b64=polygon_wkb_b64,
+            out_dir=out_dir,
+            tmp_dir=tmp_dir,
+            cloud_max=cloud_max,
+            apply_nbar=apply_nbar,
+            n_workers=n_workers,
+        )
 
 
 # ---------------------------------------------------------------------------

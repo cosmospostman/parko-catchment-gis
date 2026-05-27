@@ -28,6 +28,8 @@ import pyarrow.parquet as pq
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from analysis.constants import add_spectral_indices, ensure_float32_bands
+
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -41,11 +43,16 @@ def _read_tile(path: Path, bands: list[str]) -> pl.DataFrame:
     import re
     pf = pq.ParquetFile(path)
     available = set(pf.schema_arrow.names)
-    cols = [c for c in ["point_id", "lat", "date", "item_id", "tile_id", "scl_purity"] + bands
+    # Request raw bands only; indices are computed after load
+    _raw_bands = [c for c in bands if c not in ("NDVI", "NDWI", "EVI", "MAVI", "NDRE", "CI_RE")]
+    cols = [c for c in ["point_id", "lat", "date", "item_id", "tile_id", "scl_purity",
+                        "B02", "B03", "B04", "B08", "B11", "source"] + _raw_bands
             if c in available]
     chunks = [pl.from_arrow(pf.read_row_group(i, columns=cols))
               for i in range(pf.metadata.num_row_groups)]
-    df = pl.concat(chunks).filter(pl.col("scl_purity") >= 0.5).with_columns([
+    df = add_spectral_indices(ensure_float32_bands(pl.concat(chunks))).filter(
+        pl.col("scl_purity") >= 0.5
+    ).with_columns([
         pl.col("date").cast(pl.Date).dt.month().alias("month"),
     ])
     # season: months 1-3 and 10-12 → wet, 4-9 → dry

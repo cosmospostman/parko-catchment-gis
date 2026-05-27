@@ -40,6 +40,7 @@ import asyncio
 import logging
 import re
 import sys
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -52,7 +53,7 @@ from pyproj import Transformer
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from analysis.constants import BANDS, SCL_BAND, AOT_BAND, SCL_CLEAR_VALUES, add_spectral_indices, SPECTRAL_INDEX_COLS
+from analysis.constants import BANDS, SCL_BAND, AOT_BAND, SCL_CLEAR_VALUES, UINT16_BAND_SCALE
 from utils.chip_store import CachedNpzChipStore, MemoryChipStore
 from utils.fetch import fetch_patches
 from utils.stac import search_sentinel2
@@ -153,6 +154,20 @@ def make_pixel_grid(
 # Vectorised per-item extraction → DataFrame (no Observation objects)
 # ---------------------------------------------------------------------------
 
+def _band_to_uint16(arr: np.ndarray) -> pl.Series:
+    """Convert float32 reflectance [0, 1] to a nullable uint16 Series ×10000.
+
+    NaN values (S1 rows carry no S2 bands) become null in the output column.
+    """
+    nan_mask = np.isnan(arr)
+    safe = np.where(nan_mask, 0.0, arr)
+    quantised = np.clip(np.round(safe * UINT16_BAND_SCALE), 0, 65535).astype(np.uint16)
+    s = pl.Series(quantised, dtype=pl.UInt16)
+    if nan_mask.any():
+        s = s.scatter(np.where(nan_mask)[0].tolist(), None)
+    return s
+
+
 def extract_item_to_df(
     item,
     store: MemoryChipStore,
@@ -226,8 +241,8 @@ def extract_item_to_df(
         vza_mean = np.mean(
             [angles[b]["vza"] for b in BANDS if b in angles], axis=0
         ).astype(np.float32)
-        sun_zenith_col  = np.clip(1.0 - sza_mean / 90.0, 0.0, 1.0)
-        view_zenith_col = np.clip(1.0 - vza_mean / 90.0, 0.0, 1.0)
+        sun_zenith_col  = np.where(np.isnan(sza_mean), 1.0, np.clip(1.0 - sza_mean / 90.0, 0.0, 1.0))
+        view_zenith_col = np.where(np.isnan(vza_mean), 1.0, np.clip(1.0 - vza_mean / 90.0, 0.0, 1.0))
     else:
         sun_zenith_col  = np.ones(n, dtype=np.float32)
         view_zenith_col = np.ones(n, dtype=np.float32)
@@ -254,15 +269,15 @@ def extract_item_to_df(
         "date":        pl.Series([item_date] * n_clear),
         "item_id":     [item_id] * n_clear,
         "tile_id":     [tile_id] * n_clear,
-        "scl_purity":  scl_purity[idx].astype(np.float32),
+        "scl_purity":  scl_purity[idx].astype(np.int8),
         "scl":         scl_int[idx].astype(np.int8),
-        "aot":         aot_quality[idx].astype(np.float32),
-        "view_zenith": view_zenith_col[idx].astype(np.float32),
-        "sun_zenith":  sun_zenith_col[idx].astype(np.float32),
-        **{band: arr.astype(np.float32) for band, arr in band_data.items()},
+        "aot":         np.round(aot_quality[idx] * 100).astype(np.uint8),
+        "view_zenith": np.round(view_zenith_col[idx] * 100).astype(np.uint8),
+        "sun_zenith":  np.round(sun_zenith_col[idx] * 100).astype(np.uint8),
+        **{band: _band_to_uint16(arr) for band, arr in band_data.items()},
     })
 
-    return add_spectral_indices(df)
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +298,136 @@ def _auto_n_workers(n_pixels: int, n_bands: int = 12, target_gb: float = 4.0) ->
     return workers
 
 
+def _collect_per_scene(
+    points: list[tuple[str, float, float]],
+    items: list,
+    bbox_wgs84: list[float],
+    out_dir: Path,
+    cache_dir: Path,
+    apply_nbar: bool,
+    max_concurrent: int,
+    n_workers: int | None,
+    phases: set[str] | None,
+    utm_crs: str,
+) -> Iterator[tuple[str, Path]]:
+    """per_scene=True implementation for collect().
+
+    Yields (scene_id, path) for each item that produces at least one clear
+    pixel.  Each output parquet is sorted by point_id.  No shard accumulation,
+    no stale-cache check (VM is freshly launched), no cross-tile dedup.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from utils.parquet_utils import _optimise_schema, _WRITE_OPTS
+
+    _phases = phases if phases is not None else {"fetch", "extract"}
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    point_ids  = [pid          for pid, _, _   in points]
+    lons       = np.array([lon for _, lon, _   in points], dtype=np.float64)
+    lats       = np.array([lat for _, _, lat   in points], dtype=np.float64)
+    point_coords = {pid: (lon, lat) for pid, lon, lat in points}
+
+    col_order = (
+        ["point_id", "lon", "lat", "date", "item_id", "tile_id"]
+        + list(BANDS)
+        + ["scl_purity", "scl", "aot", "view_zenith", "sun_zenith"]
+    )
+
+    # --- Fetch phase ---------------------------------------------------------
+    if "fetch" in _phases:
+        from utils.fetch import _cache_path
+        import os as _os
+        cached_keys: set[tuple[str, str]] = set()
+        try:
+            for _entry in _os.scandir(cache_dir):
+                if _entry.is_dir():
+                    for _f in _os.scandir(_entry.path):
+                        if _f.name.endswith(".npz"):
+                            cached_keys.add((_entry.name, _f.name[:-4]))
+        except FileNotFoundError:
+            pass
+        uncached_items = [
+            item for item in items
+            if any((item.id, band) not in cached_keys for band in FETCH_BANDS)
+        ]
+        if uncached_items:
+            logger.info("per_scene fetch: %d/%d items not yet cached", len(uncached_items), len(items))
+            asyncio.run(fetch_patches(
+                points=points,
+                items=uncached_items,
+                bands=FETCH_BANDS,
+                bbox_wgs84=bbox_wgs84,
+                scl_filter=True,
+                band_alias=BAND_ALIAS,
+                max_concurrent=max_concurrent,
+                cache_dir=cache_dir,
+            ))
+        else:
+            logger.info("per_scene fetch: all %d items already cached", len(items))
+
+    if "extract" not in _phases:
+        return
+
+    # --- Extract phase: one parquet per item, sorted by point_id ------------
+    import threading as _threading
+    _thread_local = _threading.local()
+
+    def _get_store() -> CachedNpzChipStore:
+        if not hasattr(_thread_local, "store"):
+            _thread_local.store = CachedNpzChipStore(
+                cache_dir=cache_dir,
+                point_coords=point_coords,
+                bands=FETCH_BANDS,
+            )
+        return _thread_local.store
+
+    n_items = len(items)
+    for item_idx, item in enumerate(items):
+        scene_id = item.id
+        out_path = out_dir / f"scene_{item_idx:04d}.parquet"
+        if out_path.exists() and out_path.stat().st_size > 0:
+            try:
+                pq.ParquetFile(out_path).metadata
+                logger.info("per_scene: scene %d/%d %s already extracted — skipping", item_idx + 1, n_items, scene_id)
+                yield (scene_id, out_path)
+                continue
+            except Exception:
+                out_path.unlink(missing_ok=True)
+
+        store = _get_store()
+        df = extract_item_to_df(
+            item, store, point_ids, lons, lats,
+            apply_nbar=apply_nbar, utm_crs=utm_crs,
+        )
+        store.release_item(item.id)
+
+        if df is None or len(df) == 0:
+            logger.info("per_scene: scene %d/%d %s — no clear pixels, skipping", item_idx + 1, n_items, scene_id)
+            continue
+
+        tbl = df.select(col_order).to_arrow()
+        tbl = _optimise_schema(tbl)
+        # Sort by point_id (northing integer extracted from suffix)
+        tbl_pl = pl.from_arrow(tbl).with_columns(
+            pl.col("point_id").str.extract(r"_(\d+)$", 1).cast(pl.Int32).alias("_northing")
+        ).sort("_northing").drop("_northing")
+        tbl_sorted = tbl_pl.to_arrow().cast(tbl.schema)
+
+        tmp_path = out_path.with_suffix(".tmp.parquet")
+        tmp_path.unlink(missing_ok=True)
+        writer = pq.ParquetWriter(str(tmp_path), tbl_sorted.schema, **_WRITE_OPTS)
+        writer.write_table(tbl_sorted)
+        writer.close()
+        tmp_path.replace(out_path)
+
+        logger.info(
+            "per_scene: scene %d/%d %s — %d rows → %s",
+            item_idx + 1, n_items, scene_id, len(tbl_sorted), out_path.name,
+        )
+        yield (scene_id, out_path)
+
+
 def collect(
     bbox_wgs84: list[float],
     start: str,
@@ -299,7 +444,8 @@ def collect(
     n_workers: int | None = None,
     phases: set[str] | None = None,
     target_extraction_gb: float = 4.0,
-) -> list[Path]:
+    per_scene: bool = False,
+) -> "list[Path] | Iterator[tuple[str, Path]]":
     """Collect S2 observations for bbox_wgs84, writing one parquet per S2 tile.
 
     Output files are written to ``out_dir/<tile_id>.parquet``, one per MGRS
@@ -414,6 +560,24 @@ def collect(
             )
         items = deduped_items
 
+    # --- per_scene mode: yield one sorted parquet per item -------------------
+    # Used by proxy/server.py. Skips shard planning, stale-cache check, and
+    # the concat/dedup step. Returns an Iterator so the caller can stream
+    # results as each scene completes.
+    if per_scene:
+        return _collect_per_scene(
+            points=points,
+            items=items,
+            bbox_wgs84=bbox_wgs84,
+            out_dir=out_dir,
+            cache_dir=cache_dir,
+            apply_nbar=apply_nbar,
+            max_concurrent=max_concurrent,
+            n_workers=n_workers,
+            phases=phases,
+            utm_crs=utm_crs,
+        )
+
     # --- Canonical tile assignment -------------------------------------------
     # Adjacent MGRS tiles have non-aligned 10 m pixel grids. A point sampled
     # from tile A vs tile B gets a different sub-pixel position, producing
@@ -423,7 +587,6 @@ def collect(
         ["point_id", "lon", "lat", "date", "item_id", "tile_id"]
         + list(BANDS)
         + ["scl_purity", "scl", "aot", "view_zenith", "sun_zenith"]
-        + SPECTRAL_INDEX_COLS
     )
 
     # --- 3+4. Plan shards, then fetch only if needed -------------------------

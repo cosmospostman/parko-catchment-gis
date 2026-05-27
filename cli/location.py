@@ -674,6 +674,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
             cloud_max=args.cloud_max,
             apply_nbar=not args.no_nbar,
             n_workers=args.workers,
+            proxy_url=getattr(args, "proxy", None),
         )
     except KeyboardInterrupt:
         print(file=sys.stderr)
@@ -951,6 +952,9 @@ def main() -> None:
                     help="Disable BRDF NBAR c-factor correction")
     pf.add_argument("--workers", type=int, default=None, metavar="N",
                     help="Concurrent item extraction workers (default: auto-scaled by pixel count)")
+    pf.add_argument("--proxy", type=str, default=None, metavar="URL",
+                    help="Proxy VM URL (e.g. http://localhost:8765). "
+                         "Routes extraction to the VM; only compressed parquet is transferred.")
 
     pv = sub.add_parser("validate", help="Validate parquet data quality for a location")
     pv.add_argument("id", help="Location id (e.g. longreach, flinders0)")

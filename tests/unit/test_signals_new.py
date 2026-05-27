@@ -195,10 +195,12 @@ class TestTemporalVarianceSignal:
         self.sig = TemporalVarianceSignal()
 
     def test_t1_passes_ndvi_through(self):
-        ndvi_val = 0.72
-        df = _make_df(NDVI=ndvi_val)
+        # Signal computes NDVI inline from B08/B04 (not from the NDVI column).
+        # _make_df defaults: B08=0.5, B04=0.1 → NDVI = (0.5-0.1)/(0.5+0.1) = 2/3.
+        expected_ndvi = (0.5 - 0.1) / (0.5 + 0.1)
+        df = _make_df()
         ts = self.sig.compute(df)
-        assert np.allclose(_valid(ts), ndvi_val, atol=1e-5)
+        assert np.allclose(_valid(ts), expected_ndvi, atol=1e-5)
 
     def test_t2_nan_for_s1_rows(self):
         df = _make_df(source="S1")

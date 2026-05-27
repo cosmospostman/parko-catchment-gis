@@ -202,7 +202,7 @@ def test_utm_crs_lon180_produces_invalid_zone():
 
 def test_extract_item_to_df_clear_pixels():
     item = _make_item()
-    # SCL=4 (vegetation, clear). band raw DN=1500 → SR=0.15.
+    # SCL=4 (vegetation, clear). band raw DN=1500 (uint16 ×10000, not SR).
     store, lons, lats, _ = _make_store(3, scl_value=4.0, band_value=1500.0)
     pids = _point_ids(3)
 
@@ -211,17 +211,21 @@ def test_extract_item_to_df_clear_pixels():
     assert df is not None
     assert len(df) == 3
 
+    # Spectral indices are NOT stored — computed at read time via add_spectral_indices().
     expected_cols = (
         ["point_id", "lon", "lat", "date", "item_id", "tile_id"]
         + list(BANDS)
         + ["scl_purity", "scl", "aot", "view_zenith", "sun_zenith"]
-        + SPECTRAL_INDEX_COLS
     )
     for col in expected_cols:
         assert col in df.columns, f"missing column: {col}"
+    for col in SPECTRAL_INDEX_COLS:
+        assert col not in df.columns, f"unexpected derived column: {col}"
 
-    assert df[0, "B03"] == pytest.approx(0.15, rel=1e-4)
-    assert (df["scl_purity"] == 1.0).all()   # 1×1 chip, clear → purity=1
+    # Bands stored as uint16 DN (×10000), not float SR.
+    assert df[0, "B03"] == 1500
+    assert df["B03"].dtype == pl.UInt16
+    assert (df["scl_purity"] == 1).all()   # 1×1 chip, clear → purity=1
     assert (df["item_id"] == item.id).all()
     assert (df["tile_id"] == "55HBU").all()
 
@@ -318,14 +322,14 @@ def test_extract_item_to_df_partial_nan_rows_not_dropped():
 # Test 15 — spectral index columns present (regression)
 # ---------------------------------------------------------------------------
 
-def test_extract_item_to_df_has_spectral_index_columns():
+def test_extract_item_to_df_has_no_spectral_index_columns():
+    """Spectral indices are not stored in the parquet — computed at read time."""
     item = _make_item()
     store, lons, lats, _ = _make_store(2, scl_value=4.0, band_value=1000.0)
     df = extract_item_to_df(item, store, _point_ids(2), lons, lats, apply_nbar=False)
     assert df is not None
     for col in SPECTRAL_INDEX_COLS:
-        assert col in df.columns
-        assert not df[col].is_nan().all()
+        assert col not in df.columns
 
 
 # ---------------------------------------------------------------------------
@@ -333,13 +337,15 @@ def test_extract_item_to_df_has_spectral_index_columns():
 # ---------------------------------------------------------------------------
 
 def test_extract_item_to_df_missing_aot_defaults_to_one():
+    """Missing AOT defaults to quality=1.0, stored as uint8 100 (×100 encoding)."""
     item = _make_item()
     store, lons, lats, _ = _make_store(
         2, scl_value=4.0, band_value=500.0, missing_bands=(AOT_BAND,)
     )
     df = extract_item_to_df(item, store, _point_ids(2), lons, lats, apply_nbar=False)
     assert df is not None
-    assert float((df["aot"] - 1.0).abs().max()) == pytest.approx(0.0, abs=1e-5)
+    assert df["aot"].dtype == pl.UInt8
+    assert (df["aot"] == 100).all()  # aot quality=1.0 → uint8 ×100 = 100
 
 
 # ---------------------------------------------------------------------------
@@ -402,10 +408,10 @@ def test_extract_item_to_df_band_values_aligned_to_point_ids():
     pid_to_row = {row[0]: row for row in df.select(["point_id"] + list(BANDS)).iter_rows()}
     b0_idx = 1  # BANDS[0] is at position 1 in the selected cols
     for i, pid in enumerate(point_ids):
-        expected_sr = (i + 1) / 10.0
-        actual = float(pid_to_row[pid][b0_idx])
-        assert abs(actual - expected_sr) < 1e-3, (
-            f"{pid}: expected SR {expected_sr:.3f}, got {actual:.3f} — "
+        expected_dn = (i + 1) * 1000  # raw DN stored as uint16 ×10000
+        actual = pid_to_row[pid][b0_idx]
+        assert actual == expected_dn, (
+            f"{pid}: expected DN {expected_dn}, got {actual} — "
             "point_id/band-value ordering mismatch"
         )
 
@@ -580,8 +586,9 @@ def test_nbar_nan_angles_do_not_produce_nan_bands():
         df = extract_item_to_df(item, store, pids, lons, lats, apply_nbar=True)
 
     assert df is not None, "NaN angles must not cause all rows to be dropped"
-    nan_count = sum(df[b].is_nan().sum() for b in BANDS)
-    assert nan_count == 0, (
+    # Bands are nullable uint16 — NaN propagation shows up as null, not NaN.
+    null_count = sum(df[b].null_count() for b in BANDS)
+    assert null_count == 0, (
         "NaN c-factors must not propagate to band columns — "
         "fall back to uncorrected reflectance instead"
     )
@@ -606,13 +613,14 @@ def test_nbar_all_nan_angles_do_not_produce_nan_bands():
         df = extract_item_to_df(item, store, pids, lons, lats, apply_nbar=True)
 
     assert df is not None
-    nan_count = sum(df[b].is_nan().sum() for b in BANDS)
-    assert nan_count == 0, (
+    # Bands are nullable uint16 — check null count not nan count.
+    null_count = sum(df[b].null_count() for b in BANDS)
+    assert null_count == 0, (
         "All-NaN angles must not corrupt any band — fall back to uncorrected"
     )
-    # Values should be the uncorrected raw/10000 = 800/10000 = 0.08
-    assert abs(float(df[0, "B02"]) - 0.08) < 1e-4, (
-        "Uncorrected fallback value should be raw DN / 10000"
+    # Values should be the uncorrected raw DN = 800 (uint16 ×10000).
+    assert int(df[0, "B02"]) == 800, (
+        "Uncorrected fallback value should be raw DN (800)"
     )
 
 
@@ -635,13 +643,13 @@ def test_nbar_valid_angles_are_still_applied():
         df = extract_item_to_df(item, store, pids, lons, lats, apply_nbar=True)
 
     assert df is not None
-    # Compute expected c-factor for these angles
+    # Compute expected c-factor for these angles; result stored as uint16 DN (×10000).
     a = angles["B02"]
     cf = compute_cf(a["sza"], a["vza"], a["saa"] - a["vaa"], "B02")
-    expected = float(np.clip(500.0 / 10000.0 * cf[0], 0.0, 1.0))
-    actual = float(df[0, "B02"])
-    assert abs(actual - expected) < 1e-4, (
-        f"Valid-angle pixels should be NBAR-corrected: expected {expected:.4f}, got {actual:.4f}"
+    expected_dn = int(np.round(np.clip(500.0 / 10000.0 * cf[0], 0.0, 1.0) * 10000))
+    actual = int(df[0, "B02"])
+    assert abs(actual - expected_dn) <= 1, (
+        f"Valid-angle pixels should be NBAR-corrected: expected DN {expected_dn}, got {actual}"
     )
 
 # ---------------------------------------------------------------------------

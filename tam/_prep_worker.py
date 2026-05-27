@@ -7,12 +7,12 @@ Reads:
   <work_dir>/pixel_df_cache.parquet
   <work_dir>/pixel_df_pixel_coords.parquet
   <work_dir>/pixel_df_band_summaries.parquet  (optional)
-  <work_dir>/worker_args.json
+  <out_dir>/worker_args.json
 
 Writes:
-  <work_dir>/prep_train_pixel_df.parquet
-  <work_dir>/prep_val_pixel_df.parquet
-  <work_dir>/prep_results.json  — train_py_labels, val_py_labels, global_feat_df path
+  <out_dir>/prep_train_pixel_df.parquet
+  <out_dir>/prep_val_pixel_df.parquet
+  <out_dir>/prep_results.json  — train_py_labels, val_py_labels, global_feat_df path
 
 Design: the full pixel_df_cache.parquet (~5 GB compressed, ~20 GB in RAM) is
 never loaded as a single DataFrame. Instead all operations are done via
@@ -64,6 +64,7 @@ def _log_rss(tag: str) -> None:
 
 
 def main(work_dir: Path, out_dir: Path, experiment: str) -> None:
+    from analysis.constants import ensure_float32_bands
     from tam.core.config import TAMConfig
     from tam.core.constants import DRY_DOY_MIN as _DRY_DOY_MIN, DRY_DOY_MAX as _DRY_DOY_MAX
     from tam.core.dataset import BAND_COLS, S1_FEATURE_COLS, V9_FEATURE_COLS, lin_to_db
@@ -78,7 +79,7 @@ def main(work_dir: Path, out_dir: Path, experiment: str) -> None:
         spatial_split,
     )
 
-    args_path = work_dir / "worker_args.json"
+    args_path = out_dir / "worker_args.json"
     with open(args_path) as f:
         worker_args = json.load(f)
 
@@ -199,9 +200,9 @@ def main(work_dir: Path, out_dir: Path, experiment: str) -> None:
             logger.info("Using precomputed band summaries: %d pixels, %d features",
                         len(global_feat_df), global_feat_df.width - 1)
         else:
-            _slim_df = pl.scan_parquet(str(_cache_path), n_rows=None).select(
+            _slim_df = ensure_float32_bands(pl.scan_parquet(str(_cache_path), n_rows=None).select(
                 [c for c in _scan_cols if c in _cache_schema]
-            ).collect()
+            ).collect())
             logger.info("Computing band summaries (%d rows) ...", len(_slim_df))
             global_feat_df = _compute_band_summaries(_slim_df, V9_FEATURE_COLS)
             del _slim_df
@@ -334,8 +335,8 @@ def main(work_dir: Path, out_dir: Path, experiment: str) -> None:
         return lf
 
     # --- Write train parquet (one scan, never materialised in full) ----------
-    train_path = work_dir / "prep_train_pixel_df.parquet"
-    val_path   = work_dir / "prep_val_pixel_df.parquet"
+    train_path = out_dir / "prep_train_pixel_df.parquet"
+    val_path   = out_dir / "prep_val_pixel_df.parquet"
 
     def _write_scan(pids: set[str], path: Path, tag: str) -> None:
         # sink_parquet streams without materialising the full slice in RAM.
@@ -351,7 +352,7 @@ def main(work_dir: Path, out_dir: Path, experiment: str) -> None:
     # --- Write global features if present ------------------------------------
     global_feat_path: str | None = None
     if global_feat_df is not None:
-        global_feat_path = str(work_dir / "prep_global_feat_df.parquet")
+        global_feat_path = str(out_dir / "prep_global_feat_df.parquet")
         global_feat_df.write_parquet(global_feat_path)
         logger.info("Wrote global_feat_df: %d pixels  %d features", len(global_feat_df), global_feat_df.width - 1)
 
@@ -364,7 +365,7 @@ def main(work_dir: Path, out_dir: Path, experiment: str) -> None:
         "val_py_labels":   _labels_to_json(val_py_labels),
         "global_feat_path": global_feat_path,
     }
-    with open(work_dir / "prep_results.json", "w") as f:
+    with open(out_dir / "prep_results.json", "w") as f:
         json.dump(prep_results, f)
     logger.info("Prep worker done: RSS=%.1f GB", _rss_gb())
 

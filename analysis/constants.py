@@ -66,14 +66,38 @@ FLOWERING_THRESHOLD: float = 0.15
 # Spectral index computation
 # ---------------------------------------------------------------------------
 
+UINT16_BAND_SCALE: float = 10_000.0
+UINT8_QUALITY_SCALE: float = 100.0
+
+
+def ensure_float32_bands(df: "pl.DataFrame") -> "pl.DataFrame":
+    """Cast uint16 band columns back to float32 reflectance after parquet load.
+
+    New parquets store bands as uint16 ×10000 to halve storage. This function
+    is idempotent — float32 columns are left unchanged, so it is safe to call
+    on both old (float32) and new (uint16) parquets.
+    """
+    import polars as pl
+
+    exprs = [
+        (pl.col(b).cast(pl.Float32) / UINT16_BAND_SCALE).alias(b)
+        for b in BANDS
+        if b in df.columns and df[b].dtype == pl.UInt16
+    ]
+    return df.with_columns(exprs) if exprs else df
+
+
 def add_spectral_indices(df):
     """Return df with NDVI, NDWI, EVI, MAVI, NDRE, CI_RE columns appended.
 
-    Accepts both polars.DataFrame and pandas.DataFrame.
+    Accepts both polars.DataFrame and pandas.DataFrame. Automatically
+    converts uint16 band columns to float32 before computing indices.
     """
     import polars as pl
 
     if isinstance(df, pl.DataFrame):
+        df = ensure_float32_bands(df)
+
         # Build a single quality guard expression (source==S2 and scl_purity>=0.5).
         # All six index formulas share it so Polars fuses them into one scan instead
         # of recomputing the mask six times via the Signal.quality_mask() path.

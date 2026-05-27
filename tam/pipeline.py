@@ -102,6 +102,8 @@ def _cmd_train(args: argparse.Namespace) -> None:
 
     out_dir = Path(args.output_dir) if args.output_dir else PROJECT_ROOT / "outputs" / "models" / f"tam-{exp.name}"
     out_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir = Path(args.pixel_cache_dir) if args.pixel_cache_dir else PROJECT_ROOT / "outputs" / "pixel_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
 
     # Load labeled pixels from training tile parquets — row groups read in parallel.
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -135,8 +137,8 @@ def _cmd_train(args: argparse.Namespace) -> None:
     _load_stride = args.spatial_stride or exp.train_kwargs.get("spatial_stride", 1) or 1
 
     # --- Cache check: skip tile loading if pixel_df_cache is up to date ------
-    _cache_parquet = out_dir / "pixel_df_cache.parquet"
-    _cache_key_path = out_dir / "pixel_df_cache.key"
+    _cache_parquet = cache_dir / "pixel_df_cache.parquet"
+    _cache_key_path = cache_dir / "pixel_df_cache.key"
     _cache_key = _pixel_df_cache_key(
         tile_specs, exp.name, list(exp.feature_cols), list(exp.region_ids),
         _want_pixel_zscore, _want_s1_data, _load_stride,
@@ -151,7 +153,7 @@ def _cmd_train(args: argparse.Namespace) -> None:
         logger.info("pixel_df cache hit — skipping tile load (key=%s)", _cache_key[:12])
         # Load supporting files written alongside the cache.
         band_summaries: pl.DataFrame | None = None
-        _bs_cache = out_dir / "pixel_df_band_summaries.parquet"
+        _bs_cache = cache_dir / "pixel_df_band_summaries.parquet"
         if _bs_cache.exists():
             band_summaries = pl.from_arrow(pq.read_table(_bs_cache))
             logger.info("Band summaries from cache: %d pixels", len(band_summaries))
@@ -388,17 +390,17 @@ def _cmd_train(args: argparse.Namespace) -> None:
         _cache_key_path.write_text(_cache_key)
         logger.info("Cache key written: %s", _cache_key[:12])
 
-        pixel_coords.write_parquet(out_dir / "pixel_df_pixel_coords.parquet")
+        pixel_coords.write_parquet(cache_dir / "pixel_df_pixel_coords.parquet")
         if band_summaries is not None:
-            band_summaries.write_parquet(out_dir / "pixel_df_band_summaries.parquet")
-        with open(out_dir / "pixel_df_labels.json", "w") as _fh:
+            band_summaries.write_parquet(cache_dir / "pixel_df_band_summaries.parquet")
+        with open(cache_dir / "pixel_df_labels.json", "w") as _fh:
             json.dump(labels, _fh)
 
     # --- Build cfg (needed whether cache hit or miss) -------------------------
     if _cache_hit:
-        with open(out_dir / "pixel_df_labels.json") as _fh:
+        with open(cache_dir / "pixel_df_labels.json") as _fh:
             labels = {k: float(v) for k, v in json.load(_fh).items()}
-        pixel_coords = pl.from_arrow(pq.read_table(out_dir / "pixel_df_pixel_coords.parquet"))
+        pixel_coords = pl.from_arrow(pq.read_table(cache_dir / "pixel_df_pixel_coords.parquet"))
 
     train_kwargs = dict(exp.train_kwargs)
     model_kwargs = dict(exp.model_kwargs)
@@ -422,6 +424,7 @@ def _cmd_train(args: argparse.Namespace) -> None:
         "use_s1":                args.use_s1,
         "p_gate":                args.p_gate,
         "T_gate":                args.t_gate,
+        "max_seq_len":           args.max_seq_len,
     }.items() if v is not None}
     if args.val_sites:
         overrides["val_sites"] = tuple(args.val_sites)
@@ -474,7 +477,7 @@ def _cmd_train(args: argparse.Namespace) -> None:
     logger.info("Spawning training worker (fresh process, zero phantom arenas) ...")
     result = subprocess.run(
         [sys.executable, "-m", "tam._train_worker",
-         str(out_dir), str(out_dir), args.experiment],
+         str(cache_dir), str(out_dir), args.experiment],
         check=False,
     )
     if result.returncode != 0:
@@ -725,6 +728,7 @@ if __name__ == "__main__":
     p_train = sub.add_parser("train", help="Train a named experiment")
     p_train.add_argument("--experiment", required=True, help="Experiment module name (e.g. v1_spectral)")
     p_train.add_argument("--output-dir", default=None, help="Override output directory (default: outputs/models/tam-<experiment>)")
+    p_train.add_argument("--pixel-cache-dir", default=None, help="Directory for pixel_df cache files (default: same as --output-dir)")
     p_train.add_argument("--epochs",           type=int,   default=None)
     p_train.add_argument("--patience",         type=int,   default=None)
     p_train.add_argument("--lr",               type=float, default=None)
@@ -755,6 +759,7 @@ if __name__ == "__main__":
     p_train.add_argument("--s1-despeckle-window",  type=int,   default=None,
                          help="Temporal despeckle window for S1 (rolling median over N acquisitions). 0=off, default=3. Other reasonable values: 5, 7.")
     p_train.add_argument("--batch-size",           type=int,   default=None)
+    p_train.add_argument("--max-seq-len",          type=int,   default=None)
     p_train.add_argument("--scl-purity", type=float, default=0.5)
     p_train.add_argument("--use-s1", type=lambda x: x.lower() in ("true", "1", "yes") if x.lower() not in ("s1_only",) else "s1_only",
                          default=None, help="Enable S1: true/false or 's1_only'")
