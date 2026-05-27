@@ -160,7 +160,7 @@ def _sort_s1_shards(
 
     if len(shard_paths) == 1:
         _log.info("sorting 1 shard ...")
-        sort_parquet_by_pixel(shard_paths[0], out_path, row_group_size=5_000_000)
+        sort_parquet_by_pixel(shard_paths[0], out_path, row_group_size=5_000_000, _skip_dict_rewrite=True)
         _log.info("sort done → %s", out_path.name)
         return
 

@@ -16,7 +16,7 @@ Calibrated from Kowanyama 2021 (same tropical NQ climate, measured actuals):
 
 | Metric | Value |
 |---|---|
-| Clear obs/pixel/year (S2+S1 combined) | ~92 (~85 S2, ~7 S1) |
+| Clear obs/pixel/year (S2+S1 combined) | ~115 (~85 S2, ~30 S1) |
 | Final parquet per million pixels per year | ~3.7 GB |
 | One MGRS tile (~121M pixels), one year | **~60 GB** |
 | Mitchell River (45 tiles), one year | **~2.7 TB total** |
@@ -31,7 +31,7 @@ The Element84 COG bucket is in us-west-2. A VM in the same region gets free, Gbp
 
 The goal is to minimise WAN bytes. Sorted+dict parquet achieves ~10× compression over raw unsorted because:
 
-1. **Dictionary encoding on `point_id`**: sorted output groups all ~92 observations for each pixel consecutively. The dictionary stores each unique `point_id` string once; the index stream is long runs of the same integer — ZSTD compresses runs to near-zero. Per-scene parquets have every `point_id` appearing exactly once — no runs, no compression benefit, full string storage cost.
+1. **Dictionary encoding on `point_id`**: sorted output groups all ~115 observations for each pixel consecutively. The dictionary stores each unique `point_id` string once; the index stream is long runs of the same integer — ZSTD compresses runs to near-zero. Per-scene parquets have every `point_id` appearing exactly once — no runs, no compression benefit, full string storage cost.
 
 2. **Spectral locality in band columns**: all observations for a pixel are consecutive. A pixel's spectral signature is relatively stable across dates (same land cover), so band values have low variance within each run — ZSTD exploits that locality.
 
@@ -42,7 +42,7 @@ Per-scene transfer (deferring merge to workstation) would be ~57 GB/strip uncomp
 The proxy handles **both** Sentinel-2 and Sentinel-1. Both sensors are fetched, extracted, and sorted on the VM before streaming:
 
 - **Sentinel-2** (~85 obs/pixel/year): STAC via Element84, COG bands (B02–B12 + SCL + B8A), polygon-masked, per-scene parquets sorted by `point_id`
-- **Sentinel-1** (~7 obs/pixel/year): STAC via Element84, VH+VV COGs, same polygon mask — fetched via `collect_s1_for_tile()` after all S2 scenes are extracted, producing one S1 parquet per strip
+- **Sentinel-1** (~30 obs/pixel/year): STAC via Microsoft Planetary Computer (MPC), VH+VV COGs, same polygon mask — fetched via `collect_s1_for_tile()` after all S2 scenes are extracted, producing one S1 parquet per strip
 
 Each strip shard contains interleaved S2 and S1 rows, sorted by `(point_id, date)`, produced by `merge_scenes()` in `proxy/server.py`.
 
@@ -149,18 +149,23 @@ NBAR correction (`apply_nbar=True`) is applied on the VM inside `collect()`, usi
 
 ## COG block geometry
 
-Element84 Sentinel-2 COGs (verified against live tiles) use **1024×1024 pixel internal blocks**. A range request for a window smaller than 1024 px tall still reads a full 1024 px block from S3.
+Both sensors have been verified against live tiles:
 
-Strip height must be a multiple of 1024 px to avoid wasting COG fetch bandwidth:
-
-| Strip height | COG blocks fetched | Wasted rows | Over-fetch penalty |
+| Sensor | Source | Block size | Compression |
 |---|---|---|---|
-| 256 px | 1 block (1024 px) | 768 px | 75% |
-| 512 px | 1 block (1024 px) | 512 px | 50% |
-| **1024 px** | **1 block — zero waste** | **0 px** | **0%** |
-| 2048 px | 2 blocks — zero waste | 0 px | 0% |
+| Sentinel-2 | Element84 / AWS S3 | **1024×1024 px** | DEFLATE/LZW |
+| Sentinel-1 RTC | MPC / Azure Blob | **512×512 px** | DEFLATE |
 
-**1024 px is the natural strip unit.** Narrower strips waste S3 reads and inflate producer time, making it harder to keep the WAN link saturated.
+A range request for a window smaller than one block tall reads a full block. Strip height must therefore be a multiple of both block sizes to avoid wasting COG fetch bandwidth. Since 1024 = 2 × 512, **1024 px satisfies both sensors simultaneously** with zero over-fetch penalty for either.
+
+| Strip height | S2 blocks fetched | S2 waste | S1 blocks fetched | S1 waste |
+|---|---|---|---|---|
+| 256 px | 1 (1024 px) | 75% | 1 (512 px) | 50% |
+| 512 px | 1 (1024 px) | 50% | **1 — zero waste** | **0%** |
+| **1024 px** | **1 — zero waste** | **0%** | **2 — zero waste** | **0%** |
+| 2048 px | 2 — zero waste | 0% | 4 — zero waste | 0% |
+
+**1024 px is the natural strip unit for both sensors.** Narrower strips waste COG fetch bandwidth and inflate producer time, making it harder to keep the WAN link saturated. Do not use sub-1024 px strips to work around a slow producer — the fix is always more parallelism or a larger VM.
 
 ## VM-side pipeline
 
@@ -168,7 +173,7 @@ The architecture has four concurrent workers. The goal is that the streamer **ne
 
 ### Within a strip: three overlapping stages
 
-For each 1024 px strip (~85 S2 scenes + ~7 S1 granules, 1024×11,000 px):
+For each 1024 px strip (~85 S2 scenes + ~30 S1 granules, 1024×11,000 px):
 
 ```
 [S2 Fetcher]   scene 0   scene 1   scene 2  ...  scene 84
@@ -180,8 +185,8 @@ For each 1024 px strip (~85 S2 scenes + ~7 S1 granules, 1024×11,000 px):
 
 - **S2 Fetcher** (async, network-bound): fetches bands for one S2 scene at a time via `fetch_patches()` (13 bands → `scene_NNN.npz` ~570 MB), signals extractor, deletes `.npz` after extractor ACKs. Runs one scene ahead of extractor.
 - **S2 Extractor** (CPU-bound, one scene at a time): `collect(phases={"extract"}, per_scene=True)` — loads `.npz`, applies polygon mask via `extract_item_to_df()`, writes `scene_NNN.parquet` sorted by `point_id`, ACKs fetcher. Peak RAM: ~1–2 GB (one `.npz` + one DataFrame).
-- **S1 Collector** (after all S2 scenes extracted): `collect_s1_for_tile(points=pixel_grid, ...)` — STAC search, COG fetch and extraction for ~7 S1 granules, writes one `s1_strip.parquet`. Uses the pixel coordinate list derived from the strip bbox (same list used by the S2 fetcher), so no S2 parquet file is needed as input.
-- **Merger** (after S1 collector completes): `merge_scenes()` — DuckDB N-way sort-merge of ~85 S2 scene parquets + 1 S1 parquet, sorted by `(point_id, date)`, written as ZSTD + dictionary-encoded `strip_NNNN_sorted.parquet` (~5.5 GB). Output schema is `COMBINED_PIXEL_SCHEMA` — no S2 parquet file is opened to derive the schema. Deletes all scene parquets and the S1 strip parquet. Peak RAM: bounded by DuckDB spill budget (~2 GB).
+- **S1 Collector** (after all S2 scenes extracted): `collect_s1_for_tile(points=pixel_grid, ...)` — STAC search, COG fetch and extraction for ~30 S1 granules, writes one `s1_strip.parquet`. Uses the pixel coordinate list derived from the strip bbox (same list used by the S2 fetcher), so no S2 parquet file is needed as input. Each S1 granule covers a ~250 km swath; the strip window is a small clip from a ~29,000×22,500 px raster, fetched as ~44 block reads per band (2 block rows × 22 block columns at 512 px blocks over an 11,000 px wide strip).
+- **Merger** (after S1 collector completes): `merge_scenes()` — DuckDB N-way sort-merge of ~85 S2 scene parquets + 1 S1 parquet, sorted by `(point_id, date)`, written as ZSTD + dictionary-encoded `strip_NNNN_sorted.parquet` (~5.6 GB). Output schema is `COMBINED_PIXEL_SCHEMA` — no S2 parquet file is opened to derive the schema. Deletes all scene parquets and the S1 strip parquet. Peak RAM: bounded by DuckDB spill budget (~2 GB).
 
 Each scene parquet is **already sorted by `point_id`** — the pixel grid is fixed within a strip, so extraction order is deterministic. The merge only interleaves by `date`. DuckDB exploits the existing per-file sort order, making this effectively O(n) in practice while running entirely in C++ — no Python row iteration. This is the same strategy used by `parquet_utils._merge_sorted_parquets()` and `_sort_s1_shards()`.
 
@@ -207,8 +212,8 @@ Peak disk at any moment is ~7 GB — far below the 20 GB VM disk:
 |---|---|---|
 | 1 S2 `.npz` in flight (deleted after extractor ACKs) | ~570 MB | During S2 fetch/extract phase |
 | All S2 scene parquets accumulated (deleted after merge) | ~630 MB | From first S2 scene until `merge_scenes()` completes — includes the S1 collection window |
-| S1 strip parquet (deleted after merge) | ~25 MB | From S1 collection until `merge_scenes()` completes |
-| Strip N sorted shard (streaming) | ~5.5 GB | During stream to workstation |
+| S1 strip parquet (deleted after merge) | ~110 MB | From S1 collection until `merge_scenes()` completes |
+| Strip N sorted shard (streaming) | ~5.6 GB | During stream to workstation |
 | **Total** | **~7 GB** | — |
 
 The per-scene `.npz` files are deleted one at a time as extraction proceeds — they never accumulate. The ~630 MB figure for scene parquets is: ~57k clear pixels × 85 S2 scenes × ~120 bytes/row. S2 scene parquets persist through S1 collection because the merger needs all of them together.
@@ -248,7 +253,7 @@ The architecture is designed so the streamer never goes idle — fetch+extract+m
 | Both too slow | Upsize VM (more vCPU → higher `n_workers` ceiling) | — |
 | Strip too large for budget | `PROXY_STRIP_HEIGHT` (px, must be multiple of 1024) | 1024 |
 
-Do not narrow strips to fix a slow producer — sub-1024 px strips waste COG fetch bandwidth and make the problem worse. The fix is always more parallelism or a larger VM.
+See **COG block geometry** above for why sub-1024 px strips waste bandwidth for both sensors.
 
 ## Workstation-side merge
 
@@ -395,7 +400,7 @@ Same ergonomics as `bench_score.py`, `bench_train.py`, etc.: standalone script, 
 python scripts/bench_proxy.py
 python scripts/bench_proxy.py --n-scenes 100 --strip-px 1024 --n-pixels 11000
 python scripts/bench_proxy.py --assert-merge-s 30 --assert-compression-ratio 5
-python scripts/bench_proxy.py --sim-fetch-s 80 --sim-extract-s 60 --sim-merge-s 30 --sim-stream-s 147
+python scripts/bench_proxy.py --sim-fetch-s 80 --sim-extract-s 60 --sim-merge-s 30 --sim-stream-s 150
 ```
 
 | Benchmark / simulation | Hypothesis being tested | Pass condition |
@@ -412,16 +417,16 @@ python scripts/bench_proxy.py --sim-fetch-s 80 --sim-extract-s 60 --sim-merge-s 
 
 | Unit | Transfer time at 300 Mbps |
 |---|---|
-| One strip — 1024 px (~5.5 GB) | ~147 s |
+| One strip — 1024 px (~5.6 GB) | ~150 s |
 | One tile/year (~60 GB, 11 strips — ⌈11,000 px ÷ 1024⌉) | ~27 min |
 | Full Mitchell River, 1 year (~2.7 TB) | ~20 hours |
 
-Producer budget per strip: ≤147 s for fetch+extract+merge. Whether this is achievable depends on S3→VM throughput, which must be measured on first use. If the producer can't keep pace, the knobs are `max_concurrent`, `n_workers`, and VM size — in that order.
+Producer budget per strip: ≤150 s for fetch+extract+merge. Whether this is achievable depends on S3→VM throughput, which must be measured on first use. If the producer can't keep pace, the knobs are `max_concurrent`, `n_workers`, and VM size — in that order.
 
 ## Verification
 
 1. Run server locally against a 2×2 km sub-bbox of 54LWH for one year; confirm final parquet matches a direct `Location.fetch()` run (same rows, same order, same NBAR-corrected values).
 2. After each strip, assert all scene parquets and `.npz` files are deleted.
-3. Log bytes streamed per strip — confirm ~5.5 GB (sorted+dict), not ~57 GB (unsorted).
+3. Log bytes streamed per strip — confirm ~5.6 GB (sorted+dict), not ~57 GB (unsorted).
 4. Monitor idle time between strips — target zero; any idle time identifies the bottleneck stage.
 5. Time producer vs consumer per strip on first real tile; adjust knobs until idle ≈ 0.

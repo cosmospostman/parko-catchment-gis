@@ -23,7 +23,7 @@ from torch.utils.data import DataLoader
 
 from tam.core.config import TAMConfig
 from tam.core.constants import DRY_DOY_MIN as _DRY_DOY_MIN, DRY_DOY_MAX as _DRY_DOY_MAX
-from tam.core.dataset import BAND_COLS, MAX_SEQ_LEN, S1_FEATURE_COLS, TAMDataset, V9_FEATURE_COLS, collate_fn, lin_to_db
+from tam.core.dataset import BAND_COLS, MAX_SEQ_LEN, S1_FEATURE_COLS, TAMDataset, V9_FEATURE_COLS, collate_fn, lin_to_db, ForcedGateDataset, GateAugDataset
 from tam.core.global_features import GLOBAL_FEATURE_NAMES, compute_global_features
 from tam.core.model import TAMClassifier
 
@@ -1238,8 +1238,24 @@ def train_tam(
     _mp_ctx = "fork" if n_workers > 0 else None
 
     torch.set_num_threads(1)
+
+    # Wrap train_ds with gate augmentation if p_gate > 0.
+    # GateAugDataset expands __len__ by round(p_gate*N) extra slots, each a
+    # T_gate-truncated view of a randomly selected pixel. reshuffle_gate() is
+    # called at the start of every epoch so coverage rotates without replacement.
+    _gate_aug_ds: GateAugDataset | None = None
+    if cfg.p_gate > 0.0:
+        _gate_aug_ds = GateAugDataset(train_ds, p_gate=cfg.p_gate, T_gate=cfg.T_gate)
+        _train_source = _gate_aug_ds
+        logger.info(
+            "GateAugDataset: %d base + %d gate slots/epoch  (p_gate=%.2f T_gate=%d)",
+            len(train_ds), _gate_aug_ds._n_gate, cfg.p_gate, cfg.T_gate,
+        )
+    else:
+        _train_source = train_ds
+
     train_loader = DataLoader(
-        train_ds, batch_size=cfg.batch_size, shuffle=True,
+        _train_source, batch_size=cfg.batch_size, shuffle=True,
         collate_fn=collate_fn, num_workers=n_workers, persistent_workers=_persist,
         pin_memory=_pin, prefetch_factor=_prefetch, multiprocessing_context=_mp_ctx,
     )
@@ -1248,6 +1264,15 @@ def train_tam(
         collate_fn=collate_fn, num_workers=n_workers, persistent_workers=_persist,
         pin_memory=_pin, prefetch_factor=_prefetch, multiprocessing_context=_mp_ctx,
     )
+    # Gate val loader: forces T_gate truncation on every val item; used to
+    # measure cascade TNR (fraction of absence pixels scoring < 0.5 at T=T_gate).
+    _gate_val_loader = None
+    if cfg.p_gate > 0.0:
+        _gate_val_ds = ForcedGateDataset(val_ds, T_gate=cfg.T_gate)
+        _gate_val_loader = DataLoader(
+            _gate_val_ds, batch_size=max(1, cfg.batch_size // 2), shuffle=False,
+            collate_fn=collate_fn, num_workers=0,
+        )
     _log_rss("after DataLoader creation")
     logger.info(
         "DataLoader workers: %d  PyTorch threads: %d  avail_mem=%.1f GB",
@@ -1330,6 +1355,8 @@ def train_tam(
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer, T_max=cfg.n_epochs - cfg.warmup_freeze_epochs
             )
+        if _gate_aug_ds is not None:
+            _gate_aug_ds.reshuffle_gate()
         model.train()
         epoch_loss = 0.0
         train_probs, train_labels_list = [], []
@@ -1409,13 +1436,38 @@ def train_tam(
         )
         val_auc_macro = float(np.mean([r["auc"] for r in site_records])) if site_records else float("nan")
 
+        # Gate val pass: T_gate-truncated sequences, measure TNR on absence pixels.
+        # Logged as supplementary info; does not affect early stopping.
+        gate_tnr = float("nan")
+        if _gate_val_loader is not None:
+            model.eval()
+            gate_probs, gate_labels = [], []
+            with torch.no_grad():
+                for batch in _gate_val_loader:
+                    prob, _ = model(
+                        batch["bands"].to(device),
+                        batch["doy"].to(device),
+                        batch["mask"].to(device),
+                        batch["n_obs"].to(device),
+                        batch["global_feats"].to(device),
+                        is_s1=batch["is_s1"].to(device),
+                    )
+                    gate_probs.extend(prob.cpu().float().numpy())
+                    gate_labels.extend(batch["label"].float().numpy())
+            gate_probs_arr  = np.array(gate_probs)
+            gate_labels_arr = np.array(gate_labels)
+            absence_mask = gate_labels_arr == 0
+            if absence_mask.any():
+                gate_tnr = float((gate_probs_arr[absence_mask] < 0.5).mean())
+
         logger.info(
-            "epoch %3d/%d  loss=%.4f  train_auc=%.3f  val_cvar%.0f=%.3f%s",
+            "epoch %3d/%d  loss=%.4f  train_auc=%.3f  val_cvar%.0f=%.3f%s%s",
             epoch, cfg.n_epochs,
             epoch_loss / max(len(train_loader), 1),
             train_auc,
             cfg.cvar_alpha * 100, val_cvar,
             "  *" if (not np.isnan(val_cvar) and val_cvar >= best_val_auc) else "",
+            f"  gate_tnr={gate_tnr:.3f}" if not np.isnan(gate_tnr) else "",
         )
 
         if logger.isEnabledFor(logging.DEBUG) and site_records:

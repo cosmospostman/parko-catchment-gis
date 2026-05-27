@@ -718,13 +718,6 @@ class TAMDataset(Dataset):
             src_np   = src_np[idx_keep]
             n        = len(idx_keep)
 
-        if self._p_gate > 0.0 and n > self._T_gate and np.random.random() < self._p_gate:
-            gate_keep = subsample_obs_indices(np.arange(n), doy_np, self._T_gate)
-            bands_np = bands_np[gate_keep]
-            doy_np   = doy_np[gate_keep]
-            src_np   = src_np[gate_keep]
-            n        = len(gate_keep)
-
         if self._band_noise_std > 0.0:
             n_s2 = min(len(ALL_FEATURE_COLS), self._n_features)
             n_s1 = self._n_features - n_s2
@@ -784,6 +777,43 @@ class TAMDataset(Dataset):
             is_s1        = torch.from_numpy(is_s1),
             point_id     = pid,
             year         = yr,
+        )
+
+    def _get_forced_gate(self, idx: int, T: int) -> TAMSample:
+        """Return item *idx* with sequence truncated to *T* obs via farthest-point DOY sampling."""
+        sample = self[idx]
+        n = int(sample.n_obs.item() * self._max_seq_len + 0.5)
+        if n <= T:
+            return sample
+        # Unpack live observations (before padding)
+        bands_np = sample.bands[:n].numpy()
+        doy_np   = sample.doy[:n].numpy()
+        src_np   = sample.is_s1[:n].numpy()
+        gate_keep = subsample_obs_indices(np.arange(n), doy_np, T)
+        bands_np  = bands_np[gate_keep]
+        doy_np    = doy_np[gate_keep]
+        src_np    = src_np[gate_keep]
+        n2 = len(gate_keep)
+        seq_cap = self._max_seq_len
+        bands_out = np.zeros((seq_cap, self._n_features), dtype=np.float32)
+        doy_out   = np.zeros(seq_cap, dtype=np.int64)
+        mask_out  = np.ones(seq_cap, dtype=bool)
+        is_s1_out = np.zeros(seq_cap, dtype=bool)
+        bands_out[:n2] = bands_np
+        doy_out[:n2]   = doy_np
+        mask_out[:n2]  = False
+        is_s1_out[:n2] = src_np
+        return TAMSample(
+            bands        = torch.from_numpy(bands_out),
+            doy          = torch.from_numpy(doy_out),
+            mask         = torch.from_numpy(mask_out),
+            n_obs        = torch.tensor(n2 / seq_cap, dtype=torch.float32),
+            global_feats = sample.global_feats,
+            label        = sample.label,
+            weight       = sample.weight,
+            is_s1        = torch.from_numpy(is_s1_out),
+            point_id     = sample.point_id,
+            year         = sample.year,
         )
 
     # ------------------------------------------------------------------
@@ -968,3 +998,56 @@ class TAMDataset(Dataset):
                 seen.add(pid)
                 out.append(pid)
         return out
+
+
+class GateAugDataset(Dataset):
+    """Wraps a TAMDataset to add T_gate-truncated views as extra training items.
+
+    For each epoch, ``round(p_gate * N)`` pixel indices are sampled without
+    replacement and appended to the index space as T_gate-truncated items.
+    The mapping is reshuffled each epoch via ``reshuffle_gate(rng)``, which
+    the training loop must call once at the start of every epoch.
+
+    The base dataset must have p_gate=0 (gate logic lives here, not there).
+    """
+
+    def __init__(self, base: TAMDataset, p_gate: float, T_gate: int, rng: np.random.Generator | None = None) -> None:
+        self._base    = base
+        self._p_gate  = p_gate
+        self._T_gate  = T_gate
+        self._n_base  = len(base)
+        self._n_gate  = round(p_gate * self._n_base)
+        self._rng     = rng if rng is not None else np.random.default_rng()
+        self._gate_perm: np.ndarray = np.empty(0, dtype=np.int64)
+        self.reshuffle_gate()
+
+    def reshuffle_gate(self, rng: np.random.Generator | None = None) -> None:
+        """Resample which pixels get the T_gate view this epoch (without replacement)."""
+        r = rng if rng is not None else self._rng
+        self._gate_perm = r.choice(self._n_base, size=self._n_gate, replace=False)
+
+    def __len__(self) -> int:
+        return self._n_base + self._n_gate
+
+    def __getitem__(self, idx: int) -> TAMSample:
+        if idx < self._n_base:
+            return self._base[idx]
+        return self._base._get_forced_gate(int(self._gate_perm[idx - self._n_base]), self._T_gate)
+
+
+class ForcedGateDataset(Dataset):
+    """Wraps a TAMDataset and forces T_gate truncation on every item.
+
+    Used for the gate val pass: evaluates model quality on T_gate-length
+    sequences to verify cascade filter effectiveness (TNR at T=T_gate).
+    """
+
+    def __init__(self, base: TAMDataset, T_gate: int) -> None:
+        self._base   = base
+        self._T_gate = T_gate
+
+    def __len__(self) -> int:
+        return len(self._base)
+
+    def __getitem__(self, idx: int) -> TAMSample:
+        return self._base._get_forced_gate(idx, self._T_gate)

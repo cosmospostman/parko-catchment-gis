@@ -84,60 +84,6 @@ def _budget_params(memory_budget_gb: float) -> dict:
     return dict(strip_height_px=500,  max_extract_years=1,  max_concurrent_strips=1, target_extraction_gb=1.0, n_s1_workers=1)
 
 
-def _strip_bboxes(bbox_wgs84: list[float], strip_height_px: int, resolution_m: float = 10.0) -> list[list[float]]:
-    """Divide bbox_wgs84 into horizontal strips of strip_height_px UTM rows.
-
-    Strips share the full longitude extent of the original bbox and are ordered
-    south-to-north (ascending northing), matching the pixel sort order so the
-    N-way merge emits them in sequence with minimal heap churn.
-
-    Returns a list of [lon_min, lat_min, lon_max, lat_max] bboxes in WGS84.
-    Each strip's lat_max equals the next strip's lat_min (no overlap, no gap).
-    """
-    import numpy as np
-    from pyproj import Transformer
-
-    lon_min, lat_min, lon_max, lat_max = bbox_wgs84
-
-    # Derive UTM CRS from bbox centre (same logic as pixel_collector)
-    lon_c = (lon_min + lon_max) / 2
-    lat_c = (lat_min + lat_max) / 2
-    zone = min(int((lon_c + 180) / 6) + 1, 60)
-    epsg = 32600 + zone if lat_c >= 0 else 32700 + zone
-    utm_crs = f"EPSG:{epsg}"
-
-    to_utm = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
-    to_wgs = Transformer.from_crs(utm_crs, "EPSG:4326", always_xy=True)
-
-    # Use centre longitude for the UTM transforms to minimise round-trip distortion.
-    # Edge-of-zone distortion causes y → WGS84 lat to overshoot by ~0.1° at lon_min/max.
-    _, y_min = to_utm.transform(lon_c, lat_min)
-    _, y_max = to_utm.transform(lon_c, lat_max)
-
-    strip_m = strip_height_px * resolution_m
-    y_edges = np.arange(y_min, y_max, strip_m).tolist()
-    y_edges.append(y_max)
-
-    strips: list[list[float]] = []
-    for i in range(len(y_edges) - 1):
-        y0, y1 = y_edges[i], y_edges[i + 1]
-        _, slat_min = to_wgs.transform(lon_c, y0)
-        _, slat_max = to_wgs.transform(lon_c, y1)
-        strips.append([lon_min, slat_min, lon_max, slat_max])
-
-    # Clamp boundary edges so coverage exactly matches the original bbox.
-    # UTM round-trip distortion (edge-of-zone) can shift outer strip lats by ~0.1°;
-    # clamping ensures no coverage is dropped at bbox_wgs84's southern/northern edges.
-    # Strips whose clamped extent collapses (lat_min ≥ lat_max) are dropped — this
-    # only happens when the second-to-last strip's WGS84 lat already overshoots lat_max,
-    # meaning coverage is already complete.
-    if strips:
-        strips[0][1] = lat_min
-        strips[-1][3] = lat_max
-    strips = [s for s in strips if s[1] < s[3]]
-
-    return strips
-
 
 def fetch_spec(
     spec: FetchSpec,
@@ -165,28 +111,18 @@ def fetch_spec(
         merge_tile / merge_strips      → <out_dir>/<year>/<tile_id>.parquet
 
     ``memory_budget_gb`` is the primary sizing knob.  Defaults to total system
-    RAM (auto-detected).  From it, _budget_params() derives strip_height_px,
-    max_extract_years, max_concurrent_strips, target_extraction_gb, and
-    n_s1_workers.  All of these can still be overridden individually via the
-    explicit keyword arguments below.
-
-    When strip_height_px > 0 the bbox is divided into horizontal UTM strips of
-    that many pixel rows.  Each strip runs the full three-stage pipeline
-    independently (with a shared .npz patch cache so COG fetches are not
-    repeated).  After all strips complete, merge_strips() assembles them into
-    the same final output path that the non-strip path produces.  Downstream
-    consumers see no difference.
+    RAM (auto-detected).  From it, _budget_params() derives max_extract_years,
+    target_extraction_gb, and n_s1_workers.  All of these can still be
+    overridden individually via the explicit keyword arguments below.
 
     ``items`` may be a pre-fetched, deduplicated STAC item list (training
     pipeline passes the tile-level search result here to avoid redundant
-    searches across regions on the same tile).  When stripping is active the
-    same item list is passed to every strip — COG reads are skipped for strips
-    whose patches are already cached.
+    searches across regions on the same tile).
 
     Returns {year: [merged_parquet_paths]}.
     """
     from utils.pixel_collector import collect
-    from utils.s1_collector import collect_s1_for_tile, _DEFAULT_CACHE_DIR as _S1_CACHE_DIR
+    from utils.s1_collector import collect_s1_for_tile
     from utils.parquet_utils import merge_tile, merge_strips
 
     if spec.out_dir is None:
@@ -196,20 +132,16 @@ def fetch_spec(
     _budget_gb = memory_budget_gb if memory_budget_gb is not None else _system_memory_gb()
     _params = _budget_params(_budget_gb)
 
-    _strip_height: int | None = _params["strip_height_px"]
     _max_extract: int = max_extract_years if max_extract_years is not None else _params["max_extract_years"]
-    _max_strips: int = _params["max_concurrent_strips"]
     _target_gb: float = _params["target_extraction_gb"]
     _n_s1: int = n_s1_workers if n_s1_workers is not None else _params["n_s1_workers"]
 
     _budget_source = "explicit" if memory_budget_gb is not None else "auto-detected"
     logger.info(
         "fetch_spec %s: memory budget %.0f GB (%s) → "
-        "strip_height=%s, max_extract_years=%d, max_concurrent_strips=%d, "
-        "target_extraction_gb=%.0f, n_s1_workers=%d",
+        "max_extract_years=%d, target_extraction_gb=%.0f, n_s1_workers=%d",
         spec.id, _budget_gb, _budget_source,
-        f"{_strip_height} px" if _strip_height else "none (full bbox)",
-        _max_extract, _max_strips, _target_gb, _n_s1,
+        _max_extract, _target_gb, _n_s1,
     )
 
     results: dict[int, list[Path]] = {}
@@ -232,33 +164,6 @@ def fetch_spec(
         n_workers=_resolved_n_workers,
         target_extraction_gb=_target_gb,
     )
-
-    # -------------------------------------------------------------------------
-    # Strip decomposition
-    # When _strip_height is set, split the bbox into horizontal strips and run
-    # each through the full three-stage pipeline independently.  After all
-    # strips complete, merge_strips() reassembles them.
-    #
-    # Key properties:
-    #   - Same cache_dir for all strips → COG patches fetched once, shared
-    #   - Same items list for all strips → no redundant STAC searches
-    #   - Strips are south-to-north (ascending northing) → the N-way merge
-    #     emits whole blocks with minimal heap churn
-    #   - max_concurrent_strips bounds how many strips run Phase B at once
-    # -------------------------------------------------------------------------
-    if _strip_height is not None:
-        strips = _strip_bboxes(spec.bbox, _strip_height)
-        logger.info("fetch_spec %s: %d strips of ≤%d px height", spec.id, len(strips), _strip_height)
-        return _fetch_spec_strips(
-            spec=spec,
-            strips=strips,
-            years=years,
-            collect_kwargs_base=_collect_kwargs,
-            max_extract_years=_max_extract,
-            max_concurrent_strips=_max_strips,
-            n_s1_workers=_n_s1,
-            s1_cache_dir=spec.cache_dir if spec.cache_dir is not None else _S1_CACHE_DIR,
-        )
 
     # -------------------------------------------------------------------------
     # Full-bbox path (no strips)
@@ -387,184 +292,3 @@ def fetch_spec(
             results[yr] = []
 
     return results
-
-
-def _fetch_spec_strips(
-    spec: FetchSpec,
-    strips: list[list[float]],
-    years: list[int],
-    collect_kwargs_base: dict,
-    max_extract_years: int,
-    max_concurrent_strips: int,
-    n_s1_workers: int,
-    s1_cache_dir: Path,
-) -> dict[int, list[Path]]:
-    """Strip-decomposed fetch pipeline.
-
-    For each year:
-      Phase A: fetch patches for all strips in parallel (network-bound, shared cache)
-      Phase B: extract strips sequentially (capped at max_concurrent_strips),
-               then merge_strips() reassembles them into one parquet per tile.
-
-    Strip outputs land in:
-      <out_dir>/<year>/strips/<strip_NNNN>/<tile_id>.parquet
-
-    Final merged outputs:
-      <out_dir>/<year>/<tile_id>.parquet   ← same as the no-strip path
-    """
-    from utils.pixel_collector import collect
-    from utils.s1_collector import collect_s1_for_tile
-    from utils.parquet_utils import merge_tile, merge_strips
-
-    results: dict[int, list[Path]] = {}
-    n_strips = len(strips)
-
-    def _strip_dir(year: int, strip_idx: int) -> Path:
-        return spec.out_dir / str(year) / "strips" / f"strip_{strip_idx:04d}"
-
-    def _fetch_patches_strip(year: int, strip_idx: int, strip_bbox: list[float]) -> None:
-        sdir = _strip_dir(year, strip_idx)
-        sdir.mkdir(parents=True, exist_ok=True)
-        kwargs = {**collect_kwargs_base, "bbox_wgs84": strip_bbox}
-        collect(
-            start=f"{year}-01-01",
-            end=f"{year}-12-31",
-            out_dir=sdir,
-            phases={"fetch"},
-            **kwargs,
-        )
-
-    def _extract_strip(year: int, strip_idx: int, strip_bbox: list[float]) -> list[Path]:
-        sdir = _strip_dir(year, strip_idx)
-        kwargs = {**collect_kwargs_base, "bbox_wgs84": strip_bbox}
-        s2_paths = collect(
-            start=f"{year}-01-01",
-            end=f"{year}-12-31",
-            out_dir=sdir,
-            phases={"extract"},
-            **kwargs,
-        )
-        if not s2_paths:
-            s2_paths = sorted(
-                p for p in sdir.glob("*.s2.parquet")
-                if not p.stem.startswith("_") and "_tmp" not in p.stem
-            )
-        if not s2_paths:
-            logger.warning("fetch_spec %s year %d strip %d: no S2 data", spec.id, year, strip_idx)
-            return []
-
-        strip_merged: list[Path] = []
-        for s2_path in s2_paths:
-            tile_id = s2_path.name.replace(".s2.parquet", "")
-            s1_path = sdir / f"{tile_id}.s1.parquet"
-            out_path = sdir / f"{tile_id}.parquet"
-
-            collect_s1_for_tile(
-                s2_path=s2_path,
-                bbox_wgs84=strip_bbox,
-                start=f"{year}-01-01",
-                end=f"{year}-12-31",
-                out_path=s1_path,
-                cache_dir=s1_cache_dir,
-                max_concurrent=n_s1_workers,
-            )
-
-            merge_tile(
-                s2_path=s2_path,
-                s1_path=s1_path if s1_path.exists() else None,
-                out_path=out_path,
-            )
-            strip_merged.append(out_path)
-
-        return strip_merged
-
-    def _process_year(year: int) -> tuple[int, list[Path]]:
-        year_dir = spec.out_dir / str(year)
-        year_dir.mkdir(parents=True, exist_ok=True)
-
-        _phase_a_workers = min(n_strips, 8)
-        logger.info(
-            "fetch_spec %s year %d: Phase A — fetching %d strips (%d concurrent threads)",
-            spec.id, year, n_strips, _phase_a_workers,
-        )
-
-        # Phase A: fetch all strips in parallel (shared cache_dir — COG reads happen once).
-        # Cap at 8 threads: each thread runs asyncio.run(fetch_patches(..., max_concurrent=32)),
-        # so 8 threads already saturates a typical link (8 × 32 = 256 concurrent requests).
-        with ThreadPoolExecutor(max_workers=_phase_a_workers) as fetch_pool:
-            fetch_futs = [
-                fetch_pool.submit(_fetch_patches_strip, year, i, bbox)
-                for i, bbox in enumerate(strips)
-            ]
-            for fut in as_completed(fetch_futs):
-                fut.result()  # re-raise network errors
-
-        logger.info("fetch_spec %s year %d: Phase A complete — starting extraction", spec.id, year)
-        logger.info(
-            "fetch_spec %s year %d: Phase B — extracting %d strips (%d concurrent)",
-            spec.id, year, n_strips, max_concurrent_strips,
-        )
-
-        # Phase B: extract strips, bounded concurrency
-        strip_results: dict[int, list[Path]] = {}
-        with ThreadPoolExecutor(max_workers=max_concurrent_strips) as extract_pool:
-            ext_futs = {
-                extract_pool.submit(_extract_strip, year, i, bbox): i
-                for i, bbox in enumerate(strips)
-            }
-            for fut in as_completed(ext_futs):
-                i = ext_futs[fut]
-                try:
-                    strip_results[i] = fut.result()
-                except Exception as exc:
-                    logger.error(
-                        "fetch_spec %s year %d strip %d extract failed: %s",
-                        spec.id, year, i, exc, exc_info=exc,
-                    )
-                    strip_results[i] = []
-
-        # Collect per-tile strip parquets (strips are already S2+S1 merged)
-        # Group by tile_id: {tile_id: [strip_0_path, strip_1_path, ...]}
-        tile_strip_paths: dict[str, list[Path]] = {}
-        for i in range(n_strips):
-            for strip_path in strip_results.get(i, []):
-                tile_id = strip_path.name.replace(".parquet", "")
-                tile_strip_paths.setdefault(tile_id, []).append(strip_path)
-
-        # Final merge: N-way merge of sorted strips → one parquet per tile
-        merged_paths: list[Path] = []
-        n_tiles = len(tile_strip_paths)
-        for tile_idx, (tile_id, strip_parquets) in enumerate(sorted(tile_strip_paths.items()), 1):
-            out_path = year_dir / f"{tile_id}.parquet"
-            logger.info(
-                "fetch_spec %s year %d: tile %d/%d — %s",
-                spec.id, year, tile_idx, n_tiles, tile_id,
-            )
-            if len(strip_parquets) == 1:
-                # Only one strip produced data for this tile — rename, no merge needed
-                import shutil
-                shutil.copy2(strip_parquets[0], out_path)
-            else:
-                logger.info(
-                    "fetch_spec %s year %d: merging %d strips → %s",
-                    spec.id, year, len(strip_parquets), out_path.name,
-                )
-                merge_strips(strip_parquets, out_path)
-            merged_paths.append(out_path)
-
-        return year, merged_paths
-
-    # Years themselves are still subject to max_extract_years concurrency cap
-    year_results: dict[int, list[Path]] = {}
-    with ThreadPoolExecutor(max_workers=max_extract_years) as year_pool:
-        year_futs = {year_pool.submit(_process_year, yr): yr for yr in years}
-        for fut in as_completed(year_futs):
-            yr = year_futs[fut]
-            try:
-                _, paths = fut.result()
-                year_results[yr] = paths
-            except Exception as exc:
-                logger.error("fetch_spec %s year %d failed: %s", spec.id, yr, exc, exc_info=exc)
-                year_results[yr] = []
-
-    return year_results

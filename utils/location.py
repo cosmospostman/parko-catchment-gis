@@ -280,30 +280,52 @@ class Location:
                 n_workers=n_workers,
             )
 
-        from utils.fetch_spec import FetchSpec, fetch_spec  # noqa: PLC0415
+        from concurrent.futures import ThreadPoolExecutor, as_completed  # noqa: PLC0415
+        from shapely.geometry import box  # noqa: PLC0415
+        from utils.fetch_spec import _budget_params, _system_memory_gb  # noqa: PLC0415
+        from utils.tile_pipeline import fetch_tile_local  # noqa: PLC0415
+
+        _params      = _budget_params(_system_memory_gb())
+        _max_extract = _params["max_extract_years"]
+        _strip_px    = _params["strip_height_px"] or 1024
+
+        out_dir = _PROJECT_ROOT / "data" / "pixels" / self.id
+        tmp_dir = out_dir / "_local_tmp"
 
         _cal_out: Path | None = None
         if len(self.tile_ids()) > 1:
             _cal_out = _PROJECT_ROOT / "data" / "calibration" / f"{self.id}.parquet"
             _cal_out.parent.mkdir(parents=True, exist_ok=True)
 
-        spec = FetchSpec(
-            id=self.id,
-            bbox=self.bbox,
-            years=years,
-            point_id_prefix="px",
-            geometry=self.geometry,
-            out_dir=_PROJECT_ROOT / "data" / "pixels" / self.id,
-            cache_dir=cache_dir or self.cache_dir(),
-        )
-        year_results = fetch_spec(
-            spec,
-            cloud_max=cloud_max,
-            apply_nbar=apply_nbar,
-            n_workers=n_workers,
-            calibration_out=_cal_out,
-        )
-        return [p for paths in year_results.values() for p in paths]
+        location_geom = self.geometry or box(*self.bbox)
+
+        written: list[Path] = []
+        for tile_id in self.tile_ids():
+            tile_polygon = _tile_polygon(tile_id)
+            tile_geom = tile_polygon.intersection(location_geom) if tile_polygon else location_geom
+            if tile_geom.is_empty:
+                continue
+
+            with ThreadPoolExecutor(max_workers=_max_extract) as pool:
+                futs = {
+                    pool.submit(
+                        fetch_tile_local,
+                        tile_id, year, tile_geom,
+                        out_dir, tmp_dir,
+                        cloud_max=cloud_max,
+                        apply_nbar=apply_nbar,
+                        strip_height_px=_strip_px,
+                        n_workers=n_workers,
+                        calibration_out=_cal_out,
+                    ): year
+                    for year in years
+                }
+                for fut in as_completed(futs):
+                    result = fut.result()
+                    if result is not None:
+                        written.append(result)
+
+        return written
 
     def _fetch_via_proxy(
         self,
@@ -340,6 +362,19 @@ class Location:
             apply_nbar=apply_nbar,
             n_workers=n_workers,
         )
+
+
+# ---------------------------------------------------------------------------
+# Tile geometry helper
+# ---------------------------------------------------------------------------
+
+def _tile_polygon(tile_id: str):
+    """Return the Shapely polygon for an MGRS tile, or None if not found."""
+    from utils.s2_tiles import get_au_tile_grid  # noqa: PLC0415
+    for name, geom in get_au_tile_grid():
+        if name == tile_id:
+            return geom
+    return None
 
 
 # ---------------------------------------------------------------------------

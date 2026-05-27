@@ -33,7 +33,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from proxy._pipeline import write_frame, progress_frame, merge_scenes, compute_strips
+from proxy._pipeline import write_frame, progress_frame
 
 logger = logging.getLogger("proxy.server")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -90,119 +90,61 @@ async def _produce(req: TileRequest) -> AsyncGenerator[bytes, None]:
 
 async def _run_pipeline(req: TileRequest, loop: asyncio.AbstractEventLoop) -> AsyncGenerator[bytes, None]:
     import base64
-    import shutil
+    import queue as _queue
+    import threading as _threading
     from shapely import wkb as shapely_wkb
-    from utils.stac import search_sentinel2
-    from utils.pixel_collector import collect
-    from utils.s1_collector import collect_s1_for_tile
+    from proxy._pipeline import run_tile_pipeline
 
     t_start = time.monotonic()
-
     polygon_geometry = shapely_wkb.loads(base64.b64decode(req.polygon_wkb_b64))
-    bbox_wgs84 = list(polygon_geometry.bounds)
-
-    start_date = f"{req.year}-01-01"
-    end_date   = f"{req.year}-12-31"
-
-    logger.info("[tile %s %d] STAC search ...", req.tile_id, req.year)
-    items = await loop.run_in_executor(None, lambda: search_sentinel2(
-        bbox=bbox_wgs84,
-        start=start_date,
-        end=end_date,
-        cloud_cover_max=req.cloud_max,
-    ))
-    logger.info("[tile %s %d] %d STAC items", req.tile_id, req.year, len(items))
-
-    if not items:
-        return
-
-    strips = await loop.run_in_executor(
-        None, lambda: compute_strips(bbox_wgs84, req.strip_height_px, polygon_geometry)
-    )
-    logger.info("[tile %s %d] %d strips of %d px", req.tile_id, req.year, len(strips), req.strip_height_px)
-
     n_workers = req.n_workers or int(os.environ.get("PROXY_N_WORKERS", "0")) or None
 
     with tempfile.TemporaryDirectory(prefix=f"proxy_{req.tile_id}_{req.year}_") as _tmpdir:
         tmp = Path(_tmpdir)
 
-        for strip in strips:
-            strip_idx  = strip["strip_idx"]
-            strip_bbox = strip["bbox"]
-            strip_pts  = strip["points"]
+        # Run the synchronous generator in a thread so yielded strips can be
+        # streamed back to the client as they complete, not all at once.
+        q: _queue.Queue = _queue.Queue()
 
-            if strip_idx < req.resume_from_strip:
-                logger.info("[strip %04d] skipping (resume_from_strip=%d)", strip_idx, req.resume_from_strip)
-                continue
-
-            t_strip = time.monotonic()
-            scene_dir = tmp / f"strip_{strip_idx:04d}_scenes"
-            scene_dir.mkdir(parents=True, exist_ok=True)
-
-            yield progress_frame(strip_idx, "fetch", time.monotonic() - t_start)
-            logger.info("[strip %04d] fetch+extract %d points, %d items ...", strip_idx, len(strip_pts), len(items))
-
-            scene_paths: list[Path] = []
-            for scene_id, scene_path in await loop.run_in_executor(
-                None,
-                lambda sd=scene_dir, sb=strip_bbox, sp=strip_pts: list(collect(
-                    bbox_wgs84=sb,
-                    start=start_date,
-                    end=end_date,
-                    out_dir=sd,
+        def _run_gen():
+            try:
+                for item in run_tile_pipeline(
+                    tile_id=req.tile_id,
+                    year=req.year,
+                    polygon_geometry=polygon_geometry,
+                    tmp=tmp,
                     cloud_max=req.cloud_max,
                     apply_nbar=req.apply_nbar,
+                    strip_height_px=req.strip_height_px,
                     max_concurrent=req.max_concurrent,
-                    items=items,
-                    geometry=polygon_geometry,
                     n_workers=n_workers,
-                    per_scene=True,
-                    cache_dir=sd / "cache",
-                )),
-            ):
-                scene_paths.append(scene_path)
+                    resume_from_strip=req.resume_from_strip,
+                ):
+                    q.put(item)
+            except Exception as exc:
+                q.put(exc)
+            finally:
+                q.put(None)  # sentinel
 
-            yield progress_frame(strip_idx, "extract", time.monotonic() - t_start)
+        t = _threading.Thread(target=_run_gen, daemon=True)
+        t.start()
 
-            s1_path: Path | None = await loop.run_in_executor(
-                None,
-                lambda sb=strip_bbox, sd=scene_dir, sp=strip_pts: collect_s1_for_tile(
-                    s2_path=None,
-                    bbox_wgs84=sb,
-                    start=start_date,
-                    end=end_date,
-                    out_path=sd / "s1_strip.parquet",
-                    cache_dir=sd / "cache",
-                    max_concurrent=req.max_concurrent,
-                    points=sp,
-                ),
-            )
-
-            yield progress_frame(strip_idx, "merge", time.monotonic() - t_start)
-            strip_out = tmp / f"strip_{strip_idx:04d}_sorted.parquet"
-
-            if not scene_paths:
-                logger.info("[strip %04d] no scene data — skipping", strip_idx)
-                shutil.rmtree(scene_dir, ignore_errors=True)
-                continue
-
-            await loop.run_in_executor(
-                None,
-                lambda sp=scene_paths, s1=s1_path, so=strip_out: merge_scenes(sp, s1, so),
-            )
-
-            shutil.rmtree(scene_dir, ignore_errors=True)
-
+        while True:
+            item = await loop.run_in_executor(None, q.get)
+            if item is None:
+                break
+            if isinstance(item, Exception):
+                raise item
+            strip_idx, strip_path = item
             yield progress_frame(strip_idx, "stream", time.monotonic() - t_start)
-            logger.info("[strip %04d] streaming %s ...", strip_idx, strip_out.name)
+            logger.info("[strip %04d] streaming %s ...", strip_idx, strip_path.name)
+            yield write_frame(0x02, strip_path.read_bytes())
+            strip_path.unlink(missing_ok=True)
 
-            strip_bytes = strip_out.read_bytes()
-            yield write_frame(0x02, strip_bytes)
-            strip_out.unlink(missing_ok=True)
+        t.join()
 
-            logger.info("[strip %04d] done in %.1f s", strip_idx, time.monotonic() - t_strip)
-
-    logger.info("[tile %s %d] all strips complete (%.0f s total)", req.tile_id, req.year, time.monotonic() - t_start)
+    logger.info("[tile %s %d] all strips complete (%.0f s total)",
+                req.tile_id, req.year, time.monotonic() - t_start)
 
 
 # ---------------------------------------------------------------------------
