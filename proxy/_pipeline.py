@@ -284,19 +284,67 @@ def compute_strips(
         if len(lons_arr) == 0:
             continue
 
-        # Global j offset so point_ids are unique across strips.
-        j_offset = round((lower - y0_snap) / r)
-        pids = [f"px_{int(i):04d}_{int(j + j_offset):04d}" for i, j in zip(ii_flat, jj_flat)]
-        strip_points = list(zip(pids, lons_arr.tolist(), lats_arr.tolist()))
-
         strip_bbox = [
             float(lons_arr.min()), float(lats_arr.min()),
             float(lons_arr.max()), float(lats_arr.max()),
         ]
-        strips.append({"strip_idx": strip_idx, "bbox": strip_bbox, "points": strip_points})
+        # Store y_lower so points can be regenerated on demand via make_strip_points().
+        strips.append({"strip_idx": strip_idx, "bbox": strip_bbox, "y_lower": lower})
         strip_idx += 1
 
-    return strips
+    # Stash grid params on the list object so make_strip_points() can regenerate
+    # points for any strip without re-running the full bbox computation.
+    strips_meta = {
+        "utm_crs": utm_crs, "xs": xs, "y0_snap": y0_snap, "y1": y1,
+        "block_m": block_m, "r": r, "polygon_geometry": polygon_geometry,
+    }
+    return strips, strips_meta
+
+
+def make_strip_points(strip: dict, meta: dict) -> list[tuple[str, float, float]]:
+    """Generate points for one strip on demand.  Call just before the strip is needed;
+    discard (del) after use so only one strip's points are in memory at a time.
+    """
+    import numpy as np
+    from pyproj import Transformer
+
+    utm_crs = meta["utm_crs"]
+    xs = meta["xs"]
+    y0_snap = meta["y0_snap"]
+    y1 = meta["y1"]
+    block_m = meta["block_m"]
+    r = meta["r"]
+    polygon_geometry = meta["polygon_geometry"]
+
+    lower = strip["y_lower"]
+    upper = lower + block_m
+    ys = np.arange(lower, upper, r)
+    ys = ys[(ys >= y0_snap) & (ys < y1)]
+
+    to_wgs = Transformer.from_crs(utm_crs, "EPSG:4326", always_xy=True)
+    xx, yy = np.meshgrid(xs, ys, indexing="ij")
+    lons_arr, lats_arr = to_wgs.transform(xx.ravel(), yy.ravel())
+    lons_arr = np.asarray(lons_arr)
+    lats_arr = np.asarray(lats_arr)
+
+    ii, jj = np.meshgrid(np.arange(len(xs)), np.arange(len(ys)), indexing="ij")
+    ii_flat = ii.ravel()
+    jj_flat = jj.ravel()
+
+    if polygon_geometry is not None:
+        from shapely.vectorized import contains as _shp_contains
+        mask = _shp_contains(polygon_geometry, lons_arr, lats_arr)
+        lons_arr = lons_arr[mask]
+        lats_arr = lats_arr[mask]
+        ii_flat = ii_flat[mask]
+        jj_flat = jj_flat[mask]
+
+    if len(lons_arr) == 0:
+        return []
+
+    j_offset = round((lower - y0_snap) / r)
+    pids = [f"px_{int(i):04d}_{int(j + j_offset):04d}" for i, j in zip(ii_flat, jj_flat)]
+    return list(zip(pids, lons_arr.tolist(), lats_arr.tolist()))
 
 
 # ---------------------------------------------------------------------------
@@ -385,7 +433,7 @@ def run_tile_pipeline(
                                tile_id, year, exc)
             break
 
-    strips = compute_strips(
+    strips, strips_meta = compute_strips(
         bbox_wgs84, strip_height_px, polygon_geometry,
         cog_utm_crs=cog_utm_crs, cog_y_top=cog_y_top,
     )
@@ -400,7 +448,7 @@ def run_tile_pipeline(
     # keeps at most one strip prefetching at a time (bounded cache growth).
     from concurrent.futures import ThreadPoolExecutor as _TPE
 
-    def _fetch_strip(strip: dict) -> dict:
+    def _fetch_strip(strip: dict, pts: list) -> dict:
         """Run the fetch-only phase for one strip (S2 + S1); returns the strip dict."""
         s_dir = tmp / f"strip_{strip['strip_idx']:04d}_scenes"
         s_dir.mkdir(parents=True, exist_ok=True)
@@ -431,7 +479,7 @@ def run_tile_pipeline(
             out_path=s_dir / "s1_strip.parquet",
             cache_dir=s_cache,
             max_concurrent=max_concurrent,
-            points=strip["points"],
+            points=pts,
             phases={"fetch"},
         )
         return strip
@@ -448,23 +496,29 @@ def run_tile_pipeline(
         return
 
     with _TPE(max_workers=1) as prefetch_pool:
-        # Kick off the first strip's fetch immediately.
-        fetch_fut = prefetch_pool.submit(_fetch_strip, active_strips[0])
+        # Generate points for the first strip and kick off its fetch immediately.
+        # Points are generated on demand and held only for the current and next strip.
+        next_pts = make_strip_points(active_strips[0], strips_meta)
+        fetch_fut = prefetch_pool.submit(_fetch_strip, active_strips[0], next_pts)
 
         for i, strip in enumerate(active_strips):
             strip_idx = strip["strip_idx"]
             strip_bbox = strip["bbox"]
-            strip_pts  = strip["points"]
+            strip_pts  = next_pts
 
             # Wait for this strip's fetch to complete.
             fetch_fut.result()
             logger.info("[tile %s %d] [strip %04d] fetch done; starting extract (%d pts, %d items)",
                         tile_id, year, strip_idx, len(strip_pts), len(items))
 
-            # Immediately queue the next strip's fetch before we do CPU work.
+            # Generate next strip's points and queue its fetch before CPU work.
+            # Freeing next_pts here releases the current strip's points list.
             next_i = i + 1
             if next_i < len(active_strips):
-                fetch_fut = prefetch_pool.submit(_fetch_strip, active_strips[next_i])
+                next_pts = make_strip_points(active_strips[next_i], strips_meta)
+                fetch_fut = prefetch_pool.submit(_fetch_strip, active_strips[next_i], next_pts)
+            else:
+                next_pts = []
 
             scene_dir   = tmp / f"strip_{strip_idx:04d}_scenes"
             strip_cache = scene_dir / "cache"
