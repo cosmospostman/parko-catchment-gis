@@ -26,6 +26,27 @@ _WRITE_OPTS = dict(
 )
 
 
+def _arrow_to_polars(arrow_type: "pa.DataType") -> "pl.PolarsDataType":
+    """Map a PyArrow type to the equivalent Polars dtype."""
+    import pyarrow as pa
+    _map = {
+        pa.string():  pl.String,
+        pa.float32(): pl.Float32,
+        pa.float64(): pl.Float64,
+        pa.int8():    pl.Int8,
+        pa.int16():   pl.Int16,
+        pa.int32():   pl.Int32,
+        pa.int64():   pl.Int64,
+        pa.uint8():   pl.UInt8,
+        pa.uint16():  pl.UInt16,
+        pa.uint32():  pl.UInt32,
+        pa.uint64():  pl.UInt64,
+        pa.date32():  pl.Date,
+        pa.bool_():   pl.Boolean,
+    }
+    return _map.get(arrow_type, pl.String)
+
+
 # ---------------------------------------------------------------------------
 # Canonical combined S2+S1 schema for VM-facing code paths.
 # Hardcoded so proxy/server.py and collect_s1_for_tile(points=...) have no
@@ -149,12 +170,14 @@ def _kway_merge_parquets(
     Spills to disk automatically if working set exceeds RAM.
     """
     out_col_names = schema.names
+    pl_dtype = {f.name: _arrow_to_polars(f.type) for f in schema}
     str_paths = [str(p) for p in input_paths]
 
     lf = pl.scan_parquet(str_paths, glob=False)
     existing = lf.collect_schema().names()
     exprs = [
-        pl.col(name) if name in existing else pl.lit(None).alias(name)
+        pl.col(name) if name in existing
+        else pl.lit(None, dtype=pl_dtype[name]).alias(name)
         for name in out_col_names
     ]
     lf = (
@@ -218,6 +241,7 @@ def _merge_sorted_parquets(
     )
 
     out_col_names = combined_schema.names
+    pl_dtype = {f.name: _arrow_to_polars(f.type) for f in combined_schema}
 
     def _scan_with_source(path: Path, source_val: str | None) -> pl.LazyFrame:
         lf = pl.scan_parquet(str(path), glob=False)
@@ -229,7 +253,7 @@ def _merge_sorted_parquets(
             elif name in existing:
                 exprs.append(pl.col(name))
             else:
-                exprs.append(pl.lit(None).alias(name))
+                exprs.append(pl.lit(None, dtype=pl_dtype[name]).alias(name))
         return lf.select(exprs)
 
     s2_lf = _scan_with_source(s2_path, "S2" if tag_s2_source else None)

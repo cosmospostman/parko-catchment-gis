@@ -105,7 +105,7 @@ def merge_scenes(
     when the working set exceeds available RAM.  No Python heap, no per-row loops.
     """
     import polars as pl
-    from utils.parquet_utils import COMBINED_PIXEL_SCHEMA
+    from utils.parquet_utils import COMBINED_PIXEL_SCHEMA, _arrow_to_polars
 
     s2_str = [str(p) for p in scene_paths]
     has_s1 = s1_path is not None and s1_path.exists()
@@ -121,6 +121,10 @@ def merge_scenes(
 
     out_col_names = COMBINED_PIXEL_SCHEMA.names
 
+    _pl_dtype = {
+        f.name: _arrow_to_polars(f.type) for f in COMBINED_PIXEL_SCHEMA
+    }
+
     def _scan(paths: list[str], source_val: str | None) -> pl.LazyFrame:
         lf = pl.scan_parquet(paths, glob=False)
         existing = lf.collect_schema().names()
@@ -131,7 +135,7 @@ def merge_scenes(
             elif name in existing:
                 exprs.append(pl.col(name))
             else:
-                exprs.append(pl.lit(None).alias(name))
+                exprs.append(pl.lit(None, dtype=_pl_dtype[name]).alias(name))
         return lf.select(exprs)
 
     frames: list[pl.LazyFrame] = []
