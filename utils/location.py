@@ -197,6 +197,8 @@ class Location:
                 if p.suffix == ".parquet" and not p.stem.startswith("_collect_")
                 and not p.stem.endswith("-by-pixel")
                 and not p.stem.endswith(".coords")
+                and not p.stem.endswith(".s1")
+                and not p.stem.endswith(".s2")
                 and "coords" not in p.stem
             )
             if paths:

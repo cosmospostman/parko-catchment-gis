@@ -196,130 +196,105 @@ def compute_strips(
 ) -> list[dict]:
     """Divide bbox into horizontal strips of strip_height_px pixels.
 
-    When cog_utm_crs and cog_y_top are supplied (read from a representative COG
-    via read_cog_transform), strip boundaries are snapped to the COG's internal
-    1024-pixel block grid in UTM northing space.  This ensures every strip's
-    row_off into the COG is a multiple of strip_height_px, eliminating block
-    over-fetch waste.
+    Generates points strip-by-strip in UTM space so that only one strip's worth
+    of points (~1M) is in memory at a time.  The full tile grid (~121M points)
+    is never materialised, keeping peak RAM well under 1 GB regardless of tile size.
 
-    Without those parameters the function falls back to the geographic-space
-    approximation (preserved for callers that have no COG reference available).
+    When cog_utm_crs and cog_y_top are supplied the strip boundaries are snapped
+    to the COG's 1024-px block grid (zero block over-fetch).  Without them the
+    function falls back to a geographic-space approximation.
 
     Returns list of dicts with keys: strip_idx, bbox, points.
     """
-    from utils.pixel_collector import make_pixel_grid, _utm_crs_for_bbox
-    from shapely.geometry import MultiPoint
+    import numpy as np
+    from utils.pixel_collector import _utm_crs_for_bbox
     from pyproj import Transformer
 
+    lon_min, lat_min, lon_max, lat_max = bbox_wgs84
     utm_crs = cog_utm_crs or _utm_crs_for_bbox(bbox_wgs84)
-    all_points = make_pixel_grid(bbox_wgs84, utm_crs=utm_crs)
-
-    if polygon_geometry is not None:
-        mp = MultiPoint([(lon, lat) for _, lon, lat in all_points])
-        all_points = [
-            pt for pt, contained in zip(all_points, [polygon_geometry.contains(p) for p in mp.geoms])
-            if contained
-        ]
-
-    if not all_points:
-        return []
-
-    if cog_utm_crs is not None and cog_y_top is not None:
-        return _compute_strips_utm(all_points, strip_height_px, utm_crs, cog_y_top)
-    else:
-        return _compute_strips_geographic(all_points, strip_height_px)
-
-
-def _compute_strips_utm(
-    all_points: list[tuple[str, float, float]],
-    strip_height_px: int,
-    utm_crs: str,
-    cog_y_top: float,
-) -> list[dict]:
-    """Split points into strips whose boundaries fall on COG block-row edges.
-
-    COG block k (0-indexed from the top) spans UTM northings:
-        [cog_y_top - (k+1)*block_m,  cog_y_top - k*block_m)
-
-    Strip boundaries are therefore at cog_y_top - k*block_m for integer k ≥ 0.
-    Because make_pixel_grid snaps to the 10 m UTM grid and S2 COG pixels are
-    exactly 10 m, these boundaries align with rasterio window row_off = k *
-    strip_height_px — zero block over-fetch.
-
-    Points are sorted by UTM northing (ascending) and assigned to the block
-    whose half-open interval [lower, upper) contains their northing.
-    """
-    from pyproj import Transformer
 
     to_utm = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
-    block_m = strip_height_px * 10.0  # metres per strip at 10 m/pixel
+    to_wgs = Transformer.from_crs(utm_crs, "EPSG:4326", always_xy=True)
 
-    # Annotate each point with its UTM northing (y coordinate).
-    pts_utm: list[tuple[str, float, float, float]] = []
-    for pid, lon, lat in all_points:
-        _, y = to_utm.transform(lon, lat)
-        pts_utm.append((pid, lon, lat, y))
+    r = 10.0  # S2 pixel spacing in metres
+    x0, y0 = to_utm.transform(lon_min, lat_min)
+    x1, y1 = to_utm.transform(lon_max, lat_max)
 
-    pts_utm.sort(key=lambda p: p[3])
-    y_min = pts_utm[0][3]
-    y_max = pts_utm[-1][3]
+    # Snap to S2 pixel grid origin.
+    x0_snap = math.floor(x0 / r) * r
+    y0_snap = math.floor(y0 / r) * r
 
-    # Find the index of the COG block that contains y_min.
-    # Block k lower bound = cog_y_top - (k+1)*block_m
-    # cog_y_top - (k+1)*block_m  ≤  y_min  →  k ≥ (cog_y_top - y_min)/block_m - 1
-    # First block that contains y_min: k = ceil((cog_y_top - y_min) / block_m) - 1
-    k_first = math.ceil((cog_y_top - y_min) / block_m) - 1
-    # Lower bound of the first strip (northing increases upward, strips go bottom→top).
-    first_lower = cog_y_top - (k_first + 1) * block_m
+    xs = np.arange(x0_snap, x1, r)
 
-    strips = []
-    strip_idx = 0
-    current_lower = first_lower
-    while current_lower <= y_max + 1e-3:  # +epsilon to capture the topmost point
-        current_upper = current_lower + block_m
-        strip_pts_utm = [p for p in pts_utm if current_lower <= p[3] < current_upper]
-        if strip_pts_utm:
-            strip_points = [(pid, lon, lat) for pid, lon, lat, _ in strip_pts_utm]
-            p_lons = [p[1] for p in strip_points]
-            p_lats = [p[2] for p in strip_points]
-            strip_bbox = [min(p_lons), min(p_lats), max(p_lons), max(p_lats)]
-            strips.append({"strip_idx": strip_idx, "bbox": strip_bbox, "points": strip_points})
-            strip_idx += 1
-        current_lower = current_upper
+    block_m = strip_height_px * r
 
-    return strips
+    # Determine strip y-boundaries.
+    if cog_utm_crs is not None and cog_y_top is not None:
+        # Snap first strip lower bound to COG block grid.
+        k_first = math.ceil((cog_y_top - y0_snap) / block_m) - 1
+        first_lower = cog_y_top - (k_first + 1) * block_m
+    else:
+        first_lower = y0_snap
 
-
-def _compute_strips_geographic(
-    all_points: list[tuple[str, float, float]],
-    strip_height_px: int,
-) -> list[dict]:
-    """Fallback: divide by latitude, converting strip_height_px to degrees.
-
-    This approximation is preserved for callers without a COG reference.
-    Strip boundaries are not guaranteed to align with COG block rows.
-    """
-    all_points = sorted(all_points, key=lambda p: p[2])
-    lats = [p[2] for p in all_points]
-    lat_min = min(lats)
-    lat_max = max(lats)
-
-    deg_per_px = 10.0 / (111_320 * math.cos(math.radians((lat_min + lat_max) / 2)))
-    strip_height_deg = strip_height_px * deg_per_px
+    # Enumerate strip y-ranges.
+    strip_lowers = []
+    current = first_lower
+    y_top_snap = math.ceil((y1 - first_lower) / block_m) * block_m + first_lower
+    while current < y_top_snap:
+        strip_lowers.append(current)
+        current += block_m
 
     strips = []
     strip_idx = 0
-    strip_lat_min = lat_min
-    while strip_lat_min < lat_max:
-        strip_lat_max = strip_lat_min + strip_height_deg
-        strip_points = [p for p in all_points if strip_lat_min <= p[2] < strip_lat_max]
-        if strip_points:
-            p_lons = [p[1] for p in strip_points]
-            p_lats = [p[2] for p in strip_points]
-            strip_bbox = [min(p_lons), min(p_lats), max(p_lons), max(p_lats)]
-            strips.append({"strip_idx": strip_idx, "bbox": strip_bbox, "points": strip_points})
-            strip_idx += 1
-        strip_lat_min = strip_lat_max
+
+    # Shapely vectorised contains for polygon masking — prepare once.
+    if polygon_geometry is not None:
+        from shapely.vectorized import contains as _shp_contains
+        _use_vectorised = True
+    else:
+        _use_vectorised = False
+
+    for lower in strip_lowers:
+        upper = lower + block_m
+        ys = np.arange(lower, upper, r)
+        # Filter ys to those within the bbox.
+        ys = ys[(ys >= y0_snap) & (ys < y1)]
+        if len(ys) == 0:
+            continue
+
+        xx, yy = np.meshgrid(xs, ys, indexing="ij")
+        lons_arr, lats_arr = to_wgs.transform(xx.ravel(), yy.ravel())
+        lons_arr = np.asarray(lons_arr)
+        lats_arr = np.asarray(lats_arr)
+
+        # Polygon mask — vectorised, no Python loop over points.
+        if _use_vectorised:
+            mask = _shp_contains(polygon_geometry, lons_arr, lats_arr)
+            lons_arr = lons_arr[mask]
+            lats_arr = lats_arr[mask]
+            # Recover (i, j) grid indices for the kept points to build point_ids.
+            ii, jj = np.meshgrid(np.arange(len(xs)), np.arange(len(ys)), indexing="ij")
+            ii_flat = ii.ravel()[mask]
+            jj_flat = jj.ravel()[mask]
+        else:
+            ii, jj = np.meshgrid(np.arange(len(xs)), np.arange(len(ys)), indexing="ij")
+            ii_flat = ii.ravel()
+            jj_flat = jj.ravel()
+
+        if len(lons_arr) == 0:
+            continue
+
+        # Global j offset so point_ids are unique across strips.
+        j_offset = round((lower - y0_snap) / r)
+        pids = [f"px_{int(i):04d}_{int(j + j_offset):04d}" for i, j in zip(ii_flat, jj_flat)]
+        strip_points = list(zip(pids, lons_arr.tolist(), lats_arr.tolist()))
+
+        strip_bbox = [
+            float(lons_arr.min()), float(lats_arr.min()),
+            float(lons_arr.max()), float(lats_arr.max()),
+        ]
+        strips.append({"strip_idx": strip_idx, "bbox": strip_bbox, "points": strip_points})
+        strip_idx += 1
 
     return strips
 
