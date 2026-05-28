@@ -98,136 +98,70 @@ def merge_scenes(
     s1_path: Path | None,
     out_path: Path,
 ) -> None:
-    """K-way merge of pre-sorted S2 per-scene parquets (+ optional S1) into out_path.
+    """Sort-merge S2 per-scene parquets (+ optional S1) into out_path via Polars streaming.
 
-    Each scene parquet is already sorted by northing (_n extracted from point_id).
-    Streams one row-group at a time through a min-heap; northing values are
-    extracted once per batch via vectorised PyArrow compute and run boundaries
-    are found with np.searchsorted — no per-row Python loops.
-
-    Heap entries: (northing, date_str, cursor_id, row, batch, ns)
-    where ns is the int32 northing array for the full batch.
-    cursor_id breaks all ties before reaching batch/ns.
-    Peak RAM is O(k * row_group_size).
+    Uses Polars' streaming engine (scan_parquet → sort → sink_parquet) which
+    reads files lazily, sorts with native Rust, and spills to disk automatically
+    when the working set exceeds available RAM.  No Python heap, no per-row loops.
     """
-    import heapq
-    import numpy as np
-    import pyarrow as pa
-    import pyarrow.compute as pc
-    import pyarrow.parquet as pq
-    from utils.parquet_utils import COMBINED_PIXEL_SCHEMA, _WRITE_OPTS
+    import polars as pl
+    from utils.parquet_utils import COMBINED_PIXEL_SCHEMA
 
-    out_names = COMBINED_PIXEL_SCHEMA.names
+    s2_str = [str(p) for p in scene_paths]
+    has_s1 = s1_path is not None and s1_path.exists()
 
-    def _cast_and_stamp(tbl: "pa.Table", source: "str | None") -> "pa.Table":
-        cols = {}
-        for field in COMBINED_PIXEL_SCHEMA:
-            if field.name == "source" and source is not None:
-                cols["source"] = pa.repeat(source, len(tbl)).cast(pa.string())
-            elif field.name in tbl.schema.names:
-                arr = tbl.column(field.name)
-                cols[field.name] = arr.cast(field.type, safe=False) if arr.type != field.type else arr
-            else:
-                cols[field.name] = pa.nulls(len(tbl), type=field.type)
-        return pa.table(cols, schema=COMBINED_PIXEL_SCHEMA)
-
-    def _northings_np(tbl: "pa.Table") -> "np.ndarray":
-        parts = pc.split_pattern(
-            tbl.column("point_id"), pattern="_", reverse=True, max_splits=1,
-        )
-        suffix = pc.list_slice(parts, 1, 2).combine_chunks().flatten()
-        return pc.cast(suffix, pa.int32()).to_numpy(zero_copy_only=False)
-
-    all_paths: list[tuple[Path, str | None]] = [(sp, "S2") for sp in scene_paths]
-    if s1_path and s1_path.exists():
-        all_paths.append((s1_path, None))
-
-    if not all_paths:
+    if not s2_str and not has_s1:
         return
 
-    logger.info("merge_scenes: merging %d files → %s", len(all_paths), out_path.name)
+    n_files = len(s2_str) + (1 if has_s1 else 0)
+    logger.info("merge_scenes: merging %d files → %s", n_files, out_path.name)
+
     tmp_path = out_path.with_suffix(".merge_tmp.parquet")
     tmp_path.unlink(missing_ok=True)
 
-    class _FileCursor:
-        __slots__ = ("_pf", "_rg", "_n_rg", "_source", "_cols")
+    out_col_names = COMBINED_PIXEL_SCHEMA.names
 
-        def __init__(self, path: Path, source: "str | None") -> None:
-            self._pf     = pq.ParquetFile(path)
-            self._rg     = 0
-            self._n_rg   = self._pf.metadata.num_row_groups
-            self._source = source
-            file_names   = set(self._pf.schema_arrow.names)
-            self._cols   = [c for c in out_names if c in file_names]
-
-        def next_batch(self) -> "tuple[pa.Table, np.ndarray] | None":
-            while self._rg < self._n_rg:
-                tbl = self._pf.read_row_group(self._rg, columns=self._cols)
-                self._rg += 1
-                tbl = _cast_and_stamp(tbl, self._source)
-                if len(tbl) == 0:
-                    continue
-                return tbl, _northings_np(tbl)
-            return None
-
-    cursors: list[_FileCursor] = []
-    heap: list[tuple] = []
-
-    for path, source in all_paths:
-        cur = _FileCursor(path, source)
-        result = cur.next_batch()
-        if result is None:
-            continue
-        batch, ns = result
-        cid = len(cursors)
-        cursors.append(cur)
-        heapq.heappush(heap, (int(ns[0]), str(batch.column("date")[0].as_py()), cid, 0, batch, ns))
-
-    writer: "pq.ParquetWriter | None" = None
-    try:
-        ROW_GROUP = 250_000
-        out_batches: list["pa.Table"] = []
-        out_rows = 0
-
-        def _flush() -> None:
-            nonlocal out_batches, out_rows, writer
-            if not out_batches:
-                return
-            chunk = pa.concat_tables(out_batches)
-            if writer is None:
-                writer = pq.ParquetWriter(tmp_path, schema=COMBINED_PIXEL_SCHEMA, **_WRITE_OPTS)
-            writer.write_table(chunk)
-            out_batches = []
-            out_rows = 0
-
-        while heap:
-            n, dt, cid, row, batch, ns = heapq.heappop(heap)
-            # Find the run of consecutive rows with the same (northing, date) so we
-            # emit them as a slice rather than one row at a time, while still letting
-            # the heap interleave rows from other files with the same northing/date.
-            end = row + 1
-            batch_len = len(ns)
-            while end < batch_len and ns[end] == n and str(batch.column("date")[end].as_py()) == dt:
-                end += 1
-            out_batches.append(batch.slice(row, end - row))
-            out_rows += end - row
-            if out_rows >= ROW_GROUP:
-                _flush()
-            if end < batch_len:
-                heapq.heappush(heap, (int(ns[end]), str(batch.column("date")[end].as_py()), cid, end, batch, ns))
+    def _scan(paths: list[str], source_val: str | None) -> pl.LazyFrame:
+        lf = pl.scan_parquet(paths, glob=False)
+        existing = lf.collect_schema().names()
+        exprs = []
+        for name in out_col_names:
+            if name == "source" and source_val is not None:
+                exprs.append(pl.lit(source_val).alias("source"))
+            elif name in existing:
+                exprs.append(pl.col(name))
             else:
-                result = cursors[cid].next_batch()
-                if result is not None:
-                    nb, nns = result
-                    heapq.heappush(heap, (int(nns[0]), str(nb.column("date")[0].as_py()), cid, 0, nb, nns))
+                exprs.append(pl.lit(None).alias(name))
+        return lf.select(exprs)
 
-        _flush()
-        logger.info("merge_scenes done: %d input files → %s", len(all_paths), out_path.name)
-    finally:
-        if writer is not None:
-            writer.close()
+    frames: list[pl.LazyFrame] = []
+    if s2_str:
+        frames.append(_scan(s2_str, "S2"))
+    if has_s1:
+        frames.append(_scan([str(s1_path)], None))
+
+    lf = pl.concat(frames) if len(frames) > 1 else frames[0]
+    lf = (
+        lf
+        .with_columns(
+            pl.col("point_id").str.split("_").list.get(-1)
+            .cast(pl.Int32, strict=False).fill_null(0)
+            .alias("_northing")
+        )
+        .sort(["_northing", "date"])
+        .drop("_northing")
+    )
+
+    lf.sink_parquet(
+        tmp_path,
+        compression="zstd",
+        compression_level=3,
+        row_group_size=250_000,
+        statistics=True,
+    )
 
     tmp_path.replace(out_path)
+    logger.info("merge_scenes done: %d input files → %s", n_files, out_path.name)
 
 
 # ---------------------------------------------------------------------------

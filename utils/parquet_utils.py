@@ -142,124 +142,41 @@ def _kway_merge_parquets(
     out_path: Path,
     schema: "pa.Schema",
 ) -> None:
-    """Streaming k-way merge of northing-sorted parquets into out_path.
+    """Sort-merge parquets into out_path by northing via Polars streaming.
 
-    Each input file must be sorted by northing (last '_'-delimited segment of
-    point_id).  Streams one row-group at a time through a min-heap — peak RAM
-    is O(k * row_group_size), constant regardless of total dataset size.
-
-    Northing values are extracted once per row-group via vectorised NumPy string
-    ops; run-end finding uses np.searchsorted — no per-row Python loops.
-
-    Heap entries: (northing: int, date_str: str, cursor_id: int,
-                   row: int, batch: pa.Table, ns: np.ndarray)
-    ns is the int32 northing array for the full batch, computed once on load.
-    cursor_id breaks ties before reaching batch/ns, so no Arrow comparison occurs.
+    Uses Polars' streaming engine (scan_parquet → sort → sink_parquet).
+    Handles mixed schemas by null-filling columns absent in any input file.
+    Spills to disk automatically if working set exceeds RAM.
     """
-    import heapq
-    import numpy as np
-    import pyarrow as pa
-    import pyarrow.parquet as pq
+    out_col_names = schema.names
+    str_paths = [str(p) for p in input_paths]
 
-    out_names = schema.names
-
-    def _cast(tbl: "pa.Table") -> "pa.Table":
-        cols = {}
-        for field in schema:
-            if field.name in tbl.schema.names:
-                arr = tbl.column(field.name)
-                cols[field.name] = arr.cast(field.type, safe=False) if arr.type != field.type else arr
-            else:
-                cols[field.name] = pa.nulls(len(tbl), type=field.type)
-        return pa.table(cols, schema=schema)
-
-    def _northings_np(tbl: "pa.Table") -> "np.ndarray":
-        # Extract the last '_'-delimited segment of every point_id as an int32
-        # NumPy array — fully vectorised, no Python loop over rows.
-        import pyarrow.compute as pc
-        # split_pattern(reverse=True, max_splits=1) on "px_0003" → ["px", "0003"]
-        parts = pc.split_pattern(
-            tbl.column("point_id"), pattern="_", reverse=True, max_splits=1,
+    lf = pl.scan_parquet(str_paths, glob=False)
+    existing = lf.collect_schema().names()
+    exprs = [
+        pl.col(name) if name in existing else pl.lit(None).alias(name)
+        for name in out_col_names
+    ]
+    lf = (
+        lf.select(exprs)
+        .with_columns(
+            pl.col("point_id").str.split("_").list.get(-1)
+            .cast(pl.Int32, strict=False).fill_null(0)
+            .alias("_northing")
         )
-        # list_slice([1,2)) extracts the last segment (the northing number).
-        suffix = pc.list_slice(parts, 1, 2).combine_chunks().flatten()
-        return pc.cast(suffix, pa.int32()).to_numpy(zero_copy_only=False)
-
-    class _Cursor:
-        __slots__ = ("_pf", "_rg", "_n_rg", "_cols")
-        def __init__(self, path: Path) -> None:
-            self._pf   = pq.ParquetFile(path)
-            self._rg   = 0
-            self._n_rg = self._pf.metadata.num_row_groups
-            file_names = set(self._pf.schema_arrow.names)
-            self._cols = [c for c in out_names if c in file_names]
-        def next_batch(self) -> "tuple[pa.Table, np.ndarray] | None":
-            while self._rg < self._n_rg:
-                tbl = self._pf.read_row_group(self._rg, columns=self._cols)
-                self._rg += 1
-                tbl = _cast(tbl)
-                if len(tbl) == 0:
-                    continue
-                ns = _northings_np(tbl)
-                return tbl, ns
-            return None
-
-    heap: list[tuple] = []
-    cursors: list[_Cursor] = []
-    for path in input_paths:
-        cur = _Cursor(path)
-        result = cur.next_batch()
-        if result is None:
-            continue
-        batch, ns = result
-        cid = len(cursors)
-        cursors.append(cur)
-        heapq.heappush(heap, (int(ns[0]), str(batch.column("date")[0].as_py()), cid, 0, batch, ns))
+        .sort(["_northing", "date"])
+        .drop("_northing")
+    )
 
     tmp_path = out_path.with_suffix(".kmerge_tmp.parquet")
     tmp_path.unlink(missing_ok=True)
-
-    ROW_GROUP = 250_000
-    out_batches: list["pa.Table"] = []
-    out_rows = 0
-    writer: "pq.ParquetWriter | None" = None
-
-    try:
-        def _flush() -> None:
-            nonlocal out_batches, out_rows, writer
-            if not out_batches:
-                return
-            chunk = pa.concat_tables(out_batches)
-            if writer is None:
-                writer = pq.ParquetWriter(tmp_path, schema=schema, **_WRITE_OPTS)
-            writer.write_table(chunk)
-            out_batches = []
-            out_rows = 0
-
-        while heap:
-            n, dt, cid, row, batch, ns = heapq.heappop(heap)
-            # Find end of current northing run via binary search — O(log batch_size).
-            # Slice from `row` so the search is within the unprocessed suffix.
-            end = row + int(np.searchsorted(ns[row:], n + 1, side="left"))
-            out_batches.append(batch.slice(row, end - row))
-            out_rows += end - row
-            if out_rows >= ROW_GROUP:
-                _flush()
-            if end < len(ns):
-                next_n = int(ns[end])
-                next_dt = str(batch.column("date")[end].as_py())
-                heapq.heappush(heap, (next_n, next_dt, cid, end, batch, ns))
-            else:
-                result = cursors[cid].next_batch()
-                if result is not None:
-                    nb, nns = result
-                    heapq.heappush(heap, (int(nns[0]), str(nb.column("date")[0].as_py()), cid, 0, nb, nns))
-
-        _flush()
-    finally:
-        if writer is not None:
-            writer.close()
-
+    lf.sink_parquet(
+        tmp_path,
+        compression="zstd",
+        compression_level=3,
+        row_group_size=250_000,
+        statistics=True,
+    )
     tmp_path.replace(out_path)
 
 
@@ -290,47 +207,54 @@ def _merge_sorted_parquets(
     tag_s2_source: bool = False,
     memory_limit_gb: int = 16,
 ) -> None:
-    """2-way k-merge of northing-sorted S2 and S1 parquets into out_path.
-
-    Both inputs are already northing-sorted, so this is a streaming merge —
-    no full sort needed.  Peak RAM is O(one row-group each).
-    """
-    import pyarrow as pa
+    """2-way sort-merge of S2 and S1 parquets into out_path via Polars streaming."""
     import pyarrow.parquet as pq
 
     s2_rows = pq.ParquetFile(s2_path).metadata.num_rows
     s1_rows = pq.ParquetFile(s1_path).metadata.num_rows
     logger.info(
-        "merge_tile: k-merging %s (%s S2 rows + %s S1 rows) ...",
+        "merge_tile: merging %s (%s S2 rows + %s S1 rows) ...",
         out_path.name, f"{s2_rows:,}", f"{s1_rows:,}",
     )
 
-    if tag_s2_source:
-        # Write a source-tagged copy of S2 into a sibling tmp, then k-merge.
-        s2_tagged = out_path.with_suffix(".s2_tagged_tmp.parquet")
-        s2_tagged.unlink(missing_ok=True)
-        try:
-            pf = pq.ParquetFile(s2_path)
-            s2_schema = pf.schema_arrow
-            if "source" not in s2_schema.names:
-                s2_schema = s2_schema.append(pa.field("source", pa.string()))
-            w = pq.ParquetWriter(s2_tagged, s2_schema, **_WRITE_OPTS)
-            try:
-                for rg in range(pf.metadata.num_row_groups):
-                    blk = pf.read_row_group(rg)
-                    src_col = pa.repeat("S2", len(blk))
-                    if "source" in blk.schema.names:
-                        blk = blk.set_column(blk.schema.get_field_index("source"), "source", src_col)
-                    else:
-                        blk = blk.append_column(pa.field("source", pa.string()), src_col)
-                    w.write_table(_conform_table(blk, s2_schema))
-            finally:
-                w.close()
-            _kway_merge_parquets([s2_tagged, s1_path], out_path, combined_schema)
-        finally:
-            s2_tagged.unlink(missing_ok=True)
-    else:
-        _kway_merge_parquets([s2_path, s1_path], out_path, combined_schema)
+    out_col_names = combined_schema.names
+
+    def _scan_with_source(path: Path, source_val: str | None) -> pl.LazyFrame:
+        lf = pl.scan_parquet(str(path), glob=False)
+        existing = lf.collect_schema().names()
+        exprs = []
+        for name in out_col_names:
+            if name == "source" and source_val is not None:
+                exprs.append(pl.lit(source_val).alias("source"))
+            elif name in existing:
+                exprs.append(pl.col(name))
+            else:
+                exprs.append(pl.lit(None).alias(name))
+        return lf.select(exprs)
+
+    s2_lf = _scan_with_source(s2_path, "S2" if tag_s2_source else None)
+    s1_lf = _scan_with_source(s1_path, None)
+
+    tmp_path = out_path.with_suffix(".kmerge_tmp.parquet")
+    tmp_path.unlink(missing_ok=True)
+    (
+        pl.concat([s2_lf, s1_lf])
+        .with_columns(
+            pl.col("point_id").str.split("_").list.get(-1)
+            .cast(pl.Int32, strict=False).fill_null(0)
+            .alias("_northing")
+        )
+        .sort(["_northing", "date"])
+        .drop("_northing")
+        .sink_parquet(
+            tmp_path,
+            compression="zstd",
+            compression_level=3,
+            row_group_size=250_000,
+            statistics=True,
+        )
+    )
+    tmp_path.replace(out_path)
 
 
 def merge_strips(
