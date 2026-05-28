@@ -215,6 +215,7 @@ def _sort_s1_shards(
     sequential concat produces a sorted output without any sort step.
     Streams one shard at a time to avoid loading all 136 shards into RAM.
     """
+    import pyarrow as pa
     import pyarrow.parquet as pq
 
     _log = logging.getLogger(__name__)

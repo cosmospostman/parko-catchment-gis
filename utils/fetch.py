@@ -328,7 +328,7 @@ async def fetch_patches(
             nonlocal scl_done
             result = await (fetch_one_patch(item, SCL_BAND, scl_asset_key) if scl_asset_key else _none())
             scl_done += 1
-            logger.info("  %s chips  fetch %d/%d patches done", sensor_label, scl_done, n_scl)
+            logger.debug("  %s chips  fetch %d/%d patches done", sensor_label, scl_done, n_scl)
             return result
 
         scl_results = await asyncio.gather(*[
@@ -375,7 +375,7 @@ async def fetch_patches(
         completed += 1
         if data is not None and _accumulate:
             result[(item_id, band)] = data
-        logger.info("  %s chips  fetch %d/%d patches done", sensor_label, completed, n_spectral)
+        logger.debug("  %s chips  fetch %d/%d patches done", sensor_label, completed, n_spectral)
 
     await asyncio.gather(*[tracked(item_id, band, t) for item_id, band, t in spectral_tasks])
 

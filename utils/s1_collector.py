@@ -434,6 +434,11 @@ def _collect_s1_shards(
 
     for shard_idx in range(n_shards):
         shard_points = points[shard_idx * point_shard_size : (shard_idx + 1) * point_shard_size]
+        shard_path = out_dir / f"shard_{shard_idx:04d}.parquet"
+        if shard_path.exists():
+            logger.info("S1: shard %d/%d — cached, skipping", shard_idx + 1, n_shards)
+            shard_paths.append(shard_path)
+            continue
         if use_sharding:
             logger.info("S1: shard %d/%d — %d points", shard_idx + 1, n_shards, len(shard_points))
 
@@ -473,7 +478,6 @@ def _collect_s1_shards(
             bands=_S1_BANDS,
         )
 
-        shard_path = out_dir / f"shard_{shard_idx:04d}.parquet"
         writer = pq.ParquetWriter(shard_path, _ARROW_SCHEMA, compression="none", write_statistics=False)
         total_rows = 0
         log_interval = max(1, len(items) // 10)
