@@ -179,6 +179,7 @@ def get_item_angles(
     lats: np.ndarray,
     utm_crs: str,
     bands: list[str],
+    utm_xy: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> dict[str, dict[str, np.ndarray]] | None:
     """Return per-band angle arrays interpolated to (lon, lat) pixel positions.
 
@@ -188,6 +189,8 @@ def get_item_angles(
     lons, lats: WGS84 coordinates, shape (N,)
     utm_crs   : UTM CRS of the tile, e.g. "EPSG:32754"
     bands     : list of S2 band names, e.g. ["B04", "B05", "B07"]
+    utm_xy    : optional pre-computed (easting, northing) arrays in utm_crs.
+                When supplied the Transformer.transform() call is skipped.
 
     Returns
     -------
@@ -211,9 +214,12 @@ def get_item_angles(
     grid_eastings  = ul_e + np.arange(_GRID_SIZE) * _GRID_STEP_M
     grid_northings = ul_n - np.arange(_GRID_SIZE) * _GRID_STEP_M  # N decreases southward
 
-    # Convert pixel lon/lat → UTM
-    to_utm = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
-    px_e, px_n = to_utm.transform(lons, lats)
+    # Convert pixel lon/lat → UTM (skip if caller pre-computed)
+    if utm_xy is not None:
+        px_e, px_n = utm_xy
+    else:
+        to_utm = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
+        px_e, px_n = to_utm.transform(lons, lats)
 
     # Clip query points to the grid extent (avoids extrapolation errors on edge pixels)
     px_e_clipped = np.clip(px_e, grid_eastings[0],  grid_eastings[-1])
@@ -253,3 +259,25 @@ def get_item_angles(
         result[band] = {"sza": sza_all, "vza": vza, "saa": saa_all, "vaa": vaa}
 
     return result
+
+
+def prefetch_granule_xmls(items, max_workers: int = 8) -> None:
+    """Eagerly fetch and cache granule_metadata XMLs for a list of STAC items.
+
+    Fires concurrent HTTP requests so that subsequent get_item_angles() calls
+    find the results already in _xml_cache and skip the network round-trip.
+    Safe to call from any thread; _fetch_and_parse_xml is internally serialised
+    per item_id via _xml_cache_lock.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _warm(item):
+        asset = item.assets.get("granule_metadata")
+        if asset is None:
+            return
+        _fetch_and_parse_xml(item.id, asset.href)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futs = [pool.submit(_warm, item) for item in items]
+        for fut in as_completed(futs):
+            fut.result()  # surface exceptions via logger inside _fetch_and_parse_xml

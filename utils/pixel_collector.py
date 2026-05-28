@@ -177,6 +177,7 @@ def _extract_item_from_tiffs(
     lats: np.ndarray,
     apply_nbar: bool = True,
     utm_crs: str = "EPSG:32755",
+    utm_xy: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> pl.DataFrame | None:
     """Extract all usable pixels for one STAC item from on-disk GeoTIFF patches.
 
@@ -293,7 +294,7 @@ def _extract_item_from_tiffs(
     if apply_nbar:
         from utils.granule_angles import get_item_angles
         from utils.nbar import c_factor as compute_cf
-        angles = get_item_angles(item, lons, lats, utm_crs=utm_crs, bands=list(BANDS))
+        angles = get_item_angles(item, lons, lats, utm_crs=utm_crs, bands=list(BANDS), utm_xy=utm_xy)
         if angles is not None:
             for band in BANDS:
                 if band not in angles or band_arrays[band] is None:

@@ -195,10 +195,10 @@ def _kway_merge_parquets(
     tmp_path.unlink(missing_ok=True)
     lf.sink_parquet(
         tmp_path,
-        compression="zstd",
-        compression_level=3,
+        compression="uncompressed",
         row_group_size=250_000,
-        statistics=True,
+        statistics=False,
+        engine="streaming",
     )
     tmp_path.replace(out_path)
 
@@ -272,10 +272,10 @@ def _merge_sorted_parquets(
         .drop("_northing")
         .sink_parquet(
             tmp_path,
-            compression="zstd",
-            compression_level=3,
+            compression="uncompressed",
             row_group_size=250_000,
-            statistics=True,
+            statistics=False,
+            engine="streaming",
         )
     )
     tmp_path.replace(out_path)

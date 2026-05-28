@@ -474,7 +474,7 @@ def _collect_s1_shards(
         )
 
         shard_path = out_dir / f"shard_{shard_idx:04d}.parquet"
-        writer = pq.ParquetWriter(shard_path, _ARROW_SCHEMA)
+        writer = pq.ParquetWriter(shard_path, _ARROW_SCHEMA, compression="none", write_statistics=False)
         total_rows = 0
         log_interval = max(1, len(items) // 10)
 
