@@ -161,11 +161,10 @@ def merge_scenes(
             ROW_GROUP_SIZE 5000000
         )
     """
-    con = duckdb.connect()
+    con = duckdb.connect(config={"temp_directory": tmp_dir, "memory_limit": f"{mem_gb}GB"})
     try:
-        con.execute(f"SET memory_limit = '{mem_gb}GB'")
-        con.execute(f"SET temp_directory = '{tmp_dir}'")
         con.execute(f"SET threads = {n_threads}")
+        con.execute("SET preserve_insertion_order = false")
         con.execute(sql)
     finally:
         con.close()
