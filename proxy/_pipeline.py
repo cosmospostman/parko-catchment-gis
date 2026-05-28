@@ -204,6 +204,7 @@ def merge_scenes(
                     use_dictionary=["point_id", "item_id", "tile_id"],
                 )
             writer.write_table(tbl)
+            del tbl
     finally:
         if writer is not None:
             writer.close()
@@ -812,12 +813,22 @@ def run_tile_pipeline_v2(
                             strip_idx, item_idx + 1, n_items, scene_id)
                 return None
 
-            tbl = df.select(col_order).to_arrow()
-            tbl = _optimise_schema(tbl)
-            tbl_pl = pl.from_arrow(tbl).with_columns(
-                pl.col("point_id").str.extract(r"_(\d+)$", 1).cast(pl.Int32).alias("_northing")
-            ).sort("_northing").drop("_northing")
-            tbl_sorted = tbl_pl.to_arrow().cast(tbl.schema)
+            tbl = _optimise_schema(df.select(col_order).to_arrow())
+            del df
+            schema = tbl.schema
+            # Convert to Polars for sort, then immediately release the Arrow source.
+            tbl_pl = pl.from_arrow(tbl); del tbl
+            tbl_sorted = (
+                tbl_pl
+                .with_columns(
+                    pl.col("point_id").str.extract(r"_(\d+)$", 1).cast(pl.Int32).alias("_northing")
+                )
+                .sort("_northing")
+                .drop("_northing")
+                .to_arrow()
+                .cast(schema)
+            )
+            del tbl_pl
 
             tmp_path = out_path.with_suffix(".tmp.parquet")
             tmp_path.unlink(missing_ok=True)
@@ -872,13 +883,6 @@ def run_tile_pipeline_v2(
                 logger.info("[v2 tile %s %d] [strip %04d] Pool A done; starting Pool B (%d pts, %d items)",
                             tile_id, year, strip_idx, len(strip_pts), len(items))
 
-                # Submit Pool A for the next strip so the network stays busy.
-                next_k = i + prefetch_depth
-                if next_k < len(active_strips):
-                    pts = make_strip_points(active_strips[next_k], strips_meta)
-                    pts_queue.append(pts)
-                    fetch_futs.append(prefetch_pool.submit(_fetch_strip_to_tiff, active_strips[next_k]))
-
                 # Pool B: extract all items from tiffs → scene parquets
                 scene_paths = _extract_strip(strip, tiff_dir, strip_pts)
 
@@ -889,6 +893,12 @@ def run_tile_pipeline_v2(
                 if not scene_paths:
                     logger.info("[v2 tile %s %d] [strip %04d] no scene data — skipping",
                                 tile_id, year, strip_idx)
+                    # No merge needed — safe to start next prefetch now.
+                    next_k = i + prefetch_depth
+                    if next_k < len(active_strips):
+                        pts = make_strip_points(active_strips[next_k], strips_meta)
+                        pts_queue.append(pts)
+                        fetch_futs.append(prefetch_pool.submit(_fetch_strip_to_tiff, active_strips[next_k]))
                     continue
 
                 # S1 extraction
@@ -908,6 +918,13 @@ def run_tile_pipeline_v2(
                 merge_scenes(scene_paths, s1_path, strip_out)
 
                 shutil.rmtree(scene_dir, ignore_errors=True)
+
+                # merge_scenes is done — memory is free, safe to start next prefetch.
+                next_k = i + prefetch_depth
+                if next_k < len(active_strips):
+                    pts = make_strip_points(active_strips[next_k], strips_meta)
+                    pts_queue.append(pts)
+                    fetch_futs.append(prefetch_pool.submit(_fetch_strip_to_tiff, active_strips[next_k]))
 
                 logger.info("[v2 tile %s %d] [strip %04d] ready → %s",
                             tile_id, year, strip_idx, strip_out.name)
