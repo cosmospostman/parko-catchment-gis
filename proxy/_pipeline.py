@@ -98,74 +98,119 @@ def merge_scenes(
     s1_path: Path | None,
     out_path: Path,
 ) -> None:
-    """Sort-merge S2 per-scene parquets (+ optional S1) into out_path via Polars streaming.
+    """K-way merge of pre-sorted S2 per-scene parquets (+ optional S1) into out_path.
 
-    Uses Polars' streaming engine (scan_parquet → sort → sink_parquet) which
-    reads files lazily, sorts with native Rust, and spills to disk automatically
-    when the working set exceeds available RAM.  No Python heap, no per-row loops.
+    Each scene parquet is already sorted by northing (last segment of point_id).
+    Streams one row-group at a time through a min-heap — peak RAM is
+    O(k * row_group_size).  Row groups are capped at 250k rows on write so
+    82 cursors × 250k rows × ~24 bytes ≈ 500 MB, safe on 16 GB machines.
     """
-    import polars as pl
-    from utils.parquet_utils import COMBINED_PIXEL_SCHEMA, _arrow_to_polars
+    import heapq
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from utils.parquet_utils import COMBINED_PIXEL_SCHEMA, _WRITE_OPTS
 
-    s2_str = [str(p) for p in scene_paths]
-    has_s1 = s1_path is not None and s1_path.exists()
+    schema = COMBINED_PIXEL_SCHEMA
+    out_names = schema.names
 
-    if not s2_str and not has_s1:
+    all_paths: list[tuple[Path, str | None]] = [(sp, "S2") for sp in scene_paths]
+    if s1_path and s1_path.exists():
+        all_paths.append((s1_path, None))
+
+    if not all_paths:
         return
 
-    n_files = len(s2_str) + (1 if has_s1 else 0)
+    n_files = len(all_paths)
     logger.info("merge_scenes: merging %d files → %s", n_files, out_path.name)
-
     tmp_path = out_path.with_suffix(".merge_tmp.parquet")
     tmp_path.unlink(missing_ok=True)
 
-    out_col_names = COMBINED_PIXEL_SCHEMA.names
-
-    _pl_dtype = {
-        f.name: _arrow_to_polars(f.type) for f in COMBINED_PIXEL_SCHEMA
-    }
-
-    def _scan(paths: list[str], source_val: str | None) -> pl.LazyFrame:
-        lf = pl.scan_parquet(paths, glob=False)
-        existing = lf.collect_schema().names()
-        exprs = []
-        for name in out_col_names:
-            if name == "source" and source_val is not None:
-                exprs.append(pl.lit(source_val).alias("source"))
-            elif name in existing:
-                exprs.append(pl.col(name))
+    def _cast_and_stamp(tbl: "pa.Table", source: "str | None") -> "pa.Table":
+        cols = {}
+        for field in schema:
+            if field.name == "source" and source is not None:
+                cols["source"] = pa.repeat(source, len(tbl)).cast(pa.string())
+            elif field.name in tbl.schema.names:
+                arr = tbl.column(field.name)
+                cols[field.name] = arr.cast(field.type, safe=False) if arr.type != field.type else arr
             else:
-                exprs.append(pl.lit(None, dtype=_pl_dtype[name]).alias(name))
-        return lf.select(exprs)
+                cols[field.name] = pa.nulls(len(tbl), type=field.type)
+        return pa.table(cols, schema=schema)
 
-    frames: list[pl.LazyFrame] = []
-    if s2_str:
-        frames.append(_scan(s2_str, "S2"))
-    if has_s1:
-        frames.append(_scan([str(s1_path)], None))
+    def _northings(tbl: "pa.Table") -> "np.ndarray":
+        import pyarrow.compute as pc
+        parts = pc.split_pattern(tbl.column("point_id"), pattern="_", reverse=True, max_splits=1)
+        suffix = pc.list_slice(parts, 1, 2).combine_chunks().flatten()
+        return pc.cast(suffix, pa.int32()).to_numpy(zero_copy_only=False)
 
-    lf = pl.concat(frames) if len(frames) > 1 else frames[0]
-    lf = (
-        lf
-        .with_columns(
-            pl.col("point_id").str.split("_").list.get(-1)
-            .cast(pl.Int32, strict=False).fill_null(0)
-            .alias("_northing")
-        )
-        .sort(["_northing", "date"])
-        .drop("_northing")
-    )
+    class _Cursor:
+        __slots__ = ("_pf", "_rg", "_n_rg", "_source", "_cols")
+        def __init__(self, path: Path, source: "str | None") -> None:
+            self._pf     = pq.ParquetFile(path)
+            self._rg     = 0
+            self._n_rg   = self._pf.metadata.num_row_groups
+            self._source = source
+            file_names   = set(self._pf.schema_arrow.names)
+            self._cols   = [c for c in out_names if c in file_names]
+        def next_batch(self) -> "tuple[pa.Table, np.ndarray] | None":
+            while self._rg < self._n_rg:
+                tbl = self._pf.read_row_group(self._rg, columns=self._cols)
+                self._rg += 1
+                tbl = _cast_and_stamp(tbl, self._source)
+                if len(tbl):
+                    return tbl, _northings(tbl)
+            return None
 
-    lf.sink_parquet(
-        tmp_path,
-        compression="zstd",
-        compression_level=3,
-        row_group_size=250_000,
-        statistics=True,
-    )
+    cursors: list[_Cursor] = []
+    heap: list[tuple] = []
+    for path, source in all_paths:
+        cur = _Cursor(path, source)
+        result = cur.next_batch()
+        if result is None:
+            continue
+        batch, ns = result
+        cid = len(cursors)
+        cursors.append(cur)
+        heapq.heappush(heap, (int(ns[0]), str(batch.column("date")[0].as_py()), cid, 0, batch, ns))
+
+    ROW_GROUP = 250_000
+    out_batches: list["pa.Table"] = []
+    out_rows = 0
+    writer: "pq.ParquetWriter | None" = None
+
+    def _flush() -> None:
+        nonlocal out_batches, out_rows, writer
+        if not out_batches:
+            return
+        if writer is None:
+            writer = pq.ParquetWriter(tmp_path, schema=schema, **_WRITE_OPTS)
+        writer.write_table(pa.concat_tables(out_batches))
+        out_batches.clear()
+        out_rows = 0
+
+    try:
+        while heap:
+            n, dt, cid, row, batch, ns = heapq.heappop(heap)
+            end = row + int(np.searchsorted(ns[row:], n + 1, side="left"))
+            out_batches.append(batch.slice(row, end - row))
+            out_rows += end - row
+            if out_rows >= ROW_GROUP:
+                _flush()
+            if end < len(ns):
+                heapq.heappush(heap, (int(ns[end]), str(batch.column("date")[end].as_py()), cid, end, batch, ns))
+            else:
+                result = cursors[cid].next_batch()
+                if result is not None:
+                    nb, nns = result
+                    heapq.heappush(heap, (int(nns[0]), str(nb.column("date")[0].as_py()), cid, 0, nb, nns))
+        _flush()
+        logger.info("merge_scenes done: %d input files → %s", n_files, out_path.name)
+    finally:
+        if writer is not None:
+            writer.close()
 
     tmp_path.replace(out_path)
-    logger.info("merge_scenes done: %d input files → %s", n_files, out_path.name)
 
 
 # ---------------------------------------------------------------------------
@@ -780,7 +825,7 @@ def run_tile_pipeline_v2(
             # A single scene can have 6 M+ rows; without this cap the cursor
             # loads the whole scene into RAM on first next_batch(), and with
             # 82 concurrent cursors in the heap that exhausts 16 GB.
-            _RG = 250_000
+            _RG = 50_000
             for off in range(0, max(len(tbl), 1), _RG):
                 writer.write_table(tbl.slice(off, _RG))
             writer.close()

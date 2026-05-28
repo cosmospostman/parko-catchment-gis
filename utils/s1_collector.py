@@ -485,7 +485,7 @@ def _collect_s1_shards(
         buf_vh:    list = []
         buf_vv:    list = []
         buf_orbit: list = []
-        _FLUSH_ROWS = max(10_000, min(200_000, len(shard_points) * 10))
+        _FLUSH_ROWS = 50_000
 
         def _flush() -> None:
             if not buf_pid:
