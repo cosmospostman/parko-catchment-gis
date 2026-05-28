@@ -1,0 +1,46 @@
+# CPU-only requirements — fetch pipeline, scoring, non-GPU inference.
+# GPU deps (torch, flash-attn-4) must be installed separately on CUDA machines:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+#   pip install "https://github.com/Dao-AILab/flash-attention/releases/download/fa4-v4.0.0.beta4/flash_attn_4-4.0.0b4-py3-none-any.whl"
+
+# Core geospatial
+rioxarray>=0.15,<0.17
+scipy>=1.12,<2
+pysheds>=0.4,<1
+xarray>=2024.1,<2026
+numpy>=2.0,<3
+shapely>=2.0,<3
+pyproj>=3.6,<4
+
+# Raster I/O
+rasterio==1.4.4
+
+# EO data loading
+sarsen>=0.9,<1
+stackstac>=0.5,<0.6
+odc-stac>=0.3,<0.4
+odc-geo>=0.4,<0.5
+pystac-client>=0.7,<0.9
+
+# Machine learning
+scikit-learn>=1.4,<2
+
+# Parallel computation
+dask[array,distributed]>=2024.1,<2024.10
+polars>=1.0,<2
+pyarrow>=15,<25
+duckdb>=1.0,<2
+adlfs>=2024.2
+
+# setuptools is required at runtime by stackstac (pkg_resources)
+setuptools>=69,<81
+
+# HTTP
+requests>=2.31,<3
+httpx>=0.27,<1
+
+# Visualization
+matplotlib>=3.8,<4
+
+# Configuration
+pyyaml>=6.0,<7

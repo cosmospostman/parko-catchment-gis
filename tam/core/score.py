@@ -950,7 +950,7 @@ def score_pixels_chunked(
     batch_size: int = 4096,
     buffer_row_groups: int = 4,
     target_chunk_rows: int = 131_072,
-    n_prep_workers: int = 4,
+    n_prep_workers: int = 5,
     device: str | None = None,
     tile_id: str | None = None,
     end_year: int | None = None,
@@ -996,8 +996,8 @@ def score_pixels_chunked(
     from tam.core._preprocess_numba import warmup as _numba_warmup
 
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    pin = device.startswith("cuda") and torch.cuda.is_available()
-    if pin:
+    pin = False  # pin_memory cost (325ms first alloc) far exceeds H2D transfer savings
+    if device.startswith("cuda") and torch.cuda.is_available():
         torch.set_float32_matmul_precision("high")  # TF32: ~2× attention throughput on Ampere+
     model.to(device)
     model.eval()
@@ -1075,27 +1075,19 @@ def score_pixels_chunked(
 
     # --- Stage 1b: parser thread — date extraction, year filter, sub-division ---
     def _reader() -> None:
-        leftover: pl.DataFrame = pl.DataFrame()
+        # Accumulate row groups until target_chunk_rows before emitting to prep workers.
+        # Date extraction uses PyArrow compute (dt.year/day_of_year) — 80× faster than
+        # the old cast(Datetime("us")) path for the Date-typed column in these parquets.
+        import pyarrow as _pa
+        import pyarrow.compute as _pac
 
-        def _emit_chunk(chunk: pl.DataFrame, is_last: bool) -> None:
-            """Prepend leftover, sub-divide on point_id boundaries, put slices on raw_q."""
-            nonlocal leftover
-            if not leftover.is_empty():
-                chunk = pl.concat([leftover, chunk])
+        accum: list[pl.DataFrame] = []
+        accum_rows = 0
 
-            if not is_last:
-                # Hold back the last (partial) pixel so it merges with the next rg.
-                boundary_pid = chunk["point_id"][-1]
-                leftover = chunk.filter(pl.col("point_id") == boundary_pid)
-                chunk   = chunk.filter(pl.col("point_id") != boundary_pid)
-            else:
-                leftover = pl.DataFrame()
-
+        def _emit_raw(chunk: pl.DataFrame) -> None:
+            """Sub-divide chunk on point_id boundaries and put _RawChunk on raw_q."""
             if chunk.is_empty():
                 return
-
-            # Sub-divide into target_chunk_rows-sized slices on point_id boundaries,
-            # then extract numpy arrays here (parser thread) so prep workers are GIL-free.
             pid_np = chunk["point_id"].to_numpy()
             n = len(pid_np)
             start = 0
@@ -1125,51 +1117,59 @@ def score_pixels_chunked(
                     raw_q.put(raw)
                 start = end
 
+        def _flush_accum(is_last: bool) -> None:
+            nonlocal accum, accum_rows
+            if not accum:
+                return
+            merged = pl.concat(accum) if len(accum) > 1 else accum[0]
+            accum = []
+            accum_rows = 0
+            if not is_last:
+                boundary_pid = merged["point_id"][-1]
+                leftover = merged.filter(pl.col("point_id") == boundary_pid)
+                merged   = merged.filter(pl.col("point_id") != boundary_pid)
+                if not leftover.is_empty():
+                    accum = [leftover]
+                    accum_rows = len(leftover)
+            _emit_raw(merged)
+
         try:
             while True:
                 tbl = io_q.get()
                 if tbl is _SENTINEL:
                     break
+                # tile_id filter in PyArrow before converting to Polars (avoids full from_arrow)
+                if tile_prefix and "item_id" in tbl.schema.names:
+                    item_ids = tbl.column("item_id")
+                    null_mask  = _pac.is_null(item_ids)
+                    match_mask = _pac.utf8_contains(item_ids.fill_null(""), tile_prefix)
+                    tbl = tbl.filter(_pac.or_(null_mask, match_mask))
+                    if tbl.num_rows == 0:
+                        continue
+                # Fast date extraction in PyArrow before from_arrow conversion.
+                # pac.year/day_of_year on a Date column is 80× faster than the old
+                # Polars cast(Datetime("us")) → numpy path (28ms vs 2276ms per 1M rows).
+                date_col = tbl.column("date")
+                year_col = _pac.year(date_col).cast("int32")
+                doy_col  = _pac.day_of_year(date_col).cast("int32")
+                tbl = tbl.append_column(_pa.field("year", _pa.int32()), year_col)
+                tbl = tbl.append_column(_pa.field("doy",  _pa.int32()), doy_col)
+                if end_year:
+                    tbl = tbl.filter(_pac.less_equal(year_col, end_year))
+                if tbl.num_rows == 0:
+                    continue
                 chunk = pl.from_arrow(tbl)
                 del tbl
-                if tile_prefix and "item_id" in chunk.columns:
-                    # S1 rows have item_id=null; keep null rows so S1 obs survive the tile filter.
-                    chunk = chunk.filter(
-                        pl.col("item_id").is_null() |
-                        pl.col("item_id").str.contains(tile_prefix, literal=True)
-                    )
                 if not s1_only and not mixed and "scl_purity" in chunk.columns:
                     chunk = chunk.filter(pl.col("scl_purity") >= scl_purity_min)
                 if chunk.is_empty():
                     continue
-                ts_us = chunk["date"].cast(pl.Datetime("us")).to_numpy(allow_copy=True).astype("int64")
-                year_arr, doy_arr = _extract_year_doy(ts_us)
-                chunk = chunk.with_columns([
-                    pl.Series("year", year_arr.astype(np.int32)),
-                    pl.Series("doy",  doy_arr.astype(np.int32)),
-                ])
-                if end_year:
-                    chunk = chunk.filter(pl.col("year") <= end_year)
-                if chunk.is_empty():
-                    continue
-                _emit_chunk(chunk, is_last=False)
+                accum.append(chunk)
+                accum_rows += len(chunk)
+                if accum_rows >= target_chunk_rows:
+                    _flush_accum(is_last=False)
 
-            if not leftover.is_empty():
-                raw = _extract_raw_arrays(
-                    leftover,
-                    scl_purity_min=scl_purity_min,
-                    s1_only=s1_only,
-                    mixed=mixed,
-                    feature_cols=feature_cols,
-                    s2_feature_cols=s2_feature_cols,
-                    s1_feature_cols=s1_feature_cols,
-                    pixel_zscore=pixel_zscore,
-                    vh_mean=_vh_mean, vh_std=_vh_std,
-                    vv_mean=_vv_mean, vv_std=_vv_std,
-                    despeckle_lookup=_despeckle_lookup,
-                )
-                if raw is not None:
-                    raw_q.put(raw)
+            _flush_accum(is_last=True)
         except Exception:
             logger.exception("Parser thread crashed")
         finally:
@@ -1318,7 +1318,7 @@ def score_location_years(
     scl_purity_min: float = 0.5,
     min_obs_per_year: int = 10,
     batch_size: int = 4096,
-    n_prep_workers: int = 4,
+    n_prep_workers: int = 5,
     device: str | None = None,
     tile_id: str | None = None,
     end_year: int | None = None,
@@ -1433,7 +1433,7 @@ def score_tile_year(
     scl_purity_min: float = 0.5,
     min_obs_per_year: int = 10,
     batch_size: int = 4096,
-    n_prep_workers: int = 4,
+    n_prep_workers: int = 5,
     device: str | None = None,
     s1_only: bool = False,
     mixed: bool = True,
@@ -1557,7 +1557,7 @@ def score_tiles_chunked(
     scl_purity_min: float = 0.5,
     min_obs_per_year: int = 10,
     batch_size: int = 4096,
-    n_prep_workers: int = 4,
+    n_prep_workers: int = 5,
     n_tile_workers: int = 1,
     device: str | None = None,
     end_year: int | None = None,

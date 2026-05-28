@@ -258,6 +258,7 @@ class Location:
         apply_nbar: bool = True,
         n_workers: Optional[int] = None,
         proxy_url: Optional[str] = None,
+        tiles: Optional[list[str]] = None,
     ) -> list[Path]:
         """Fetch Sentinel-2 and Sentinel-1 pixel observations for this location.
 
@@ -278,6 +279,7 @@ class Location:
                 cloud_max=cloud_max,
                 apply_nbar=apply_nbar,
                 n_workers=n_workers,
+                tiles=tiles,
             )
 
         from concurrent.futures import ThreadPoolExecutor, as_completed  # noqa: PLC0415
@@ -299,8 +301,12 @@ class Location:
 
         location_geom = self.geometry or box(*self.bbox)
 
+        tile_filter = set(tiles) if tiles else None
+
         written: list[Path] = []
         for tile_id in self.tile_ids():
+            if tile_filter and tile_id not in tile_filter:
+                continue
             tile_polygon = _tile_polygon(tile_id)
             tile_geom = tile_polygon.intersection(location_geom) if tile_polygon else location_geom
             if tile_geom.is_empty:
@@ -334,6 +340,7 @@ class Location:
         cloud_max: int,
         apply_nbar: bool,
         n_workers: Optional[int],
+        tiles: Optional[list[str]] = None,
     ) -> list[Path]:
         import base64
         from shapely import wkb as shapely_wkb
@@ -351,9 +358,10 @@ class Location:
         out_dir = _PROJECT_ROOT / "data" / "pixels" / self.id
         tmp_dir = _PROJECT_ROOT / "data" / "pixels" / self.id / "_proxy_tmp"
 
+        tile_ids = [t for t in self.tile_ids() if not tiles or t in tiles]
         return fetch_tiles(
             proxy_url=proxy_url,
-            tile_ids=self.tile_ids(),
+            tile_ids=tile_ids,
             years=years,
             polygon_wkb_b64=polygon_wkb_b64,
             out_dir=out_dir,

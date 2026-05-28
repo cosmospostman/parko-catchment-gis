@@ -675,6 +675,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
             apply_nbar=not args.no_nbar,
             n_workers=args.workers,
             proxy_url=getattr(args, "proxy", None),
+            tiles=getattr(args, "tiles", None),
         )
     except KeyboardInterrupt:
         print(file=sys.stderr)
@@ -952,6 +953,8 @@ def main() -> None:
                     help="Disable BRDF NBAR c-factor correction")
     pf.add_argument("--workers", type=int, default=None, metavar="N",
                     help="Concurrent item extraction workers (default: auto-scaled by pixel count)")
+    pf.add_argument("--tiles", nargs="+", metavar="TILE_ID", default=None,
+                    help="Only fetch these MGRS tile IDs (default: all tiles for the location)")
     pf.add_argument("--proxy", type=str, default=None, metavar="URL",
                     help="Proxy VM URL (e.g. http://localhost:8765). "
                          "Routes extraction to the VM; only compressed parquet is transferred.")

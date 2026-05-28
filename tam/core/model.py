@@ -46,6 +46,23 @@ def _doy_encoding(doy: torch.Tensor, d_model: int) -> torch.Tensor:
     return enc
 
 
+def _build_doy_table(d_model: int) -> torch.Tensor:
+    """Pre-compute a (366, d_model) DOY encoding lookup table.
+
+    Row 0 is all-zeros (padding); rows 1–365 are the circular sinusoidal
+    encodings for each day-of-year.  Registered as a model buffer so it
+    moves to the correct device automatically.
+    """
+    n_pairs = d_model // 2
+    k = torch.arange(1, n_pairs + 1, dtype=torch.float32)
+    omega = 2.0 * math.pi * k / 365.0
+    all_doys = torch.arange(0, 366, dtype=torch.float32).unsqueeze(-1)  # (366, 1)
+    angles = all_doys * omega.unsqueeze(0)                               # (366, n_pairs)
+    table = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)   # (366, d_model)
+    table[0] = 0.0  # padding row
+    return table
+
+
 class TAMClassifier(nn.Module):
     """Transformer encoder that maps an annual pixel time-series to P(Parkinsonia).
 
@@ -102,6 +119,10 @@ class TAMClassifier(nn.Module):
             "doy_inv_freq_s1",
             torch.ones(366, dtype=torch.float32),
         )
+        # Pre-computed DOY encoding table: (366, d_model).
+        # Row 0 = zeros (padding); rows 1-365 = circular sinusoidal encodings.
+        # Table lookup avoids recomputing sin/cos on every forward pass.
+        self.register_buffer("_doy_enc_table", _build_doy_table(d_model))
 
         self.band_proj = nn.Linear(n_bands, d_model)
         self.pre_head_dropout = nn.Dropout(dropout)
@@ -157,7 +178,7 @@ class TAMClassifier(nn.Module):
         is_s1:            torch.Tensor | None = None,  # (B, T)  bool, True=S1 obs
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return (prob, logit), each shape (B,)."""
-        x = self.band_proj(bands) + _doy_encoding(doy, self.d_model)  # (B, T, d_model)
+        x = self.band_proj(bands) + self._doy_enc_table[doy.clamp(0, 365)]  # (B, T, d_model)
 
         # Rows where every position is masked cause softmax over all-inf attention
         # logits → NaN. Unmask such rows before the encoder; the mean pool below
@@ -225,9 +246,7 @@ class TAMClassifier(nn.Module):
         B = cu_seqlens.shape[0] - 1
 
         # Project bands + add DOY encoding (flat — no batch dim)
-        # _doy_encoding expects (B, T) but we have (1, total_tokens)
-        doy_2d = doy_flat.unsqueeze(0)                                # (1, total_tokens)
-        doy_enc = _doy_encoding(doy_2d, d_model).squeeze(0)          # (total_tokens, d_model)
+        doy_enc = self._doy_enc_table[doy_flat.clamp(0, 365)]         # (total_tokens, d_model)
         # band_proj and layer norms run in float32 (model weights are float32).
         # flash_attn requires float16 or bfloat16 for Q/K/V; we cast only for that kernel.
         x = self.band_proj(bands_flat.float()) + doy_enc              # (total_tokens, d_model) fp32

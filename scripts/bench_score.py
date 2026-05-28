@@ -756,7 +756,7 @@ if __name__ == "__main__":
     parser.add_argument("--n-years",               type=int,   default=2,
                         help="Number of synthetic years")
     parser.add_argument("--batch-size",            type=int,   default=4096)
-    parser.add_argument("--n-prep-workers",        type=int,   default=4)
+    parser.add_argument("--n-prep-workers",        type=int,   default=5)
     parser.add_argument("--pixel-zscore",          action="store_true", default=False)
     parser.add_argument("--band-summaries",        action="store_true", default=False)
     parser.add_argument("--mixed",                 action="store_true", default=False,
