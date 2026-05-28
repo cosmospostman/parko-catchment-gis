@@ -138,11 +138,16 @@ def merge_scenes(
     tmp_dir = str(out_path.parent)
 
     n_threads = max(1, (os.cpu_count() or 4) // 2)
-    # Default: 75% of system RAM so DuckDB can sort large strips without OOM.
-    # It will spill to temp_directory when the limit is hit, so setting it high
-    # just avoids unnecessary spill — it does not prevent spill when needed.
-    # Override with PROXY_MERGE_MEM_GB for constrained environments.
-    _default_mem_gb = max(4, int(_system_memory_gb() * 0.75))
+    # Cap at 50% of *available* (not total) RAM so DuckDB leaves headroom for the
+    # rest of the process.  On an 8 GB machine already holding shard buffers the
+    # 75%-of-total heuristic was over-promising and triggering OOM kills.
+    # Override with PROXY_MERGE_MEM_GB for explicit control.
+    try:
+        import psutil
+        _avail_gb = psutil.virtual_memory().available / (1024 ** 3)
+    except Exception:
+        _avail_gb = _system_memory_gb() * 0.5
+    _default_mem_gb = max(2, int(_avail_gb * 0.5))
     mem_gb = int(os.environ.get("PROXY_MERGE_MEM_GB", str(_default_mem_gb)))
 
     sql = f"""
