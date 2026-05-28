@@ -241,8 +241,6 @@ async def fetch_patches(
     # Hard-set (not setdefault) so setup_gdal_env()'s "5" can't override us.
     os.environ["GDAL_HTTP_MAX_RETRY"] = "0"
     os.environ.setdefault("GDAL_DISABLE_READDIR_ON_OPEN", "EMPTY_DIR")
-    # Do not set CPL_VSIL_CURL_CACHE_SIZE — the header cache can replay stale
-    # multipart upload IDs under high concurrency, producing spurious 409s.
 
     loop = asyncio.get_running_loop()
     sem = asyncio.Semaphore(max_concurrent)
@@ -412,6 +410,11 @@ async def fetch_patches_to_tiff(
     Returns a list of all written .tif paths.
     """
     import os
+    # Header cache: rasterio.open() fetches the GeoTIFF IFD via HTTP; without
+    # caching this fires once per (item, band) open call.  Safe for read-only S3
+    # COG access — the 409-conflict risk from CPL_VSIL_CURL_CACHE_SIZE only
+    # applies to multipart write operations, not pure GETs.
+    os.environ.setdefault("CPL_VSIL_CURL_CACHE_SIZE", "134217728")  # 128 MB
     loop = asyncio.get_running_loop()
     sem = asyncio.Semaphore(max_concurrent)
     # Two executors: fetch threads saturate the network link; write threads handle

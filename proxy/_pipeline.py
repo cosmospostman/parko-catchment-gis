@@ -149,7 +149,7 @@ def merge_scenes(
         COPY (
             SELECT {col_list}
             FROM ({union_sql}) t
-            ORDER BY regexp_extract(point_id, '_([0-9]+)$', 1)::INTEGER, date
+            ORDER BY TRY_CAST(regexp_extract(point_id, '_([0-9]+)$', 1) AS INTEGER), date
         ) TO '{dst}' (
             FORMAT PARQUET,
             COMPRESSION ZSTD,

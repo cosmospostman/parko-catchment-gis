@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 from pathlib import Path
 from queue import Queue
 from threading import Thread
 from typing import NamedTuple
+
+_nullctx = contextlib.nullcontext
 
 import numpy as np
 import polars as pl
@@ -260,6 +263,10 @@ class _TransferredBatch(NamedTuple):
     pids:            np.ndarray
     years:           np.ndarray
     B:               int                   # batch size
+    # CUDA event recorded on transfer_stream after all H2D DMAs complete.
+    # compute_stream waits on this before launching kernels — GPU-side sync only,
+    # no CPU stall.  None when not using CUDA.
+    xfer_event:      "torch.cuda.Event | None"
 
 
 class _RawChunk(NamedTuple):
@@ -1026,6 +1033,7 @@ def _gpu_forward(
     tb: "_TransferredBatch",
     model: "TAMClassifier",
     gate_threshold: float,
+    compute_stream: "torch.cuda.Stream | None" = None,
 ) -> "tuple[np.ndarray, np.ndarray, np.ndarray, int]":
     """Pure GPU forward — all tensors already on device, no H2D, no CPU prep.
 
@@ -1034,7 +1042,16 @@ def _gpu_forward(
     use_varlen = _has_flash_attn()
     B = tb.B
 
-    with torch.inference_mode():
+    # GPU-side sync: wait for the transfer stream's DMA to finish before
+    # launching any compute kernels.  This is a device-side dependency only —
+    # the CPU returns immediately.
+    if compute_stream is not None and tb.xfer_event is not None:
+        compute_stream.wait_event(tb.xfer_event)
+
+    _stream_ctx = (torch.cuda.stream(compute_stream)
+                   if compute_stream is not None else _nullctx())
+
+    with torch.inference_mode(), _stream_ctx:
         if gate_threshold > 0.0:
             gate_prob, _ = model(
                 tb.gate_bands_dev,
@@ -1549,7 +1566,15 @@ def score_pixels_chunked(
     # gpu_ready_q depth=2: xfer thread can pre-transfer one batch while GPU runs.
     xfer_q:      Queue = Queue(maxsize=2)
     gpu_ready_q: Queue = Queue(maxsize=2)
-    result_q:    Queue = Queue(maxsize=8)
+
+    # Two CUDA streams: the copy engine (transfer_stream) and compute engine
+    # (compute_stream) run in parallel on the GPU.  An event recorded after the
+    # H2D DMAs lets the compute stream wait for the transfer without a CPU sync.
+    use_cuda = device.startswith("cuda") and torch.cuda.is_available()
+    transfer_stream: "torch.cuda.Stream | None" = (
+        torch.cuda.Stream(device=device) if use_cuda else None)
+    compute_stream:  "torch.cuda.Stream | None" = (
+        torch.cuda.Stream(device=device) if use_cuda else None)
 
     # --- Stage B: H2D transfer thread ---
     def _transfer_worker() -> None:
@@ -1581,24 +1606,33 @@ def score_pixels_chunked(
             gate_n_obs_np = (np.clip((~gate_mask_np).sum(axis=1), 1, None)
                              .astype(np.float32) / T_full)
 
-            # Blocking H2D transfer — this thread runs concurrently with both the
-            # main thread (building next batch) and the GPU thread (running forward),
-            # so overlap is achieved without needing async/pin_memory complexity.
-            def _to_dev(t: torch.Tensor) -> torch.Tensor:
-                return t.to(device)
-            gate_bands_dev  = _to_dev(torch.from_numpy(gate_bands_np))
-            gate_doy_dev    = _to_dev(torch.from_numpy(gate_doy_np))
-            gate_mask_dev   = _to_dev(torch.from_numpy(gate_mask_np))
-            gate_n_obs_dev  = _to_dev(torch.from_numpy(gate_n_obs_np))
-            gate_is_s1_dev  = (_to_dev(torch.from_numpy(gate_is_s1_np))
-                               if merged.is_s1 is not None else None)
-            bands_dev  = _to_dev(merged.bands)
-            doy_dev    = _to_dev(merged.doy)
-            mask_dev   = _to_dev(merged.mask)
-            n_obs_dev  = _to_dev(merged.n_obs)
-            is_s1_dev  = (_to_dev(merged.is_s1) if merged.is_s1 is not None else None)
-            gf_dev     = (_to_dev(torch.from_numpy(merged.global_feats))
-                          if merged.global_feats is not None else None)
+            # H2D on transfer_stream so the copy engine runs in parallel with
+            # whatever the compute engine is doing.  pin_memory() enables async DMA.
+            _ts_ctx = (torch.cuda.stream(transfer_stream)
+                       if transfer_stream is not None else _nullctx())
+            with _ts_ctx:
+                def _to_dev(arr) -> torch.Tensor:
+                    t = arr if isinstance(arr, torch.Tensor) else torch.from_numpy(arr)
+                    return (t.pin_memory().to(device, non_blocking=True)
+                            if use_cuda else t.to(device))
+                gate_bands_dev  = _to_dev(gate_bands_np)
+                gate_doy_dev    = _to_dev(gate_doy_np)
+                gate_mask_dev   = _to_dev(gate_mask_np)
+                gate_n_obs_dev  = _to_dev(gate_n_obs_np)
+                gate_is_s1_dev  = (_to_dev(gate_is_s1_np)
+                                   if merged.is_s1 is not None else None)
+                bands_dev  = _to_dev(merged.bands)
+                doy_dev    = _to_dev(merged.doy)
+                mask_dev   = _to_dev(merged.mask)
+                n_obs_dev  = _to_dev(merged.n_obs)
+                is_s1_dev  = (_to_dev(merged.is_s1) if merged.is_s1 is not None else None)
+                gf_dev     = (_to_dev(merged.global_feats)
+                              if merged.global_feats is not None else None)
+                # Record event after all non_blocking transfers are enqueued.
+                xfer_event: "torch.cuda.Event | None" = None
+                if use_cuda:
+                    xfer_event = torch.cuda.Event()
+                    xfer_event.record(transfer_stream)
 
             tb = _TransferredBatch(
                 gate_bands_dev=gate_bands_dev,
@@ -1615,6 +1649,7 @@ def score_pixels_chunked(
                 pids=merged.pids,
                 years=merged.years,
                 B=B_,
+                xfer_event=xfer_event,
             )
             gpu_ready_q.put(tb)
 
@@ -1624,8 +1659,8 @@ def score_pixels_chunked(
     # --- Stage A (main thread): accumulate prep_q → xfer_q ---
     # --- Stage C (main thread): pull gpu_ready_q → GPU forward ---
     # The GPU forward stays on the main thread to avoid PyTorch threading issues.
-    # Overlap comes from: while the main thread runs the forward, the xfer thread
-    # is building gate tensors + doing H2D for the next batch.
+    # Overlap: while forward runs on compute_stream, xfer thread DMAs next batch
+    # on transfer_stream — the GPU copy and compute engines run in parallel.
     _n_gpu_calls   = 0
     _t_score_total = 0.0
     _t_idle_total  = 0.0
@@ -1652,6 +1687,10 @@ def score_pixels_chunked(
                               if _acc[0].global_feats is not None else None),
             )
         _t_merge_total += _time.monotonic() - _tm
+        # Drain any GPU-ready batches before potentially blocking on xfer_q.
+        # This prevents the main thread from blocking in put() while a scored
+        # batch sits waiting to be collected.
+        _maybe_score_ready()
         xfer_q.put(merged)   # blocks if xfer_q is full — natural backpressure
 
     # Interleave: drain prep_q into xfer_q while also consuming gpu_ready_q.
@@ -1672,7 +1711,7 @@ def score_pixels_chunked(
                 # shouldn't happen mid-loop, but handle defensively
                 break
             _ts = _time.monotonic()
-            chunk = _gpu_forward(tb, model, gate_threshold)
+            chunk = _gpu_forward(tb, model, gate_threshold, compute_stream)
             _t_score_total += _time.monotonic() - _ts
             _n_gpu_calls   += 1
             px_count = tb.B
@@ -1716,7 +1755,6 @@ def score_pixels_chunked(
             continue
         _flush_acc()
         _acc.clear(); _acc_px = 0
-        _maybe_score_ready()
 
     # Signal transfer thread that input is done.
     xfer_q.put(_SENTINEL)
