@@ -209,16 +209,30 @@ def _sort_s1_shards(
     combined_schema: "pa.Schema",
     n_workers: int | None = None,
 ) -> None:
-    """Merge S1 shards into one northing-sorted parquet conforming to combined_schema.
+    """Concat S1 shards (already northing-sorted) into one parquet.
 
-    Points are passed to _collect_s1_shards in northing order (from make_strip_points),
-    so each shard's rows are already northing-sorted within each date.  Shards cover
-    non-overlapping northing ranges, so a k-way merge produces a fully sorted output
-    without any per-shard sort step.
+    Shards cover non-overlapping northing ranges written in order, so a plain
+    sequential concat produces a sorted output without any sort step.
+    Streams one shard at a time to avoid loading all 136 shards into RAM.
     """
+    import pyarrow.parquet as pq
+
     _log = logging.getLogger(__name__)
     _log.info("merging %d S1 shards → %s ...", len(shard_paths), out_path.name)
-    _kway_merge_parquets(shard_paths, out_path, combined_schema)
+
+    tmp_path = out_path.with_suffix(".shards_tmp.parquet")
+    tmp_path.unlink(missing_ok=True)
+    writer = pq.ParquetWriter(str(tmp_path), combined_schema, compression="none", write_statistics=False)
+    try:
+        for shard_path in shard_paths:
+            pf = pq.ParquetFile(str(shard_path))
+            for batch in pf.iter_batches(batch_size=250_000):
+                tbl = pa.Table.from_batches([batch])
+                tbl = _conform_table(tbl, combined_schema)
+                writer.write_table(tbl)
+    finally:
+        writer.close()
+    tmp_path.replace(out_path)
     _log.info("merge done → %s", out_path.name)
 
 
