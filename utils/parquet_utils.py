@@ -214,10 +214,15 @@ def _sort_s1_shards(
     """
 
     try:
-        con = duckdb.connect(config={"temp_directory": tmp_dir, "memory_limit": "2GB"})
+        con = duckdb.connect(
+            config={
+                "temp_directory": tmp_dir,
+                "memory_limit": "2GB",
+                "preserve_insertion_order": "false",
+                "threads": "4",
+            }
+        )
         try:
-            con.execute("SET threads = 4")
-            con.execute("SET preserve_insertion_order = false")
             con.execute(sql)
         finally:
             con.close()
@@ -300,10 +305,15 @@ def _merge_sorted_parquets(
         out_path.name, f"{s2_rows:,}", f"{s1_rows:,}", n_threads, memory_limit_gb,
     )
 
-    con = duckdb.connect(config={"temp_directory": tmp_dir, "memory_limit": f"{memory_limit_gb}GB"})
+    con = duckdb.connect(
+        config={
+            "temp_directory": tmp_dir,
+            "memory_limit": f"{memory_limit_gb}GB",
+            "preserve_insertion_order": "false",
+            "threads": str(n_threads),
+        }
+    )
     try:
-        con.execute(f"SET threads = {n_threads}")
-        con.execute("SET preserve_insertion_order = false")
         con.execute(sql)
     finally:
         con.close()
