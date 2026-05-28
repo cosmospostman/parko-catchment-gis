@@ -1054,7 +1054,7 @@ def score_pixels_chunked(
     min_obs_per_year: int = 10,
     batch_size: int = 4096,
     buffer_row_groups: int = 4,
-    target_chunk_rows: int = 131_072,
+    target_chunk_rows: int = 393_216,
     n_prep_workers: int = 5,
     device: str | None = None,
     tile_id: str | None = None,
@@ -1186,18 +1186,21 @@ def score_pixels_chunked(
         import pyarrow as _pa
         import pyarrow.compute as _pac
 
-        # PA-mode: accumulate PyArrow tables; Polars-mode: accumulate pl.DataFrames
-        accum: list = []
-        accum_rows = 0
-
         _eff_s2_cols = s2_feature_cols or list(ALL_FEATURE_COLS)
         _eff_s1_cols = s1_feature_cols or ["s1_vh", "s1_vv"]
 
         def _emit_raw_pa(tbl: "pa.Table") -> None:
-            """Slice PA table on point_id boundaries and put _PASlice on raw_q."""
+            """Slice PA table on point_id boundaries and put _PASlice on raw_q.
+
+            The parquet is pixel-sorted so tbl is at most 2 Arrow chunks (a small
+            leftover from the previous rg prepended to the current rg).  combine_chunks
+            is therefore cheap — at most one copy of ~80 leftover rows is needed.
+            """
             if tbl.num_rows == 0:
                 return
-            pid_np = np.asarray(tbl.column("point_id").combine_chunks())
+            pid_col = tbl.column("point_id")
+            pid_np  = np.asarray(pid_col.combine_chunks()) if pid_col.num_chunks > 1 \
+                      else np.asarray(pid_col.chunks[0])
             n = len(pid_np)
             start = 0
             while start < n:
@@ -1245,33 +1248,11 @@ def score_pixels_chunked(
                     raw_q.put(raw)
                 start = end
 
-        def _flush_accum(is_last: bool) -> None:
-            nonlocal accum, accum_rows
-            if not accum:
-                return
-            if mixed:
-                import pyarrow as _pa2
-                merged = _pa2.concat_tables(accum) if len(accum) > 1 else accum[0]
-                accum.clear(); accum_rows = 0
-                if not is_last and merged.num_rows > 0:
-                    pid_np = np.asarray(merged.column("point_id").combine_chunks())
-                    bp = pid_np[-1]
-                    keep = pid_np != bp
-                    lv_tbl = merged.filter(~keep) if not keep.all() else None
-                    merged = merged.filter(keep) if not keep.all() else merged
-                    if lv_tbl is not None and lv_tbl.num_rows > 0:
-                        accum.append(lv_tbl); accum_rows = lv_tbl.num_rows
-                _emit_raw_pa(merged)
-            else:
-                merged = pl.concat(accum) if len(accum) > 1 else accum[0]
-                accum.clear(); accum_rows = 0
-                if not is_last:
-                    boundary_pid = merged["point_id"][-1]
-                    leftover = merged.filter(pl.col("point_id") == boundary_pid)
-                    merged   = merged.filter(pl.col("point_id") != boundary_pid)
-                    if not leftover.is_empty():
-                        accum.append(leftover); accum_rows = len(leftover)
-                _emit_raw_pl(merged)
+        # Leftover: at most ~80 rows (one pixel's observations) carried from the
+        # previous rg to handle pixels that straddle an rg boundary.  Never grows
+        # beyond one pixel's worth because the parquet is pixel-sorted.
+        pa_leftover:  "pa.Table | None" = None
+        pl_leftover:  "pl.DataFrame | None" = None
 
         try:
             while True:
@@ -1297,23 +1278,52 @@ def score_pixels_chunked(
                 if tbl.num_rows == 0:
                     continue
                 if mixed:
-                    # Keep as PyArrow — workers do extraction (GIL-releasing)
-                    accum.append(tbl)
-                    accum_rows += tbl.num_rows
+                    # Prepend the tiny leftover (≤1 pixel) from the previous rg.
+                    # concat_tables with a near-empty table is cheap; the result has
+                    # at most 2 chunks so combine_chunks in _emit_raw_pa is fast.
+                    if pa_leftover is not None:
+                        tbl = _pa.concat_tables([pa_leftover, tbl])
+                        pa_leftover = None
+                    # Peel off the trailing pixel — it may continue in the next rg.
+                    pid_last = tbl.column("point_id")[-1].as_py()
+                    # Find where the last pixel starts (scan from end — usually <80 rows)
+                    pid_arr = np.asarray(tbl.column("point_id").chunks[-1])
+                    tail_start_in_chunk = int(np.searchsorted(pid_arr, pid_last, side="left"))
+                    n_chunks = tbl.column("point_id").num_chunks
+                    if n_chunks > 1:
+                        # leftover straddles the concat boundary; recompute on combined
+                        pid_arr_full = np.asarray(tbl.column("point_id").combine_chunks())
+                        tail_start = int(np.searchsorted(pid_arr_full, pid_last, side="left"))
+                    else:
+                        tail_start = tail_start_in_chunk
+                    if tail_start > 0:
+                        pa_leftover = tbl.slice(tail_start)
+                        tbl = tbl.slice(0, tail_start)
+                        _emit_raw_pa(tbl)
+                    else:
+                        # Entire rg is one pixel (extremely rare) — carry it all forward
+                        pa_leftover = tbl
                 else:
-                    # Non-mixed: convert to Polars here as before
                     chunk = pl.from_arrow(tbl)
                     del tbl
                     if not s1_only and "scl_purity" in chunk.columns:
                         chunk = chunk.filter(pl.col("scl_purity") >= scl_purity_min)
                     if chunk.is_empty():
                         continue
-                    accum.append(chunk)
-                    accum_rows += len(chunk)
-                if accum_rows >= target_chunk_rows:
-                    _flush_accum(is_last=False)
+                    if pl_leftover is not None:
+                        chunk = pl.concat([pl_leftover, chunk])
+                        pl_leftover = None
+                    boundary_pid = chunk["point_id"][-1]
+                    tail = chunk.filter(pl.col("point_id") == boundary_pid)
+                    chunk = chunk.filter(pl.col("point_id") != boundary_pid)
+                    pl_leftover = tail if not tail.is_empty() else None
+                    _emit_raw_pl(chunk)
 
-            _flush_accum(is_last=True)
+            # Flush final leftovers (no next rg to continue into)
+            if pa_leftover is not None:
+                _emit_raw_pa(pa_leftover)
+            if pl_leftover is not None:
+                _emit_raw_pl(pl_leftover)
         except Exception:
             logger.exception("Parser thread crashed")
         finally:
@@ -1404,6 +1414,12 @@ def score_pixels_chunked(
     n_total_gate_cut = 0
     import time as _time
     _t0 = _time.monotonic()
+    _t_last_logged = _t0
+
+    # Timing breakdown: track idle (waiting on prep_q) vs active (GPU score).
+    _t_idle_total  = 0.0  # seconds blocked in prep_q.get() with nothing to score
+    _t_score_total = 0.0  # seconds inside _gpu_score
+    _n_gpu_calls   = 0
 
     # Small-batch accumulator: prep workers often produce batches well under
     # batch_size (e.g. ~1400 px from a 131k-row chunk on sparse tiles), so the
@@ -1414,6 +1430,7 @@ def score_pixels_chunked(
     _acc_px = 0
 
     def _merge_and_score(items: list[_PreparedBatch]) -> tuple:
+        nonlocal _t_score_total, _n_gpu_calls
         if len(items) == 1:
             merged = items[0]
         else:
@@ -1429,11 +1446,19 @@ def score_pixels_chunked(
                 global_feats=(np.concatenate([b.global_feats for b in items], axis=0)
                               if items[0].global_feats is not None else None),
             )
-        return _gpu_score(merged, model, device,
-                          gate_threshold=gate_threshold, T_gate=T_gate)
+        _ts = _time.monotonic()
+        result = _gpu_score(merged, model, device,
+                            gate_threshold=gate_threshold, T_gate=T_gate)
+        _t_score_total += _time.monotonic() - _ts
+        _n_gpu_calls   += 1
+        return result
 
     while sentinels_seen < n_prep_workers:
+        _t_get_start = _time.monotonic()
         item = prep_q.get()
+        # Only count as idle time when we have nothing accumulated (GPU starved).
+        if _acc_px == 0:
+            _t_idle_total += _time.monotonic() - _t_get_start
         if item is _SENTINEL:
             sentinels_seen += 1
             # Flush any remaining accumulated batches when all workers finish.
@@ -1462,8 +1487,9 @@ def score_pixels_chunked(
             all_pids.append(chunk[0]); all_years.append(chunk[1]); all_probs.append(chunk[2])
         n_scored += n_scored_batch
         if n_scored - n_last_logged >= progress_log_interval:
-            elapsed = _time.monotonic() - _t0
-            rate = n_scored / elapsed if elapsed > 0 else 0.0
+            _t_now = _time.monotonic()
+            dt_interval = _t_now - _t_last_logged
+            rate = (n_scored - n_last_logged) / dt_interval if dt_interval > 0 else 0.0
             if n_total_pixels:
                 logger.info(
                     "[%s yr=%s] %.1f%% (%d/%d px) @ %.0f px/s",
@@ -1476,12 +1502,25 @@ def score_pixels_chunked(
                     tile_id or "?", end_year or "?", n_scored, rate,
                 )
             n_last_logged = n_scored
+            _t_last_logged = _t_now
 
     io_thread.join()
     reader_thread.join()
     for f in prep_futures:
         f.result()
     prep_pool.shutdown(wait=False)
+
+    _t_total = _time.monotonic() - _t0
+    _t_other  = max(0.0, _t_total - _t_idle_total - _t_score_total)
+    logger.info(
+        "GPU consumer breakdown — total %.1fs: score %.1fs (%.0f%%), "
+        "idle/starved %.1fs (%.0f%%), other %.1fs (%.0f%%) | %d GPU calls",
+        _t_total,
+        _t_score_total, 100.0 * _t_score_total / _t_total if _t_total else 0,
+        _t_idle_total,  100.0 * _t_idle_total  / _t_total if _t_total else 0,
+        _t_other,       100.0 * _t_other        / _t_total if _t_total else 0,
+        _n_gpu_calls,
+    )
 
     if writer_thread is not None:
         out_q.put(_SENTINEL)

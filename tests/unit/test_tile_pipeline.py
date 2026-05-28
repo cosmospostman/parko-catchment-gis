@@ -336,7 +336,7 @@ def test_fetch_tile_local_done_sentinel_skips(tmp_path):
 
     pipeline_called = []
 
-    with patch("proxy._pipeline.run_tile_pipeline", side_effect=lambda *a, **kw: iter([])) as mock_pipeline:
+    with patch("proxy._pipeline.run_tile_pipeline_v2", side_effect=lambda *a, **kw: iter([])) as mock_pipeline:
         result = fetch_tile_local(
             tile_id="55HBU", year=2022,
             polygon_geometry=_make_polygon(),
@@ -380,7 +380,7 @@ def test_fetch_tile_local_resume(tmp_path):
         out_path.parent.mkdir(parents=True, exist_ok=True)
         _write_strip_parquet(out_path)
 
-    with patch("proxy._pipeline.run_tile_pipeline", side_effect=fake_pipeline), \
+    with patch("proxy._pipeline.run_tile_pipeline_v2", side_effect=fake_pipeline), \
          patch("utils.parquet_utils.merge_strips", side_effect=fake_merge):
         fetch_tile_local(
             tile_id="55HBU", year=2022,
@@ -418,7 +418,7 @@ def test_fetch_tile_local_atomic_write_and_merge(tmp_path):
         out_path.parent.mkdir(parents=True, exist_ok=True)
         _write_strip_parquet(out_path)
 
-    with patch("proxy._pipeline.run_tile_pipeline", side_effect=fake_pipeline), \
+    with patch("proxy._pipeline.run_tile_pipeline_v2", side_effect=fake_pipeline), \
          patch("utils.parquet_utils.merge_strips", side_effect=fake_merge):
         result = fetch_tile_local(
             tile_id="55HBU", year=2022,

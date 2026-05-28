@@ -669,17 +669,17 @@ def test_cs1_strip_boundaries_on_block_grid():
     All points in a strip must share the same block index — this is the
     invariant that guarantees zero over-fetch waste.
     """
-    from proxy._pipeline import compute_strips
+    from proxy._pipeline import compute_strips, make_strip_points
 
     cog_y_top = _reference_y_top(_CS_BBOX, _CS_CRS, extra_m=500.0)
-    strips = compute_strips(
+    strips, meta = compute_strips(
         _CS_BBOX, 1024, None,
         cog_utm_crs=_CS_CRS, cog_y_top=cog_y_top,
     )
     assert strips, "expected at least one strip"
 
     for s in strips:
-        northings = _utm_northings(s["points"], _CS_CRS)
+        northings = _utm_northings(make_strip_points(s, meta), _CS_CRS)
         block_indices = {math.ceil((cog_y_top - y) / _CS_BLOCK_M) - 1 for y in northings}
         assert len(block_indices) == 1, (
             f"strip {s['strip_idx']}: points span multiple COG blocks {block_indices}"
@@ -689,17 +689,17 @@ def test_cs1_strip_boundaries_on_block_grid():
 # CS-2: all points land in exactly one strip
 def test_cs2_all_points_in_exactly_one_strip():
     """No point is missing from or duplicated across strips."""
-    from proxy._pipeline import compute_strips
+    from proxy._pipeline import compute_strips, make_strip_points
 
     cog_y_top = _reference_y_top(_CS_BBOX, _CS_CRS)
-    strips = compute_strips(
+    strips, meta = compute_strips(
         _CS_BBOX, 1024, None,
         cog_utm_crs=_CS_CRS, cog_y_top=cog_y_top,
     )
 
     seen: dict[str, int] = {}
     for s in strips:
-        for pid, _, _ in s["points"]:
+        for pid, _, _ in make_strip_points(s, meta):
             seen[pid] = seen.get(pid, 0) + 1
 
     all_ids = {pid for pid, _, _ in _CS_POINTS}
@@ -717,16 +717,16 @@ def test_cs3_utm_and_geographic_assign_same_points():
     for a bbox that spans fewer than 2 block heights the total set of points in
     all strips must be the same.
     """
-    from proxy._pipeline import compute_strips
+    from proxy._pipeline import compute_strips, make_strip_points
 
     cog_y_top = _reference_y_top(_CS_BBOX, _CS_CRS)
 
-    strips_utm  = compute_strips(_CS_BBOX, 1024, None,
-                                 cog_utm_crs=_CS_CRS, cog_y_top=cog_y_top)
-    strips_geo  = compute_strips(_CS_BBOX, 1024, None)
+    strips_utm, meta_utm = compute_strips(_CS_BBOX, 1024, None,
+                                          cog_utm_crs=_CS_CRS, cog_y_top=cog_y_top)
+    strips_geo, meta_geo = compute_strips(_CS_BBOX, 1024, None)
 
-    utm_ids = {pid for s in strips_utm for pid, _, _ in s["points"]}
-    geo_ids = {pid for s in strips_geo for pid, _, _ in s["points"]}
+    utm_ids = {pid for s in strips_utm for pid, _, _ in make_strip_points(s, meta_utm)}
+    geo_ids = {pid for s in strips_geo for pid, _, _ in make_strip_points(s, meta_geo)}
     all_ids = {pid for pid, _, _ in _CS_POINTS}
 
     assert utm_ids == all_ids, "UTM path lost some points"
@@ -736,18 +736,18 @@ def test_cs3_utm_and_geographic_assign_same_points():
 # CS-4: alignment holds when cog_y_top has a non-trivial offset from the bbox
 def test_cs4_alignment_with_offset_cog_origin():
     """Block alignment is preserved when cog_y_top is not an exact multiple of block_m."""
-    from proxy._pipeline import compute_strips
+    from proxy._pipeline import compute_strips, make_strip_points
 
     # Use a cog_y_top that is deliberately NOT a multiple of block_m.
     cog_y_top = 7_813_456.78
-    strips = compute_strips(
+    strips, meta = compute_strips(
         _CS_BBOX, 1024, None,
         cog_utm_crs=_CS_CRS, cog_y_top=cog_y_top,
     )
     assert strips
 
     for s in strips:
-        northings = _utm_northings(s["points"], _CS_CRS)
+        northings = _utm_northings(make_strip_points(s, meta), _CS_CRS)
         block_indices = {math.ceil((cog_y_top - y) / _CS_BLOCK_M) - 1 for y in northings}
         assert len(block_indices) == 1, (
             f"strip {s['strip_idx']}: points span multiple COG blocks {block_indices} "
@@ -758,19 +758,19 @@ def test_cs4_alignment_with_offset_cog_origin():
 # CS-5: works with strip_height_px = 2048 (2 × 1024)
 def test_cs5_larger_strip_height():
     """strip_height_px=2048 uses a 20480 m block_m and still aligns boundaries."""
-    from proxy._pipeline import compute_strips
+    from proxy._pipeline import compute_strips, make_strip_points
 
     strip_px = 2048
     block_m  = strip_px * 10.0
     cog_y_top = _reference_y_top(_CS_BBOX, _CS_CRS)
-    strips = compute_strips(
+    strips, meta = compute_strips(
         _CS_BBOX, strip_px, None,
         cog_utm_crs=_CS_CRS, cog_y_top=cog_y_top,
     )
     assert strips
 
     for s in strips:
-        northings = _utm_northings(s["points"], _CS_CRS)
+        northings = _utm_northings(make_strip_points(s, meta), _CS_CRS)
         block_indices = {math.ceil((cog_y_top - y) / block_m) - 1 for y in northings}
         assert len(block_indices) == 1, (
             f"strip {s['strip_idx']}: points span multiple 2048-px blocks {block_indices}"
@@ -785,7 +785,7 @@ def test_cs6_bbox_starts_mid_block():
     contains those pixels starts at the block boundary (below the bbox), so
     block_m waste is still zero.
     """
-    from proxy._pipeline import compute_strips
+    from proxy._pipeline import compute_strips, make_strip_points
     from pyproj import Transformer
 
     to_utm = Transformer.from_crs("EPSG:4326", _CS_CRS, always_xy=True)
@@ -795,14 +795,14 @@ def test_cs6_bbox_starts_mid_block():
     block_m = 1024 * 10.0
     cog_y_top = y_bbox_min + 3_000.0  # 3000 m above the bbox min
 
-    strips = compute_strips(
+    strips, meta = compute_strips(
         _CS_BBOX, 1024, None,
         cog_utm_crs=_CS_CRS, cog_y_top=cog_y_top,
     )
     assert strips
 
     for s in strips:
-        northings = _utm_northings(s["points"], _CS_CRS)
+        northings = _utm_northings(make_strip_points(s, meta), _CS_CRS)
         block_indices = {math.ceil((cog_y_top - y) / block_m) - 1 for y in northings}
         assert len(block_indices) == 1, (
             f"strip {s['strip_idx']}: points span multiple blocks {block_indices} "
@@ -815,7 +815,7 @@ def test_cs7_geographic_fallback_strip_count():
     """Geographic fallback produces a positive number of strips for a valid bbox."""
     from proxy._pipeline import compute_strips
 
-    strips = compute_strips(_CS_BBOX, 1024, None)  # no cog params → geographic
+    strips, _ = compute_strips(_CS_BBOX, 1024, None)  # no cog params → geographic
     assert len(strips) > 0
     # All returned strip indices are sequential starting from 0
     for expected_idx, s in enumerate(strips):
@@ -831,7 +831,7 @@ def test_cs8_empty_polygon_returns_no_strips():
     # Tiny polygon well outside the bbox
     tiny_poly = box(0.0, 0.0, 0.001, 0.001)
     cog_y_top = _reference_y_top(_CS_BBOX, _CS_CRS)
-    strips = compute_strips(
+    strips, _ = compute_strips(
         _CS_BBOX, 1024, tiny_poly,
         cog_utm_crs=_CS_CRS, cog_y_top=cog_y_top,
     )
@@ -841,14 +841,14 @@ def test_cs8_empty_polygon_returns_no_strips():
 # CS-9: falls back to geographic path when cog_y_top is None
 def test_cs9_falls_back_when_cog_y_top_none():
     """Passing cog_utm_crs but no cog_y_top uses the geographic fallback."""
-    from proxy._pipeline import compute_strips
+    from proxy._pipeline import compute_strips, make_strip_points
 
-    strips_fallback = compute_strips(_CS_BBOX, 1024, None)
-    strips_no_y_top = compute_strips(_CS_BBOX, 1024, None, cog_utm_crs=_CS_CRS, cog_y_top=None)
+    strips_fallback, meta_fallback = compute_strips(_CS_BBOX, 1024, None)
+    strips_no_y_top, meta_no_y_top = compute_strips(_CS_BBOX, 1024, None, cog_utm_crs=_CS_CRS, cog_y_top=None)
 
     # Both paths must cover the same total set of points.
-    ids_fallback = {pid for s in strips_fallback for pid, _, _ in s["points"]}
-    ids_no_y_top = {pid for s in strips_no_y_top for pid, _, _ in s["points"]}
+    ids_fallback = {pid for s in strips_fallback for pid, _, _ in make_strip_points(s, meta_fallback)}
+    ids_no_y_top = {pid for s in strips_no_y_top for pid, _, _ in make_strip_points(s, meta_no_y_top)}
     assert ids_fallback == ids_no_y_top
 
 
@@ -862,12 +862,12 @@ def test_cs10_strips_contiguous():
     Uses strip_height_px=32 (block_m=320 m) so the ~550 m tall tiny bbox produces
     multiple strips without enlarging the pixel grid.
     """
-    from proxy._pipeline import compute_strips
+    from proxy._pipeline import compute_strips, make_strip_points
 
     strip_px = 32
     block_m  = strip_px * 10.0  # 320 m
     cog_y_top_small = math.ceil(max(_CS_NORTHINGS) / block_m) * block_m + block_m
-    strips = compute_strips(
+    strips, meta = compute_strips(
         _CS_BBOX, strip_px, None,
         cog_utm_crs=_CS_CRS, cog_y_top=cog_y_top_small,
     )
@@ -878,7 +878,7 @@ def test_cs10_strips_contiguous():
     # Collect per-strip northing ranges
     ranges: list[tuple[float, float]] = []
     for s in strips:
-        ys = _utm_northings(s["points"], _CS_CRS)
+        ys = _utm_northings(make_strip_points(s, meta), _CS_CRS)
         ranges.append((min(ys), max(ys)))
 
     for i in range(len(ranges) - 1):
