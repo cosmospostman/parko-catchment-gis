@@ -186,30 +186,42 @@ def _sort_s1_shards(
 
     _log.info("merging %d sorted shards → %s ...", len(shard_paths), out_path.name)
 
-    # Step 2: k-way merge of the pre-sorted shards via Polars merge_sorted.
-    # Each shard is already sorted by (_northing, point_id, date) from step 1,
-    # so merge_sorted on _northing is a true streaming merge with no re-sort and
-    # O(k) peak RAM (one row-group buffer per shard), unlike .sort() which
-    # materialises the entire dataset.
-    import polars as pl
-    import functools
+    # Step 2: sort-merge via DuckDB with an explicit memory cap and spill-to-disk.
+    # The shards are partitioned by point batch, not northing band, so their
+    # northing ranges overlap fully — a k-way merge gains nothing over a sort.
+    # DuckDB spills to temp_directory when the memory limit is hit, so peak RSS
+    # stays bounded on the 8 GB fetcher machine.
+    import duckdb
 
     tmp_path = out_path.with_suffix(".s1_merge_tmp.parquet")
     tmp_path.unlink(missing_ok=True)
 
-    try:
-        frames = [
-            pl.scan_parquet(str(p), missing_columns="insert").with_columns(
-                pl.col("point_id").str.split("_").list.get(-1).cast(pl.Int32, strict=False).fill_null(0).alias("_northing")
-            )
-            for p in sorted_paths
-        ]
-        merged = functools.reduce(lambda acc, f: acc.merge_sorted(f, key="_northing"), frames[1:], frames[0])
-        (
-            merged
-            .drop("_northing")
-            .sink_parquet(str(tmp_path), compression="zstd", row_group_size=5_000_000, engine="streaming")
+    shard_glob = str(sorted_paths[0].parent / "*.sorted.parquet")
+    tmp_dir    = str(out_path.parent)
+
+    sql = f"""
+        COPY (
+            SELECT * EXCLUDE (_n)
+            FROM (
+                SELECT *,
+                    regexp_extract(point_id, '_([0-9]+)$', 1)::INTEGER AS _n
+                FROM read_parquet('{shard_glob}', union_by_name=true)
+            ) t
+            ORDER BY _n, date
+        ) TO '{tmp_path!s}' (
+            FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 5000000
         )
+    """
+
+    try:
+        con = duckdb.connect()
+        try:
+            con.execute("SET memory_limit = '2GB'")
+            con.execute(f"SET temp_directory = '{tmp_dir}'")
+            con.execute("SET threads = 4")
+            con.execute(sql)
+        finally:
+            con.close()
         tmp_path.replace(out_path)
         _log.info("merge done → %s", out_path.name)
     except Exception:
