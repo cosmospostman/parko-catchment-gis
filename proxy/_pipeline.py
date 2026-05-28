@@ -135,6 +135,7 @@ def merge_scenes(
     if not all_paths:
         return
 
+    logger.info("merge_scenes: merging %d files → %s", len(all_paths), out_path.name)
     tmp_path = out_path.with_suffix(".merge_tmp.parquet")
     tmp_path.unlink(missing_ok=True)
 
@@ -235,6 +236,7 @@ def merge_scenes(
                     heapq.heappush(heap, (next_n, next_dt, cid, 0, next_batch))
 
         _flush()
+        logger.info("merge_scenes done: %d input files → %s", len(all_paths), out_path.name)
     finally:
         if writer is not None:
             writer.close()
@@ -709,7 +711,7 @@ def run_tile_pipeline_v2(
     # On machines with ≤12 GB RAM, depth-1 avoids OOM; override with PREFETCH_DEPTH=2
     # on larger instances.
     _mem_gb = _system_memory_gb()
-    _default_prefetch = 1 if _mem_gb <= 12 else 2
+    _default_prefetch = 1 if _mem_gb <= 20 else 2
     prefetch_depth = int(os.environ.get("PREFETCH_DEPTH", str(_default_prefetch)))
 
     bbox_wgs84 = list(polygon_geometry.bounds)
