@@ -1184,7 +1184,7 @@ def score_pixels_chunked(
     batch_size: int = 4096,
     buffer_row_groups: int = 4,
     target_chunk_rows: int = 393_216,
-    n_prep_workers: int = 5,
+    n_prep_workers: int = 16,
     device: str | None = None,
     tile_id: str | None = None,
     end_year: int | None = None,
@@ -1653,20 +1653,39 @@ def score_pixels_chunked(
             )
             gpu_ready_q.put(tb)
 
-    xfer_thread = Thread(target=_transfer_worker, daemon=True)
-    xfer_thread.start()
+    # result_q: gpu thread → main thread for bookkeeping/logging
+    result_q: Queue = Queue(maxsize=8)
 
-    # --- Stage A (main thread): accumulate prep_q → xfer_q ---
-    # --- Stage C (main thread): pull gpu_ready_q → GPU forward ---
-    # The GPU forward stays on the main thread to avoid PyTorch threading issues.
-    # Overlap: while forward runs on compute_stream, xfer thread DMAs next batch
-    # on transfer_stream — the GPU copy and compute engines run in parallel.
+    # --- Stage C: dedicated GPU forward thread ---
+    # Model forward confirmed safe to call from a background thread (tested).
     _n_gpu_calls   = 0
     _t_score_total = 0.0
+
+    def _gpu_worker() -> None:
+        nonlocal _n_gpu_calls, _t_score_total
+        while True:
+            tb = gpu_ready_q.get()
+            if tb is _SENTINEL:
+                result_q.put(_SENTINEL)
+                break
+            _ts = _time.monotonic()
+            chunk = _gpu_forward(tb, model, gate_threshold, compute_stream)
+            _t_score_total += _time.monotonic() - _ts
+            _n_gpu_calls   += 1
+            result_q.put((chunk, tb.B))
+
+    xfer_thread = Thread(target=_transfer_worker, daemon=True)
+    gpu_thread  = Thread(target=_gpu_worker,      daemon=True)
+    xfer_thread.start()
+    gpu_thread.start()
+
+    # --- Stage A: main thread — accumulate prep_q → xfer_q,
+    #              and drain result_q for bookkeeping/logging ---
     _t_idle_total  = 0.0
     _t_merge_total = 0.0
     _acc: list[_PreparedBatch] = []
     _acc_px = 0
+    import queue as _queue
 
     def _flush_acc() -> None:
         nonlocal _t_merge_total
@@ -1687,34 +1706,19 @@ def score_pixels_chunked(
                               if _acc[0].global_feats is not None else None),
             )
         _t_merge_total += _time.monotonic() - _tm
-        # Drain any GPU-ready batches before potentially blocking on xfer_q.
-        # This prevents the main thread from blocking in put() while a scored
-        # batch sits waiting to be collected.
-        _maybe_score_ready()
         xfer_q.put(merged)   # blocks if xfer_q is full — natural backpressure
 
-    # Interleave: drain prep_q into xfer_q while also consuming gpu_ready_q.
-    # When gpu_ready_q has a batch ready (non-blocking check), run the forward
-    # immediately before going back to drain prep_q.
-    import queue as _queue
-
-    def _maybe_score_ready() -> None:
-        """Score any batches the xfer thread has ready, without blocking."""
+    def _collect_results() -> None:
+        """Drain result_q non-blocking; update n_scored and log progress."""
         nonlocal n_scored, n_total_gate_cut, n_last_logged, _t_last_logged
-        nonlocal _n_gpu_calls, _t_score_total
         while True:
             try:
-                tb = gpu_ready_q.get_nowait()
+                res = result_q.get_nowait()
             except _queue.Empty:
                 break
-            if tb is _SENTINEL:
-                # shouldn't happen mid-loop, but handle defensively
+            if res is _SENTINEL:
                 break
-            _ts = _time.monotonic()
-            chunk = _gpu_forward(tb, model, gate_threshold, compute_stream)
-            _t_score_total += _time.monotonic() - _ts
-            _n_gpu_calls   += 1
-            px_count = tb.B
+            chunk, px_count = res
             n_total_gate_cut += chunk[3]
             if out_writer is not None:
                 out_q.put(chunk)
@@ -1755,20 +1759,16 @@ def score_pixels_chunked(
             continue
         _flush_acc()
         _acc.clear(); _acc_px = 0
+        _collect_results()
 
-    # Signal transfer thread that input is done.
     xfer_q.put(_SENTINEL)
 
-    # Drain remaining gpu_ready_q until we see the sentinel.
+    # Drain result_q until GPU thread signals done.
     while True:
-        tb = gpu_ready_q.get()
-        if tb is _SENTINEL:
+        res = result_q.get()
+        if res is _SENTINEL:
             break
-        _ts = _time.monotonic()
-        chunk = _gpu_forward(tb, model, gate_threshold)
-        _t_score_total += _time.monotonic() - _ts
-        _n_gpu_calls   += 1
-        px_count = tb.B
+        chunk, px_count = res
         n_total_gate_cut += chunk[3]
         if out_writer is not None:
             out_q.put(chunk)
@@ -1794,6 +1794,7 @@ def score_pixels_chunked(
             _t_last_logged = _t_now
 
     xfer_thread.join()
+    gpu_thread.join()
 
     io_thread.join()
     reader_thread.join()

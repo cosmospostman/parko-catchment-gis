@@ -217,8 +217,14 @@ def _extract_item_from_tiffs(
                 )
                 rows = np.clip(rows_raw, 0, h - 1)
                 cols = np.clip(cols_raw, 0, w - 1)
-                arr = src.read(1)
-                vals = arr[rows, cols].astype(np.float32)
+                # Read only the tight bounding window of the point set rather than
+                # the full raster.  A 1024-px strip spanning a wide tile can be
+                # ~44 MB per band; reading a sub-window keeps peak RAM O(bbox).
+                r0, r1 = int(rows.min()), int(rows.max()) + 1
+                c0, c1 = int(cols.min()), int(cols.max()) + 1
+                win = rasterio.windows.Window(c0, r0, c1 - c0, r1 - r0)
+                arr = src.read(1, window=win)
+                vals = arr[rows - r0, cols - c0].astype(np.float32)
                 if oob_mask.any():
                     vals[oob_mask] = np.nan
                 return vals
