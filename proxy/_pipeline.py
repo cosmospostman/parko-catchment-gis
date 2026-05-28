@@ -585,7 +585,7 @@ def run_tile_pipeline_v2(
     cloud_max: int = 20,
     apply_nbar: bool = True,
     strip_height_px: int = 1024,
-    max_concurrent: int = 32,
+    max_concurrent: int = 128,
     n_workers: int | None = None,
     resume_from_strip: int = 0,
     items=None,
@@ -797,63 +797,80 @@ def run_tile_pipeline_v2(
     # --- Main loop with depth-2 prefetch -------------------------------------
 
     from collections import deque as _deque
+    from concurrent.futures import TimeoutError as _FutureTimeout
+
+    def _await(fut):
+        """Block until future completes, waking every 0.25 s so Ctrl-C lands."""
+        while True:
+            try:
+                return fut.result(timeout=0.25)
+            except _FutureTimeout:
+                pass
 
     with _TPE(max_workers=2) as prefetch_pool:
         pts_queue:   _deque = _deque()
         fetch_futs:  _deque = _deque()
 
-        for k in range(min(2, len(active_strips))):
-            pts = make_strip_points(active_strips[k], strips_meta)
-            pts_queue.append(pts)
-            fetch_futs.append(prefetch_pool.submit(_fetch_strip_to_tiff, active_strips[k]))
-
-        for i, strip in enumerate(active_strips):
-            strip_idx  = strip["strip_idx"]
-            strip_bbox = strip["bbox"]
-            strip_pts  = pts_queue.popleft()
-
-            tiff_dir = fetch_futs.popleft().result()
-            logger.info("[v2 tile %s %d] [strip %04d] Pool A done; starting Pool B (%d pts, %d items)",
-                        tile_id, year, strip_idx, len(strip_pts), len(items))
-
-            # Submit Pool A for strip i+2 before Pool B starts so the network
-            # stays busy throughout extraction.
-            next_k = i + 2
-            if next_k < len(active_strips):
-                pts = make_strip_points(active_strips[next_k], strips_meta)
+        try:
+            for k in range(min(2, len(active_strips))):
+                pts = make_strip_points(active_strips[k], strips_meta)
                 pts_queue.append(pts)
-                fetch_futs.append(prefetch_pool.submit(_fetch_strip_to_tiff, active_strips[next_k]))
+                fetch_futs.append(prefetch_pool.submit(_fetch_strip_to_tiff, active_strips[k]))
 
-            # Pool B: extract all items from tiffs → scene parquets
-            scene_paths = _extract_strip(strip, tiff_dir, strip_pts)
+            for i, strip in enumerate(active_strips):
+                strip_idx  = strip["strip_idx"]
+                strip_bbox = strip["bbox"]
+                strip_pts  = pts_queue.popleft()
 
-            # Clean up remaining tiff subdirs (any items that weren't cloud-filtered
-            # but produced no clear pixels and thus weren't cleaned up in _extract_one)
-            shutil.rmtree(tiff_dir, ignore_errors=True)
+                tiff_dir = _await(fetch_futs.popleft())
+                logger.info("[v2 tile %s %d] [strip %04d] Pool A done; starting Pool B (%d pts, %d items)",
+                            tile_id, year, strip_idx, len(strip_pts), len(items))
 
-            if not scene_paths:
-                logger.info("[v2 tile %s %d] [strip %04d] no scene data — skipping",
-                            tile_id, year, strip_idx)
-                continue
+                # Submit Pool A for strip i+2 before Pool B starts so the network
+                # stays busy throughout extraction.
+                next_k = i + 2
+                if next_k < len(active_strips):
+                    pts = make_strip_points(active_strips[next_k], strips_meta)
+                    pts_queue.append(pts)
+                    fetch_futs.append(prefetch_pool.submit(_fetch_strip_to_tiff, active_strips[next_k]))
 
-            # S1 extraction
-            scene_dir = tmp / f"strip_{strip_idx:04d}_scenes"
-            s1_path = collect_s1_for_tile(
-                s2_path=None,
-                bbox_wgs84=strip_bbox,
-                start=start_date,
-                end=end_date,
-                out_path=scene_dir / "s1_strip.parquet",
-                cache_dir=scene_dir / "s1_cache",
-                max_concurrent=max_concurrent,
-                points=strip_pts,
-            )
+                # Pool B: extract all items from tiffs → scene parquets
+                scene_paths = _extract_strip(strip, tiff_dir, strip_pts)
 
-            strip_out = tmp / f"strip_{strip_idx:04d}_sorted.parquet"
-            merge_scenes(scene_paths, s1_path, strip_out)
+                # Clean up remaining tiff subdirs (any items that weren't cloud-filtered
+                # but produced no clear pixels and thus weren't cleaned up in _extract_one)
+                shutil.rmtree(tiff_dir, ignore_errors=True)
 
-            shutil.rmtree(scene_dir, ignore_errors=True)
+                if not scene_paths:
+                    logger.info("[v2 tile %s %d] [strip %04d] no scene data — skipping",
+                                tile_id, year, strip_idx)
+                    continue
 
-            logger.info("[v2 tile %s %d] [strip %04d] ready → %s",
-                        tile_id, year, strip_idx, strip_out.name)
-            yield strip_idx, strip_out
+                # S1 extraction
+                scene_dir = tmp / f"strip_{strip_idx:04d}_scenes"
+                s1_path = collect_s1_for_tile(
+                    s2_path=None,
+                    bbox_wgs84=strip_bbox,
+                    start=start_date,
+                    end=end_date,
+                    out_path=scene_dir / "s1_strip.parquet",
+                    cache_dir=scene_dir / "s1_cache",
+                    max_concurrent=max_concurrent,
+                    points=strip_pts,
+                )
+
+                strip_out = tmp / f"strip_{strip_idx:04d}_sorted.parquet"
+                merge_scenes(scene_paths, s1_path, strip_out)
+
+                shutil.rmtree(scene_dir, ignore_errors=True)
+
+                logger.info("[v2 tile %s %d] [strip %04d] ready → %s",
+                            tile_id, year, strip_idx, strip_out.name)
+                yield strip_idx, strip_out
+
+        except KeyboardInterrupt:
+            logger.warning("[v2 tile %s %d] interrupted — cancelling pending fetches", tile_id, year)
+            for fut in fetch_futs:
+                fut.cancel()
+            prefetch_pool.shutdown(wait=False, cancel_futures=True)
+            raise

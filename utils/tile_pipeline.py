@@ -29,7 +29,7 @@ def fetch_tile_local(
     cloud_max: int = 20,
     apply_nbar: bool = True,
     strip_height_px: int = 1024,
-    max_concurrent: int = 32,
+    max_concurrent: int = 128,
     n_workers: int | None = None,
     items=None,
     calibration_out: Path | None = None,

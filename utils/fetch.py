@@ -60,7 +60,10 @@ def _read_bbox_patch(
                     win.col_off - _EXPAND, win.row_off - _EXPAND,
                     win.width + 2 * _EXPAND, win.height + 2 * _EXPAND,
                 )
-                win = win.intersection(Window(0, 0, src.width, src.height))
+                try:
+                    win = win.intersection(Window(0, 0, src.width, src.height))
+                except Exception:
+                    return None  # bbox doesn't overlap this item's raster extent
                 if win.width <= 0 or win.height <= 0:
                     return None
                 # Ensure at least 1×1 pixel — low-res bands (e.g. AOT at 60m)
@@ -393,7 +396,7 @@ async def fetch_patches_to_tiff(
     bands: list[str],
     bbox_wgs84: list[float],
     out_dir: Path,
-    max_concurrent: int = 32,
+    max_concurrent: int = 128,
     band_alias: dict[str, str] | None = None,
     item_signer: object | None = None,
 ) -> list[Path]:

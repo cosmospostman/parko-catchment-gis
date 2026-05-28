@@ -1418,8 +1418,18 @@ def score_pixels_chunked(
 
     # Timing breakdown: track idle (waiting on prep_q) vs active (GPU score).
     _t_idle_total  = 0.0  # seconds blocked in prep_q.get() with nothing to score
-    _t_score_total = 0.0  # seconds inside _gpu_score
+    _t_merge_total = 0.0  # seconds in torch.cat / np.concatenate (batch merging)
+    _t_score_total = 0.0  # seconds inside _gpu_score (includes H2D + forward + D2H)
     _n_gpu_calls   = 0
+
+    # Double-buffer: GPU scores batch N in a background thread while the main
+    # thread accumulates and merges batch N+1.  The executor serialises GPU calls
+    # (max_workers=1); the main thread never blocks on scoring — it just submits
+    # and loops back to prep_q immediately.  We cap the executor's internal queue
+    # at 1 pending (+ 1 running = 2 in-flight max) by using a bounded queue so
+    # tensors don't pile up if prep vastly outruns the GPU.
+    _gpu_executor   = ThreadPoolExecutor(max_workers=1)
+    _result_futures: list = []       # futures in submission order
 
     # Small-batch accumulator: prep workers often produce batches well under
     # batch_size (e.g. ~1400 px from a 131k-row chunk on sparse tiles), so the
@@ -1429,8 +1439,20 @@ def score_pixels_chunked(
     _acc: list[_PreparedBatch] = []
     _acc_px = 0
 
-    def _merge_and_score(items: list[_PreparedBatch]) -> tuple:
+    def _do_gpu_score(merged: _PreparedBatch, px_count: int) -> tuple:
+        """Runs in the GPU executor thread."""
         nonlocal _t_score_total, _n_gpu_calls
+        _ts = _time.monotonic()
+        result = _gpu_score(merged, model, device,
+                            gate_threshold=gate_threshold, T_gate=T_gate)
+        _t_score_total += _time.monotonic() - _ts
+        _n_gpu_calls   += 1
+        return result, px_count
+
+    def _submit_batch(items: list[_PreparedBatch]) -> None:
+        """Merge items on the main thread, then hand off to GPU executor."""
+        nonlocal _t_merge_total
+        _tm = _time.monotonic()
         if len(items) == 1:
             merged = items[0]
         else:
@@ -1446,12 +1468,22 @@ def score_pixels_chunked(
                 global_feats=(np.concatenate([b.global_feats for b in items], axis=0)
                               if items[0].global_feats is not None else None),
             )
-        _ts = _time.monotonic()
-        result = _gpu_score(merged, model, device,
-                            gate_threshold=gate_threshold, T_gate=T_gate)
-        _t_score_total += _time.monotonic() - _ts
-        _n_gpu_calls   += 1
-        return result
+        _t_merge_total += _time.monotonic() - _tm
+        px_count = len(merged.pids)
+        _result_futures.append(_gpu_executor.submit(_do_gpu_score, merged, px_count))
+
+    def _drain_results() -> None:
+        """Collect all completed futures and store results. Called after the
+        accumulator loop finishes so the GPU executor can drain in order."""
+        nonlocal n_scored, n_total_gate_cut
+        for fut in _result_futures:
+            chunk, px_count = fut.result()
+            n_total_gate_cut += chunk[3]
+            if out_writer is not None:
+                out_q.put(chunk)
+            else:
+                all_pids.append(chunk[0]); all_years.append(chunk[1]); all_probs.append(chunk[2])
+            n_scored += px_count
 
     while sentinels_seen < n_prep_workers:
         _t_get_start = _time.monotonic()
@@ -1461,48 +1493,47 @@ def score_pixels_chunked(
             _t_idle_total += _time.monotonic() - _t_get_start
         if item is _SENTINEL:
             sentinels_seen += 1
-            # Flush any remaining accumulated batches when all workers finish.
             if sentinels_seen == n_prep_workers and _acc:
-                n_scored_tail = _acc_px
-                chunk = _merge_and_score(_acc)
+                _submit_batch(_acc)
                 _acc.clear(); _acc_px = 0
-                n_total_gate_cut += chunk[3]
-                if out_writer is not None:
-                    out_q.put(chunk)
-                else:
-                    all_pids.append(chunk[0]); all_years.append(chunk[1]); all_probs.append(chunk[2])
-                n_scored += n_scored_tail
             continue
         _acc.append(item)
         _acc_px += len(item.pids)
         if _acc_px < batch_size:
             continue
-        chunk = _merge_and_score(_acc)
-        n_scored_batch = _acc_px
+        _submit_batch(_acc)
         _acc.clear(); _acc_px = 0
-        n_total_gate_cut += chunk[3]
-        if out_writer is not None:
-            out_q.put(chunk)
-        else:
-            all_pids.append(chunk[0]); all_years.append(chunk[1]); all_probs.append(chunk[2])
-        n_scored += n_scored_batch
-        if n_scored - n_last_logged >= progress_log_interval:
-            _t_now = _time.monotonic()
-            dt_interval = _t_now - _t_last_logged
-            rate = (n_scored - n_last_logged) / dt_interval if dt_interval > 0 else 0.0
-            if n_total_pixels:
-                logger.info(
-                    "[%s yr=%s] %.1f%% (%d/%d px) @ %.0f px/s",
-                    tile_id or "?", end_year or "?",
-                    100.0 * n_scored / n_total_pixels, n_scored, n_total_pixels, rate,
-                )
+        # Drain any futures that have already completed so n_scored stays current
+        # for progress logging (non-blocking: only collect futures that are done).
+        while _result_futures and _result_futures[0].done():
+            chunk, px_count = _result_futures.pop(0).result()
+            n_total_gate_cut += chunk[3]
+            if out_writer is not None:
+                out_q.put(chunk)
             else:
-                logger.info(
-                    "[%s yr=%s] %d px scored @ %.0f px/s",
-                    tile_id or "?", end_year or "?", n_scored, rate,
-                )
-            n_last_logged = n_scored
-            _t_last_logged = _t_now
+                all_pids.append(chunk[0]); all_years.append(chunk[1]); all_probs.append(chunk[2])
+            n_scored += px_count
+            if n_scored - n_last_logged >= progress_log_interval:
+                _t_now = _time.monotonic()
+                dt_interval = _t_now - _t_last_logged
+                rate = (n_scored - n_last_logged) / dt_interval if dt_interval > 0 else 0.0
+                if n_total_pixels:
+                    logger.info(
+                        "[%s yr=%s] %.1f%% (%d/%d px) @ %.0f px/s",
+                        tile_id or "?", end_year or "?",
+                        100.0 * n_scored / n_total_pixels, n_scored, n_total_pixels, rate,
+                    )
+                else:
+                    logger.info(
+                        "[%s yr=%s] %d px scored @ %.0f px/s",
+                        tile_id or "?", end_year or "?", n_scored, rate,
+                    )
+                n_last_logged = n_scored
+                _t_last_logged = _t_now
+
+    # Wait for all in-flight GPU batches to complete.
+    _drain_results()
+    _gpu_executor.shutdown(wait=False)
 
     io_thread.join()
     reader_thread.join()
@@ -1511,14 +1542,15 @@ def score_pixels_chunked(
     prep_pool.shutdown(wait=False)
 
     _t_total = _time.monotonic() - _t0
-    _t_other  = max(0.0, _t_total - _t_idle_total - _t_score_total)
+    _t_other  = max(0.0, _t_total - _t_idle_total - _t_merge_total - _t_score_total)
     logger.info(
         "GPU consumer breakdown — total %.1fs: score %.1fs (%.0f%%), "
-        "idle/starved %.1fs (%.0f%%), other %.1fs (%.0f%%) | %d GPU calls",
+        "merge %.1fs (%.0f%%), idle/starved %.1fs (%.0f%%), other %.1fs (%.0f%%) | %d GPU calls",
         _t_total,
         _t_score_total, 100.0 * _t_score_total / _t_total if _t_total else 0,
-        _t_idle_total,  100.0 * _t_idle_total  / _t_total if _t_total else 0,
-        _t_other,       100.0 * _t_other        / _t_total if _t_total else 0,
+        _t_merge_total, 100.0 * _t_merge_total  / _t_total if _t_total else 0,
+        _t_idle_total,  100.0 * _t_idle_total   / _t_total if _t_total else 0,
+        _t_other,       100.0 * _t_other         / _t_total if _t_total else 0,
         _n_gpu_calls,
     )
 
