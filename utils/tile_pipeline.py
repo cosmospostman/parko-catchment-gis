@@ -68,7 +68,7 @@ def fetch_tile_local(
     Path | None
         The written output path, or None if no strips produced data.
     """
-    from proxy._pipeline import run_tile_pipeline
+    from proxy._pipeline import run_tile_pipeline_v2 as run_tile_pipeline
     from utils.parquet_utils import merge_strips
 
     out_path      = out_dir / str(year) / f"{tile_id}.parquet"

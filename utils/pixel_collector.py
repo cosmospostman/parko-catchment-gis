@@ -168,6 +168,147 @@ def _band_to_uint16(arr: np.ndarray) -> pl.Series:
     return s
 
 
+def _extract_item_from_tiffs(
+    item,
+    tiff_dir: Path,
+    point_ids: list[str],
+    lons: np.ndarray,
+    lats: np.ndarray,
+    apply_nbar: bool = True,
+    utm_crs: str = "EPSG:32755",
+) -> pl.DataFrame | None:
+    """Extract all usable pixels for one STAC item from on-disk GeoTIFF patches.
+
+    Counterpart to extract_item_to_df() for the network→disk pipeline.
+    Reads from {tiff_dir}/{band}.tif files written by fetch_patches_to_tiff().
+    Peak RAM = one item's bands sampled to n_points floats — a few MB per worker.
+
+    Returns None if the item has no clear pixels or the SCL tif is missing.
+    """
+    import rasterio
+    from pyproj import Transformer, CRS
+
+    item_id = item.id
+    m = _TILE_ID_RE.match(item_id)
+    tile_id = m.group(1) if m else item.properties.get("s2:mgrs_tile", "")
+    _dt = item.datetime.replace(tzinfo=None)
+    item_date = _dt
+    n = len(point_ids)
+
+    def _sample_tif(band: str) -> np.ndarray | None:
+        """Open {tiff_dir}/{band}.tif and sample pixel values at all points."""
+        path = tiff_dir / f"{band}.tif"
+        if not path.exists():
+            return None
+        try:
+            with rasterio.open(path) as src:
+                crs = src.crs
+                transform = src.transform
+                h, w = src.height, src.width
+                t = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+                xs, ys = t.transform(lons, lats)
+                cols_f, rows_f = ~transform * (xs, ys)
+                rows_raw = np.floor(rows_f).astype(np.intp)
+                cols_raw = np.floor(cols_f).astype(np.intp)
+                _EDGE_SLOP = 1
+                oob_mask = (
+                    (rows_raw < -_EDGE_SLOP) | (rows_raw >= h + _EDGE_SLOP) |
+                    (cols_raw < -_EDGE_SLOP) | (cols_raw >= w + _EDGE_SLOP)
+                )
+                rows = np.clip(rows_raw, 0, h - 1)
+                cols = np.clip(cols_raw, 0, w - 1)
+                arr = src.read(1)
+                vals = arr[rows, cols].astype(np.float32)
+                if oob_mask.any():
+                    vals[oob_mask] = np.nan
+                return vals
+        except Exception as exc:
+            logger.debug("_extract_item_from_tiffs: failed to read %s/%s: %s", item_id, band, exc)
+            return None
+
+    # SCL
+    scl_vals = _sample_tif(SCL_BAND)
+    if scl_vals is None:
+        return None
+    with np.errstate(invalid="ignore"):
+        scl_int = scl_vals.astype(np.int32)
+    clear_mask = np.isin(scl_int, list(SCL_CLEAR_VALUES))
+    if not clear_mask.any():
+        return None
+    scl_purity = clear_mask.astype(np.float32)
+
+    # AOT
+    aot_vals = _sample_tif(AOT_BAND)
+    if aot_vals is not None:
+        aot_quality = np.clip(1.0 - aot_vals * 0.001, 0.0, 1.0)
+    else:
+        aot_quality = np.ones(n, dtype=np.float32)
+
+    # Spectral bands
+    band_arrays: dict[str, np.ndarray] = {}
+    for band in BANDS:
+        vals = _sample_tif(band)
+        band_arrays[band] = vals / 10000.0 if vals is not None else np.full(n, np.nan, dtype=np.float32)
+
+    # NBAR c-factor correction
+    angles = None
+    if apply_nbar:
+        from utils.granule_angles import get_item_angles
+        from utils.nbar import c_factor as compute_cf
+        angles = get_item_angles(item, lons, lats, utm_crs=utm_crs, bands=list(BANDS))
+        if angles is not None:
+            for band in BANDS:
+                if band not in angles or band_arrays[band] is None:
+                    continue
+                a = angles[band]
+                raa = a["saa"] - a["vaa"]
+                cf = compute_cf(a["sza"], a["vza"], raa, band)
+                corrected = np.clip(band_arrays[band] * cf, 0.0, 1.0)
+                band_arrays[band] = np.where(np.isnan(cf), band_arrays[band], corrected)
+
+    # Zenith columns
+    if angles is not None:
+        sza_mean = np.mean(
+            [angles[b]["sza"] for b in BANDS if b in angles], axis=0
+        ).astype(np.float32)
+        vza_mean = np.mean(
+            [angles[b]["vza"] for b in BANDS if b in angles], axis=0
+        ).astype(np.float32)
+        sun_zenith_col  = np.where(np.isnan(sza_mean), 1.0, np.clip(1.0 - sza_mean / 90.0, 0.0, 1.0))
+        view_zenith_col = np.where(np.isnan(vza_mean), 1.0, np.clip(1.0 - vza_mean / 90.0, 0.0, 1.0))
+    else:
+        sun_zenith_col  = np.ones(n, dtype=np.float32)
+        view_zenith_col = np.ones(n, dtype=np.float32)
+
+    idx = np.where(clear_mask)[0]
+    n_clear = len(idx)
+    if n_clear == 0:
+        return None
+
+    band_data = {band: band_arrays[band][idx] for band in BANDS}
+
+    all_nan_mask = np.ones(n_clear, dtype=bool)
+    for arr in band_data.values():
+        all_nan_mask &= np.isnan(arr)
+    if all_nan_mask.all():
+        return None
+
+    return pl.DataFrame({
+        "point_id":    list(np.array(point_ids)[idx]),
+        "lon":         lons[idx].astype(np.float64),
+        "lat":         lats[idx].astype(np.float64),
+        "date":        pl.Series([item_date] * n_clear),
+        "item_id":     [item_id] * n_clear,
+        "tile_id":     [tile_id] * n_clear,
+        "scl_purity":  scl_purity[idx].astype(np.int8),
+        "scl":         scl_int[idx].astype(np.int8),
+        "aot":         np.round(aot_quality[idx] * 100).astype(np.uint8),
+        "view_zenith": np.round(view_zenith_col[idx] * 100).astype(np.uint8),
+        "sun_zenith":  np.round(sun_zenith_col[idx] * 100).astype(np.uint8),
+        **{band: _band_to_uint16(arr) for band, arr in band_data.items()},
+    })
+
+
 def extract_item_to_df(
     item,
     store: MemoryChipStore,

@@ -386,3 +386,164 @@ async def fetch_patches(
         fetched, cached, filtered, errors,
     )
     return result
+
+
+async def fetch_patches_to_tiff(
+    items: list,
+    bands: list[str],
+    bbox_wgs84: list[float],
+    out_dir: Path,
+    max_concurrent: int = 32,
+    band_alias: dict[str, str] | None = None,
+    item_signer: object | None = None,
+) -> list[Path]:
+    """Fetch one bbox-covering patch per (item, band) and write each to a GeoTIFF on disk.
+
+    Unlike fetch_patches(), no patch arrays are accumulated in memory — each array is
+    written to {out_dir}/{item_id}/{band}.tif immediately and then dereferenced.  This
+    keeps peak RAM at O(one patch) regardless of item count, suitable for 8 GB machines.
+
+    Applies the same SCL cloud filter as fetch_patches(): wholly-clouded items are skipped.
+    Existing non-empty .tif files are skipped (resume support within a strip restart).
+
+    Returns a list of all written .tif paths.
+    """
+    import os
+    os.environ["GDAL_HTTP_MAX_RETRY"] = "0"
+    os.environ.setdefault("GDAL_DISABLE_READDIR_ON_OPEN", "EMPTY_DIR")
+
+    loop = asyncio.get_running_loop()
+    sem = asyncio.Semaphore(max_concurrent)
+    executor = ThreadPoolExecutor(max_workers=max_concurrent)
+    _alias: dict[str, str] = band_alias or {}
+    written: list[Path] = []
+    written_lock = asyncio.Lock()
+    fetched = cached = filtered = errors = 0
+    lon_min, lat_min, lon_max, lat_max = bbox_wgs84
+
+    def _get_href(item, asset_key: str) -> str:
+        if item_signer is not None:
+            try:
+                item = item_signer(item)
+            except Exception:
+                pass
+        return item.assets[asset_key].href
+
+    def _write_tif(path: Path, arr: np.ndarray, transform, crs) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        with rasterio.open(
+            tmp, "w",
+            driver="GTiff",
+            height=arr.shape[0],
+            width=arr.shape[1],
+            count=1,
+            dtype=arr.dtype,
+            crs=crs,
+            transform=transform,
+            compress="lzw",
+        ) as dst:
+            dst.write(arr, 1)
+        tmp.replace(path)
+
+    async def _fetch_and_write(item, band: str, asset_key: str) -> Path | None:
+        nonlocal fetched, cached, errors
+        item_id = item.id
+        path = out_dir / item_id / f"{band}.tif"
+        if path.exists() and path.stat().st_size > 0:
+            cached += 1
+            return path
+        href = await loop.run_in_executor(executor, _get_href, item, asset_key)
+        async with sem:
+            data = await loop.run_in_executor(executor, _read_bbox_patch, href, bbox_wgs84)
+        if data is None:
+            errors += 1
+            return None
+        arr, transform, crs = data
+        await loop.run_in_executor(executor, _write_tif, path, arr, transform, crs)
+        fetched += 1
+        return path
+
+    # Build item specs (same pre-filter as fetch_patches)
+    item_specs = []
+    for item in items:
+        if item.bbox:
+            ib = item.bbox
+            if ib[0] > lon_max or ib[2] < lon_min or ib[1] > lat_max or ib[3] < lat_min:
+                continue
+        assets = item.assets
+        scl_asset_key = _alias.get(SCL_BAND, SCL_BAND)
+        has_scl = scl_asset_key in assets
+        band_asset_keys = []
+        for band in bands:
+            if band == SCL_BAND:
+                continue
+            asset_key = _alias.get(band, band)
+            if asset_key in assets:
+                band_asset_keys.append((band, asset_key))
+        item_specs.append((item, scl_asset_key if has_scl else None, band_asset_keys))
+
+    # Phase 1: SCL patches
+    n_scl = len(item_specs)
+    logger.info("fetch_patches_to_tiff: phase 1 — fetching %d SCL patches", n_scl)
+    scl_done = 0
+
+    async def fetch_scl_tracked(item, scl_asset_key):
+        nonlocal scl_done
+        if scl_asset_key is None:
+            return None
+        result = await _fetch_and_write(item, SCL_BAND, scl_asset_key)
+        scl_done += 1
+        logger.info("  S2 chips  fetch %d/%d SCL done", scl_done, n_scl)
+        return result
+
+    scl_paths = await asyncio.gather(*[
+        fetch_scl_tracked(item, scl_asset_key)
+        for (item, scl_asset_key, _) in item_specs
+    ])
+
+    # Phase 2: spectral patches for non-clouded items
+    spectral_tasks: list[tuple[asyncio.Task]] = []
+    for (item, scl_asset_key, band_asset_keys), scl_path in zip(item_specs, scl_paths):
+        if scl_asset_key is not None:
+            if scl_path is None:
+                continue
+            # Load SCL from the written tif to apply cloud filter
+            try:
+                with rasterio.open(scl_path) as src:
+                    scl_arr = src.read(1)
+            except Exception:
+                continue
+            if not _scl_has_clear_pixels(scl_arr):
+                filtered += 1
+                logger.debug("Skipping wholly-clouded item %s", item.id)
+                continue
+        for band, asset_key in band_asset_keys:
+            spectral_tasks.append(asyncio.ensure_future(_fetch_and_write(item, band, asset_key)))
+
+    n_spectral = len(spectral_tasks)
+    logger.info(
+        "fetch_patches_to_tiff: phase 2 — fetching %d spectral patches (%d items cloud-filtered)",
+        n_spectral, filtered,
+    )
+    completed = 0
+
+    async def tracked(task):
+        nonlocal completed
+        path = await task
+        completed += 1
+        logger.info("  S2 chips  fetch %d/%d spectral done", completed, n_spectral)
+        if path is not None:
+            async with written_lock:
+                written.append(path)
+
+    await asyncio.gather(*[tracked(t) for t in spectral_tasks])
+
+    executor.shutdown(wait=False)
+    _log = logger.warning if errors > 0 and fetched == 0 and cached == 0 else logger.info
+    _log(
+        "fetch_patches_to_tiff complete: %d fetched, %d cached, "
+        "%d items cloud-filtered, %d errors",
+        fetched, cached, filtered, errors,
+    )
+    return written

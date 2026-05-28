@@ -93,7 +93,7 @@ async def _run_pipeline(req: TileRequest, loop: asyncio.AbstractEventLoop) -> As
     import queue as _queue
     import threading as _threading
     from shapely import wkb as shapely_wkb
-    from proxy._pipeline import run_tile_pipeline
+    from proxy._pipeline import run_tile_pipeline_v2 as run_tile_pipeline
 
     t_start = time.monotonic()
     polygon_geometry = shapely_wkb.loads(base64.b64decode(req.polygon_wkb_b64))

@@ -575,3 +575,285 @@ def run_tile_pipeline(
 
             logger.info("[tile %s %d] [strip %04d] ready → %s", tile_id, year, strip_idx, strip_out.name)
             yield strip_idx, strip_out
+
+
+def run_tile_pipeline_v2(
+    tile_id: str,
+    year: int,
+    polygon_geometry,
+    tmp: Path,
+    cloud_max: int = 20,
+    apply_nbar: bool = True,
+    strip_height_px: int = 1024,
+    max_concurrent: int = 32,
+    n_workers: int | None = None,
+    resume_from_strip: int = 0,
+    items=None,
+    calibration_out: Path | None = None,
+) -> Iterator[tuple[int, Path]]:
+    """Two-pool network→disk / disk→extract pipeline for memory-constrained machines.
+
+    Pool A (network→disk): fetch_patches_to_tiff() writes one GeoTIFF per
+    (item, band) to disk immediately, dereferencing the array after each write.
+    Peak RAM during fetch = O(one patch array) regardless of item count.
+
+    Pool B (disk→extract→parquet): _extract_item_from_tiffs() opens on-disk
+    tifs, samples pixel values, and writes per-scene parquets.
+    Peak RAM during extract = O(n_points × n_bands × 4 bytes) per worker (~MB).
+
+    Depth-2 prefetch: Pool A for strip i+2 runs concurrently with Pool B for
+    strip i, keeping the network link saturated throughout extraction.
+
+    Same signature and yield contract as run_tile_pipeline().
+    """
+    import asyncio
+    import shutil
+    import os
+    from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _as_completed
+
+    from utils.stac import search_sentinel2
+    from utils.pixel_collector import (
+        collect, STAC_ENDPOINT, S2_COLLECTION, FETCH_BANDS, BAND_ALIAS,
+        _extract_item_from_tiffs, _TILE_ID_RE,
+        _band_to_uint16, BANDS,
+    )
+    from utils.s1_collector import collect_s1_for_tile
+    from analysis.constants import SCL_BAND, AOT_BAND, SCL_CLEAR_VALUES
+
+    # GDAL settings must be set before any ThreadPoolExecutor so worker threads inherit them.
+    _gdal_env = {
+        "AWS_NO_SIGN_REQUEST": "YES",
+        "AWS_DEFAULT_REGION": "us-west-2",
+        "GDAL_HTTP_MAX_RETRY": "5",
+        "GDAL_HTTP_RETRY_DELAY": "2",
+        "GDAL_HTTP_RETRY_ON_HTTP_ERROR": "429,500,502,503,504",
+        "GDAL_HTTP_PERSISTENT": "YES",
+        "CPL_VSIL_CURL_CACHE_SIZE": "67108864",   # 64 MB connection cache
+        "CPL_VSIL_CURL_CHUNK_SIZE": "10485760",   # 10 MB range requests
+        "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
+    }
+    for k, v in _gdal_env.items():
+        os.environ[k] = v
+
+    fetch_workers   = int(os.environ.get("FETCH_WORKERS",   "16"))
+    extract_workers = int(os.environ.get("EXTRACT_WORKERS", str(min(4, os.cpu_count() or 4))))
+
+    bbox_wgs84 = list(polygon_geometry.bounds)
+    start_date = f"{year}-01-01"
+    end_date   = f"{year}-12-31"
+
+    if items is None:
+        logger.info("[v2 tile %s %d] STAC search ...", tile_id, year)
+        items = search_sentinel2(
+            bbox=bbox_wgs84,
+            start=start_date,
+            end=end_date,
+            cloud_cover_max=cloud_max,
+            endpoint=STAC_ENDPOINT,
+            collection=S2_COLLECTION,
+        )
+    logger.info("[v2 tile %s %d] %d STAC items", tile_id, year, len(items))
+
+    if not items:
+        return
+
+    cog_utm_crs: str | None = None
+    cog_y_top: float | None = None
+    for item in items:
+        href_obj = item.assets.get("red") or item.assets.get("B04")
+        if href_obj is not None:
+            try:
+                cog_utm_crs, cog_y_top = read_cog_transform(href_obj.href)
+                logger.info("[v2 tile %s %d] COG origin: crs=%s y_top=%.1f",
+                            tile_id, year, cog_utm_crs, cog_y_top)
+            except Exception as exc:
+                logger.warning("[v2 tile %s %d] Could not read COG transform (%s) — using geographic fallback",
+                               tile_id, year, exc)
+            break
+
+    strips, strips_meta = compute_strips(
+        bbox_wgs84, strip_height_px, polygon_geometry,
+        cog_utm_crs=cog_utm_crs, cog_y_top=cog_y_top,
+    )
+    logger.info("[v2 tile %s %d] %d strips of %d px", tile_id, year, len(strips), strip_height_px)
+
+    if not strips:
+        return
+
+    active_strips = [s for s in strips if s["strip_idx"] >= resume_from_strip]
+    for s in strips:
+        if s["strip_idx"] < resume_from_strip:
+            logger.info("[v2 tile %s %d] [strip %04d] skipping (resume_from_strip=%d)",
+                        tile_id, year, s["strip_idx"], resume_from_strip)
+
+    if not active_strips:
+        return
+
+    from utils.parquet_utils import _optimise_schema, _WRITE_OPTS
+    import pyarrow.parquet as pq
+    import polars as pl
+    import numpy as np
+
+    col_order = (
+        ["point_id", "lon", "lat", "date", "item_id", "tile_id"]
+        + list(BANDS)
+        + ["scl_purity", "scl", "aot", "view_zenith", "sun_zenith"]
+    )
+
+    # --- Pool A: fetch one strip's patches to disk ----------------------------
+
+    def _fetch_strip_to_tiff(strip: dict) -> Path:
+        """Run Pool A for one strip: write all item×band tifs, return the tiff_dir."""
+        strip_idx = strip["strip_idx"]
+        tiff_dir = tmp / f"strip_{strip_idx:04d}_tiffs"
+        tiff_dir.mkdir(parents=True, exist_ok=True)
+        logger.info("[v2 tile %s %d] [strip %04d] Pool A fetch → %s",
+                    tile_id, year, strip_idx, tiff_dir.name)
+        asyncio.run(_fetch_strip_async(strip, tiff_dir))
+        return tiff_dir
+
+    async def _fetch_strip_async(strip: dict, tiff_dir: Path) -> None:
+        from utils.fetch import fetch_patches_to_tiff
+        await fetch_patches_to_tiff(
+            items=items,
+            bands=FETCH_BANDS,
+            bbox_wgs84=strip["bbox"],
+            out_dir=tiff_dir,
+            max_concurrent=max_concurrent,
+            band_alias=BAND_ALIAS,
+        )
+
+    # --- Pool B: extract one strip's items from tiffs → per-scene parquets ----
+
+    def _extract_strip(strip: dict, tiff_dir: Path, strip_pts: list) -> list[Path]:
+        """Run Pool B for one strip: extract all items to scene parquets."""
+        strip_idx = strip["strip_idx"]
+        scene_dir = tmp / f"strip_{strip_idx:04d}_scenes"
+        scene_dir.mkdir(parents=True, exist_ok=True)
+
+        point_ids = [pid      for pid, _, _   in strip_pts]
+        lons      = np.array([lon for _, lon, _ in strip_pts], dtype=np.float64)
+        lats      = np.array([lat for _, _, lat in strip_pts], dtype=np.float64)
+
+        n_items = len(items)
+
+        def _extract_one(item_idx: int, item) -> Path | None:
+            scene_id  = item.id
+            out_path  = scene_dir / f"scene_{item_idx:04d}.parquet"
+            item_tiff_dir = tiff_dir / scene_id
+
+            if out_path.exists() and out_path.stat().st_size > 0:
+                try:
+                    pq.ParquetFile(out_path).metadata
+                    return out_path
+                except Exception:
+                    out_path.unlink(missing_ok=True)
+
+            if not item_tiff_dir.exists():
+                # Item was cloud-filtered or had no data in fetch phase
+                return None
+
+            df = _extract_item_from_tiffs(
+                item, item_tiff_dir, point_ids, lons, lats,
+                apply_nbar=apply_nbar,
+                utm_crs=cog_utm_crs or "EPSG:32755",
+            )
+            # Free the tiff dir for this item immediately after sampling
+            shutil.rmtree(item_tiff_dir, ignore_errors=True)
+
+            if df is None or len(df) == 0:
+                logger.info("[v2] [strip %04d] scene %d/%d %s — no clear pixels",
+                            strip_idx, item_idx + 1, n_items, scene_id)
+                return None
+
+            tbl = df.select(col_order).to_arrow()
+            tbl = _optimise_schema(tbl)
+            tbl_pl = pl.from_arrow(tbl).with_columns(
+                pl.col("point_id").str.extract(r"_(\d+)$", 1).cast(pl.Int32).alias("_northing")
+            ).sort("_northing").drop("_northing")
+            tbl_sorted = tbl_pl.to_arrow().cast(tbl.schema)
+
+            tmp_path = out_path.with_suffix(".tmp.parquet")
+            tmp_path.unlink(missing_ok=True)
+            writer = pq.ParquetWriter(str(tmp_path), tbl_sorted.schema, **_WRITE_OPTS)
+            writer.write_table(tbl_sorted)
+            writer.close()
+            tmp_path.replace(out_path)
+
+            logger.info("[v2] [strip %04d] scene %d/%d %s — %d rows",
+                        strip_idx, item_idx + 1, n_items, scene_id, len(tbl_sorted))
+            return out_path
+
+        scene_paths: list[Path] = []
+        with _TPE(max_workers=extract_workers) as pool:
+            futs = {pool.submit(_extract_one, idx, item): idx for idx, item in enumerate(items)}
+            for fut in _as_completed(futs):
+                result = fut.result()
+                if result is not None:
+                    scene_paths.append(result)
+
+        return scene_paths
+
+    # --- Main loop with depth-2 prefetch -------------------------------------
+
+    from collections import deque as _deque
+
+    with _TPE(max_workers=2) as prefetch_pool:
+        pts_queue:   _deque = _deque()
+        fetch_futs:  _deque = _deque()
+
+        for k in range(min(2, len(active_strips))):
+            pts = make_strip_points(active_strips[k], strips_meta)
+            pts_queue.append(pts)
+            fetch_futs.append(prefetch_pool.submit(_fetch_strip_to_tiff, active_strips[k]))
+
+        for i, strip in enumerate(active_strips):
+            strip_idx  = strip["strip_idx"]
+            strip_bbox = strip["bbox"]
+            strip_pts  = pts_queue.popleft()
+
+            tiff_dir = fetch_futs.popleft().result()
+            logger.info("[v2 tile %s %d] [strip %04d] Pool A done; starting Pool B (%d pts, %d items)",
+                        tile_id, year, strip_idx, len(strip_pts), len(items))
+
+            # Submit Pool A for strip i+2 before Pool B starts so the network
+            # stays busy throughout extraction.
+            next_k = i + 2
+            if next_k < len(active_strips):
+                pts = make_strip_points(active_strips[next_k], strips_meta)
+                pts_queue.append(pts)
+                fetch_futs.append(prefetch_pool.submit(_fetch_strip_to_tiff, active_strips[next_k]))
+
+            # Pool B: extract all items from tiffs → scene parquets
+            scene_paths = _extract_strip(strip, tiff_dir, strip_pts)
+
+            # Clean up remaining tiff subdirs (any items that weren't cloud-filtered
+            # but produced no clear pixels and thus weren't cleaned up in _extract_one)
+            shutil.rmtree(tiff_dir, ignore_errors=True)
+
+            if not scene_paths:
+                logger.info("[v2 tile %s %d] [strip %04d] no scene data — skipping",
+                            tile_id, year, strip_idx)
+                continue
+
+            # S1 extraction
+            scene_dir = tmp / f"strip_{strip_idx:04d}_scenes"
+            s1_path = collect_s1_for_tile(
+                s2_path=None,
+                bbox_wgs84=strip_bbox,
+                start=start_date,
+                end=end_date,
+                out_path=scene_dir / "s1_strip.parquet",
+                cache_dir=scene_dir / "s1_cache",
+                max_concurrent=max_concurrent,
+                points=strip_pts,
+            )
+
+            strip_out = tmp / f"strip_{strip_idx:04d}_sorted.parquet"
+            merge_scenes(scene_paths, s1_path, strip_out)
+
+            shutil.rmtree(scene_dir, ignore_errors=True)
+
+            logger.info("[v2 tile %s %d] [strip %04d] ready → %s",
+                        tile_id, year, strip_idx, strip_out.name)
+            yield strip_idx, strip_out
