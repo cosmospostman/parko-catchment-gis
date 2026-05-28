@@ -98,16 +98,20 @@ def merge_scenes(
     s1_path: Path | None,
     out_path: Path,
 ) -> None:
-    """DuckDB N-way sort-merge of S2 per-scene parquets (+ optional S1) into out_path.
+    """Sort-merge of S2 per-scene parquets (+ optional S1) into out_path.
 
-    Output is sorted by (northing, date), ZSTD compressed, dictionary encoded
-    on point_id.  Uses COMBINED_PIXEL_SCHEMA — no live-file schema derivation.
+    Output is sorted by (northing, date).  Uses a bucket-sort approach to avoid
+    materialising the full dataset in RAM: DuckDB extracts the northing key and
+    partitions into N buckets; each bucket is sorted independently (fitting in
+    RAM) then streamed in order to a single PyArrow parquet writer.
     """
     import duckdb
+    import pyarrow as pa
     import pyarrow.parquet as pq
     from utils.parquet_utils import COMBINED_PIXEL_SCHEMA
 
     out_names = COMBINED_PIXEL_SCHEMA.names
+    col_list  = ", ".join(f'"{c}"' for c in out_names)
 
     def _select(file_cols: set[str], source_override: str | None) -> str:
         parts = []
@@ -120,51 +124,79 @@ def merge_scenes(
                 parts.append(f'NULL AS "{name}"')
         return ", ".join(parts)
 
-    col_list = ", ".join(f'"{c}"' for c in out_names)
-
     union_parts = []
     for sp in scene_paths:
         s2_cols = set(pq.ParquetFile(sp).schema_arrow.names)
-        sel = _select(s2_cols, "S2")
-        union_parts.append(f"SELECT {sel} FROM read_parquet('{sp}')")
-
+        union_parts.append(f"SELECT {_select(s2_cols, 'S2')} FROM read_parquet('{sp}')")
     if s1_path and s1_path.exists():
         s1_cols = set(pq.ParquetFile(s1_path).schema_arrow.names)
-        sel = _select(s1_cols, None)
-        union_parts.append(f"SELECT {sel} FROM read_parquet('{s1_path}')")
+        union_parts.append(f"SELECT {_select(s1_cols, None)} FROM read_parquet('{s1_path}')")
 
     union_sql = "\nUNION ALL\n".join(union_parts)
-    dst = str(out_path)
-    tmp_dir = str(out_path.parent)
+    tmp_dir   = str(out_path.parent)
+    tmp_path  = out_path.with_suffix(".merge_tmp.parquet")
+    tmp_path.unlink(missing_ok=True)
 
-    # Single thread: lower peak RAM per sort run, more predictable spill.
-    # PROXY_MERGE_MEM_GB overrides the cap (default 2 GB — enough to spill-sort
-    # hundreds of millions of rows given temp_directory is set).
-    mem_gb = int(os.environ.get("PROXY_MERGE_MEM_GB", "4"))
+    # N_BUCKETS controls peak RAM: each bucket is sorted independently.
+    # 16 buckets over ~4 GB parquet input ≈ 250 MB compressed per bucket;
+    # uncompressed in DuckDB ≈ 1–2 GB per bucket — fits comfortably in 8 GB.
+    n_buckets = int(os.environ.get("PROXY_MERGE_BUCKETS", "16"))
+    mem_gb    = int(os.environ.get("PROXY_MERGE_MEM_GB",  "4"))
 
-    sql = f"""
-        COPY (
-            SELECT {col_list}
-            FROM ({union_sql}) t
-            ORDER BY TRY_CAST(regexp_extract(point_id, '_([0-9]+)$', 1) AS INTEGER), date
-        ) TO '{dst}' (
-            FORMAT PARQUET,
-            COMPRESSION ZSTD,
-            ROW_GROUP_SIZE 5000000
-        )
-    """
-    con = duckdb.connect(
-        config={
+    def _con() -> "duckdb.DuckDBPyConnection":
+        return duckdb.connect(config={
             "temp_directory": tmp_dir,
             "memory_limit": f"{mem_gb}GB",
             "preserve_insertion_order": False,
             "threads": 2,
-        }
-    )
+        })
+
+    # Pass 1: write a staging parquet that adds _n (northing int) and _bucket.
+    staging = out_path.with_suffix(".stage_tmp.parquet")
+    staging.unlink(missing_ok=True)
+    con = _con()
     try:
-        con.execute(sql)
+        con.execute(f"""
+            COPY (
+                SELECT {col_list},
+                    TRY_CAST(regexp_extract(point_id, '_([0-9]+)$', 1) AS INTEGER) AS _n,
+                    TRY_CAST(regexp_extract(point_id, '_([0-9]+)$', 1) AS INTEGER) % {n_buckets} AS _bucket
+                FROM ({union_sql}) t
+            ) TO '{staging!s}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 5000000)
+        """)
     finally:
         con.close()
+
+    # Pass 2: read each bucket in order, sort within it, stream to output writer.
+    writer = None
+    try:
+        for bucket in range(n_buckets):
+            con = _con()
+            try:
+                tbl = con.execute(f"""
+                    SELECT {col_list}
+                    FROM read_parquet('{staging!s}')
+                    WHERE _bucket = {bucket}
+                    ORDER BY _n, date
+                """).arrow()
+            finally:
+                con.close()
+            if tbl.num_rows == 0:
+                continue
+            if writer is None:
+                writer = pq.ParquetWriter(
+                    tmp_path,
+                    schema=COMBINED_PIXEL_SCHEMA,
+                    compression="zstd",
+                    use_dictionary=["point_id", "item_id", "tile_id"],
+                )
+            writer.write_table(tbl)
+    finally:
+        if writer is not None:
+            writer.close()
+        staging.unlink(missing_ok=True)
+
+    tmp_path.replace(out_path)
 
 
 # ---------------------------------------------------------------------------
