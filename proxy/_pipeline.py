@@ -674,7 +674,7 @@ def run_tile_pipeline_v2(
     setup_gdal_env()
 
     fetch_workers   = int(os.environ.get("FETCH_WORKERS",   "16"))
-    extract_workers = int(os.environ.get("EXTRACT_WORKERS", str(min(4, os.cpu_count() or 4))))
+    extract_workers = int(os.environ.get("EXTRACT_WORKERS", "2"))
     # Prefetch depth: how many strips to fetch ahead concurrently.
     # Depth-2 saturates the network during extraction but doubles peak memory.
     # On machines with ≤8 GB RAM, depth-1 avoids OOM; override with PREFETCH_DEPTH=2
