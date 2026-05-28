@@ -1184,7 +1184,7 @@ def score_pixels_chunked(
     batch_size: int = 4096,
     buffer_row_groups: int = 4,
     target_chunk_rows: int = 393_216,
-    n_prep_workers: int = 16,
+    n_prep_workers: int = 5,
     device: str | None = None,
     tile_id: str | None = None,
     end_year: int | None = None,
@@ -1238,6 +1238,33 @@ def score_pixels_chunked(
 
     logger.info("Warming up numba kernels ...")
     _numba_warmup()
+
+    # Warm up GPU: pre-pin memory (CUDA allocator caches pinned pages after first call)
+    # and trigger cuDNN autotuning at the shapes we'll use during inference.
+    # Without this, the first real batch pays ~2s in pin_memory page faults and
+    # ~700ms in cuDNN algorithm selection.
+    if device.startswith("cuda") and torch.cuda.is_available():
+        _n_feat  = model.n_bands if hasattr(model, "n_bands") else 14
+        _T_full  = getattr(model, "_max_seq_len", MAX_SEQ_LEN)
+        # 1. Pre-pin: allocate and immediately free pinned memory at batch shape.
+        #    PyTorch caches pinned allocations so subsequent calls are O(1).
+        for _T_w in (T_gate, _T_full):
+            _ = torch.zeros(batch_size, _T_w, _n_feat).pin_memory()
+            _ = torch.zeros(batch_size, _T_w, dtype=torch.int64).pin_memory()
+            _ = torch.zeros(batch_size, _T_w, dtype=torch.bool).pin_memory()
+        del _
+        # 2. Trigger cuDNN algorithm selection at the exact shapes used in inference.
+        with torch.inference_mode():
+            for _T_w in (T_gate, _T_full):
+                _dm_b = torch.zeros(batch_size, _T_w, _n_feat, device=device)
+                _dm_d = torch.zeros(batch_size, _T_w, dtype=torch.int64, device=device)
+                _dm_m = torch.zeros(batch_size, _T_w, dtype=torch.bool, device=device)
+                _dm_n = torch.full((batch_size,), _T_w / _T_full, device=device)
+                try:
+                    model(_dm_b, _dm_d, _dm_m, _dm_n)
+                except Exception:
+                    pass
+        torch.cuda.synchronize(device)
 
     # Pre-pass: compute per-pixel VH/VV stats for z-scoring (s1_only mode only).
     # Must happen before the main pipeline so chunked preprocessors have full-pixel history.
@@ -1577,7 +1604,12 @@ def score_pixels_chunked(
         torch.cuda.Stream(device=device) if use_cuda else None)
 
     # --- Stage B: H2D transfer thread ---
+    _t_xfer_bgt_total  = 0.0   # transfer thread: Numba build_gate_tensors
+    _t_xfer_h2d_total  = 0.0   # transfer thread: pin+H2D enqueue
+    _t_xfer_push_total = 0.0   # transfer thread: blocked on gpu_ready_q.put()
+
     def _transfer_worker() -> None:
+        nonlocal _t_xfer_bgt_total, _t_xfer_h2d_total, _t_xfer_push_total
         from tam.core._preprocess_numba import build_gate_tensors as _bgt
         while True:
             item = xfer_q.get()
@@ -1601,8 +1633,10 @@ def score_pixels_chunked(
             gate_doy_np     = np.zeros((B_, gate_t),         dtype=np.int64)
             gate_is_s1_np   = np.zeros((B_, gate_t),         dtype=bool)
             gate_mask_np    = np.ones( (B_, gate_t),         dtype=bool)
+            _tb = _time.monotonic()
             _bgt(bands_np, doy_np, mask_np, is_s1_np, np.int64(gate_t),
                  gate_bands_np, gate_doy_np, gate_mask_np, gate_is_s1_np)
+            _t_xfer_bgt_total += _time.monotonic() - _tb
             gate_n_obs_np = (np.clip((~gate_mask_np).sum(axis=1), 1, None)
                              .astype(np.float32) / T_full)
 
@@ -1610,6 +1644,7 @@ def score_pixels_chunked(
             # whatever the compute engine is doing.  pin_memory() enables async DMA.
             _ts_ctx = (torch.cuda.stream(transfer_stream)
                        if transfer_stream is not None else _nullctx())
+            _th = _time.monotonic()
             with _ts_ctx:
                 def _to_dev(arr) -> torch.Tensor:
                     t = arr if isinstance(arr, torch.Tensor) else torch.from_numpy(arr)
@@ -1633,6 +1668,7 @@ def score_pixels_chunked(
                 if use_cuda:
                     xfer_event = torch.cuda.Event()
                     xfer_event.record(transfer_stream)
+            _t_xfer_h2d_total += _time.monotonic() - _th
 
             tb = _TransferredBatch(
                 gate_bands_dev=gate_bands_dev,
@@ -1651,7 +1687,9 @@ def score_pixels_chunked(
                 B=B_,
                 xfer_event=xfer_event,
             )
+            _tp = _time.monotonic()
             gpu_ready_q.put(tb)
+            _t_xfer_push_total += _time.monotonic() - _tp
 
     # result_q: gpu thread → main thread for bookkeeping/logging
     result_q: Queue = Queue(maxsize=8)
@@ -1660,18 +1698,28 @@ def score_pixels_chunked(
     # Model forward confirmed safe to call from a background thread (tested).
     _n_gpu_calls   = 0
     _t_score_total = 0.0
+    _t_gpu_wait_total = 0.0   # time GPU worker spent blocked on gpu_ready_q
+
+    _gpu_batch_times: list[float] = []   # per-batch forward time for variance analysis
 
     def _gpu_worker() -> None:
-        nonlocal _n_gpu_calls, _t_score_total
+        nonlocal _n_gpu_calls, _t_score_total, _t_gpu_wait_total
         while True:
+            _tw = _time.monotonic()
             tb = gpu_ready_q.get()
+            _t_gpu_wait_total += _time.monotonic() - _tw
             if tb is _SENTINEL:
                 result_q.put(_SENTINEL)
                 break
             _ts = _time.monotonic()
             chunk = _gpu_forward(tb, model, gate_threshold, compute_stream)
-            _t_score_total += _time.monotonic() - _ts
+            _dt = _time.monotonic() - _ts
+            _t_score_total += _dt
             _n_gpu_calls   += 1
+            _gpu_batch_times.append(_dt)
+            if _dt > 0.5:   # log any batch taking >500ms — should be ~100ms normally
+                logger.debug("GPU batch %d: %.0fms  B=%d  n_gate_cut=%d",
+                             _n_gpu_calls, _dt * 1000, tb.B, chunk[3])
             result_q.put((chunk, tb.B))
 
     xfer_thread = Thread(target=_transfer_worker, daemon=True)
@@ -1683,12 +1731,13 @@ def score_pixels_chunked(
     #              and drain result_q for bookkeeping/logging ---
     _t_idle_total  = 0.0
     _t_merge_total = 0.0
+    _t_xfer_wait_total = 0.0  # time main thread blocked on xfer_q.put()
     _acc: list[_PreparedBatch] = []
     _acc_px = 0
     import queue as _queue
 
     def _flush_acc() -> None:
-        nonlocal _t_merge_total
+        nonlocal _t_merge_total, _t_xfer_wait_total
         _tm = _time.monotonic()
         if len(_acc) == 1:
             merged = _acc[0]
@@ -1706,7 +1755,9 @@ def score_pixels_chunked(
                               if _acc[0].global_feats is not None else None),
             )
         _t_merge_total += _time.monotonic() - _tm
+        _tx = _time.monotonic()
         xfer_q.put(merged)   # blocks if xfer_q is full — natural backpressure
+        _t_xfer_wait_total += _time.monotonic() - _tx
 
     def _collect_results() -> None:
         """Drain result_q non-blocking; update n_scored and log progress."""
@@ -1806,14 +1857,33 @@ def score_pixels_chunked(
     _t_other  = max(0.0, _t_total - _t_idle_total - _t_merge_total - _t_score_total)
     logger.info(
         "GPU pipeline breakdown — total %.1fs: score %.1fs (%.0f%%), "
-        "merge %.1fs (%.0f%%), idle/starved %.1fs (%.0f%%), other %.1fs (%.0f%%) | %d GPU calls",
+        "merge %.1fs (%.0f%%), prep_wait %.1fs (%.0f%%), xfer_backpressure %.1fs (%.0f%%), "
+        "gpu_starvation %.1fs (%.0f%%), other %.1fs (%.0f%%) | %d GPU calls",
         _t_total,
-        _t_score_total, 100.0 * _t_score_total / _t_total if _t_total else 0,
-        _t_merge_total, 100.0 * _t_merge_total  / _t_total if _t_total else 0,
-        _t_idle_total,  100.0 * _t_idle_total   / _t_total if _t_total else 0,
-        _t_other,       100.0 * _t_other         / _t_total if _t_total else 0,
+        _t_score_total,    100.0 * _t_score_total    / _t_total if _t_total else 0,
+        _t_merge_total,    100.0 * _t_merge_total     / _t_total if _t_total else 0,
+        _t_idle_total,     100.0 * _t_idle_total      / _t_total if _t_total else 0,
+        _t_xfer_wait_total,100.0 * _t_xfer_wait_total / _t_total if _t_total else 0,
+        _t_gpu_wait_total, 100.0 * _t_gpu_wait_total  / _t_total if _t_total else 0,
+        _t_other,          100.0 * _t_other            / _t_total if _t_total else 0,
         _n_gpu_calls,
     )
+    logger.info(
+        "Transfer thread breakdown — bgt %.1fs (%.0f%%), h2d %.1fs (%.0f%%), "
+        "push_wait %.1fs (%.0f%%)",
+        _t_xfer_bgt_total,  100.0 * _t_xfer_bgt_total  / _t_total if _t_total else 0,
+        _t_xfer_h2d_total,  100.0 * _t_xfer_h2d_total  / _t_total if _t_total else 0,
+        _t_xfer_push_total, 100.0 * _t_xfer_push_total / _t_total if _t_total else 0,
+    )
+    if _gpu_batch_times:
+        _bt = np.array(_gpu_batch_times)
+        logger.info(
+            "GPU forward per-batch (ms): mean=%.1f  median=%.1f  p95=%.1f  max=%.1f  "
+            "min=%.1f  n=%d",
+            _bt.mean() * 1000, np.median(_bt) * 1000,
+            np.percentile(_bt, 95) * 1000, _bt.max() * 1000,
+            _bt.min() * 1000, len(_bt),
+        )
 
     if writer_thread is not None:
         out_q.put(_SENTINEL)

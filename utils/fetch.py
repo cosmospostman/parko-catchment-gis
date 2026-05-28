@@ -417,10 +417,13 @@ async def fetch_patches_to_tiff(
     os.environ.setdefault("CPL_VSIL_CURL_CACHE_SIZE", "134217728")  # 128 MB
     loop = asyncio.get_running_loop()
     sem = asyncio.Semaphore(max_concurrent)
-    # Two executors: fetch threads saturate the network link; write threads handle
-    # disk I/O without stealing slots from in-flight range requests.
-    fetch_executor = ThreadPoolExecutor(max_workers=max_concurrent)
-    write_executor = ThreadPoolExecutor(max_workers=min(32, os.cpu_count() or 8))
+    # Thread count is capped independently of the asyncio semaphore.  The semaphore
+    # limits in-flight GDAL range requests; threads just shuttle work to GDAL.
+    # 32 threads keep GDAL's 256-connection pool fed without the 8 MB/thread stack
+    # cost of 128 threads (~1 GB on Linux).
+    _thread_cap = min(max_concurrent, 32)
+    fetch_executor = ThreadPoolExecutor(max_workers=_thread_cap)
+    write_executor = ThreadPoolExecutor(max_workers=min(16, os.cpu_count() or 8))
     _alias: dict[str, str] = band_alias or {}
     written: list[Path] = []
     written_lock = asyncio.Lock()
