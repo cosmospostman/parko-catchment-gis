@@ -412,9 +412,6 @@ async def fetch_patches_to_tiff(
     Returns a list of all written .tif paths.
     """
     import os
-    os.environ["GDAL_HTTP_MAX_RETRY"] = "0"
-    os.environ.setdefault("GDAL_DISABLE_READDIR_ON_OPEN", "EMPTY_DIR")
-
     loop = asyncio.get_running_loop()
     sem = asyncio.Semaphore(max_concurrent)
     # Two executors: fetch threads saturate the network link; write threads handle

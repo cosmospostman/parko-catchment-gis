@@ -1545,8 +1545,6 @@ def score_pixels_chunked(
     # batch N+1 and Stage A is building batch N+2.
     # -------------------------------------------------------------------------
 
-    use_cuda = device.startswith("cuda") and torch.cuda.is_available()
-
     # xfer_q depth=2: main thread can pre-build one batch while xfer is running.
     # gpu_ready_q depth=2: xfer thread can pre-transfer one batch while GPU runs.
     xfer_q:      Queue = Queue(maxsize=2)
@@ -1583,43 +1581,24 @@ def score_pixels_chunked(
             gate_n_obs_np = (np.clip((~gate_mask_np).sum(axis=1), 1, None)
                              .astype(np.float32) / T_full)
 
-            if use_cuda:
-                # pin_memory enables async DMA; non_blocking=True starts the
-                # DMA and returns immediately — GPU kernel will see the data.
-                def _to_dev(t: torch.Tensor) -> torch.Tensor:
-                    return t.pin_memory().to(device, non_blocking=True)
-                gate_bands_dev  = _to_dev(torch.from_numpy(gate_bands_np))
-                gate_doy_dev    = _to_dev(torch.from_numpy(gate_doy_np))
-                gate_mask_dev   = _to_dev(torch.from_numpy(gate_mask_np))
-                gate_n_obs_dev  = _to_dev(torch.from_numpy(gate_n_obs_np))
-                gate_is_s1_dev  = (_to_dev(torch.from_numpy(gate_is_s1_np))
-                                   if merged.is_s1 is not None else None)
-                bands_dev  = _to_dev(merged.bands)
-                doy_dev    = _to_dev(merged.doy)
-                mask_dev   = _to_dev(merged.mask)
-                n_obs_dev  = _to_dev(merged.n_obs)
-                is_s1_dev  = (_to_dev(merged.is_s1) if merged.is_s1 is not None else None)
-                gf_dev     = (_to_dev(torch.from_numpy(merged.global_feats))
-                              if merged.global_feats is not None else None)
-                # Synchronise so all DMAs are complete before the GPU thread starts
-                # the forward pass.  This is the only sync point in Stage B.
-                torch.cuda.synchronize(device)
-            else:
-                def _to_dev(t: torch.Tensor) -> torch.Tensor:  # type: ignore[misc]
-                    return t.to(device)
-                gate_bands_dev  = torch.from_numpy(gate_bands_np).to(device)
-                gate_doy_dev    = torch.from_numpy(gate_doy_np).to(device)
-                gate_mask_dev   = torch.from_numpy(gate_mask_np).to(device)
-                gate_n_obs_dev  = torch.from_numpy(gate_n_obs_np).to(device)
-                gate_is_s1_dev  = (torch.from_numpy(gate_is_s1_np).to(device)
-                                   if merged.is_s1 is not None else None)
-                bands_dev  = merged.bands.to(device)
-                doy_dev    = merged.doy.to(device)
-                mask_dev   = merged.mask.to(device)
-                n_obs_dev  = merged.n_obs.to(device)
-                is_s1_dev  = (merged.is_s1.to(device) if merged.is_s1 is not None else None)
-                gf_dev     = (torch.from_numpy(merged.global_feats).to(device)
-                              if merged.global_feats is not None else None)
+            # Blocking H2D transfer — this thread runs concurrently with both the
+            # main thread (building next batch) and the GPU thread (running forward),
+            # so overlap is achieved without needing async/pin_memory complexity.
+            def _to_dev(t: torch.Tensor) -> torch.Tensor:
+                return t.to(device)
+            gate_bands_dev  = _to_dev(torch.from_numpy(gate_bands_np))
+            gate_doy_dev    = _to_dev(torch.from_numpy(gate_doy_np))
+            gate_mask_dev   = _to_dev(torch.from_numpy(gate_mask_np))
+            gate_n_obs_dev  = _to_dev(torch.from_numpy(gate_n_obs_np))
+            gate_is_s1_dev  = (_to_dev(torch.from_numpy(gate_is_s1_np))
+                               if merged.is_s1 is not None else None)
+            bands_dev  = _to_dev(merged.bands)
+            doy_dev    = _to_dev(merged.doy)
+            mask_dev   = _to_dev(merged.mask)
+            n_obs_dev  = _to_dev(merged.n_obs)
+            is_s1_dev  = (_to_dev(merged.is_s1) if merged.is_s1 is not None else None)
+            gf_dev     = (_to_dev(torch.from_numpy(merged.global_feats))
+                          if merged.global_feats is not None else None)
 
             tb = _TransferredBatch(
                 gate_bands_dev=gate_bands_dev,

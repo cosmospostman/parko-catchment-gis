@@ -619,21 +619,10 @@ def run_tile_pipeline_v2(
     )
     from utils.s1_collector import collect_s1_for_tile
     from analysis.constants import SCL_BAND, AOT_BAND, SCL_CLEAR_VALUES
+    from utils.pipeline import setup_gdal_env
 
-    # GDAL settings must be set before any ThreadPoolExecutor so worker threads inherit them.
-    _gdal_env = {
-        "AWS_NO_SIGN_REQUEST": "YES",
-        "AWS_DEFAULT_REGION": "us-west-2",
-        "GDAL_HTTP_MAX_RETRY": "5",
-        "GDAL_HTTP_RETRY_DELAY": "2",
-        "GDAL_HTTP_RETRY_ON_HTTP_ERROR": "429,500,502,503,504",
-        "GDAL_HTTP_PERSISTENT": "YES",
-        "CPL_VSIL_CURL_CACHE_SIZE": "67108864",   # 64 MB connection cache
-        "CPL_VSIL_CURL_CHUNK_SIZE": "10485760",   # 10 MB range requests
-        "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
-    }
-    for k, v in _gdal_env.items():
-        os.environ[k] = v
+    # Must be called before any ThreadPoolExecutor so worker threads inherit the env.
+    setup_gdal_env()
 
     fetch_workers   = int(os.environ.get("FETCH_WORKERS",   "16"))
     extract_workers = int(os.environ.get("EXTRACT_WORKERS", str(min(4, os.cpu_count() or 4))))
