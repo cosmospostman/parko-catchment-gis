@@ -151,9 +151,14 @@ def merge_scenes(
             "threads": 2,
         })
 
-    # Pass 1: write a staging parquet that adds _n (northing int) and _bucket.
-    staging = out_path.with_suffix(".stage_tmp.parquet")
-    staging.unlink(missing_ok=True)
+    # Pass 1: partition the union into per-bucket directories.
+    # Each bucket file is ~1/N of the total — small enough to sort in RAM.
+    staging_dir = out_path.parent / f"{out_path.stem}_stage_tmp"
+    if staging_dir.exists():
+        import shutil
+        shutil.rmtree(staging_dir)
+    staging_dir.mkdir()
+
     con = _con()
     try:
         con.execute(f"""
@@ -162,21 +167,29 @@ def merge_scenes(
                     TRY_CAST(regexp_extract(point_id, '_([0-9]+)$', 1) AS INTEGER) AS _n,
                     TRY_CAST(regexp_extract(point_id, '_([0-9]+)$', 1) AS INTEGER) % {n_buckets} AS _bucket
                 FROM ({union_sql}) t
-            ) TO '{staging!s}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 5000000)
+            ) TO '{staging_dir!s}' (
+                FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 5000000,
+                PARTITION_BY (_bucket), OVERWRITE_OR_IGNORE true
+            )
         """)
     finally:
         con.close()
 
-    # Pass 2: read each bucket in order, sort within it, stream to output writer.
+    # Pass 2: sort each bucket independently and stream to a single output writer.
+    # Each bucket file is read once; no repeated full-file scans.
     writer = None
     try:
         for bucket in range(n_buckets):
+            bucket_file = staging_dir / f"_bucket={bucket}" / "*.parquet"
+            bucket_glob = str(bucket_file)
+            # skip missing buckets (sparse northing distributions)
+            if not list(staging_dir.glob(f"_bucket={bucket}/*.parquet")):
+                continue
             con = _con()
             try:
                 tbl = con.execute(f"""
                     SELECT {col_list}
-                    FROM read_parquet('{staging!s}')
-                    WHERE _bucket = {bucket}
+                    FROM read_parquet('{bucket_glob}')
                     ORDER BY _n, date
                 """).arrow()
             finally:
@@ -194,7 +207,8 @@ def merge_scenes(
     finally:
         if writer is not None:
             writer.close()
-        staging.unlink(missing_ok=True)
+        import shutil
+        shutil.rmtree(staging_dir, ignore_errors=True)
 
     tmp_path.replace(out_path)
 
