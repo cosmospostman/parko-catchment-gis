@@ -1240,30 +1240,15 @@ def score_pixels_chunked(
     _numba_warmup()
 
     # Warm up GPU: pre-pin memory (CUDA allocator caches pinned pages after first call)
-    # and trigger cuDNN autotuning at the shapes we'll use during inference.
-    # Without this, the first real batch pays ~2s in pin_memory page faults and
-    # ~700ms in cuDNN algorithm selection.
+    # so the first real batch doesn't pay ~2s in OS page-fault costs during H2D.
     if device.startswith("cuda") and torch.cuda.is_available():
         _n_feat  = model.n_bands if hasattr(model, "n_bands") else 14
         _T_full  = getattr(model, "_max_seq_len", MAX_SEQ_LEN)
-        # 1. Pre-pin: allocate and immediately free pinned memory at batch shape.
-        #    PyTorch caches pinned allocations so subsequent calls are O(1).
         for _T_w in (T_gate, _T_full):
             _ = torch.zeros(batch_size, _T_w, _n_feat).pin_memory()
             _ = torch.zeros(batch_size, _T_w, dtype=torch.int64).pin_memory()
             _ = torch.zeros(batch_size, _T_w, dtype=torch.bool).pin_memory()
         del _
-        # 2. Trigger cuDNN algorithm selection at the exact shapes used in inference.
-        with torch.inference_mode():
-            for _T_w in (T_gate, _T_full):
-                _dm_b = torch.zeros(batch_size, _T_w, _n_feat, device=device)
-                _dm_d = torch.zeros(batch_size, _T_w, dtype=torch.int64, device=device)
-                _dm_m = torch.zeros(batch_size, _T_w, dtype=torch.bool, device=device)
-                _dm_n = torch.full((batch_size,), _T_w / _T_full, device=device)
-                try:
-                    model(_dm_b, _dm_d, _dm_m, _dm_n)
-                except Exception:
-                    pass
         torch.cuda.synchronize(device)
 
     # Pre-pass: compute per-pixel VH/VV stats for z-scoring (s1_only mode only).
