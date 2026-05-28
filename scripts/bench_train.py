@@ -287,6 +287,7 @@ def run_profile(
     pixel_zscore: bool,
     run_presence_filter: bool,
     dataset_subprocess: bool,
+    n_shards: int,
     assert_rss_gb: float | None,
     assert_wall_s: float | None,
     out_dir: Path,
@@ -297,6 +298,8 @@ def run_profile(
     from tam.core.train import (
         _apply_presence_filter,
         _build_dataset_subprocess,
+        _build_dataset_sharded,
+        _compute_band_stats_subprocess,
         _write_dataset_parquet,
         _compute_band_summaries,
         _site_class,
@@ -455,14 +458,52 @@ def run_profile(
         gc.collect()
         probe("after write train parquet + free frame")
 
-        probe("before TAMDataset(train) subprocess")
-        train_ds = _build_dataset_subprocess(
-            _train_parquet, train_py_labels, _ds_tmp_path, "train",
-            kwargs=dict(**_ds_kwargs, doy_jitter=0),
+        # --- Band stats subprocess -------------------------------------------
+        _use_s1_mode = "mixed" if use_s1 else False
+        _npz = _ds_tmp_path / "band_stats"
+        _gf_parquet = _ds_tmp_path / "global_feat.parquet"
+        band_summaries.write_parquet(str(_gf_parquet))
+        probe("before band stats subprocess")
+        _stats = _compute_band_stats_subprocess(
+            parquet_path=_train_parquet,
+            out_npz=_npz,
+            use_s1=_use_s1_mode,
+            feature_cols=list(V10_FEATURE_COLS) + (list(V10_S1_FEATURE_COLS) if use_s1 else []),
+            s1_feature_cols=list(V10_S1_FEATURE_COLS) if use_s1 else [],
+            scl_purity_min=0.5,
+            s1_despeckle_window=0,
+            global_features_df_path=_gf_parquet,
         )
-        probe("after TAMDataset(train) subprocess", rows=len(train_ds))
+        band_mean = _stats["band_mean"]
+        band_std  = _stats["band_std"]
+        probe("after band stats subprocess")
 
-        band_mean, band_std = train_ds.band_stats
+        if n_shards > 1:
+            probe(f"before TAMDataset(train) sharded n={n_shards}")
+            _train_kwargs = dict(**_ds_kwargs, doy_jitter=0)
+            train_ds = _build_dataset_sharded(
+                parquet_path=_train_parquet,
+                labels=train_py_labels,
+                tmp_dir=_ds_tmp_path,
+                name="train",
+                kwargs=_train_kwargs,
+                n_shards=n_shards,
+                band_mean=band_mean,
+                band_std=band_std,
+                global_feat_mean=_stats["global_feat_mean"],
+                global_feat_std=_stats["global_feat_std"],
+            )
+            probe(f"after TAMDataset(train) sharded n={n_shards}", rows=len(train_ds))
+        else:
+            probe("before TAMDataset(train) subprocess")
+            train_ds = _build_dataset_subprocess(
+                _train_parquet, train_py_labels, _ds_tmp_path, "train",
+                kwargs=dict(**_ds_kwargs, doy_jitter=0,
+                            band_mean=band_mean, band_std=band_std,
+                            global_feat_mean=_stats["global_feat_mean"],
+                            global_feat_std=_stats["global_feat_std"]),
+            )
+            probe("after TAMDataset(train) subprocess", rows=len(train_ds))
 
         _val_parquet = _write_dataset_parquet(val_pixel_df, _ds_tmp_path, "val")
         del val_pixel_df
@@ -561,6 +602,8 @@ if __name__ == "__main__":
                         help="Enable presence filter stage (requires S1 rows)")
     parser.add_argument("--dataset-subprocess", action="store_true", default=False,
                         help="Build TAMDataset in subprocess to reclaim jemalloc phantom arenas")
+    parser.add_argument("--n-shards",          type=int,   default=1,
+                        help="Number of dataset shards (>1 uses _build_dataset_sharded + band stats subprocess)")
     parser.add_argument("--timeout",        type=int,   default=120,
                         help="Abort with exit 2 after this many seconds (default: 120)")
     parser.add_argument("--assert-rss-gb",  type=float, default=None,
@@ -592,6 +635,7 @@ if __name__ == "__main__":
             pixel_zscore=args.pixel_zscore,
             run_presence_filter=args.presence_filter,
             dataset_subprocess=args.dataset_subprocess,
+            n_shards=args.n_shards,
             assert_rss_gb=args.assert_rss_gb,
             assert_wall_s=args.assert_wall_s,
             out_dir=Path(_tmp),

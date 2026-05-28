@@ -422,12 +422,11 @@ def _build_dataset_worker(
     process exits — the OS reclaims the arenas regardless of jemalloc's pool.
     """
     import gc as _gc
-    import pyarrow.parquet as _pq
     import polars as _pl
     from analysis.constants import ensure_float32_bands
     from tam.core.dataset import TAMDataset
 
-    pixel_df = ensure_float32_bands(_pl.from_arrow(_pq.read_table(pixel_df_path)))
+    pixel_df = ensure_float32_bands(_pl.read_parquet(pixel_df_path))
     _gc.collect()
 
     ds = TAMDataset(pixel_df, labels, **kwargs)
@@ -551,9 +550,18 @@ def _build_dataset_sharded(
         shard_dirs.append(shard_dir)
         shard_parquets.append(tmp_dir / f"{shard_name}_pixel_df.parquet")
 
-    # Route rows to shards using Polars join — read once, join a small shard-map
-    # DataFrame, then filter+write per shard.  Benchmarks at full scale show this
-    # is ~8× faster than the previous index_in approach (2.5 s vs 20 s for 110 M rows).
+    # Route rows to shards using a lazy scan + join — avoids materialising the full
+    # frame in the parent process.  Each shard parquet is written via sink_parquet
+    # (streaming), keeping peak RSS to roughly one shard at a time rather than the
+    # full dataset.
+    def _rss_gb() -> float:
+        with open("/proc/self/status") as _f:
+            for _l in _f:
+                if _l.startswith("VmRSS:"):
+                    return int(_l.split()[1]) / 1e6
+        return float("nan")
+
+    logger.info("_build_dataset_sharded: RSS before shard split: %.1f GB", _rss_gb())
     _shard_map = pl.DataFrame({
         "point_id": [p for g in pid_groups_pa for p in g.to_pylist()],
         "_shard":   pl.Series(
@@ -561,17 +569,20 @@ def _build_dataset_sharded(
             dtype=pl.Int8,
         ),
     })
-    _full = pl.read_parquet(str(parquet_path)).join(_shard_map, on="point_id", how="left")
+    _lazy_full = pl.scan_parquet(str(parquet_path)).join(
+        _shard_map.lazy(), on="point_id", how="left"
+    )
     del _shard_map
-    # Write each shard parquet by filtering on the shard index so the i-th
-    # shard parquet always contains exactly the rows assigned to shard i.
-    # partition_by(..., maintain_order=False) returns partitions in an undefined
-    # order, which causes shard data/label mismatches when popped sequentially.
+    # Write each shard parquet by streaming — never materialises the full frame.
     for i, _path in enumerate(shard_parquets):
-        _full.filter(pl.col("_shard") == i).drop("_shard").write_parquet(
-            str(_path), compression="uncompressed"
+        (
+            _lazy_full
+            .filter(pl.col("_shard") == i)
+            .drop("_shard")
+            .sink_parquet(str(_path), compression="uncompressed")
         )
-    del _full
+        logger.info("_build_dataset_sharded: shard %d written, RSS=%.1f GB", i, _rss_gb())
+    del _lazy_full
     gc.collect()
 
     # Launch one subprocess per shard sequentially; each reads its pre-written parquet.

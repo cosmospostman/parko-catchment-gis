@@ -146,8 +146,8 @@ def _sort_s1_shards(
     """Merge S1 shards into one pixel-sorted parquet conforming to combined_schema.
 
     Strategy: sort each shard independently (each covers ≤50 k points, so small),
-    then merge-sort via Polars scan → sort → sink (Rust engine, ~2 M rows/s,
-    streaming so peak RAM stays bounded regardless of total shard count).
+    then merge-sort via DuckDB with spill-to-disk so peak RAM stays bounded
+    regardless of total shard count.
     """
     import logging
     import multiprocessing
@@ -186,27 +186,29 @@ def _sort_s1_shards(
 
     _log.info("merging %d sorted shards → %s ...", len(shard_paths), out_path.name)
 
-    # Step 2: merge-sort all sorted shards via Polars scan → sort → sink.
-    # Polars pushes the sort into its Rust engine (~2.4 M rows/s vs ~200 K rows/s
-    # for the Python k-way heap merge), keeping peak RAM to one streaming batch.
+    # Step 2: k-way merge of the pre-sorted shards via Polars merge_sorted.
+    # Each shard is already sorted by (_northing, point_id, date) from step 1,
+    # so merge_sorted on _northing is a true streaming merge with no re-sort and
+    # O(k) peak RAM (one row-group buffer per shard), unlike .sort() which
+    # materialises the entire dataset.
     import polars as pl
+    import functools
 
     tmp_path = out_path.with_suffix(".s1_merge_tmp.parquet")
     tmp_path.unlink(missing_ok=True)
 
     try:
+        frames = [
+            pl.scan_parquet(str(p), missing_columns="insert").with_columns(
+                pl.col("point_id").str.split("_").list.get(-1).cast(pl.Int32, strict=False).fill_null(0).alias("_northing")
+            )
+            for p in sorted_paths
+        ]
+        merged = functools.reduce(lambda acc, f: acc.merge_sorted(f, key="_northing"), frames[1:], frames[0])
         (
-            pl.scan_parquet([str(p) for p in sorted_paths], missing_columns="insert")
-            .with_columns(
-                pl.col("point_id").str.extract(r"_(\d+)$", 1).cast(pl.Int32).alias("_northing")
-            )
-            .sort(["_northing", "date"])
+            merged
             .drop("_northing")
-            .sink_parquet(
-                str(tmp_path),
-                compression="zstd",
-                row_group_size=5_000_000,
-            )
+            .sink_parquet(str(tmp_path), compression="zstd", row_group_size=5_000_000)
         )
         tmp_path.replace(out_path)
         _log.info("merge done → %s", out_path.name)
