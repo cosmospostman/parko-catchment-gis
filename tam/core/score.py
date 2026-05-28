@@ -264,6 +264,9 @@ class _PASlice(NamedTuple):
     s2_feature_cols: list[str]
     s1_feature_cols: list[str]
     scl_purity_min:  float
+    # Pre-computed by the parser thread to avoid re-evaluating source=="S1" in each worker.
+    # None means workers must compute it themselves (backward-compatible).
+    is_s1_precomputed: "pa.BooleanArray | None" = None
 
 
 class _ZscoreArrays:

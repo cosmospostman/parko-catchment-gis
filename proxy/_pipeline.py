@@ -497,30 +497,37 @@ def run_tile_pipeline(
     if not active_strips:
         return
 
-    with _TPE(max_workers=1) as prefetch_pool:
-        # Generate points for the first strip and kick off its fetch immediately.
-        # Points are generated on demand and held only for the current and next strip.
-        next_pts = make_strip_points(active_strips[0], strips_meta)
-        fetch_fut = prefetch_pool.submit(_fetch_strip, active_strips[0], next_pts)
+    from collections import deque as _deque
+
+    with _TPE(max_workers=2) as prefetch_pool:
+        # Depth-2 prefetch: submit fetches for the first two strips immediately so
+        # the network is busy while the CPU works.  At steady state strip i+2 is
+        # fetching while strip i is being extracted/merged and strip i+1 is ready.
+        pts_queue: _deque = _deque()
+        fetch_futs: _deque = _deque()
+
+        for k in range(min(2, len(active_strips))):
+            pts = make_strip_points(active_strips[k], strips_meta)
+            pts_queue.append(pts)
+            fetch_futs.append(prefetch_pool.submit(_fetch_strip, active_strips[k], pts))
 
         for i, strip in enumerate(active_strips):
             strip_idx = strip["strip_idx"]
             strip_bbox = strip["bbox"]
-            strip_pts  = next_pts
+            strip_pts  = pts_queue.popleft()
 
             # Wait for this strip's fetch to complete.
-            fetch_fut.result()
+            fetch_futs.popleft().result()
             logger.info("[tile %s %d] [strip %04d] fetch done; starting extract (%d pts, %d items)",
                         tile_id, year, strip_idx, len(strip_pts), len(items))
 
-            # Generate next strip's points and queue its fetch before CPU work.
-            # Freeing next_pts here releases the current strip's points list.
-            next_i = i + 1
-            if next_i < len(active_strips):
-                next_pts = make_strip_points(active_strips[next_i], strips_meta)
-                fetch_fut = prefetch_pool.submit(_fetch_strip, active_strips[next_i], next_pts)
-            else:
-                next_pts = []
+            # Submit fetch for strip i+2 immediately (before CPU-bound extract/merge)
+            # so the network stays busy throughout extraction.
+            next_k = i + 2
+            if next_k < len(active_strips):
+                pts = make_strip_points(active_strips[next_k], strips_meta)
+                pts_queue.append(pts)
+                fetch_futs.append(prefetch_pool.submit(_fetch_strip, active_strips[next_k], pts))
 
             scene_dir   = tmp / f"strip_{strip_idx:04d}_scenes"
             strip_cache = scene_dir / "cache"
