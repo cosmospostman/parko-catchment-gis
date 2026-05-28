@@ -218,8 +218,8 @@ def _sort_s1_shards(
             config={
                 "temp_directory": tmp_dir,
                 "memory_limit": "2GB",
-                "preserve_insertion_order": "false",
-                "threads": "4",
+                "preserve_insertion_order": False,
+                "threads": 1,
             }
         )
         try:
@@ -309,8 +309,8 @@ def _merge_sorted_parquets(
         config={
             "temp_directory": tmp_dir,
             "memory_limit": f"{memory_limit_gb}GB",
-            "preserve_insertion_order": "false",
-            "threads": str(n_threads),
+            "preserve_insertion_order": False,
+            "threads": 1,
         }
     )
     try:

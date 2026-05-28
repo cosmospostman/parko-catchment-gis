@@ -137,15 +137,10 @@ def merge_scenes(
     dst = str(out_path)
     tmp_dir = str(out_path.parent)
 
-    n_threads = max(1, (os.cpu_count() or 4) // 2)
-    try:
-        import psutil
-        _avail_gb = psutil.virtual_memory().available / (1024 ** 3)
-    except Exception:
-        _avail_gb = _system_memory_gb() * 0.4
-    # 80% of *available* RAM — never exceed available or spill-to-disk is defeated.
-    _default_mem_gb = max(1, int(_avail_gb * 0.80))
-    mem_gb = int(os.environ.get("PROXY_MERGE_MEM_GB", str(_default_mem_gb)))
+    # Single thread: lower peak RAM per sort run, more predictable spill.
+    # PROXY_MERGE_MEM_GB overrides the cap (default 2 GB — enough to spill-sort
+    # hundreds of millions of rows given temp_directory is set).
+    mem_gb = int(os.environ.get("PROXY_MERGE_MEM_GB", "4"))
 
     sql = f"""
         COPY (
@@ -162,8 +157,8 @@ def merge_scenes(
         config={
             "temp_directory": tmp_dir,
             "memory_limit": f"{mem_gb}GB",
-            "preserve_insertion_order": "false",
-            "threads": str(n_threads),
+            "preserve_insertion_order": False,
+            "threads": 2,
         }
     )
     try:
