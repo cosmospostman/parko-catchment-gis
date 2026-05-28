@@ -90,7 +90,7 @@ def progress_frame(strip_idx: int, stage: str, t: float) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# merge_scenes — DuckDB N-way sort of per-scene parquets + optional S1 parquet
+# merge_scenes — streaming k-way merge of pre-sorted per-scene parquets
 # ---------------------------------------------------------------------------
 
 def merge_scenes(
@@ -98,118 +98,146 @@ def merge_scenes(
     s1_path: Path | None,
     out_path: Path,
 ) -> None:
-    """Sort-merge of S2 per-scene parquets (+ optional S1) into out_path.
+    """K-way merge of pre-sorted S2 per-scene parquets (+ optional S1) into out_path.
 
-    Output is sorted by (northing, date).  Uses a bucket-sort approach to avoid
-    materialising the full dataset in RAM: DuckDB extracts the northing key and
-    partitions into N buckets; each bucket is sorted independently (fitting in
-    RAM) then streamed in order to a single PyArrow parquet writer.
+    Each scene parquet is already sorted by northing (_n extracted from point_id).
+    This streams one row-group at a time from each file through a min-heap, writing
+    directly to the output.  Peak RAM is O(k * row_group_size) — constant regardless
+    of total dataset size.
     """
-    import duckdb
+    import heapq
     import pyarrow as pa
     import pyarrow.parquet as pq
-    from utils.parquet_utils import COMBINED_PIXEL_SCHEMA
+    from utils.parquet_utils import COMBINED_PIXEL_SCHEMA, _WRITE_OPTS
 
     out_names = COMBINED_PIXEL_SCHEMA.names
-    col_list  = ", ".join(f'"{c}"' for c in out_names)
 
-    def _select(file_cols: set[str], source_override: str | None) -> str:
-        parts = []
-        for name in out_names:
-            if name == "source" and source_override is not None:
-                parts.append(f"'{source_override}' AS source")
-            elif name in file_cols:
-                parts.append(f'"{name}"')
+    def _cast_to_schema(tbl: "pa.Table") -> "pa.Table":
+        """Align a table to COMBINED_PIXEL_SCHEMA, filling missing cols with null."""
+        cols = {}
+        for field in COMBINED_PIXEL_SCHEMA:
+            if field.name in tbl.schema.names:
+                cols[field.name] = tbl.column(field.name).cast(field.type, safe=False)
             else:
-                parts.append(f'NULL AS "{name}"')
-        return ", ".join(parts)
+                cols[field.name] = pa.nulls(len(tbl), type=field.type)
+        return pa.table(cols, schema=COMBINED_PIXEL_SCHEMA)
 
-    union_parts = []
-    for sp in scene_paths:
-        s2_cols = set(pq.ParquetFile(sp).schema_arrow.names)
-        union_parts.append(f"SELECT {_select(s2_cols, 'S2')} FROM read_parquet('{sp}')")
+    def _northing(tbl: "pa.Table", row: int) -> int:
+        pid: str = tbl.column("point_id")[row].as_py()
+        return int(pid.rsplit("_", 1)[1])
+
+    all_paths: list[tuple[Path, str | None]] = [
+        (sp, "S2") for sp in scene_paths
+    ]
     if s1_path and s1_path.exists():
-        s1_cols = set(pq.ParquetFile(s1_path).schema_arrow.names)
-        union_parts.append(f"SELECT {_select(s1_cols, None)} FROM read_parquet('{s1_path}')")
+        all_paths.append((s1_path, None))
 
-    union_sql = "\nUNION ALL\n".join(union_parts)
-    tmp_dir   = str(out_path.parent)
-    tmp_path  = out_path.with_suffix(".merge_tmp.parquet")
+    if not all_paths:
+        return
+
+    tmp_path = out_path.with_suffix(".merge_tmp.parquet")
     tmp_path.unlink(missing_ok=True)
 
-    # N_BUCKETS controls peak RAM: each bucket is sorted independently.
-    # 16 buckets over ~4 GB parquet input ≈ 250 MB compressed per bucket;
-    # uncompressed in DuckDB ≈ 1–2 GB per bucket — fits comfortably in 8 GB.
-    n_buckets = int(os.environ.get("PROXY_MERGE_BUCKETS", "16"))
-    mem_gb    = int(os.environ.get("PROXY_MERGE_MEM_GB",  "6"))
+    # Open all parquet files and prime the heap with the first row of each.
+    # Heap entries: (northing, date_str, source_idx, row_within_batch, batch_table)
+    # We use a list-of-batches cursor per file to avoid re-reading row groups.
 
-    def _con() -> "duckdb.DuckDBPyConnection":
-        return duckdb.connect(config={
-            "temp_directory": tmp_dir,
-            "memory_limit": f"{mem_gb}GB",
-            "preserve_insertion_order": False,
-            "threads": 2,
-        })
+    class _FileCursor:
+        """Iterates row-groups of a parquet file, yielding Arrow tables."""
+        __slots__ = ("_pf", "_rg", "_n_rg", "_source", "_cols")
 
-    # Pass 1: partition the union into per-bucket directories.
-    # Each bucket file is ~1/N of the total — small enough to sort in RAM.
-    staging_dir = out_path.parent / f"{out_path.stem}_stage_tmp"
-    if staging_dir.exists():
-        import shutil
-        shutil.rmtree(staging_dir)
-    staging_dir.mkdir()
+        def __init__(self, path: Path, source: str | None) -> None:
+            self._pf     = pq.ParquetFile(path)
+            self._rg     = 0
+            self._n_rg   = self._pf.metadata.num_row_groups
+            self._source = source
+            file_names   = set(self._pf.schema_arrow.names)
+            self._cols   = [c for c in out_names if c in file_names]
 
-    con = _con()
+        def next_batch(self) -> "pa.Table | None":
+            while self._rg < self._n_rg:
+                tbl = self._pf.read_row_group(self._rg, columns=self._cols)
+                self._rg += 1
+                tbl = _cast_to_schema(tbl)
+                if self._source == "S2":
+                    # stamp source column
+                    tbl = tbl.set_column(
+                        tbl.schema.get_field_index("source"),
+                        "source",
+                        pa.array(["S2"] * len(tbl), type=pa.string()),
+                    )
+                if len(tbl) > 0:
+                    return tbl
+            return None
+
+    # Each heap entry: (northing, date, cursor_id, row, batch)
+    # cursor_id breaks ties deterministically.
+    cursors: list[_FileCursor] = []
+    heap: list[tuple] = []
+
+    for path, source in all_paths:
+        cur = _FileCursor(path, source)
+        batch = cur.next_batch()
+        if batch is None:
+            continue
+        cid = len(cursors)
+        cursors.append(cur)
+        n   = _northing(batch, 0)
+        dt  = batch.column("date")[0].as_py()
+        heapq.heappush(heap, (n, str(dt), cid, 0, batch))
+
+    writer: "pq.ParquetWriter | None" = None
     try:
-        con.execute(f"""
-            COPY (
-                SELECT {col_list},
-                    TRY_CAST(regexp_extract(point_id, '_([0-9]+)$', 1) AS INTEGER) AS _n,
-                    TRY_CAST(regexp_extract(point_id, '_([0-9]+)$', 1) AS INTEGER) % {n_buckets} AS _bucket
-                FROM ({union_sql}) t
-            ) TO '{staging_dir!s}' (
-                FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 5000000,
-                PARTITION_BY (_bucket), OVERWRITE_OR_IGNORE true
-            )
-        """)
-    finally:
-        con.close()
+        # Accumulate output rows; flush in row-group-sized chunks.
+        ROW_GROUP = 500_000
+        out_batches: list["pa.Table"] = []
+        out_rows = 0
 
-    # Pass 2: sort each bucket independently and stream to a single output writer.
-    # Each bucket file is read once; no repeated full-file scans.
-    writer = None
-    try:
-        for bucket in range(n_buckets):
-            bucket_file = staging_dir / f"_bucket={bucket}" / "*.parquet"
-            bucket_glob = str(bucket_file)
-            # skip missing buckets (sparse northing distributions)
-            if not list(staging_dir.glob(f"_bucket={bucket}/*.parquet")):
-                continue
-            con = _con()
-            try:
-                tbl = con.execute(f"""
-                    SELECT {col_list}
-                    FROM read_parquet('{bucket_glob}')
-                    ORDER BY _n, date
-                """).fetch_arrow_table()
-            finally:
-                con.close()
-            if tbl.num_rows == 0:
-                continue
+        def _flush() -> None:
+            nonlocal out_batches, out_rows, writer
+            if not out_batches:
+                return
+            chunk = pa.concat_tables(out_batches)
             if writer is None:
-                writer = pq.ParquetWriter(
-                    tmp_path,
-                    schema=COMBINED_PIXEL_SCHEMA,
-                    compression="zstd",
-                    use_dictionary=["point_id", "item_id", "tile_id"],
-                )
-            writer.write_table(tbl)
-            del tbl
+                writer = pq.ParquetWriter(tmp_path, schema=COMBINED_PIXEL_SCHEMA, **_WRITE_OPTS)
+            writer.write_table(chunk)
+            out_batches = []
+            out_rows = 0
+
+        while heap:
+            n, dt, cid, row, batch = heapq.heappop(heap)
+
+            # Find the run of rows in this batch with the same northing — emit them
+            # as a slice so we avoid per-row Python overhead.
+            col_n = batch.column("point_id")
+            end = row + 1
+            batch_len = len(batch)
+            while end < batch_len and int(col_n[end].as_py().rsplit("_", 1)[1]) == n:
+                end += 1
+
+            out_batches.append(batch.slice(row, end - row))
+            out_rows += end - row
+
+            if out_rows >= ROW_GROUP:
+                _flush()
+
+            if end < batch_len:
+                # More rows remain in this batch — push next row back.
+                next_n  = _northing(batch, end)
+                next_dt = str(batch.column("date")[end].as_py())
+                heapq.heappush(heap, (next_n, next_dt, cid, end, batch))
+            else:
+                # Batch exhausted — fetch next row group from this cursor.
+                next_batch = cursors[cid].next_batch()
+                if next_batch is not None:
+                    next_n  = _northing(next_batch, 0)
+                    next_dt = str(next_batch.column("date")[0].as_py())
+                    heapq.heappush(heap, (next_n, next_dt, cid, 0, next_batch))
+
+        _flush()
     finally:
         if writer is not None:
             writer.close()
-        import shutil
-        shutil.rmtree(staging_dir, ignore_errors=True)
 
     tmp_path.replace(out_path)
 
