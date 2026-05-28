@@ -141,7 +141,7 @@ def merge_scenes(
     # 16 buckets over ~4 GB parquet input ≈ 250 MB compressed per bucket;
     # uncompressed in DuckDB ≈ 1–2 GB per bucket — fits comfortably in 8 GB.
     n_buckets = int(os.environ.get("PROXY_MERGE_BUCKETS", "16"))
-    mem_gb    = int(os.environ.get("PROXY_MERGE_MEM_GB",  "4"))
+    mem_gb    = int(os.environ.get("PROXY_MERGE_MEM_GB",  "6"))
 
     def _con() -> "duckdb.DuckDBPyConnection":
         return duckdb.connect(config={
@@ -675,13 +675,13 @@ def run_tile_pipeline_v2(
     setup_gdal_env()
 
     fetch_workers   = int(os.environ.get("FETCH_WORKERS",   "16"))
-    extract_workers = int(os.environ.get("EXTRACT_WORKERS", "2"))
+    extract_workers = int(os.environ.get("EXTRACT_WORKERS", "3"))
     # Prefetch depth: how many strips to fetch ahead concurrently.
     # Depth-2 saturates the network during extraction but doubles peak memory.
-    # On machines with ≤8 GB RAM, depth-1 avoids OOM; override with PREFETCH_DEPTH=2
+    # On machines with ≤12 GB RAM, depth-1 avoids OOM; override with PREFETCH_DEPTH=2
     # on larger instances.
     _mem_gb = _system_memory_gb()
-    _default_prefetch = 1 if _mem_gb <= 10 else 2
+    _default_prefetch = 1 if _mem_gb <= 12 else 2
     prefetch_depth = int(os.environ.get("PREFETCH_DEPTH", str(_default_prefetch)))
 
     bbox_wgs84 = list(polygon_geometry.bounds)
