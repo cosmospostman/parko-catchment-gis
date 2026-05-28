@@ -98,67 +98,78 @@ def merge_scenes(
     s1_path: Path | None,
     out_path: Path,
 ) -> None:
-    """Sort-merge S2 per-scene parquets (+ optional S1) into out_path via Polars streaming.
+    """Sort-merge per-scene parquets (+ optional S1) into out_path via DuckDB.
 
-    Uses Polars streaming engine (engine="streaming") which sorts with native Rust
-    and spills intermediate passes to disk — no full dataset in RAM at once.
+    Each scene parquet is northing-sorted (single date); S1 covers all dates.
+    DuckDB's external sort spills to disk when the in-memory budget is exceeded,
+    bounding peak RAM regardless of dataset size.  This replaces the previous
+    Polars streaming sort which materialised the full dataset (~8–12 GB on large
+    tiles) — DuckDB caps usage at memory_limit_gb plus a small overhead.
     """
-    import polars as pl
-    from utils.parquet_utils import COMBINED_PIXEL_SCHEMA, _arrow_to_polars
+    import duckdb
+    from utils.parquet_utils import COMBINED_PIXEL_SCHEMA
 
-    s2_str = [str(p) for p in scene_paths]
-    has_s1 = s1_path is not None and s1_path.exists()
+    all_paths: list[Path] = list(scene_paths)
+    if s1_path is not None and s1_path.exists():
+        all_paths.append(s1_path)
 
-    if not s2_str and not has_s1:
+    if not all_paths:
         return
 
-    n_files = len(s2_str) + (1 if has_s1 else 0)
+    n_files = len(all_paths)
     logger.info("merge_scenes: merging %d files → %s", n_files, out_path.name)
 
     tmp_path = out_path.with_suffix(".merge_tmp.parquet")
     tmp_path.unlink(missing_ok=True)
 
-    out_col_names = COMBINED_PIXEL_SCHEMA.names
-    _pl_dtype = {f.name: _arrow_to_polars(f.type) for f in COMBINED_PIXEL_SCHEMA}
+    # DuckDB spill dir lives next to the output so spill files stay on the same
+    # filesystem and the final tmp → out rename is atomic.
+    spill_dir = out_path.parent / ".duckdb_spill"
+    spill_dir.mkdir(exist_ok=True)
 
-    def _scan(paths: list[str], source_val: str | None) -> pl.LazyFrame:
-        lf = pl.scan_parquet(paths, glob=False)
-        existing = lf.collect_schema().names()
-        exprs = []
-        for name in out_col_names:
-            if name == "source" and source_val is not None:
-                exprs.append(pl.lit(source_val).alias("source"))
-            elif name in existing:
-                exprs.append(pl.col(name))
-            else:
-                exprs.append(pl.lit(None, dtype=_pl_dtype[name]).alias(name))
-        return lf.select(exprs)
+    paths_literal = "[" + ", ".join(f"'{p}'" for p in all_paths) + "]"
 
-    frames: list[pl.LazyFrame] = []
-    if s2_str:
-        frames.append(_scan(s2_str, "S2"))
-    if has_s1:
-        frames.append(_scan([str(s1_path)], None))
+    con = duckdb.connect()
+    try:
+        con.execute("SET memory_limit='4GB'")
+        con.execute(f"SET temp_directory='{spill_dir}'")
+        con.execute("SET threads=2")
 
-    lf = pl.concat(frames) if len(frames) > 1 else frames[0]
-    lf = (
-        lf
-        .with_columns(
-            pl.col("point_id").str.split("_").list.get(-1)
-            .cast(pl.Int32, strict=False).fill_null(0)
-            .alias("_northing")
+        # Discover which columns are actually present across all input files.
+        # union_by_name=true fills absent columns with NULL, but only for columns
+        # that exist in *at least one* file. We must not reference columns absent
+        # from every file. Build the SELECT list from the union schema.
+        available = set(
+            row[0] for row in con.execute(
+                f"DESCRIBE SELECT * FROM read_parquet({paths_literal}, union_by_name=true) LIMIT 0"
+            ).fetchall()
         )
-        .sort(["_northing", "date"])
-        .drop("_northing")
-    )
+        col_names = COMBINED_PIXEL_SCHEMA.names
+        select_parts = []
+        for name in col_names:
+            if name == "source":
+                if "source" in available:
+                    select_parts.append("COALESCE(source, 'S2') AS source")
+                else:
+                    select_parts.append("'S2' AS source")
+            elif name in available:
+                select_parts.append(name)
+            else:
+                select_parts.append(f"NULL AS {name}")
+        select_cols = ", ".join(select_parts)
 
-    lf.sink_parquet(
-        tmp_path,
-        compression="uncompressed",
-        row_group_size=250_000,
-        statistics=False,
-        engine="streaming",
-    )
+        con.execute(f"""
+            COPY (
+                SELECT {select_cols}
+                FROM read_parquet({paths_literal}, union_by_name=true)
+                ORDER BY
+                    TRY_CAST(regexp_extract(point_id, '_([0-9]+)$', 1) AS INTEGER),
+                    date
+            ) TO '{tmp_path}'
+            (FORMAT PARQUET, COMPRESSION 'uncompressed', ROW_GROUP_SIZE 250000)
+        """)
+    finally:
+        con.close()
 
     tmp_path.replace(out_path)
     logger.info("merge_scenes done: %d input files → %s", n_files, out_path.name)
@@ -807,6 +818,11 @@ def run_tile_pipeline_v2(
                 if result is not None:
                     scene_paths.append(result)
 
+        # Free the large per-strip arrays captured by _extract_one before returning
+        # to the caller, which will immediately call collect_s1_for_tile + merge_scenes.
+        del _strip_utm_xy, lons, lats, point_ids
+        import gc; gc.collect()
+
         return scene_paths
 
     # --- Main loop with depth-2 prefetch -------------------------------------
@@ -871,6 +887,10 @@ def run_tile_pipeline_v2(
                     max_concurrent=max_concurrent,
                     points=strip_pts,
                 )
+
+                # strip_pts is no longer needed — free ~800 MB before the merge.
+                del strip_pts
+                import gc; gc.collect()
 
                 strip_out = tmp / f"strip_{strip_idx:04d}_sorted.parquet"
                 merge_scenes(scene_paths, s1_path, strip_out)

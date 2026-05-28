@@ -432,6 +432,9 @@ def _collect_s1_shards(
     use_sharding = n_shards > 1
     shard_paths: list[Path] = []
 
+    if use_sharding:
+        logger.info("S1: %d shards total (%d points each)", n_shards, point_shard_size)
+
     for shard_idx in range(n_shards):
         shard_points = points[shard_idx * point_shard_size : (shard_idx + 1) * point_shard_size]
         shard_path = out_dir / f"shard_{shard_idx:04d}.parquet"

@@ -158,6 +158,10 @@ class _ProgressState:
                 completed_units=self._completed_units,
             )
 
+    def set_total(self, n: int) -> None:
+        with self._lock:
+            self._total_units = max(self._total_units, n)
+
     def reset(self) -> None:
         with self._lock:
             self._slots.clear()
@@ -458,8 +462,13 @@ class _FetchHandler(logging.StreamHandler):
             m_item   = _PAT_ITEM_PROGRESS.search(msg)   if self._use_color else None
             m_chips  = _PAT_CHIP_PROGRESS.search(msg)   if self._use_color else None
             m_concat = _PAT_CONCAT_PROGRESS.search(msg) if self._use_color else None
+            m_total  = re.search(r"S1: (\d+) shards total", msg) if self._use_color else None
 
             with self._lock:
+                if m_total:
+                    _progress.set_total(int(m_total.group(1)))
+                    # fall through — let the line render normally
+
                 if m_item:
                     label   = m_item.group(1)
                     shard_i = int(m_item.group(2))
