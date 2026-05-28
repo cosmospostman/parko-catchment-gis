@@ -297,6 +297,7 @@ def compute_strips(
     strips_meta = {
         "utm_crs": utm_crs, "xs": xs, "y0_snap": y0_snap, "y1": y1,
         "block_m": block_m, "r": r, "polygon_geometry": polygon_geometry,
+        "first_lower": first_lower,
     }
     return strips, strips_meta
 
@@ -315,6 +316,7 @@ def make_strip_points(strip: dict, meta: dict) -> list[tuple[str, float, float]]
     block_m = meta["block_m"]
     r = meta["r"]
     polygon_geometry = meta["polygon_geometry"]
+    first_lower = meta["first_lower"]
 
     lower = strip["y_lower"]
     upper = lower + block_m
@@ -342,7 +344,7 @@ def make_strip_points(strip: dict, meta: dict) -> list[tuple[str, float, float]]
     if len(lons_arr) == 0:
         return []
 
-    j_offset = round((lower - y0_snap) / r)
+    j_offset = round((lower - first_lower) / r)
     pids = [f"px_{int(i):04d}_{int(j + j_offset):04d}" for i, j in zip(ii_flat, jj_flat)]
     return list(zip(pids, lons_arr.tolist(), lats_arr.tolist()))
 
