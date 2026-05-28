@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import sys
 from collections.abc import Iterator
@@ -186,6 +187,9 @@ def _extract_item_from_tiffs(
     Returns None if the item has no clear pixels or the SCL tif is missing.
     """
     import rasterio
+    import rasterio.windows
+    import threading
+    from concurrent.futures import ThreadPoolExecutor as _BandTPE
     from pyproj import Transformer, CRS
 
     item_id = item.id
@@ -194,6 +198,13 @@ def _extract_item_from_tiffs(
     _dt = item.datetime.replace(tzinfo=None)
     item_date = _dt
     n = len(point_ids)
+
+    # Cache projected coordinates keyed by CRS string — bands at the same
+    # resolution share a CRS so the expensive Transformer.transform() call
+    # (6.5 M points × pyproj) is paid once per resolution, not once per band.
+    # Lock guards concurrent initialisation when _sample_tif runs in parallel.
+    _xy_cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    _xy_lock = threading.Lock()
 
     def _sample_tif(band: str) -> np.ndarray | None:
         """Open {tiff_dir}/{band}.tif and sample pixel values at all points."""
@@ -205,8 +216,12 @@ def _extract_item_from_tiffs(
                 crs = src.crs
                 transform = src.transform
                 h, w = src.height, src.width
-                t = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
-                xs, ys = t.transform(lons, lats)
+                crs_key = crs.to_string()
+                with _xy_lock:
+                    if crs_key not in _xy_cache:
+                        t = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+                        _xy_cache[crs_key] = t.transform(lons, lats)
+                xs, ys = _xy_cache[crs_key]
                 cols_f, rows_f = ~transform * (xs, ys)
                 rows_raw = np.floor(rows_f).astype(np.intp)
                 cols_raw = np.floor(cols_f).astype(np.intp)
@@ -223,6 +238,8 @@ def _extract_item_from_tiffs(
                 r0, r1 = int(rows.min()), int(rows.max()) + 1
                 c0, c1 = int(cols.min()), int(cols.max()) + 1
                 win = rasterio.windows.Window(c0, r0, c1 - c0, r1 - r0)
+                # rasterio releases the GIL during src.read() so band reads
+                # genuinely parallelise across threads.
                 arr = src.read(1, window=win)
                 vals = arr[rows - r0, cols - c0].astype(np.float32)
                 if oob_mask.any():
@@ -232,8 +249,25 @@ def _extract_item_from_tiffs(
             logger.debug("_extract_item_from_tiffs: failed to read %s/%s: %s", item_id, band, exc)
             return None
 
-    # SCL
-    scl_vals = _sample_tif(SCL_BAND)
+    # Fan-out all band reads across a small thread pool.  rasterio releases the
+    # GIL during src.read(), so 2–4 threads measurably reduce wall time.
+    # _BAND_WORKERS=4 is the empirical sweet spot: beyond 4 the reads are
+    # memory-bandwidth-bound and additional threads add no benefit.
+    _BAND_WORKERS = int(os.environ.get("BAND_WORKERS", "4"))
+
+    def _sample_all(bands: list[str]) -> dict[str, np.ndarray | None]:
+        if _BAND_WORKERS <= 1 or len(bands) <= 1:
+            return {b: _sample_tif(b) for b in bands}
+        with _BandTPE(max_workers=_BAND_WORKERS) as pool:
+            futs = {pool.submit(_sample_tif, b): b for b in bands}
+            return {b: fut.result() for fut, b in ((f, futs[f]) for f in futs)}
+
+    # Read all bands in parallel (SCL + AOT + spectral).  SCL is checked first
+    # after the fan-out completes — cloud-filtered scenes are rare enough that
+    # the wasted work on spectral bands is outweighed by the parallel speedup.
+    all_sampled = _sample_all([SCL_BAND, AOT_BAND] + list(BANDS))
+
+    scl_vals = all_sampled[SCL_BAND]
     if scl_vals is None:
         return None
     with np.errstate(invalid="ignore"):
@@ -243,17 +277,15 @@ def _extract_item_from_tiffs(
         return None
     scl_purity = clear_mask.astype(np.float32)
 
-    # AOT
-    aot_vals = _sample_tif(AOT_BAND)
+    aot_vals = all_sampled[AOT_BAND]
     if aot_vals is not None:
         aot_quality = np.clip(1.0 - aot_vals * 0.001, 0.0, 1.0)
     else:
         aot_quality = np.ones(n, dtype=np.float32)
 
-    # Spectral bands
     band_arrays: dict[str, np.ndarray] = {}
     for band in BANDS:
-        vals = _sample_tif(band)
+        vals = all_sampled[band]
         band_arrays[band] = vals / 10000.0 if vals is not None else np.full(n, np.nan, dtype=np.float32)
 
     # NBAR c-factor correction

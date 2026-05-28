@@ -219,7 +219,7 @@ def _kway_merge_parquets(
     tmp_path = out_path.with_suffix(".kmerge_tmp.parquet")
     tmp_path.unlink(missing_ok=True)
 
-    ROW_GROUP = 500_000
+    ROW_GROUP = 250_000
     out_batches: list["pa.Table"] = []
     out_rows = 0
     writer: "pq.ParquetWriter | None" = None

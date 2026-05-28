@@ -185,7 +185,7 @@ def merge_scenes(
 
     writer: "pq.ParquetWriter | None" = None
     try:
-        ROW_GROUP = 500_000
+        ROW_GROUP = 250_000
         out_batches: list["pa.Table"] = []
         out_rows = 0
 
@@ -838,7 +838,13 @@ def run_tile_pipeline_v2(
             tmp_path = out_path.with_suffix(".tmp.parquet")
             tmp_path.unlink(missing_ok=True)
             writer = pq.ParquetWriter(str(tmp_path), tbl.schema, **_WRITE_OPTS)
-            writer.write_table(tbl)
+            # Cap row-group size so merge_scenes cursors load bounded slices.
+            # A single scene can have 6 M+ rows; without this cap the cursor
+            # loads the whole scene into RAM on first next_batch(), and with
+            # 82 concurrent cursors in the heap that exhausts 16 GB.
+            _RG = 250_000
+            for off in range(0, max(len(tbl), 1), _RG):
+                writer.write_table(tbl.slice(off, _RG))
             writer.close()
             tmp_path.replace(out_path)
 
