@@ -253,6 +253,19 @@ class _RawChunk(NamedTuple):
     n_s1:     int                 # width of S1 feature block (0 in s2-only)
 
 
+class _PASlice(NamedTuple):
+    """A raw PyArrow table slice for mixed-mode workers.
+
+    In mixed mode the parser puts these on raw_q instead of _RawChunk so that
+    workers do the GIL-releasing PyArrow extraction in parallel rather than
+    the parser doing it serially with Polars.
+    """
+    tbl:            "pa.Table"   # slice with year/doy columns already appended
+    s2_feature_cols: list[str]
+    s1_feature_cols: list[str]
+    scl_purity_min:  float
+
+
 class _ZscoreArrays:
     """Vectorised per-pixel z-score lookup built once per pre-pass result.
 
@@ -292,6 +305,83 @@ class _ZscoreArrays:
             dtype=np.intp, count=len(pids),
         )
         return self._means[idx], self._stds[idx]
+
+
+def _extract_mixed_pa(
+    pa_slice: "_PASlice",
+) -> "_RawChunk | None":
+    """Extract mixed-mode feature arrays directly from a PyArrow table slice.
+
+    Pure PyArrow + numpy — releases the GIL throughout so N workers can run
+    truly in parallel (unlike the Polars path which serialises on the GIL).
+    Called by prep workers in mixed mode; replaces the Polars branch of
+    _extract_raw_arrays for that path.
+    """
+    import pyarrow.compute as _pac
+
+    tbl = pa_slice.tbl
+    _s2_cols = pa_slice.s2_feature_cols
+    _s1_cols = pa_slice.s1_feature_cols
+    scl_purity_min = pa_slice.scl_purity_min
+    n_s2 = len(_s2_cols)
+    n_s1 = len(_s1_cols)
+    n_feat = n_s2 + n_s1
+
+    schema_names = set(tbl.schema.names)
+    has_source = "source" in schema_names
+
+    if has_source:
+        is_s1_pa = _pac.equal(tbl.column("source").combine_chunks(), "S1")
+        if "scl_purity" in schema_names:
+            # or_kleene: True OR null = True (keeps S1 rows whose scl_purity is null)
+            keep_pa = _pac.or_kleene(is_s1_pa, _pac.greater_equal(tbl.column("scl_purity").combine_chunks(), scl_purity_min))
+            tbl = tbl.filter(keep_pa)
+            is_s1_pa = _pac.equal(tbl.column("source").combine_chunks(), "S1")
+        is_s1_bool = is_s1_pa.to_numpy(zero_copy_only=False)
+    else:
+        if "scl_purity" in schema_names:
+            tbl = tbl.filter(_pac.greater_equal(tbl.column("scl_purity").combine_chunks(), scl_purity_min))
+        is_s1_bool = np.zeros(tbl.num_rows, dtype=bool)
+
+    if tbl.num_rows == 0:
+        return None
+
+    N = tbl.num_rows
+    feat = np.zeros((N, n_feat), dtype=np.float32)
+
+    # S2 bands: stack all columns at once, index by non-S1 mask
+    s2_mask = ~is_s1_bool
+    s2_idx  = np.where(s2_mask)[0]
+    if s2_idx.size > 0:
+        raw_s2_cols = [c for c in _s2_cols if c not in ("NDVI", "NDWI", "EVI", "MAVI", "NDRE", "CI_RE")]
+        if raw_s2_cols:
+            s2_mat = np.column_stack([
+                np.asarray(tbl.column(c).combine_chunks(), dtype=np.float32)
+                for c in raw_s2_cols
+                if c in schema_names
+            ])
+            feat[s2_idx, :len(raw_s2_cols)] = s2_mat[s2_idx]
+
+    # S1 features: VH/VV → dB + ratio features
+    s1_idx = np.where(is_s1_bool)[0]
+    if s1_idx.size > 0 and "vh" in schema_names and "vv" in schema_names:
+        vh_lin = np.asarray(tbl.column("vh").combine_chunks(), dtype=np.float32)
+        vv_lin = np.asarray(tbl.column("vv").combine_chunks(), dtype=np.float32)
+        vh_s = vh_lin[s1_idx]; vv_s = vv_lin[s1_idx]
+        s1_vh  = lin_to_db(vh_s)
+        s1_vv  = lin_to_db(vv_s)
+        vh_vv  = (s1_vh - s1_vv).astype(np.float32)
+        denom  = vh_s + vv_s
+        rvi    = np.where(denom > 0, 4 * vh_s / denom, 0.0).astype(np.float32)
+        col_map = {"s1_vh": s1_vh, "s1_vv": s1_vv, "s1_vh_vv": vh_vv, "s1_rvi": rvi}
+        for j, col in enumerate(_s1_cols):
+            if col in col_map:
+                feat[s1_idx, n_s2 + j] = col_map[col]
+
+    pid_arr  = np.asarray(tbl.column("point_id").combine_chunks())
+    year_arr = np.asarray(tbl.column("year").combine_chunks(), dtype=np.int32)
+    doy_arr  = np.asarray(tbl.column("doy").combine_chunks(),  dtype=np.int32)
+    return _RawChunk(feat, is_s1_bool, pid_arr, year_arr, doy_arr, n_feat, n_s2, n_s1)
 
 
 def _extract_raw_arrays(
@@ -1075,17 +1165,40 @@ def score_pixels_chunked(
 
     # --- Stage 1b: parser thread — date extraction, year filter, sub-division ---
     def _reader() -> None:
-        # Accumulate row groups until target_chunk_rows before emitting to prep workers.
-        # Date extraction uses PyArrow compute (dt.year/day_of_year) — 80× faster than
-        # the old cast(Datetime("us")) path for the Date-typed column in these parquets.
+        # In mixed mode the accumulator holds raw PyArrow tables and workers do
+        # _extract_mixed_pa() (GIL-releasing) so N workers run truly in parallel.
+        # In s1_only/s2-only mode we keep the Polars path (less common, single worker).
         import pyarrow as _pa
         import pyarrow.compute as _pac
 
-        accum: list[pl.DataFrame] = []
+        # PA-mode: accumulate PyArrow tables; Polars-mode: accumulate pl.DataFrames
+        accum: list = []
         accum_rows = 0
 
-        def _emit_raw(chunk: pl.DataFrame) -> None:
-            """Sub-divide chunk on point_id boundaries and put _RawChunk on raw_q."""
+        _eff_s2_cols = s2_feature_cols or list(ALL_FEATURE_COLS)
+        _eff_s1_cols = s1_feature_cols or ["s1_vh", "s1_vv"]
+
+        def _emit_raw_pa(tbl: "pa.Table") -> None:
+            """Slice PA table on point_id boundaries and put _PASlice on raw_q."""
+            if tbl.num_rows == 0:
+                return
+            pid_np = np.asarray(tbl.column("point_id").combine_chunks())
+            n = len(pid_np)
+            start = 0
+            while start < n:
+                end = min(start + target_chunk_rows, n)
+                if end < n:
+                    pivot = pid_np[end - 1]
+                    while end > start and pid_np[end - 1] == pivot:
+                        end -= 1
+                    if end == start:
+                        while end < n and pid_np[end] == pivot:
+                            end += 1
+                raw_q.put(_PASlice(tbl.slice(start, end - start), _eff_s2_cols, _eff_s1_cols, scl_purity_min))
+                start = end
+
+        def _emit_raw_pl(chunk: pl.DataFrame) -> None:
+            """Sub-divide Polars chunk on point_id boundaries and put _RawChunk on raw_q."""
             if chunk.is_empty():
                 return
             pid_np = chunk["point_id"].to_numpy()
@@ -1104,7 +1217,7 @@ def score_pixels_chunked(
                     chunk.slice(start, end - start),
                     scl_purity_min=scl_purity_min,
                     s1_only=s1_only,
-                    mixed=mixed,
+                    mixed=False,
                     feature_cols=feature_cols,
                     s2_feature_cols=s2_feature_cols,
                     s1_feature_cols=s1_feature_cols,
@@ -1121,34 +1234,44 @@ def score_pixels_chunked(
             nonlocal accum, accum_rows
             if not accum:
                 return
-            merged = pl.concat(accum) if len(accum) > 1 else accum[0]
-            accum = []
-            accum_rows = 0
-            if not is_last:
-                boundary_pid = merged["point_id"][-1]
-                leftover = merged.filter(pl.col("point_id") == boundary_pid)
-                merged   = merged.filter(pl.col("point_id") != boundary_pid)
-                if not leftover.is_empty():
-                    accum = [leftover]
-                    accum_rows = len(leftover)
-            _emit_raw(merged)
+            if mixed:
+                import pyarrow as _pa2
+                merged = _pa2.concat_tables(accum) if len(accum) > 1 else accum[0]
+                accum.clear(); accum_rows = 0
+                if not is_last and merged.num_rows > 0:
+                    pid_np = np.asarray(merged.column("point_id").combine_chunks())
+                    bp = pid_np[-1]
+                    keep = pid_np != bp
+                    lv_tbl = merged.filter(~keep) if not keep.all() else None
+                    merged = merged.filter(keep) if not keep.all() else merged
+                    if lv_tbl is not None and lv_tbl.num_rows > 0:
+                        accum.append(lv_tbl); accum_rows = lv_tbl.num_rows
+                _emit_raw_pa(merged)
+            else:
+                merged = pl.concat(accum) if len(accum) > 1 else accum[0]
+                accum.clear(); accum_rows = 0
+                if not is_last:
+                    boundary_pid = merged["point_id"][-1]
+                    leftover = merged.filter(pl.col("point_id") == boundary_pid)
+                    merged   = merged.filter(pl.col("point_id") != boundary_pid)
+                    if not leftover.is_empty():
+                        accum.append(leftover); accum_rows = len(leftover)
+                _emit_raw_pl(merged)
 
         try:
             while True:
                 tbl = io_q.get()
                 if tbl is _SENTINEL:
                     break
-                # tile_id filter in PyArrow before converting to Polars (avoids full from_arrow)
+                # tile_id filter in PyArrow before conversion
                 if tile_prefix and "item_id" in tbl.schema.names:
                     item_ids = tbl.column("item_id")
                     null_mask  = _pac.is_null(item_ids)
-                    match_mask = _pac.utf8_contains(item_ids.fill_null(""), tile_prefix)
+                    match_mask = _pac.match_substring(item_ids.fill_null(""), tile_prefix)
                     tbl = tbl.filter(_pac.or_(null_mask, match_mask))
                     if tbl.num_rows == 0:
                         continue
-                # Fast date extraction in PyArrow before from_arrow conversion.
-                # pac.year/day_of_year on a Date column is 80× faster than the old
-                # Polars cast(Datetime("us")) → numpy path (28ms vs 2276ms per 1M rows).
+                # Fast date extraction in PyArrow — 80× faster than Polars cast(Datetime("us"))
                 date_col = tbl.column("date")
                 year_col = _pac.year(date_col).cast("int32")
                 doy_col  = _pac.day_of_year(date_col).cast("int32")
@@ -1158,14 +1281,20 @@ def score_pixels_chunked(
                     tbl = tbl.filter(_pac.less_equal(year_col, end_year))
                 if tbl.num_rows == 0:
                     continue
-                chunk = pl.from_arrow(tbl)
-                del tbl
-                if not s1_only and not mixed and "scl_purity" in chunk.columns:
-                    chunk = chunk.filter(pl.col("scl_purity") >= scl_purity_min)
-                if chunk.is_empty():
-                    continue
-                accum.append(chunk)
-                accum_rows += len(chunk)
+                if mixed:
+                    # Keep as PyArrow — workers do extraction (GIL-releasing)
+                    accum.append(tbl)
+                    accum_rows += tbl.num_rows
+                else:
+                    # Non-mixed: convert to Polars here as before
+                    chunk = pl.from_arrow(tbl)
+                    del tbl
+                    if not s1_only and "scl_purity" in chunk.columns:
+                        chunk = chunk.filter(pl.col("scl_purity") >= scl_purity_min)
+                    if chunk.is_empty():
+                        continue
+                    accum.append(chunk)
+                    accum_rows += len(chunk)
                 if accum_rows >= target_chunk_rows:
                     _flush_accum(is_last=False)
 
@@ -1183,7 +1312,13 @@ def score_pixels_chunked(
                 item = raw_q.get()
                 if item is _SENTINEL:
                     break
-                batches = _preprocess(item, band_mean, band_std, min_obs_per_year, pin=pin,
+                if isinstance(item, _PASlice):
+                    raw = _extract_mixed_pa(item)
+                else:
+                    raw = item
+                if raw is None:
+                    continue
+                batches = _preprocess(raw, band_mean, band_std, min_obs_per_year, pin=pin,
                                       mixed=mixed,
                                       pixel_zscore=pixel_zscore,
                                       pixel_zscore_stats=pixel_zscore_stats,
