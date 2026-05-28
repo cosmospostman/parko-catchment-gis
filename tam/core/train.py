@@ -1079,387 +1079,354 @@ def train_tam(
     )
 
     _ds_tmp_dir: tempfile.TemporaryDirectory | None = None
-    if cfg.dataset_subprocess:
-        # Prefer /dev/shm (guaranteed tmpfs on Linux) over /tmp which may be
-        # disk-backed on some systems.  Fall back to /tmp if /dev/shm is absent.
-        _shm_base = Path("/dev/shm") if Path("/dev/shm").is_dir() else None
-        _ds_tmp_dir = tempfile.TemporaryDirectory(prefix="tam_ds_", dir=_shm_base)
-        _ds_tmp_path = Path(_ds_tmp_dir.name)
-
-        if _precomputed_paths is not None:
-            _train_parquet = _precomputed_paths["train"]
-        else:
-            _train_parquet = _write_dataset_parquet(train_pixel_df, _ds_tmp_path, "train")
-            del train_pixel_df
-            gc.collect()
-
-        _train_kwargs = dict(**_ds_common_kwargs,
-                             doy_jitter=cfg.doy_jitter,
-                             doy_phase_shift=cfg.doy_phase_shift,
-                             band_noise_std=cfg.band_noise_std,
-                             obs_dropout_min=cfg.obs_dropout_min,
-                             p_gate=cfg.p_gate,
-                             T_gate=cfg.T_gate)
-
-        if cfg.n_dataset_shards > 1:
-            # Step 1: compute normalisation stats in a lightweight subprocess.
-            # Write global_feat_df to a temp parquet so the worker can read it.
-            # Resolve feature cols the same way TAMDataset.__init__ would.
-            from tam.core.dataset import ALL_FEATURE_COLS as _ALL_FC
-            _s2_base_cols    = list(_feature_cols_override) if _feature_cols_override else list(_ALL_FC)
-            _stats_s1_cols   = list(_s1_feature_cols_override) if _s1_feature_cols_override else list(S1_FEATURE_COLS)
-            if cfg.use_s1 in (True, "mixed"):
-                _stats_feat_cols = _s2_base_cols + _stats_s1_cols
+    try:
+        if cfg.dataset_subprocess:
+            # Prefer /dev/shm (guaranteed tmpfs on Linux) over /tmp which may be
+            # disk-backed on some systems.  Fall back to /tmp if /dev/shm is absent.
+            _shm_base = Path("/dev/shm") if Path("/dev/shm").is_dir() else None
+            _ds_tmp_dir = tempfile.TemporaryDirectory(prefix="tam_ds_", dir=_shm_base)
+            _ds_tmp_path = Path(_ds_tmp_dir.name)
+    
+            if _precomputed_paths is not None:
+                _train_parquet = _precomputed_paths["train"]
             else:
-                _stats_feat_cols = _s2_base_cols
-            _gf_parquet_path: Path | None = None
-            if global_feat_df is not None:
-                _gf_parquet_path = _ds_tmp_path / "global_feat_for_stats.parquet"
-                global_feat_df.write_parquet(str(_gf_parquet_path))
-            elif _precomputed_paths is not None and "global_feat" in _precomputed_paths:
-                _gf_parquet_path = _precomputed_paths["global_feat"]
-
-            logger.info("Computing band stats from train parquet in subprocess")
-            _stats = _compute_band_stats_subprocess(
-                parquet_path=_train_parquet,
-                out_npz=_ds_tmp_path / "band_stats",
-                use_s1=cfg.use_s1,
-                feature_cols=_stats_feat_cols or [],
-                s1_feature_cols=_stats_s1_cols,
-                scl_purity_min=cfg.scl_purity_min,
-                s1_despeckle_window=cfg.s1_despeckle_window,
-                global_features_df_path=_gf_parquet_path,
-            )
-            _band_mean_pre   = _stats["band_mean"]
-            _band_std_pre    = _stats["band_std"]
-            _gf_mean_pre     = _stats["global_feat_mean"]
-            _gf_std_pre      = _stats["global_feat_std"]
-            _log_rss("after band stats subprocess")
-
-            # Step 2: build train shards, each using the shared stats.
-            logger.info("Building TAMDataset(train) in %d shards", cfg.n_dataset_shards)
-            train_ds = _build_dataset_sharded(
-                parquet_path=_train_parquet,
-                labels=train_py_labels,
-                tmp_dir=_ds_tmp_path,
-                name="train",
-                kwargs=_train_kwargs,
-                n_shards=cfg.n_dataset_shards,
-                band_mean=_band_mean_pre,
-                band_std=_band_std_pre,
-                global_feat_mean=_gf_mean_pre,
-                global_feat_std=_gf_std_pre,
-            )
-        else:
-            logger.info("Building TAMDataset(train) in subprocess → %s", _ds_tmp_path / "train")
-            train_ds = _build_dataset_subprocess(
-                _train_parquet, train_py_labels, _ds_tmp_path, "train",
-                kwargs=_train_kwargs,
-            )
-    else:
-        train_ds = TAMDataset(
-            train_pixel_df, train_py_labels,
-            doy_jitter=cfg.doy_jitter,
-            doy_phase_shift=cfg.doy_phase_shift,
-            band_noise_std=cfg.band_noise_std,
-            obs_dropout_min=cfg.obs_dropout_min,
-            p_gate=cfg.p_gate,
-            T_gate=cfg.T_gate,
-            _log_rss=_log_rss,
-            **_ds_common_kwargs,
-        )
-
-    band_mean, band_std = train_ds.band_stats
-    if not cfg.dataset_subprocess:
-        del train_pixel_df
-    gc.collect()
-    _log_rss("after train_ds, before val_ds")
-
-    # --- Val dataset ---------------------------------------------------------
-    if cfg.dataset_subprocess:
-        if _precomputed_paths is not None:
-            _val_parquet = _precomputed_paths["val"]
-        else:
-            _val_parquet = _write_dataset_parquet(val_pixel_df, _ds_tmp_path, "val")
-            del val_pixel_df
-            gc.collect()
-
-        logger.info("Building TAMDataset(val) in subprocess → %s", _ds_tmp_path / "val")
-        val_ds = _build_dataset_subprocess(
-            _val_parquet, val_py_labels, _ds_tmp_path, "val",
-            kwargs=dict(**_ds_common_kwargs,
-                        band_mean=band_mean, band_std=band_std,
-                        global_feat_mean=train_ds.global_feat_mean,
-                        global_feat_std=train_ds.global_feat_std,
-                        doy_jitter=0),
-        )
-    else:
-        val_ds = TAMDataset(
-            val_pixel_df, val_py_labels,
-            band_mean=band_mean, band_std=band_std,
-            global_feat_mean=train_ds.global_feat_mean,
-            global_feat_std=train_ds.global_feat_std,
-            doy_jitter=0,
-            _log_rss=_log_rss,
-            **_ds_common_kwargs,
-        )
-        del val_pixel_df
-    gc.collect()
-    logger.info("Train windows: %d  |  Val windows: %d", len(train_ds), len(val_ds))
-    _log_rss("after val_ds")
-
-    n_cpu = os.cpu_count() or 4
-
-    if cfg.dataloader_workers >= 0:
-        n_workers = cfg.dataloader_workers
-        _avail_gb = float("nan")
-    else:
-        n_workers = min(max(2, n_cpu - 2), 4)  # GPU-bound; cap keeps GPU fed without forking excess RAM
-
-        # Scale workers down when RSS is high: each worker spawns a new process that
-        # receives a pickled copy of the dataset over a pipe. At >40 GB RSS the OOM
-        # killer hits the worker before it finishes unpickling (exit code -9,
-        # UnpicklingError: pickle data was truncated). Fall back to 0 workers
-        # (in-process, no fork) when available memory is tight.
-        try:
-            with open("/proc/meminfo") as _mf:
-                _avail_kb = next(
-                    int(l.split()[1]) for l in _mf if l.startswith("MemAvailable")
-                )
-            _avail_gb = _avail_kb / 1e6
-        except Exception:
-            _avail_gb = float("inf")
-
-        try:
-            with open("/proc/self/status") as _sf:
-                for _sl in _sf:
-                    if _sl.startswith("VmRSS:"):
-                        _rss_gb = int(_sl.split()[1]) / 1e6
-                        break
+                _train_parquet = _write_dataset_parquet(train_pixel_df, _ds_tmp_path, "train")
+                del train_pixel_df
+                gc.collect()
+    
+            _train_kwargs = dict(**_ds_common_kwargs,
+                                 doy_jitter=cfg.doy_jitter,
+                                 doy_phase_shift=cfg.doy_phase_shift,
+                                 band_noise_std=cfg.band_noise_std,
+                                 obs_dropout_min=cfg.obs_dropout_min,
+                                 p_gate=cfg.p_gate,
+                                 T_gate=cfg.T_gate)
+    
+            if cfg.n_dataset_shards > 1:
+                # Step 1: compute normalisation stats in a lightweight subprocess.
+                # Write global_feat_df to a temp parquet so the worker can read it.
+                # Resolve feature cols the same way TAMDataset.__init__ would.
+                from tam.core.dataset import ALL_FEATURE_COLS as _ALL_FC
+                _s2_base_cols    = list(_feature_cols_override) if _feature_cols_override else list(_ALL_FC)
+                _stats_s1_cols   = list(_s1_feature_cols_override) if _s1_feature_cols_override else list(S1_FEATURE_COLS)
+                if cfg.use_s1 in (True, "mixed"):
+                    _stats_feat_cols = _s2_base_cols + _stats_s1_cols
                 else:
-                    _rss_gb = float("nan")
-        except Exception:
-            _rss_gb = float("nan")
-
-        if _avail_gb < 20:
-            n_workers = 0
-
-    _pin = n_workers > 0  # pin_memory requires worker processes; useless at 0
-    _persist = n_workers > 0
-    _prefetch = 4 if n_workers > 0 else None
-    # DataLoader is created before model.to(device) so no CUDA context exists yet.
-    # fork workers share dataset memory via copy-on-write — negligible extra RSS
-    # vs spawn which re-pickles the full dataset into each worker.
-    _mp_ctx = "fork" if n_workers > 0 else None
-
-    torch.set_num_threads(1)
-
-    # Wrap train_ds with gate augmentation if p_gate > 0.
-    # GateAugDataset expands __len__ by round(p_gate*N) extra slots, each a
-    # T_gate-truncated view of a randomly selected pixel. reshuffle_gate() is
-    # called at the start of every epoch so coverage rotates without replacement.
-    _gate_aug_ds: GateAugDataset | None = None
-    if cfg.p_gate > 0.0:
-        _gate_aug_ds = GateAugDataset(train_ds, p_gate=cfg.p_gate, T_gate=cfg.T_gate)
-        _train_source = _gate_aug_ds
-        logger.info(
-            "GateAugDataset: %d base + %d gate slots/epoch  (p_gate=%.2f T_gate=%d)",
-            len(train_ds), _gate_aug_ds._n_gate, cfg.p_gate, cfg.T_gate,
-        )
-    else:
-        _train_source = train_ds
-
-    train_loader = DataLoader(
-        _train_source, batch_size=cfg.batch_size, shuffle=True,
-        collate_fn=collate_fn, num_workers=n_workers, persistent_workers=_persist,
-        pin_memory=_pin, prefetch_factor=_prefetch, multiprocessing_context=_mp_ctx,
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=cfg.batch_size, shuffle=False,
-        collate_fn=collate_fn, num_workers=n_workers, persistent_workers=_persist,
-        pin_memory=_pin, prefetch_factor=_prefetch, multiprocessing_context=_mp_ctx,
-    )
-    # Gate val loader: forces T_gate truncation on every val item; used to
-    # measure cascade TNR (fraction of absence pixels scoring < 0.5 at T=T_gate).
-    _gate_val_loader = None
-    if cfg.p_gate > 0.0:
-        _gate_val_ds = ForcedGateDataset(val_ds, T_gate=cfg.T_gate)
-        _gate_val_loader = DataLoader(
-            _gate_val_ds, batch_size=max(1, cfg.batch_size // 2), shuffle=False,
-            collate_fn=collate_fn, num_workers=0,
-        )
-    _log_rss("after DataLoader creation")
-    logger.info(
-        "DataLoader workers: %d  PyTorch threads: %d  avail_mem=%.1f GB",
-        n_workers, torch.get_num_threads(), _avail_gb,
-    )
-
-    # --- Class imbalance weight ---
-    n_pos = float(sum(v == 1 for v in train_py_labels.values()))
-    n_neg = float(sum(v == 0 for v in train_py_labels.values()))
-    pos_weight = torch.tensor([n_neg / n_pos], dtype=torch.float32).to(device) if n_pos > 0 and n_neg > 0 else None
-
-    # --- Model + optimiser --------------------------------------------------
-    if cfg.use_band_summaries and global_feat_df is not None:
-        cfg.n_global_features = global_feat_df.width - 1  # exclude point_id column
-    del global_feat_df
-    gc.collect()
-    model = TAMClassifier.from_config(cfg)
-    model._use_s1 = cfg.use_s1
-    model._pixel_zscore = cfg.pixel_zscore
-    model._max_seq_len = cfg.max_seq_len
-    model._feature_cols    = _feature_cols_override
-    model._s1_feature_cols = _s1_feature_cols_override
-    model.to(device)
-    # Keep a reference to the unwrapped model for attribute access (.config(),
-    # .band_proj, etc.) which are not forwarded through the compiled wrapper.
-    _raw_model = model
-    if torch.cuda.is_available():
-        model = torch.compile(model, dynamic=True)
-    logger.info(
-        "Model: d_model=%d n_heads=%d n_layers=%d d_ff=%d  params=%d",
-        cfg.d_model, cfg.n_heads, cfg.n_layers, cfg.d_ff,
-        sum(p.numel() for p in model.parameters() if p.requires_grad),
-    )
-
-    if cfg.doy_density_norm and _doy_s2_counts is not None:
-        _raw_model.set_doy_frequencies(_doy_s2_counts, _doy_s1_counts)
-        logger.info(
-            "DOY density normalisation enabled — S2: %d obs, S1: %d obs",
-            int(_doy_s2_counts.sum()), int(_doy_s1_counts.sum()),
-        )
-    _log_rss("after model init")
-
-    np.savez(out_dir / "tam_band_stats.npz", mean=band_mean, std=band_std)
-    if train_ds.global_feat_mean is not None and len(train_ds.global_feat_mean) > 0:
-        np.savez(out_dir / "tam_global_feat_stats.npz",
-                 mean=train_ds.global_feat_mean, std=train_ds.global_feat_std)
-    with open(out_dir / "tam_config.json", "w") as fh:
-        json.dump(_raw_model.config(), fh, indent=2)
-
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight, reduction="none")
-
-    _temporal_modules = [_raw_model.band_proj, _raw_model.encoder]
-
-    def _set_temporal_frozen(frozen: bool) -> None:
-        for m in _temporal_modules:
-            for p in m.parameters():
-                p.requires_grad = not frozen
-        if frozen:
-            logger.info("Temporal stream frozen — training head only (globals warmup)")
-        else:
-            logger.info("Temporal stream unfrozen — full model training")
-
-    if cfg.warmup_freeze_epochs > 0:
-        _set_temporal_frozen(True)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr * 3, weight_decay=cfg.weight_decay)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.warmup_freeze_epochs)
-    else:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.n_epochs)
-
-    # --- Training loop ------------------------------------------------------
-    best_val_auc = 0.0
-    epochs_without_improvement = 0
-    checkpoint_path = out_dir / "tam_model.pt"
-
-    for epoch in range(1, cfg.n_epochs + 1):
-        if cfg.warmup_freeze_epochs > 0 and epoch == cfg.warmup_freeze_epochs + 1:
-            _set_temporal_frozen(False)
-            optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=cfg.n_epochs - cfg.warmup_freeze_epochs
-            )
-        if _gate_aug_ds is not None:
-            _gate_aug_ds.reshuffle_gate()
-        model.train()
-        epoch_loss = 0.0
-        train_probs, train_labels_list = [], []
-        for batch in train_loader:
-            bands         = batch["bands"].to(device)
-            doy           = batch["doy"].to(device)
-            mask          = batch["mask"].to(device)
-            n_obs         = batch["n_obs"].to(device)
-            global_feats  = batch["global_feats"].to(device)
-            label         = batch["label"].to(device)
-            weight        = batch["weight"].to(device)
-
-            is_s1 = batch["is_s1"].to(device)
-            with autocast(device_type="cuda" if torch.cuda.is_available() else "cpu", dtype=torch.bfloat16):
-                prob, logit = model(bands, doy, mask, n_obs, global_feats, is_s1=is_s1)
-
-                if torch.isnan(prob).any():
-                    nan_mask = torch.isnan(prob)
-                    logger.warning(
-                        "NaN in model output: %d/%d samples. "
-                        "bands NaN=%s, doy NaN=%s, mask all-pad=%s, global_feats NaN=%s",
-                        nan_mask.sum().item(), len(prob),
-                        torch.isnan(bands).any().item(),
-                        torch.isnan(doy.float()).any().item(),
-                        mask.all(dim=1).any().item(),
-                        torch.isnan(global_feats).any().item(),
-                    )
-                    prob = torch.nan_to_num(prob, nan=0.5)
-                    logit = torch.nan_to_num(logit, nan=0.0)
-
-                loss = (criterion(logit, label) * weight).mean()
-
-            optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            epoch_loss += loss.item()
-            train_probs.extend(prob.detach().cpu().float().numpy())
-            train_labels_list.extend(label.cpu().float().numpy())
-
-        scheduler.step()
-
-        train_probs_arr = np.array(train_probs)
-        train_labels_arr = np.array(train_labels_list)
-        if len(set(train_labels_arr)) > 1:
-            train_auc = roc_auc_score(train_labels_arr, train_probs_arr)
-        else:
-            train_auc = float("nan")
-
-        # --- Validation -------------------------------------------------------
-        model.eval()
-        val_probs, val_labels_list, val_pids = [], [], []
-        with torch.no_grad():
-            for batch in val_loader:
-                prob, _ = model(
-                    batch["bands"].to(device),
-                    batch["doy"].to(device),
-                    batch["mask"].to(device),
-                    batch["n_obs"].to(device),
-                    batch["global_feats"].to(device),
-                    is_s1=batch["is_s1"].to(device),
+                    _stats_feat_cols = _s2_base_cols
+                _gf_parquet_path: Path | None = None
+                if global_feat_df is not None:
+                    _gf_parquet_path = _ds_tmp_path / "global_feat_for_stats.parquet"
+                    global_feat_df.write_parquet(str(_gf_parquet_path))
+                elif _precomputed_paths is not None and "global_feat" in _precomputed_paths:
+                    _gf_parquet_path = _precomputed_paths["global_feat"]
+    
+                logger.info("Computing band stats from train parquet in subprocess")
+                _stats = _compute_band_stats_subprocess(
+                    parquet_path=_train_parquet,
+                    out_npz=_ds_tmp_path / "band_stats",
+                    use_s1=cfg.use_s1,
+                    feature_cols=_stats_feat_cols or [],
+                    s1_feature_cols=_stats_s1_cols,
+                    scl_purity_min=cfg.scl_purity_min,
+                    s1_despeckle_window=cfg.s1_despeckle_window,
+                    global_features_df_path=_gf_parquet_path,
                 )
-                val_probs.extend(prob.cpu().float().numpy())
-                val_labels_list.extend(batch["label"].float().numpy())
-                val_pids.extend(batch["point_id"])
-
-        val_probs_arr = np.array(val_probs)
-        val_labels_arr = np.array(val_labels_list)
-        finite = np.isfinite(val_probs_arr)
-        n_nan = (~finite).sum()
-        if n_nan:
-            logger.warning("epoch %d: %d NaN predictions in validation set", epoch, n_nan)
-
-        val_cvar, site_records = _cvar_auc(
-            val_probs_arr, val_labels_arr, val_pids, finite,
-            alpha=cfg.cvar_alpha,
+                _band_mean_pre   = _stats["band_mean"]
+                _band_std_pre    = _stats["band_std"]
+                _gf_mean_pre     = _stats["global_feat_mean"]
+                _gf_std_pre      = _stats["global_feat_std"]
+                _log_rss("after band stats subprocess")
+    
+                # Step 2: build train shards, each using the shared stats.
+                logger.info("Building TAMDataset(train) in %d shards", cfg.n_dataset_shards)
+                train_ds = _build_dataset_sharded(
+                    parquet_path=_train_parquet,
+                    labels=train_py_labels,
+                    tmp_dir=_ds_tmp_path,
+                    name="train",
+                    kwargs=_train_kwargs,
+                    n_shards=cfg.n_dataset_shards,
+                    band_mean=_band_mean_pre,
+                    band_std=_band_std_pre,
+                    global_feat_mean=_gf_mean_pre,
+                    global_feat_std=_gf_std_pre,
+                )
+            else:
+                logger.info("Building TAMDataset(train) in subprocess → %s", _ds_tmp_path / "train")
+                train_ds = _build_dataset_subprocess(
+                    _train_parquet, train_py_labels, _ds_tmp_path, "train",
+                    kwargs=_train_kwargs,
+                )
+        else:
+            train_ds = TAMDataset(
+                train_pixel_df, train_py_labels,
+                doy_jitter=cfg.doy_jitter,
+                doy_phase_shift=cfg.doy_phase_shift,
+                band_noise_std=cfg.band_noise_std,
+                obs_dropout_min=cfg.obs_dropout_min,
+                p_gate=cfg.p_gate,
+                T_gate=cfg.T_gate,
+                _log_rss=_log_rss,
+                **_ds_common_kwargs,
+            )
+    
+        band_mean, band_std = train_ds.band_stats
+        if not cfg.dataset_subprocess:
+            del train_pixel_df
+        gc.collect()
+        _log_rss("after train_ds, before val_ds")
+    
+        # --- Val dataset ---------------------------------------------------------
+        if cfg.dataset_subprocess:
+            if _precomputed_paths is not None:
+                _val_parquet = _precomputed_paths["val"]
+            else:
+                _val_parquet = _write_dataset_parquet(val_pixel_df, _ds_tmp_path, "val")
+                del val_pixel_df
+                gc.collect()
+    
+            logger.info("Building TAMDataset(val) in subprocess → %s", _ds_tmp_path / "val")
+            val_ds = _build_dataset_subprocess(
+                _val_parquet, val_py_labels, _ds_tmp_path, "val",
+                kwargs=dict(**_ds_common_kwargs,
+                            band_mean=band_mean, band_std=band_std,
+                            global_feat_mean=train_ds.global_feat_mean,
+                            global_feat_std=train_ds.global_feat_std,
+                            doy_jitter=0),
+            )
+        else:
+            val_ds = TAMDataset(
+                val_pixel_df, val_py_labels,
+                band_mean=band_mean, band_std=band_std,
+                global_feat_mean=train_ds.global_feat_mean,
+                global_feat_std=train_ds.global_feat_std,
+                doy_jitter=0,
+                _log_rss=_log_rss,
+                **_ds_common_kwargs,
+            )
+            del val_pixel_df
+        gc.collect()
+        logger.info("Train windows: %d  |  Val windows: %d", len(train_ds), len(val_ds))
+        _log_rss("after val_ds")
+    
+        n_cpu = os.cpu_count() or 4
+    
+        if cfg.dataloader_workers >= 0:
+            n_workers = cfg.dataloader_workers
+            _avail_gb = float("nan")
+        else:
+            n_workers = min(max(2, n_cpu - 2), 4)  # GPU-bound; cap keeps GPU fed without forking excess RAM
+    
+            # Scale workers down when RSS is high: each worker spawns a new process that
+            # receives a pickled copy of the dataset over a pipe. At >40 GB RSS the OOM
+            # killer hits the worker before it finishes unpickling (exit code -9,
+            # UnpicklingError: pickle data was truncated). Fall back to 0 workers
+            # (in-process, no fork) when available memory is tight.
+            try:
+                with open("/proc/meminfo") as _mf:
+                    _avail_kb = next(
+                        int(l.split()[1]) for l in _mf if l.startswith("MemAvailable")
+                    )
+                _avail_gb = _avail_kb / 1e6
+            except Exception:
+                _avail_gb = float("inf")
+    
+            try:
+                with open("/proc/self/status") as _sf:
+                    for _sl in _sf:
+                        if _sl.startswith("VmRSS:"):
+                            _rss_gb = int(_sl.split()[1]) / 1e6
+                            break
+                    else:
+                        _rss_gb = float("nan")
+            except Exception:
+                _rss_gb = float("nan")
+    
+            if _avail_gb < 20:
+                n_workers = 0
+    
+        _pin = n_workers > 0  # pin_memory requires worker processes; useless at 0
+        _persist = n_workers > 0
+        _prefetch = 4 if n_workers > 0 else None
+        # DataLoader is created before model.to(device) so no CUDA context exists yet.
+        # fork workers share dataset memory via copy-on-write — negligible extra RSS
+        # vs spawn which re-pickles the full dataset into each worker.
+        _mp_ctx = "fork" if n_workers > 0 else None
+    
+        torch.set_num_threads(1)
+    
+        # Wrap train_ds with gate augmentation if p_gate > 0.
+        # GateAugDataset expands __len__ by round(p_gate*N) extra slots, each a
+        # T_gate-truncated view of a randomly selected pixel. reshuffle_gate() is
+        # called at the start of every epoch so coverage rotates without replacement.
+        _gate_aug_ds: GateAugDataset | None = None
+        if cfg.p_gate > 0.0:
+            _gate_aug_ds = GateAugDataset(train_ds, p_gate=cfg.p_gate, T_gate=cfg.T_gate)
+            _train_source = _gate_aug_ds
+            logger.info(
+                "GateAugDataset: %d base + %d gate slots/epoch  (p_gate=%.2f T_gate=%d)",
+                len(train_ds), _gate_aug_ds._n_gate, cfg.p_gate, cfg.T_gate,
+            )
+        else:
+            _train_source = train_ds
+    
+        train_loader = DataLoader(
+            _train_source, batch_size=cfg.batch_size, shuffle=True,
+            collate_fn=collate_fn, num_workers=n_workers, persistent_workers=_persist,
+            pin_memory=_pin, prefetch_factor=_prefetch, multiprocessing_context=_mp_ctx,
         )
-        val_auc_macro = float(np.mean([r["auc"] for r in site_records])) if site_records else float("nan")
-
-        # Gate val pass: T_gate-truncated sequences, measure TNR on absence pixels.
-        # Logged as supplementary info; does not affect early stopping.
-        gate_tnr = float("nan")
-        gate_fnr = float("nan")
-        if _gate_val_loader is not None:
+        val_loader = DataLoader(
+            val_ds, batch_size=cfg.batch_size, shuffle=False,
+            collate_fn=collate_fn, num_workers=n_workers, persistent_workers=_persist,
+            pin_memory=_pin, prefetch_factor=_prefetch, multiprocessing_context=_mp_ctx,
+        )
+        # Gate val loader: forces T_gate truncation on every val item; used to
+        # measure cascade TNR (fraction of absence pixels scoring < 0.5 at T=T_gate).
+        _gate_val_loader = None
+        if cfg.p_gate > 0.0:
+            _gate_val_ds = ForcedGateDataset(val_ds, T_gate=cfg.T_gate)
+            _gate_val_loader = DataLoader(
+                _gate_val_ds, batch_size=max(1, cfg.batch_size // 2), shuffle=False,
+                collate_fn=collate_fn, num_workers=0,
+            )
+        _log_rss("after DataLoader creation")
+        logger.info(
+            "DataLoader workers: %d  PyTorch threads: %d  avail_mem=%.1f GB",
+            n_workers, torch.get_num_threads(), _avail_gb,
+        )
+    
+        # --- Class imbalance weight ---
+        n_pos = float(sum(v == 1 for v in train_py_labels.values()))
+        n_neg = float(sum(v == 0 for v in train_py_labels.values()))
+        pos_weight = torch.tensor([n_neg / n_pos], dtype=torch.float32).to(device) if n_pos > 0 and n_neg > 0 else None
+    
+        # --- Model + optimiser --------------------------------------------------
+        if cfg.use_band_summaries and global_feat_df is not None:
+            cfg.n_global_features = global_feat_df.width - 1  # exclude point_id column
+        del global_feat_df
+        gc.collect()
+        model = TAMClassifier.from_config(cfg)
+        model._use_s1 = cfg.use_s1
+        model._pixel_zscore = cfg.pixel_zscore
+        model._max_seq_len = cfg.max_seq_len
+        model._feature_cols    = _feature_cols_override
+        model._s1_feature_cols = _s1_feature_cols_override
+        model.to(device)
+        # Keep a reference to the unwrapped model for attribute access (.config(),
+        # .band_proj, etc.) which are not forwarded through the compiled wrapper.
+        _raw_model = model
+        if torch.cuda.is_available():
+            model = torch.compile(model, dynamic=True)
+        logger.info(
+            "Model: d_model=%d n_heads=%d n_layers=%d d_ff=%d  params=%d",
+            cfg.d_model, cfg.n_heads, cfg.n_layers, cfg.d_ff,
+            sum(p.numel() for p in model.parameters() if p.requires_grad),
+        )
+    
+        if cfg.doy_density_norm and _doy_s2_counts is not None:
+            _raw_model.set_doy_frequencies(_doy_s2_counts, _doy_s1_counts)
+            logger.info(
+                "DOY density normalisation enabled — S2: %d obs, S1: %d obs",
+                int(_doy_s2_counts.sum()), int(_doy_s1_counts.sum()),
+            )
+        _log_rss("after model init")
+    
+        np.savez(out_dir / "tam_band_stats.npz", mean=band_mean, std=band_std)
+        if train_ds.global_feat_mean is not None and len(train_ds.global_feat_mean) > 0:
+            np.savez(out_dir / "tam_global_feat_stats.npz",
+                     mean=train_ds.global_feat_mean, std=train_ds.global_feat_std)
+        with open(out_dir / "tam_config.json", "w") as fh:
+            json.dump(_raw_model.config(), fh, indent=2)
+    
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight, reduction="none")
+    
+        _temporal_modules = [_raw_model.band_proj, _raw_model.encoder]
+    
+        def _set_temporal_frozen(frozen: bool) -> None:
+            for m in _temporal_modules:
+                for p in m.parameters():
+                    p.requires_grad = not frozen
+            if frozen:
+                logger.info("Temporal stream frozen — training head only (globals warmup)")
+            else:
+                logger.info("Temporal stream unfrozen — full model training")
+    
+        if cfg.warmup_freeze_epochs > 0:
+            _set_temporal_frozen(True)
+            optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr * 3, weight_decay=cfg.weight_decay)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.warmup_freeze_epochs)
+        else:
+            optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.n_epochs)
+    
+        # --- Training loop ------------------------------------------------------
+        best_val_auc = 0.0
+        epochs_without_improvement = 0
+        checkpoint_path = out_dir / "tam_model.pt"
+    
+        for epoch in range(1, cfg.n_epochs + 1):
+            if cfg.warmup_freeze_epochs > 0 and epoch == cfg.warmup_freeze_epochs + 1:
+                _set_temporal_frozen(False)
+                optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=cfg.n_epochs - cfg.warmup_freeze_epochs
+                )
+            if _gate_aug_ds is not None:
+                _gate_aug_ds.reshuffle_gate()
+            model.train()
+            epoch_loss = 0.0
+            train_probs, train_labels_list = [], []
+            for batch in train_loader:
+                bands         = batch["bands"].to(device)
+                doy           = batch["doy"].to(device)
+                mask          = batch["mask"].to(device)
+                n_obs         = batch["n_obs"].to(device)
+                global_feats  = batch["global_feats"].to(device)
+                label         = batch["label"].to(device)
+                weight        = batch["weight"].to(device)
+    
+                is_s1 = batch["is_s1"].to(device)
+                with autocast(device_type="cuda" if torch.cuda.is_available() else "cpu", dtype=torch.bfloat16):
+                    prob, logit = model(bands, doy, mask, n_obs, global_feats, is_s1=is_s1)
+    
+                    if torch.isnan(prob).any():
+                        nan_mask = torch.isnan(prob)
+                        logger.warning(
+                            "NaN in model output: %d/%d samples. "
+                            "bands NaN=%s, doy NaN=%s, mask all-pad=%s, global_feats NaN=%s",
+                            nan_mask.sum().item(), len(prob),
+                            torch.isnan(bands).any().item(),
+                            torch.isnan(doy.float()).any().item(),
+                            mask.all(dim=1).any().item(),
+                            torch.isnan(global_feats).any().item(),
+                        )
+                        prob = torch.nan_to_num(prob, nan=0.5)
+                        logit = torch.nan_to_num(logit, nan=0.0)
+    
+                    loss = (criterion(logit, label) * weight).mean()
+    
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                epoch_loss += loss.item()
+                train_probs.extend(prob.detach().cpu().float().numpy())
+                train_labels_list.extend(label.cpu().float().numpy())
+    
+            scheduler.step()
+    
+            train_probs_arr = np.array(train_probs)
+            train_labels_arr = np.array(train_labels_list)
+            if len(set(train_labels_arr)) > 1:
+                train_auc = roc_auc_score(train_labels_arr, train_probs_arr)
+            else:
+                train_auc = float("nan")
+    
+            # --- Validation -------------------------------------------------------
             model.eval()
-            gate_probs, gate_labels = [], []
+            val_probs, val_labels_list, val_pids = [], [], []
             with torch.no_grad():
-                for batch in _gate_val_loader:
+                for batch in val_loader:
                     prob, _ = model(
                         batch["bands"].to(device),
                         batch["doy"].to(device),
@@ -1468,77 +1435,112 @@ def train_tam(
                         batch["global_feats"].to(device),
                         is_s1=batch["is_s1"].to(device),
                     )
-                    gate_probs.extend(prob.cpu().float().numpy())
-                    gate_labels.extend(batch["label"].float().numpy())
-            gate_probs_arr  = np.array(gate_probs)
-            gate_labels_arr = np.array(gate_labels)
-            absence_mask  = gate_labels_arr == 0
-            presence_mask = gate_labels_arr == 1
-            if absence_mask.any():
-                gate_tnr = float((gate_probs_arr[absence_mask] < 0.5).mean())
-            if presence_mask.any():
-                gate_fnr = float((gate_probs_arr[presence_mask] < 0.5).mean())
-
-        gate_suffix = ""
-        if not np.isnan(gate_tnr):
-            gate_suffix += f"  gate_tnr={gate_tnr:.3f}"
-        if not np.isnan(gate_fnr):
-            gate_suffix += f"  gate_fnr={gate_fnr:.3f}"
-
+                    val_probs.extend(prob.cpu().float().numpy())
+                    val_labels_list.extend(batch["label"].float().numpy())
+                    val_pids.extend(batch["point_id"])
+    
+            val_probs_arr = np.array(val_probs)
+            val_labels_arr = np.array(val_labels_list)
+            finite = np.isfinite(val_probs_arr)
+            n_nan = (~finite).sum()
+            if n_nan:
+                logger.warning("epoch %d: %d NaN predictions in validation set", epoch, n_nan)
+    
+            val_cvar, site_records = _cvar_auc(
+                val_probs_arr, val_labels_arr, val_pids, finite,
+                alpha=cfg.cvar_alpha,
+            )
+            val_auc_macro = float(np.mean([r["auc"] for r in site_records])) if site_records else float("nan")
+    
+            # Gate val pass: T_gate-truncated sequences, measure TNR on absence pixels.
+            # Logged as supplementary info; does not affect early stopping.
+            gate_tnr = float("nan")
+            gate_fnr = float("nan")
+            if _gate_val_loader is not None:
+                model.eval()
+                gate_probs, gate_labels = [], []
+                with torch.no_grad():
+                    for batch in _gate_val_loader:
+                        prob, _ = model(
+                            batch["bands"].to(device),
+                            batch["doy"].to(device),
+                            batch["mask"].to(device),
+                            batch["n_obs"].to(device),
+                            batch["global_feats"].to(device),
+                            is_s1=batch["is_s1"].to(device),
+                        )
+                        gate_probs.extend(prob.cpu().float().numpy())
+                        gate_labels.extend(batch["label"].float().numpy())
+                gate_probs_arr  = np.array(gate_probs)
+                gate_labels_arr = np.array(gate_labels)
+                absence_mask  = gate_labels_arr == 0
+                presence_mask = gate_labels_arr == 1
+                if absence_mask.any():
+                    gate_tnr = float((gate_probs_arr[absence_mask] < 0.5).mean())
+                if presence_mask.any():
+                    gate_fnr = float((gate_probs_arr[presence_mask] < 0.5).mean())
+    
+            gate_suffix = ""
+            if not np.isnan(gate_tnr):
+                gate_suffix += f"  gate_tnr={gate_tnr:.3f}"
+            if not np.isnan(gate_fnr):
+                gate_suffix += f"  gate_fnr={gate_fnr:.3f}"
+    
+            logger.info(
+                "epoch %3d/%d  loss=%.4f  train_auc=%.3f  val_cvar%.0f=%.3f%s%s",
+                epoch, cfg.n_epochs,
+                epoch_loss / max(len(train_loader), 1),
+                train_auc,
+                cfg.cvar_alpha * 100, val_cvar,
+                "  *" if (not np.isnan(val_cvar) and val_cvar >= best_val_auc) else "",
+                gate_suffix,
+            )
+    
+            if logger.isEnabledFor(logging.DEBUG) and site_records:
+                for r in sorted(site_records, key=lambda r: r["auc"]):
+                    logger.debug(
+                        "  %s  n=%6d  auc=%.3f%s",
+                        r["site"], r["n_pixels"], r["auc"],
+                        "  <-- tail" if r["in_tail"] else "",
+                    )
+    
+            if not np.isnan(val_cvar) and val_cvar > best_val_auc + cfg.min_delta:
+                best_val_auc = val_cvar
+                epochs_without_improvement = 0
+                _sd = model.state_dict()
+                _sd = {k.replace("_orig_mod.", "", 1): v for k, v in _sd.items()}
+                torch.save(_sd, checkpoint_path)
+            else:
+                epochs_without_improvement += 1
+                if epochs_without_improvement >= cfg.patience:
+                    logger.info("Early stopping at epoch %d (no improvement for %d epochs)", epoch, cfg.patience)
+                    break
+    
         logger.info(
-            "epoch %3d/%d  loss=%.4f  train_auc=%.3f  val_cvar%.0f=%.3f%s%s",
-            epoch, cfg.n_epochs,
-            epoch_loss / max(len(train_loader), 1),
-            train_auc,
-            cfg.cvar_alpha * 100, val_cvar,
-            "  *" if (not np.isnan(val_cvar) and val_cvar >= best_val_auc) else "",
-            gate_suffix,
+            "Best val CVaR%.0f AUC: %.3f  macro: %.3f — checkpoint: %s",
+            cfg.cvar_alpha * 100, best_val_auc, val_auc_macro, checkpoint_path,
         )
-
-        if logger.isEnabledFor(logging.DEBUG) and site_records:
-            for r in sorted(site_records, key=lambda r: r["auc"]):
-                logger.debug(
-                    "  %s  n=%6d  auc=%.3f%s",
-                    r["site"], r["n_pixels"], r["auc"],
-                    "  <-- tail" if r["in_tail"] else "",
-                )
-
-        if not np.isnan(val_cvar) and val_cvar > best_val_auc + cfg.min_delta:
-            best_val_auc = val_cvar
-            epochs_without_improvement = 0
+    
+        np.savez(out_dir / "tam_band_stats.npz", mean=band_mean, std=band_std)
+        if train_ds.global_feat_mean is not None and len(train_ds.global_feat_mean) > 0:
+            np.savez(out_dir / "tam_global_feat_stats.npz",
+                     mean=train_ds.global_feat_mean, std=train_ds.global_feat_std)
+        cfg_dict = _raw_model.config()
+        cfg_dict["best_val_auc"] = round(best_val_auc, 6)
+        with open(out_dir / "tam_config.json", "w") as fh:
+            json.dump(cfg_dict, fh, indent=2)
+    
+        if not checkpoint_path.exists():
             _sd = model.state_dict()
             _sd = {k.replace("_orig_mod.", "", 1): v for k, v in _sd.items()}
             torch.save(_sd, checkpoint_path)
-        else:
-            epochs_without_improvement += 1
-            if epochs_without_improvement >= cfg.patience:
-                logger.info("Early stopping at epoch %d (no improvement for %d epochs)", epoch, cfg.patience)
-                break
-
-    logger.info(
-        "Best val CVaR%.0f AUC: %.3f  macro: %.3f — checkpoint: %s",
-        cfg.cvar_alpha * 100, best_val_auc, val_auc_macro, checkpoint_path,
-    )
-
-    np.savez(out_dir / "tam_band_stats.npz", mean=band_mean, std=band_std)
-    if train_ds.global_feat_mean is not None and len(train_ds.global_feat_mean) > 0:
-        np.savez(out_dir / "tam_global_feat_stats.npz",
-                 mean=train_ds.global_feat_mean, std=train_ds.global_feat_std)
-    cfg_dict = _raw_model.config()
-    cfg_dict["best_val_auc"] = round(best_val_auc, 6)
-    with open(out_dir / "tam_config.json", "w") as fh:
-        json.dump(cfg_dict, fh, indent=2)
-
-    if not checkpoint_path.exists():
-        _sd = model.state_dict()
-        _sd = {k.replace("_orig_mod.", "", 1): v for k, v in _sd.items()}
-        torch.save(_sd, checkpoint_path)
-
-    _raw_model.load_state_dict(torch.load(checkpoint_path, map_location=device, weights_only=True))
-    _raw_model.eval()
-
-    if _ds_tmp_dir is not None:
-        _ds_tmp_dir.cleanup()
+    
+        _raw_model.load_state_dict(torch.load(checkpoint_path, map_location=device, weights_only=True))
+        _raw_model.eval()
+    
+    finally:
+        if _ds_tmp_dir is not None:
+            _ds_tmp_dir.cleanup()
 
     return _raw_model, best_val_auc
 

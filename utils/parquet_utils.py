@@ -208,7 +208,7 @@ def _sort_s1_shards(
         (
             merged
             .drop("_northing")
-            .sink_parquet(str(tmp_path), compression="zstd", row_group_size=5_000_000)
+            .sink_parquet(str(tmp_path), compression="zstd", row_group_size=5_000_000, engine="streaming")
         )
         tmp_path.replace(out_path)
         _log.info("merge done → %s", out_path.name)

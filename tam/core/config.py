@@ -37,7 +37,7 @@ class TAMConfig:
 
     # Training
     n_epochs:        int   = 30
-    batch_size:      int   = 8192
+    batch_size:      int   = 4096
     lr:              float = 1e-4
     weight_decay:    float = 1e-3
     val_frac:        float = 0.2
