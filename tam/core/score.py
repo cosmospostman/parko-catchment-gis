@@ -237,6 +237,31 @@ class _PreparedBatch(NamedTuple):
     global_feats: np.ndarray | None   # (W, n_global_features) float32; None if no global head
 
 
+class _TransferredBatch(NamedTuple):
+    """Batch with gate tensors already on GPU and full tensors pinned + transferred.
+
+    Produced by the H2D transfer thread so the GPU consumer does zero CPU work
+    and zero H2D stalls on the critical scoring path.
+    """
+    # Gate tensors — on device, ready for the gate forward pass
+    gate_bands_dev:  "torch.Tensor"        # (B, T_gate, F) float32 on device
+    gate_doy_dev:    "torch.Tensor"        # (B, T_gate) int64 on device
+    gate_mask_dev:   "torch.Tensor"        # (B, T_gate) bool on device
+    gate_n_obs_dev:  "torch.Tensor"        # (B,) float32 on device
+    gate_is_s1_dev:  "torch.Tensor | None" # (B, T_gate) bool on device, or None
+    # Full tensors — on device (transferred after gate pass selects survivors)
+    bands_dev:       "torch.Tensor"        # (B, T_full, F) on device
+    doy_dev:         "torch.Tensor"        # (B, T_full) on device
+    mask_dev:        "torch.Tensor"        # (B, T_full) on device
+    n_obs_dev:       "torch.Tensor"        # (B,) on device
+    is_s1_dev:       "torch.Tensor | None" # (B, T_full) on device, or None
+    global_feats_dev: "torch.Tensor | None" # (B, G) on device, or None
+    # CPU-side identity (never transferred)
+    pids:            np.ndarray
+    years:           np.ndarray
+    B:               int                   # batch size
+
+
 class _RawChunk(NamedTuple):
     """Pre-extracted numpy arrays from a Polars chunk — built in the parser thread.
 
@@ -997,6 +1022,93 @@ def _gpu_score(
             return pids, years, prob.cpu().float().numpy(), 0
 
 
+def _gpu_forward(
+    tb: "_TransferredBatch",
+    model: "TAMClassifier",
+    gate_threshold: float,
+) -> "tuple[np.ndarray, np.ndarray, np.ndarray, int]":
+    """Pure GPU forward — all tensors already on device, no H2D, no CPU prep.
+
+    Returns (pids, years, probs_out, n_gate_cut).
+    """
+    use_varlen = _has_flash_attn()
+    B = tb.B
+
+    with torch.inference_mode():
+        if gate_threshold > 0.0:
+            gate_prob, _ = model(
+                tb.gate_bands_dev,
+                tb.gate_doy_dev,
+                tb.gate_mask_dev,
+                tb.gate_n_obs_dev,
+                global_feats=tb.global_feats_dev,
+                is_s1=tb.gate_is_s1_dev,
+            )
+            survivor_idx_dev = torch.where(gate_prob.float() >= gate_threshold)[0]
+            n_survivors = len(survivor_idx_dev)   # one unavoidable sync
+            n_gate_cut  = B - n_survivors
+
+            probs_out = np.zeros(B, dtype=np.float32)
+            if n_survivors > 0:
+                if use_varlen:
+                    mask_surv  = tb.mask_dev[survivor_idx_dev]
+                    seq_lens   = (~mask_surv).sum(dim=1).to(torch.int32)
+                    cu_seqlens = torch.zeros(n_survivors + 1, dtype=torch.int32,
+                                             device=tb.bands_dev.device)
+                    cu_seqlens[1:] = seq_lens.cumsum(0)
+                    max_seqlen = int(seq_lens.max().item())
+                    valid_mask = ~mask_surv
+                    prob, _ = model.forward_varlen(
+                        bands_flat=tb.bands_dev[survivor_idx_dev][valid_mask],
+                        doy_flat=tb.doy_dev[survivor_idx_dev][valid_mask],
+                        cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+                        n_obs=tb.n_obs_dev[survivor_idx_dev],
+                        global_feats=(tb.global_feats_dev[survivor_idx_dev]
+                                      if tb.global_feats_dev is not None else None),
+                        is_s1_flat=(tb.is_s1_dev[survivor_idx_dev][valid_mask]
+                                    if tb.is_s1_dev is not None else None),
+                    )
+                else:
+                    prob, _ = model(
+                        tb.bands_dev[survivor_idx_dev],
+                        tb.doy_dev[survivor_idx_dev],
+                        tb.mask_dev[survivor_idx_dev],
+                        tb.n_obs_dev[survivor_idx_dev],
+                        global_feats=(tb.global_feats_dev[survivor_idx_dev]
+                                      if tb.global_feats_dev is not None else None),
+                        is_s1=(tb.is_s1_dev[survivor_idx_dev]
+                               if tb.is_s1_dev is not None else None),
+                    )
+                survivor_idx_cpu = survivor_idx_dev.cpu().numpy()
+                probs_out[survivor_idx_cpu] = prob.cpu().float().numpy()
+            return tb.pids, tb.years, probs_out, n_gate_cut
+
+        else:
+            if use_varlen:
+                seq_lens   = (~tb.mask_dev).sum(dim=1).to(torch.int32)
+                cu_seqlens = torch.zeros(B + 1, dtype=torch.int32,
+                                         device=tb.bands_dev.device)
+                cu_seqlens[1:] = seq_lens.cumsum(0)
+                max_seqlen = int(seq_lens.max().item())
+                valid_mask = ~tb.mask_dev
+                prob, _ = model.forward_varlen(
+                    bands_flat=tb.bands_dev[valid_mask],
+                    doy_flat=tb.doy_dev[valid_mask],
+                    cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+                    n_obs=tb.n_obs_dev,
+                    global_feats=tb.global_feats_dev,
+                    is_s1_flat=(tb.is_s1_dev[valid_mask]
+                                if tb.is_s1_dev is not None else None),
+                )
+            else:
+                prob, _ = model(
+                    tb.bands_dev, tb.doy_dev, tb.mask_dev, tb.n_obs_dev,
+                    global_feats=tb.global_feats_dev,
+                    is_s1=tb.is_s1_dev,
+                )
+            return tb.pids, tb.years, prob.cpu().float().numpy(), 0
+
+
 def aggregate_year_probs(
     all_pids: list,
     all_years: list,
@@ -1416,124 +1528,218 @@ def score_pixels_chunked(
     _t0 = _time.monotonic()
     _t_last_logged = _t0
 
-    # Timing breakdown: track idle (waiting on prep_q) vs active (GPU score).
-    _t_idle_total  = 0.0  # seconds blocked in prep_q.get() with nothing to score
-    _t_merge_total = 0.0  # seconds in torch.cat / np.concatenate (batch merging)
-    _t_score_total = 0.0  # seconds inside _gpu_score (includes H2D + forward + D2H)
-    _n_gpu_calls   = 0
+    # -------------------------------------------------------------------------
+    # GPU pipeline — 3 concurrent stages after prep_q:
+    #
+    #   Stage A (main thread):     drain prep_q, accumulate to batch_size,
+    #                              merge tensors, put _PreparedBatch on xfer_q.
+    #   Stage B (xfer thread):     build_gate_tensors (Numba CPU) + pin_memory +
+    #                              non-blocking H2D transfer → _TransferredBatch
+    #                              on gpu_ready_q.  Runs concurrently with Stage A
+    #                              and Stage C.
+    #   Stage C (gpu thread):      pull _TransferredBatch from gpu_ready_q, run
+    #                              _gpu_forward (pure GPU, zero H2D stalls), put
+    #                              result on result_q.
+    #
+    # While the GPU is running the forward on batch N, Stage B is transferring
+    # batch N+1 and Stage A is building batch N+2.
+    # -------------------------------------------------------------------------
 
-    # Double-buffer: GPU scores batch N in a background thread while the main
-    # thread accumulates and merges batch N+1.  The executor serialises GPU calls
-    # (max_workers=1); the main thread never blocks on scoring — it just submits
-    # and loops back to prep_q immediately.  We cap the executor's internal queue
-    # at 1 pending (+ 1 running = 2 in-flight max) by using a bounded queue so
-    # tensors don't pile up if prep vastly outruns the GPU.
-    _gpu_executor   = ThreadPoolExecutor(max_workers=1)
-    _result_futures: list = []       # futures in submission order
+    use_cuda = device.startswith("cuda") and torch.cuda.is_available()
 
-    # Small-batch accumulator: prep workers often produce batches well under
-    # batch_size (e.g. ~1400 px from a 131k-row chunk on sparse tiles), so the
-    # GPU would run at only 35% utilisation. Accumulate items from prep_q until
-    # we have at least batch_size pixels, then merge and dispatch as one call.
-    # This keeps GPU utilisation near 100% without changing any prep-side logic.
+    # xfer_q depth=2: main thread can pre-build one batch while xfer is running.
+    # gpu_ready_q depth=2: xfer thread can pre-transfer one batch while GPU runs.
+    xfer_q:      Queue = Queue(maxsize=2)
+    gpu_ready_q: Queue = Queue(maxsize=2)
+    result_q:    Queue = Queue(maxsize=8)
+
+    # --- Stage B: H2D transfer thread ---
+    def _transfer_worker() -> None:
+        from tam.core._preprocess_numba import build_gate_tensors as _bgt
+        while True:
+            item = xfer_q.get()
+            if item is _SENTINEL:
+                gpu_ready_q.put(_SENTINEL)
+                break
+            merged: _PreparedBatch = item
+            B_ = len(merged.pids)
+            T_full = merged.bands.shape[1]
+            n_feat = merged.bands.shape[2]
+            gate_t = min(T_gate, T_full)
+
+            # --- Gate tensor prep (CPU Numba, GIL-releasing) ---
+            bands_np  = merged.bands.numpy()
+            doy_np    = merged.doy.numpy()
+            mask_np   = merged.mask.numpy()
+            is_s1_np  = (merged.is_s1.numpy().astype(bool) if merged.is_s1 is not None
+                         else np.zeros((B_, T_full), dtype=bool))
+
+            gate_bands_np   = np.zeros((B_, gate_t, n_feat), dtype=np.float32)
+            gate_doy_np     = np.zeros((B_, gate_t),         dtype=np.int64)
+            gate_is_s1_np   = np.zeros((B_, gate_t),         dtype=bool)
+            gate_mask_np    = np.ones( (B_, gate_t),         dtype=bool)
+            _bgt(bands_np, doy_np, mask_np, is_s1_np, np.int64(gate_t),
+                 gate_bands_np, gate_doy_np, gate_mask_np, gate_is_s1_np)
+            gate_n_obs_np = (np.clip((~gate_mask_np).sum(axis=1), 1, None)
+                             .astype(np.float32) / T_full)
+
+            if use_cuda:
+                # pin_memory enables async DMA; non_blocking=True starts the
+                # DMA and returns immediately — GPU kernel will see the data.
+                def _to_dev(t: torch.Tensor) -> torch.Tensor:
+                    return t.pin_memory().to(device, non_blocking=True)
+                gate_bands_dev  = _to_dev(torch.from_numpy(gate_bands_np))
+                gate_doy_dev    = _to_dev(torch.from_numpy(gate_doy_np))
+                gate_mask_dev   = _to_dev(torch.from_numpy(gate_mask_np))
+                gate_n_obs_dev  = _to_dev(torch.from_numpy(gate_n_obs_np))
+                gate_is_s1_dev  = (_to_dev(torch.from_numpy(gate_is_s1_np))
+                                   if merged.is_s1 is not None else None)
+                bands_dev  = _to_dev(merged.bands)
+                doy_dev    = _to_dev(merged.doy)
+                mask_dev   = _to_dev(merged.mask)
+                n_obs_dev  = _to_dev(merged.n_obs)
+                is_s1_dev  = (_to_dev(merged.is_s1) if merged.is_s1 is not None else None)
+                gf_dev     = (_to_dev(torch.from_numpy(merged.global_feats))
+                              if merged.global_feats is not None else None)
+                # Synchronise so all DMAs are complete before the GPU thread starts
+                # the forward pass.  This is the only sync point in Stage B.
+                torch.cuda.synchronize(device)
+            else:
+                def _to_dev(t: torch.Tensor) -> torch.Tensor:  # type: ignore[misc]
+                    return t.to(device)
+                gate_bands_dev  = torch.from_numpy(gate_bands_np).to(device)
+                gate_doy_dev    = torch.from_numpy(gate_doy_np).to(device)
+                gate_mask_dev   = torch.from_numpy(gate_mask_np).to(device)
+                gate_n_obs_dev  = torch.from_numpy(gate_n_obs_np).to(device)
+                gate_is_s1_dev  = (torch.from_numpy(gate_is_s1_np).to(device)
+                                   if merged.is_s1 is not None else None)
+                bands_dev  = merged.bands.to(device)
+                doy_dev    = merged.doy.to(device)
+                mask_dev   = merged.mask.to(device)
+                n_obs_dev  = merged.n_obs.to(device)
+                is_s1_dev  = (merged.is_s1.to(device) if merged.is_s1 is not None else None)
+                gf_dev     = (torch.from_numpy(merged.global_feats).to(device)
+                              if merged.global_feats is not None else None)
+
+            tb = _TransferredBatch(
+                gate_bands_dev=gate_bands_dev,
+                gate_doy_dev=gate_doy_dev,
+                gate_mask_dev=gate_mask_dev,
+                gate_n_obs_dev=gate_n_obs_dev,
+                gate_is_s1_dev=gate_is_s1_dev,
+                bands_dev=bands_dev,
+                doy_dev=doy_dev,
+                mask_dev=mask_dev,
+                n_obs_dev=n_obs_dev,
+                is_s1_dev=is_s1_dev,
+                global_feats_dev=gf_dev,
+                pids=merged.pids,
+                years=merged.years,
+                B=B_,
+            )
+            gpu_ready_q.put(tb)
+
+    # --- Stage C: GPU forward thread ---
+    _n_gpu_calls  = 0
+    _t_score_total = 0.0
+
+    def _gpu_worker() -> None:
+        nonlocal _n_gpu_calls, _t_score_total
+        while True:
+            tb = gpu_ready_q.get()
+            if tb is _SENTINEL:
+                result_q.put(_SENTINEL)
+                break
+            _ts = _time.monotonic()
+            chunk = _gpu_forward(tb, model, gate_threshold)
+            _t_score_total += _time.monotonic() - _ts
+            _n_gpu_calls   += 1
+            result_q.put((chunk, tb.B))
+
+    xfer_thread = Thread(target=_transfer_worker, daemon=True)
+    gpu_thread  = Thread(target=_gpu_worker,      daemon=True)
+    xfer_thread.start()
+    gpu_thread.start()
+
+    # --- Stage A: main thread — accumulate prep_q → xfer_q ---
+    _t_idle_total  = 0.0
+    _t_merge_total = 0.0
     _acc: list[_PreparedBatch] = []
     _acc_px = 0
 
-    def _do_gpu_score(merged: _PreparedBatch, px_count: int) -> tuple:
-        """Runs in the GPU executor thread."""
-        nonlocal _t_score_total, _n_gpu_calls
-        _ts = _time.monotonic()
-        result = _gpu_score(merged, model, device,
-                            gate_threshold=gate_threshold, T_gate=T_gate)
-        _t_score_total += _time.monotonic() - _ts
-        _n_gpu_calls   += 1
-        return result, px_count
-
-    def _submit_batch(items: list[_PreparedBatch]) -> None:
-        """Merge items on the main thread, then hand off to GPU executor."""
+    def _flush_acc() -> None:
         nonlocal _t_merge_total
         _tm = _time.monotonic()
-        if len(items) == 1:
-            merged = items[0]
+        if len(_acc) == 1:
+            merged = _acc[0]
         else:
             merged = _PreparedBatch(
-                bands=torch.cat([b.bands for b in items], dim=0),
-                doy=torch.cat([b.doy   for b in items], dim=0),
-                mask=torch.cat([b.mask  for b in items], dim=0),
-                n_obs=torch.cat([b.n_obs for b in items], dim=0),
-                pids=np.concatenate([b.pids  for b in items]),
-                years=np.concatenate([b.years for b in items]),
-                is_s1=(torch.cat([b.is_s1 for b in items], dim=0)
-                       if items[0].is_s1 is not None else None),
-                global_feats=(np.concatenate([b.global_feats for b in items], axis=0)
-                              if items[0].global_feats is not None else None),
+                bands=torch.cat([b.bands for b in _acc], dim=0),
+                doy=torch.cat([b.doy   for b in _acc], dim=0),
+                mask=torch.cat([b.mask  for b in _acc], dim=0),
+                n_obs=torch.cat([b.n_obs for b in _acc], dim=0),
+                pids=np.concatenate([b.pids  for b in _acc]),
+                years=np.concatenate([b.years for b in _acc]),
+                is_s1=(torch.cat([b.is_s1 for b in _acc], dim=0)
+                       if _acc[0].is_s1 is not None else None),
+                global_feats=(np.concatenate([b.global_feats for b in _acc], axis=0)
+                              if _acc[0].global_feats is not None else None),
             )
         _t_merge_total += _time.monotonic() - _tm
-        px_count = len(merged.pids)
-        _result_futures.append(_gpu_executor.submit(_do_gpu_score, merged, px_count))
-
-    def _drain_results() -> None:
-        """Collect all completed futures and store results. Called after the
-        accumulator loop finishes so the GPU executor can drain in order."""
-        nonlocal n_scored, n_total_gate_cut
-        for fut in _result_futures:
-            chunk, px_count = fut.result()
-            n_total_gate_cut += chunk[3]
-            if out_writer is not None:
-                out_q.put(chunk)
-            else:
-                all_pids.append(chunk[0]); all_years.append(chunk[1]); all_probs.append(chunk[2])
-            n_scored += px_count
+        xfer_q.put(merged)   # blocks if xfer_q is full — natural backpressure
 
     while sentinels_seen < n_prep_workers:
         _t_get_start = _time.monotonic()
         item = prep_q.get()
-        # Only count as idle time when we have nothing accumulated (GPU starved).
-        if _acc_px == 0:
-            _t_idle_total += _time.monotonic() - _t_get_start
+        _t_idle_total += _time.monotonic() - _t_get_start
         if item is _SENTINEL:
             sentinels_seen += 1
             if sentinels_seen == n_prep_workers and _acc:
-                _submit_batch(_acc)
+                _flush_acc()
                 _acc.clear(); _acc_px = 0
             continue
         _acc.append(item)
         _acc_px += len(item.pids)
         if _acc_px < batch_size:
             continue
-        _submit_batch(_acc)
+        _flush_acc()
         _acc.clear(); _acc_px = 0
-        # Drain any futures that have already completed so n_scored stays current
-        # for progress logging (non-blocking: only collect futures that are done).
-        while _result_futures and _result_futures[0].done():
-            chunk, px_count = _result_futures.pop(0).result()
-            n_total_gate_cut += chunk[3]
-            if out_writer is not None:
-                out_q.put(chunk)
-            else:
-                all_pids.append(chunk[0]); all_years.append(chunk[1]); all_probs.append(chunk[2])
-            n_scored += px_count
-            if n_scored - n_last_logged >= progress_log_interval:
-                _t_now = _time.monotonic()
-                dt_interval = _t_now - _t_last_logged
-                rate = (n_scored - n_last_logged) / dt_interval if dt_interval > 0 else 0.0
-                if n_total_pixels:
-                    logger.info(
-                        "[%s yr=%s] %.1f%% (%d/%d px) @ %.0f px/s",
-                        tile_id or "?", end_year or "?",
-                        100.0 * n_scored / n_total_pixels, n_scored, n_total_pixels, rate,
-                    )
-                else:
-                    logger.info(
-                        "[%s yr=%s] %d px scored @ %.0f px/s",
-                        tile_id or "?", end_year or "?", n_scored, rate,
-                    )
-                n_last_logged = n_scored
-                _t_last_logged = _t_now
 
-    # Wait for all in-flight GPU batches to complete.
-    _drain_results()
-    _gpu_executor.shutdown(wait=False)
+    # Signal transfer thread that input is done.
+    xfer_q.put(_SENTINEL)
+
+    # Drain result_q while GPU+xfer threads wind down.
+    while True:
+        res = result_q.get()
+        if res is _SENTINEL:
+            break
+        chunk, px_count = res
+        n_total_gate_cut += chunk[3]
+        if out_writer is not None:
+            out_q.put(chunk)
+        else:
+            all_pids.append(chunk[0]); all_years.append(chunk[1]); all_probs.append(chunk[2])
+        n_scored += px_count
+        if n_scored - n_last_logged >= progress_log_interval:
+            _t_now = _time.monotonic()
+            dt_interval = _t_now - _t_last_logged
+            rate = (n_scored - n_last_logged) / dt_interval if dt_interval > 0 else 0.0
+            if n_total_pixels:
+                logger.info(
+                    "[%s yr=%s] %.1f%% (%d/%d px) @ %.0f px/s",
+                    tile_id or "?", end_year or "?",
+                    100.0 * n_scored / n_total_pixels, n_scored, n_total_pixels, rate,
+                )
+            else:
+                logger.info(
+                    "[%s yr=%s] %d px scored @ %.0f px/s",
+                    tile_id or "?", end_year or "?", n_scored, rate,
+                )
+            n_last_logged = n_scored
+            _t_last_logged = _t_now
+
+    xfer_thread.join()
+    gpu_thread.join()
 
     io_thread.join()
     reader_thread.join()
@@ -1544,7 +1750,7 @@ def score_pixels_chunked(
     _t_total = _time.monotonic() - _t0
     _t_other  = max(0.0, _t_total - _t_idle_total - _t_merge_total - _t_score_total)
     logger.info(
-        "GPU consumer breakdown — total %.1fs: score %.1fs (%.0f%%), "
+        "GPU pipeline breakdown — total %.1fs: score %.1fs (%.0f%%), "
         "merge %.1fs (%.0f%%), idle/starved %.1fs (%.0f%%), other %.1fs (%.0f%%) | %d GPU calls",
         _t_total,
         _t_score_total, 100.0 * _t_score_total / _t_total if _t_total else 0,

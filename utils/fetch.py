@@ -417,7 +417,10 @@ async def fetch_patches_to_tiff(
 
     loop = asyncio.get_running_loop()
     sem = asyncio.Semaphore(max_concurrent)
-    executor = ThreadPoolExecutor(max_workers=max_concurrent)
+    # Two executors: fetch threads saturate the network link; write threads handle
+    # disk I/O without stealing slots from in-flight range requests.
+    fetch_executor = ThreadPoolExecutor(max_workers=max_concurrent)
+    write_executor = ThreadPoolExecutor(max_workers=min(32, os.cpu_count() or 8))
     _alias: dict[str, str] = band_alias or {}
     written: list[Path] = []
     written_lock = asyncio.Lock()
@@ -444,7 +447,6 @@ async def fetch_patches_to_tiff(
             dtype=arr.dtype,
             crs=crs,
             transform=transform,
-            compress="lzw",
         ) as dst:
             dst.write(arr, 1)
         tmp.replace(path)
@@ -456,14 +458,14 @@ async def fetch_patches_to_tiff(
         if path.exists() and path.stat().st_size > 0:
             cached += 1
             return path
-        href = await loop.run_in_executor(executor, _get_href, item, asset_key)
+        href = await loop.run_in_executor(fetch_executor, _get_href, item, asset_key)
         async with sem:
-            data = await loop.run_in_executor(executor, _read_bbox_patch, href, bbox_wgs84)
+            data = await loop.run_in_executor(fetch_executor, _read_bbox_patch, href, bbox_wgs84)
         if data is None:
             errors += 1
             return None
         arr, transform, crs = data
-        await loop.run_in_executor(executor, _write_tif, path, arr, transform, crs)
+        await loop.run_in_executor(write_executor, _write_tif, path, arr, transform, crs)
         fetched += 1
         return path
 
@@ -542,7 +544,8 @@ async def fetch_patches_to_tiff(
 
     await asyncio.gather(*[tracked(t) for t in spectral_tasks])
 
-    executor.shutdown(wait=False)
+    fetch_executor.shutdown(wait=False)
+    write_executor.shutdown(wait=False)
     _log = logger.warning if errors > 0 and fetched == 0 and cached == 0 else logger.info
     _log(
         "fetch_patches_to_tiff complete: %d fetched, %d cached, "
