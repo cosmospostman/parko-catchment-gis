@@ -249,7 +249,7 @@ def compute_strips(
 
     # Shapely vectorised contains for polygon masking — prepare once.
     if polygon_geometry is not None:
-        from shapely.vectorized import contains as _shp_contains
+        from shapely import contains_xy as _shp_contains_xy
         _use_vectorised = True
     else:
         _use_vectorised = False
@@ -269,7 +269,7 @@ def compute_strips(
 
         # Polygon mask — vectorised, no Python loop over points.
         if _use_vectorised:
-            mask = _shp_contains(polygon_geometry, lons_arr, lats_arr)
+            mask = _shp_contains_xy(polygon_geometry, lons_arr, lats_arr)
             lons_arr = lons_arr[mask]
             lats_arr = lats_arr[mask]
             # Recover (i, j) grid indices for the kept points to build point_ids.
@@ -334,8 +334,8 @@ def make_strip_points(strip: dict, meta: dict) -> list[tuple[str, float, float]]
     jj_flat = jj.ravel()
 
     if polygon_geometry is not None:
-        from shapely.vectorized import contains as _shp_contains
-        mask = _shp_contains(polygon_geometry, lons_arr, lats_arr)
+        from shapely import contains_xy as _shp_contains_xy
+        mask = _shp_contains_xy(polygon_geometry, lons_arr, lats_arr)
         lons_arr = lons_arr[mask]
         lats_arr = lats_arr[mask]
         ii_flat = ii_flat[mask]
