@@ -191,7 +191,7 @@ def merge_scenes(
                     SELECT {col_list}
                     FROM read_parquet('{bucket_glob}')
                     ORDER BY _n, date
-                """).arrow()
+                """).fetch_arrow_table()
             finally:
                 con.close()
             if tbl.num_rows == 0:
