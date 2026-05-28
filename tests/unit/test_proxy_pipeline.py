@@ -96,9 +96,8 @@ def _synthetic_scene_parquet(tmp: Path, scene_id: str, n_points: int, n_dates: i
                 "source": "S2",
             })
 
-    # Shuffle to make the sort meaningful
-    import random
-    random.shuffle(rows)
+    # Sort by (northing, date) — merge_scenes is a k-way merge of pre-sorted inputs.
+    rows.sort(key=lambda r: (int(r["point_id"].split("_")[1]), r["date"]))
 
     schema = pa.schema([
         pa.field("point_id", pa.string()),

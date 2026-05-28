@@ -101,34 +101,44 @@ def merge_scenes(
     """K-way merge of pre-sorted S2 per-scene parquets (+ optional S1) into out_path.
 
     Each scene parquet is already sorted by northing (_n extracted from point_id).
-    This streams one row-group at a time from each file through a min-heap, writing
-    directly to the output.  Peak RAM is O(k * row_group_size) — constant regardless
-    of total dataset size.
+    Streams one row-group at a time through a min-heap; northing values are
+    extracted once per batch via vectorised PyArrow compute and run boundaries
+    are found with np.searchsorted — no per-row Python loops.
+
+    Heap entries: (northing, date_str, cursor_id, row, batch, ns)
+    where ns is the int32 northing array for the full batch.
+    cursor_id breaks all ties before reaching batch/ns.
+    Peak RAM is O(k * row_group_size).
     """
     import heapq
+    import numpy as np
     import pyarrow as pa
+    import pyarrow.compute as pc
     import pyarrow.parquet as pq
     from utils.parquet_utils import COMBINED_PIXEL_SCHEMA, _WRITE_OPTS
 
     out_names = COMBINED_PIXEL_SCHEMA.names
 
-    def _cast_to_schema(tbl: "pa.Table") -> "pa.Table":
-        """Align a table to COMBINED_PIXEL_SCHEMA, filling missing cols with null."""
+    def _cast_and_stamp(tbl: "pa.Table", source: "str | None") -> "pa.Table":
         cols = {}
         for field in COMBINED_PIXEL_SCHEMA:
-            if field.name in tbl.schema.names:
-                cols[field.name] = tbl.column(field.name).cast(field.type, safe=False)
+            if field.name == "source" and source is not None:
+                cols["source"] = pa.repeat(source, len(tbl)).cast(pa.string())
+            elif field.name in tbl.schema.names:
+                arr = tbl.column(field.name)
+                cols[field.name] = arr.cast(field.type, safe=False) if arr.type != field.type else arr
             else:
                 cols[field.name] = pa.nulls(len(tbl), type=field.type)
         return pa.table(cols, schema=COMBINED_PIXEL_SCHEMA)
 
-    def _northing(tbl: "pa.Table", row: int) -> int:
-        pid: str = tbl.column("point_id")[row].as_py()
-        return int(pid.rsplit("_", 1)[1])
+    def _northings_np(tbl: "pa.Table") -> "np.ndarray":
+        parts = pc.split_pattern(
+            tbl.column("point_id"), pattern="_", reverse=True, max_splits=1,
+        )
+        suffix = pc.list_slice(parts, 1, 2).combine_chunks().flatten()
+        return pc.cast(suffix, pa.int32()).to_numpy(zero_copy_only=False)
 
-    all_paths: list[tuple[Path, str | None]] = [
-        (sp, "S2") for sp in scene_paths
-    ]
+    all_paths: list[tuple[Path, str | None]] = [(sp, "S2") for sp in scene_paths]
     if s1_path and s1_path.exists():
         all_paths.append((s1_path, None))
 
@@ -139,15 +149,10 @@ def merge_scenes(
     tmp_path = out_path.with_suffix(".merge_tmp.parquet")
     tmp_path.unlink(missing_ok=True)
 
-    # Open all parquet files and prime the heap with the first row of each.
-    # Heap entries: (northing, date_str, source_idx, row_within_batch, batch_table)
-    # We use a list-of-batches cursor per file to avoid re-reading row groups.
-
     class _FileCursor:
-        """Iterates row-groups of a parquet file, yielding Arrow tables."""
         __slots__ = ("_pf", "_rg", "_n_rg", "_source", "_cols")
 
-        def __init__(self, path: Path, source: str | None) -> None:
+        def __init__(self, path: Path, source: "str | None") -> None:
             self._pf     = pq.ParquetFile(path)
             self._rg     = 0
             self._n_rg   = self._pf.metadata.num_row_groups
@@ -155,41 +160,31 @@ def merge_scenes(
             file_names   = set(self._pf.schema_arrow.names)
             self._cols   = [c for c in out_names if c in file_names]
 
-        def next_batch(self) -> "pa.Table | None":
+        def next_batch(self) -> "tuple[pa.Table, np.ndarray] | None":
             while self._rg < self._n_rg:
                 tbl = self._pf.read_row_group(self._rg, columns=self._cols)
                 self._rg += 1
-                tbl = _cast_to_schema(tbl)
-                if self._source == "S2":
-                    # stamp source column
-                    tbl = tbl.set_column(
-                        tbl.schema.get_field_index("source"),
-                        "source",
-                        pa.array(["S2"] * len(tbl), type=pa.string()),
-                    )
-                if len(tbl) > 0:
-                    return tbl
+                tbl = _cast_and_stamp(tbl, self._source)
+                if len(tbl) == 0:
+                    continue
+                return tbl, _northings_np(tbl)
             return None
 
-    # Each heap entry: (northing, date, cursor_id, row, batch)
-    # cursor_id breaks ties deterministically.
     cursors: list[_FileCursor] = []
     heap: list[tuple] = []
 
     for path, source in all_paths:
         cur = _FileCursor(path, source)
-        batch = cur.next_batch()
-        if batch is None:
+        result = cur.next_batch()
+        if result is None:
             continue
+        batch, ns = result
         cid = len(cursors)
         cursors.append(cur)
-        n   = _northing(batch, 0)
-        dt  = batch.column("date")[0].as_py()
-        heapq.heappush(heap, (n, str(dt), cid, 0, batch))
+        heapq.heappush(heap, (int(ns[0]), str(batch.column("date")[0].as_py()), cid, 0, batch, ns))
 
     writer: "pq.ParquetWriter | None" = None
     try:
-        # Accumulate output rows; flush in row-group-sized chunks.
         ROW_GROUP = 500_000
         out_batches: list["pa.Table"] = []
         out_rows = 0
@@ -206,34 +201,25 @@ def merge_scenes(
             out_rows = 0
 
         while heap:
-            n, dt, cid, row, batch = heapq.heappop(heap)
-
-            # Find the run of rows in this batch with the same northing — emit them
-            # as a slice so we avoid per-row Python overhead.
-            col_n = batch.column("point_id")
+            n, dt, cid, row, batch, ns = heapq.heappop(heap)
+            # Find the run of consecutive rows with the same (northing, date) so we
+            # emit them as a slice rather than one row at a time, while still letting
+            # the heap interleave rows from other files with the same northing/date.
             end = row + 1
-            batch_len = len(batch)
-            while end < batch_len and int(col_n[end].as_py().rsplit("_", 1)[1]) == n:
+            batch_len = len(ns)
+            while end < batch_len and ns[end] == n and str(batch.column("date")[end].as_py()) == dt:
                 end += 1
-
             out_batches.append(batch.slice(row, end - row))
             out_rows += end - row
-
             if out_rows >= ROW_GROUP:
                 _flush()
-
             if end < batch_len:
-                # More rows remain in this batch — push next row back.
-                next_n  = _northing(batch, end)
-                next_dt = str(batch.column("date")[end].as_py())
-                heapq.heappush(heap, (next_n, next_dt, cid, end, batch))
+                heapq.heappush(heap, (int(ns[end]), str(batch.column("date")[end].as_py()), cid, end, batch, ns))
             else:
-                # Batch exhausted — fetch next row group from this cursor.
-                next_batch = cursors[cid].next_batch()
-                if next_batch is not None:
-                    next_n  = _northing(next_batch, 0)
-                    next_dt = str(next_batch.column("date")[0].as_py())
-                    heapq.heappush(heap, (next_n, next_dt, cid, 0, next_batch))
+                result = cursors[cid].next_batch()
+                if result is not None:
+                    nb, nns = result
+                    heapq.heappush(heap, (int(nns[0]), str(nb.column("date")[0].as_py()), cid, 0, nb, nns))
 
         _flush()
         logger.info("merge_scenes done: %d input files → %s", len(all_paths), out_path.name)
@@ -402,12 +388,14 @@ def make_strip_points(strip: dict, meta: dict) -> list[tuple[str, float, float]]
     ys = ys[(ys >= y0_snap) & (ys < y1)]
 
     to_wgs = Transformer.from_crs(utm_crs, "EPSG:4326", always_xy=True)
-    xx, yy = np.meshgrid(xs, ys, indexing="ij")
+    # indexing="xy" gives y-major ravel order: all x for y=0, then y=1, etc.
+    # Points are therefore sorted by j (northing index) — required by merge_scenes.
+    xx, yy = np.meshgrid(xs, ys, indexing="xy")
     lons_arr, lats_arr = to_wgs.transform(xx.ravel(), yy.ravel())
     lons_arr = np.asarray(lons_arr)
     lats_arr = np.asarray(lats_arr)
 
-    ii, jj = np.meshgrid(np.arange(len(xs)), np.arange(len(ys)), indexing="ij")
+    jj, ii = np.meshgrid(np.arange(len(ys)), np.arange(len(xs)), indexing="xy")
     ii_flat = ii.ravel()
     jj_flat = jj.ravel()
 
@@ -768,7 +756,6 @@ def run_tile_pipeline_v2(
 
     from utils.parquet_utils import _optimise_schema, _WRITE_OPTS
     import pyarrow.parquet as pq
-    import polars as pl
     import numpy as np
 
     col_order = (
@@ -843,32 +830,20 @@ def run_tile_pipeline_v2(
                             strip_idx, item_idx + 1, n_items, scene_id)
                 return None
 
+            # Points are generated in northing-major order by make_strip_points,
+            # so idx (from np.where on clear_mask) preserves that order — no sort needed.
             tbl = _optimise_schema(df.select(col_order).to_arrow())
             del df
-            schema = tbl.schema
-            # Convert to Polars for sort, then immediately release the Arrow source.
-            tbl_pl = pl.from_arrow(tbl); del tbl
-            tbl_sorted = (
-                tbl_pl
-                .with_columns(
-                    pl.col("point_id").str.extract(r"_(\d+)$", 1).cast(pl.Int32).alias("_northing")
-                )
-                .sort("_northing")
-                .drop("_northing")
-                .to_arrow()
-                .cast(schema)
-            )
-            del tbl_pl
 
             tmp_path = out_path.with_suffix(".tmp.parquet")
             tmp_path.unlink(missing_ok=True)
-            writer = pq.ParquetWriter(str(tmp_path), tbl_sorted.schema, **_WRITE_OPTS)
-            writer.write_table(tbl_sorted)
+            writer = pq.ParquetWriter(str(tmp_path), tbl.schema, **_WRITE_OPTS)
+            writer.write_table(tbl)
             writer.close()
             tmp_path.replace(out_path)
 
             logger.info("[v2] [strip %04d] scene %d/%d %s — %d rows",
-                        strip_idx, item_idx + 1, n_items, scene_id, len(tbl_sorted))
+                        strip_idx, item_idx + 1, n_items, scene_id, len(tbl))
             return out_path
 
         scene_paths: list[Path] = []

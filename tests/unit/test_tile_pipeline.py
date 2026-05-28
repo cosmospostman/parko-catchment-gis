@@ -537,7 +537,7 @@ def _synthetic_scene_parquet(out_dir: Path, scene_id: str, n_points: int) -> Pat
         }
         for i in range(n_points)
     ]
-    random.shuffle(rows)
+    rows.sort(key=lambda r: (int(r["point_id"].split("_")[1]), str(r["date"])))
     tbl = pa.Table.from_pylist(rows, schema=schema)
     out = out_dir / f"{scene_id}.parquet"
     out_dir.mkdir(parents=True, exist_ok=True)

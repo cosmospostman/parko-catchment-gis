@@ -137,103 +137,149 @@ def _s1_df_to_arrow(df_s1: "pl.DataFrame", schema: "pa.Schema") -> "pa.Table":
     )
 
 
+def _kway_merge_parquets(
+    input_paths: list[Path],
+    out_path: Path,
+    schema: "pa.Schema",
+) -> None:
+    """Streaming k-way merge of northing-sorted parquets into out_path.
+
+    Each input file must be sorted by northing (last '_'-delimited segment of
+    point_id).  Streams one row-group at a time through a min-heap — peak RAM
+    is O(k * row_group_size), constant regardless of total dataset size.
+
+    Northing values are extracted once per row-group via vectorised NumPy string
+    ops; run-end finding uses np.searchsorted — no per-row Python loops.
+
+    Heap entries: (northing: int, date_str: str, cursor_id: int,
+                   row: int, batch: pa.Table, ns: np.ndarray)
+    ns is the int32 northing array for the full batch, computed once on load.
+    cursor_id breaks ties before reaching batch/ns, so no Arrow comparison occurs.
+    """
+    import heapq
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    out_names = schema.names
+
+    def _cast(tbl: "pa.Table") -> "pa.Table":
+        cols = {}
+        for field in schema:
+            if field.name in tbl.schema.names:
+                arr = tbl.column(field.name)
+                cols[field.name] = arr.cast(field.type, safe=False) if arr.type != field.type else arr
+            else:
+                cols[field.name] = pa.nulls(len(tbl), type=field.type)
+        return pa.table(cols, schema=schema)
+
+    def _northings_np(tbl: "pa.Table") -> "np.ndarray":
+        # Extract the last '_'-delimited segment of every point_id as an int32
+        # NumPy array — fully vectorised, no Python loop over rows.
+        import pyarrow.compute as pc
+        # split_pattern(reverse=True, max_splits=1) on "px_0003" → ["px", "0003"]
+        parts = pc.split_pattern(
+            tbl.column("point_id"), pattern="_", reverse=True, max_splits=1,
+        )
+        # list_slice([1,2)) extracts the last segment (the northing number).
+        suffix = pc.list_slice(parts, 1, 2).combine_chunks().flatten()
+        return pc.cast(suffix, pa.int32()).to_numpy(zero_copy_only=False)
+
+    class _Cursor:
+        __slots__ = ("_pf", "_rg", "_n_rg", "_cols")
+        def __init__(self, path: Path) -> None:
+            self._pf   = pq.ParquetFile(path)
+            self._rg   = 0
+            self._n_rg = self._pf.metadata.num_row_groups
+            file_names = set(self._pf.schema_arrow.names)
+            self._cols = [c for c in out_names if c in file_names]
+        def next_batch(self) -> "tuple[pa.Table, np.ndarray] | None":
+            while self._rg < self._n_rg:
+                tbl = self._pf.read_row_group(self._rg, columns=self._cols)
+                self._rg += 1
+                tbl = _cast(tbl)
+                if len(tbl) == 0:
+                    continue
+                ns = _northings_np(tbl)
+                return tbl, ns
+            return None
+
+    heap: list[tuple] = []
+    cursors: list[_Cursor] = []
+    for path in input_paths:
+        cur = _Cursor(path)
+        result = cur.next_batch()
+        if result is None:
+            continue
+        batch, ns = result
+        cid = len(cursors)
+        cursors.append(cur)
+        heapq.heappush(heap, (int(ns[0]), str(batch.column("date")[0].as_py()), cid, 0, batch, ns))
+
+    tmp_path = out_path.with_suffix(".kmerge_tmp.parquet")
+    tmp_path.unlink(missing_ok=True)
+
+    ROW_GROUP = 500_000
+    out_batches: list["pa.Table"] = []
+    out_rows = 0
+    writer: "pq.ParquetWriter | None" = None
+
+    try:
+        def _flush() -> None:
+            nonlocal out_batches, out_rows, writer
+            if not out_batches:
+                return
+            chunk = pa.concat_tables(out_batches)
+            if writer is None:
+                writer = pq.ParquetWriter(tmp_path, schema=schema, **_WRITE_OPTS)
+            writer.write_table(chunk)
+            out_batches = []
+            out_rows = 0
+
+        while heap:
+            n, dt, cid, row, batch, ns = heapq.heappop(heap)
+            # Find end of current northing run via binary search — O(log batch_size).
+            # Slice from `row` so the search is within the unprocessed suffix.
+            end = row + int(np.searchsorted(ns[row:], n + 1, side="left"))
+            out_batches.append(batch.slice(row, end - row))
+            out_rows += end - row
+            if out_rows >= ROW_GROUP:
+                _flush()
+            if end < len(ns):
+                next_n = int(ns[end])
+                next_dt = str(batch.column("date")[end].as_py())
+                heapq.heappush(heap, (next_n, next_dt, cid, end, batch, ns))
+            else:
+                result = cursors[cid].next_batch()
+                if result is not None:
+                    nb, nns = result
+                    heapq.heappush(heap, (int(nns[0]), str(nb.column("date")[0].as_py()), cid, 0, nb, nns))
+
+        _flush()
+    finally:
+        if writer is not None:
+            writer.close()
+
+    tmp_path.replace(out_path)
+
+
 def _sort_s1_shards(
     shard_paths: list[Path],
     out_path: Path,
     combined_schema: "pa.Schema",
     n_workers: int | None = None,
 ) -> None:
-    """Merge S1 shards into one pixel-sorted parquet conforming to combined_schema.
+    """Merge S1 shards into one northing-sorted parquet conforming to combined_schema.
 
-    Strategy: sort each shard independently (each covers ≤50 k points, so small),
-    then merge-sort via DuckDB with spill-to-disk so peak RAM stays bounded
-    regardless of total shard count.
+    Points are passed to _collect_s1_shards in northing order (from make_strip_points),
+    so each shard's rows are already northing-sorted within each date.  Shards cover
+    non-overlapping northing ranges, so a k-way merge produces a fully sorted output
+    without any per-shard sort step.
     """
-    import logging
-    import multiprocessing
-    import os
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-    from concurrent.futures import ProcessPoolExecutor, as_completed
-
     _log = logging.getLogger(__name__)
-
-    if len(shard_paths) == 1:
-        _log.info("sorting 1 shard ...")
-        sort_parquet_by_pixel(shard_paths[0], out_path, row_group_size=5_000_000, _skip_dict_rewrite=True)
-        _log.info("sort done → %s", out_path.name)
-        return
-
-    # Step 1: sort each shard independently into a sibling .sorted.parquet.
-    # Sorts are CPU-bound and independent — parallelise with processes.
-    # Must use "spawn" not "fork": Polars holds Rayon thread-pool locks that
-    # cause forked children to deadlock immediately on futex_wait.
-    sorted_paths: list[Path] = [sp.with_suffix(".sorted.parquet") for sp in shard_paths]
-    n_workers = min(len(shard_paths), n_workers or os.cpu_count() or 4)
-    _log.info("sorting %d shards (%d workers) ...", len(shard_paths), n_workers)
-
-    ctx = multiprocessing.get_context("spawn")
-    with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as pool:
-        futs = {
-            pool.submit(sort_parquet_by_pixel, sp, sp_sorted, 5_000_000, _skip_dict_rewrite=True): idx
-            for idx, (sp, sp_sorted) in enumerate(zip(shard_paths, sorted_paths))
-        }
-        done = 0
-        for fut in as_completed(futs):
-            fut.result()  # re-raise any worker exception
-            done += 1
-            _log.info("shard sort %d/%d done", done, len(shard_paths))
-
-    _log.info("merging %d sorted shards → %s ...", len(shard_paths), out_path.name)
-
-    # Step 2: sort-merge via DuckDB with an explicit memory cap and spill-to-disk.
-    # The shards are partitioned by point batch, not northing band, so their
-    # northing ranges overlap fully — a k-way merge gains nothing over a sort.
-    # DuckDB spills to temp_directory when the memory limit is hit, so peak RSS
-    # stays bounded on the 8 GB fetcher machine.
-    import duckdb
-
-    tmp_path = out_path.with_suffix(".s1_merge_tmp.parquet")
-    tmp_path.unlink(missing_ok=True)
-
-    shard_glob = str(sorted_paths[0].parent / "*.sorted.parquet")
-    tmp_dir    = str(out_path.parent)
-
-    sql = f"""
-        COPY (
-            SELECT * EXCLUDE (_n)
-            FROM (
-                SELECT *,
-                    regexp_extract(point_id, '_([0-9]+)$', 1)::INTEGER AS _n
-                FROM read_parquet('{shard_glob}', union_by_name=true)
-            ) t
-            ORDER BY _n, date
-        ) TO '{tmp_path!s}' (
-            FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 5000000
-        )
-    """
-
-    try:
-        con = duckdb.connect(
-            config={
-                "temp_directory": tmp_dir,
-                "memory_limit": "2GB",
-                "preserve_insertion_order": False,
-                "threads": 1,
-            }
-        )
-        try:
-            con.execute(sql)
-        finally:
-            con.close()
-        tmp_path.replace(out_path)
-        _log.info("merge done → %s", out_path.name)
-    except Exception:
-        tmp_path.unlink(missing_ok=True)
-        raise
-    finally:
-        for p in sorted_paths:
-            p.unlink(missing_ok=True)
+    _log.info("merging %d S1 shards → %s ...", len(shard_paths), out_path.name)
+    _kway_merge_parquets(shard_paths, out_path, combined_schema)
+    _log.info("merge done → %s", out_path.name)
 
 
 def _merge_sorted_parquets(
@@ -244,79 +290,47 @@ def _merge_sorted_parquets(
     tag_s2_source: bool = False,
     memory_limit_gb: int = 16,
 ) -> None:
-    """2-way sort-merge of S2 and S1 parquets into out_path via DuckDB.
+    """2-way k-merge of northing-sorted S2 and S1 parquets into out_path.
 
-    DuckDB reads both files, tags S2 rows with source='S2', unions them, sorts
-    by (northing, date), and writes to parquet — spilling to disk if needed so
-    peak RAM stays bounded regardless of file size.
+    Both inputs are already northing-sorted, so this is a streaming merge —
+    no full sort needed.  Peak RAM is O(one row-group each).
     """
-    import duckdb
-    import os
+    import pyarrow as pa
     import pyarrow.parquet as pq
-
-    s2_p = str(s2_path)
-    s1_p = str(s1_path)
-    dst  = str(out_path)
-    tmp_dir = str(out_path.parent)
-
-    # Determine S2 and S1 column sets to build safe SELECT clauses.
-    # S2 may not have 'source'; S1 always has it (set to "S1").
-    s2_cols = set(pq.ParquetFile(s2_path).schema_arrow.names)
-    s1_cols = set(pq.ParquetFile(s1_path).schema_arrow.names)
-    out_names = combined_schema.names  # ordered output columns
-
-    def _select_clause(file_cols: set[str], override_source: str | None) -> str:
-        parts = []
-        for name in out_names:
-            if name == "source" and override_source is not None:
-                parts.append(f"'{override_source}' AS source")
-            elif name in file_cols:
-                parts.append(f'"{name}"')
-            else:
-                parts.append(f"NULL AS \"{name}\"")
-        return ", ".join(parts)
-
-    s2_src_override = "S2" if tag_s2_source else None
-    s2_select = _select_clause(s2_cols, s2_src_override)
-    s1_select = _select_clause(s1_cols, None)
-
-    col_list = ", ".join(f'"{c}"' for c in out_names)
-
-    sql = f"""
-        COPY (
-            SELECT {col_list}
-            FROM (
-                SELECT {s2_select} FROM read_parquet('{s2_p}')
-                UNION ALL
-                SELECT {s1_select} FROM read_parquet('{s1_p}')
-            ) t
-            ORDER BY regexp_extract(point_id, '_([0-9]+)$', 1)::INTEGER, date
-        ) TO '{dst}' (
-            FORMAT PARQUET, COMPRESSION ZSTD,
-            ROW_GROUP_SIZE 5000000
-        )
-    """
 
     s2_rows = pq.ParquetFile(s2_path).metadata.num_rows
     s1_rows = pq.ParquetFile(s1_path).metadata.num_rows
-    n_threads = max(1, (os.cpu_count() or 4) // 2)
     logger.info(
-        "merge_tile: sort-merging %s (%s S2 rows + %s S1 rows) via DuckDB (%d threads, %d GB limit) ...",
-        out_path.name, f"{s2_rows:,}", f"{s1_rows:,}", n_threads, memory_limit_gb,
+        "merge_tile: k-merging %s (%s S2 rows + %s S1 rows) ...",
+        out_path.name, f"{s2_rows:,}", f"{s1_rows:,}",
     )
 
-    con = duckdb.connect(
-        config={
-            "temp_directory": tmp_dir,
-            "memory_limit": f"{memory_limit_gb}GB",
-            "preserve_insertion_order": False,
-            "threads": 1,
-        }
-    )
-    try:
-        con.execute(sql)
-    finally:
-        con.close()
+    if tag_s2_source:
+        # Write a source-tagged copy of S2 into a sibling tmp, then k-merge.
+        s2_tagged = out_path.with_suffix(".s2_tagged_tmp.parquet")
+        s2_tagged.unlink(missing_ok=True)
+        try:
+            pf = pq.ParquetFile(s2_path)
+            s2_schema = pf.schema_arrow
+            if "source" not in s2_schema.names:
+                s2_schema = s2_schema.append(pa.field("source", pa.string()))
+            w = pq.ParquetWriter(s2_tagged, s2_schema, **_WRITE_OPTS)
+            try:
+                for rg in range(pf.metadata.num_row_groups):
+                    blk = pf.read_row_group(rg)
+                    src_col = pa.repeat("S2", len(blk))
+                    if "source" in blk.schema.names:
+                        blk = blk.set_column(blk.schema.get_field_index("source"), "source", src_col)
+                    else:
+                        blk = blk.append_column(pa.field("source", pa.string()), src_col)
+                    w.write_table(_conform_table(blk, s2_schema))
+            finally:
+                w.close()
+            _kway_merge_parquets([s2_tagged, s1_path], out_path, combined_schema)
+        finally:
+            s2_tagged.unlink(missing_ok=True)
+    else:
+        _kway_merge_parquets([s2_path, s1_path], out_path, combined_schema)
 
 
 def merge_strips(
