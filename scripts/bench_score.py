@@ -460,7 +460,7 @@ def bench_tile_year_streaming(
 
     This bench exercises that exact path and verifies that RSS stays flat
     throughout inference by monkey-patching the writer flush to sample RSS
-    after each row-group write — mirroring the technique in bench_proxy.py.
+    after each row-group write — mirroring the technique in bench_fetch.py.
 
     Key numbers reported:
       - Total wall time including pre-passes

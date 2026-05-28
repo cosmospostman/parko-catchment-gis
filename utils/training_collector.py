@@ -34,7 +34,6 @@ import pickle
 import re as _re
 
 from utils.regions import TrainingRegion, load_regions, select_regions
-from utils.location import tile_chips_path
 from utils.s2_tiles import bbox_to_tile_ids
 from utils.stac import search_sentinel2
 
@@ -209,75 +208,67 @@ def _collect_one_region(
     region: TrainingRegion,
     tile_id: str,
     tile_items: list,
-    start: str,
-    end: str,
     cloud_max: int,
     apply_nbar: bool,
     max_concurrent: int,
     n_sort_workers: int | None = None,
 ) -> str | None:
-    """Fetch S2 and S1 for one region via FetchSpec, write region parquet.
+    """Fetch S2 and S1 for one region via the strip pipeline, write region parquet.
 
-    Returns the actual S2 tile_id the data was sourced from (which may differ
-    from the ``tile_id`` argument when the region straddles a tile boundary and
-    no items matched the primary tile), or None if no data was written.
+    Returns the actual S2 tile_id the data was sourced from, or None if no data
+    was written.
     """
-    from utils.fetch_spec import FetchSpec, fetch_spec
+    from shapely.geometry import box as _box
+    from utils.tile_pipeline import fetch_tile_local
+    from utils.fetch_spec import _budget_params, _system_memory_gb
 
-    out_path  = _region_parquet_path(region.id)
-    cache_dir = tile_chips_path(tile_id) / region.id
-    bbox      = list(region.bbox)
-
-    # Filter tile_items to those from this tile only — mixing items from
-    # adjacent tiles into one cache_dir breaks CachedNpzChipStore.
-    this_tile_items = [it for it in tile_items if tile_id in it.id]
+    out_path = _region_parquet_path(region.id)
+    out_dir  = _TILES_DIR / "regions" / region.id
+    tmp_dir  = out_dir / "_tmp"
+    region_geom = _box(*region.bbox)
 
     all_years = sorted(set(region.years))
-    spec = FetchSpec(
-        id=region.id,
-        bbox=bbox,
-        years=all_years,
-        point_id_prefix=region.id,
-        label=region.label,
-        out_dir=_TILES_DIR / "regions" / region.id,
-        cache_dir=cache_dir,
-    )
 
-    logger.info("Region %s: fetch start  bbox=%s  %s→%s", region.id, bbox, start, end)
+    _params   = _budget_params(_system_memory_gb())
+    _strip_px = _params["strip_height_px"] or 1024
 
-    year_results = fetch_spec(
-        spec,
-        cloud_max=cloud_max,
-        apply_nbar=apply_nbar,
-        max_concurrent=max_concurrent,
-        items=this_tile_items,
-        n_s1_workers=n_sort_workers or 4,
-    )
+    logger.info("Region %s: fetch start  bbox=%s  years=%s", region.id, list(region.bbox), all_years)
 
-    # Collect all merged per-year/per-tile paths
-    merged_paths: list[Path] = [p for paths in year_results.values() for p in paths]
+    merged_paths: list[Path] = []
+    actual_tile_id = tile_id
+
+    for year in all_years:
+        result = fetch_tile_local(
+            tile_id=tile_id,
+            year=year,
+            polygon_geometry=region_geom,
+            out_dir=out_dir,
+            tmp_dir=tmp_dir,
+            cloud_max=cloud_max,
+            apply_nbar=apply_nbar,
+            strip_height_px=_strip_px,
+            max_concurrent=max_concurrent,
+            n_workers=n_sort_workers,
+            items=[it for it in tile_items if tile_id in it.id],
+            point_id_prefix=region.id,
+        )
+        if result is not None:
+            merged_paths.append(result)
+            # Derive actual tile from the parquet filename (stem = tile_id).
+            actual_tile_id = result.stem
 
     if not merged_paths:
         logger.warning("Region %s: no data — skipping", region.id)
         return None
 
-    # Detect the actual tile from the first merged path's grandparent directory
-    # structure: out_dir / year / tile_id.parquet → tile_id is the stem.
-    # For consistency with the old behaviour, derive tile from the s2 intermediate.
-    s2_paths = sorted(
-        p for yr_paths in [spec.out_dir / str(yr) for yr in all_years]
-        if yr_paths.is_dir()
-        for p in yr_paths.glob("*.s2.parquet")
-    )
-    actual_tile_id = s2_paths[0].stem.replace(".s2", "") if s2_paths else tile_id
     if actual_tile_id != tile_id:
         logger.warning(
             "Region %s: S2 data from tile %s, not primary tile %s — indexing under %s",
             region.id, actual_tile_id, tile_id, actual_tile_id,
         )
 
-    # Concat all merged paths into the single flat region parquet expected by
-    # _rebuild_tile_parquet.  Schema may differ across years (S1 added later).
+    # Concat all per-year parquets into the single flat region parquet expected
+    # by _rebuild_tile_parquet.  Schema may differ across years (S1 added later).
     schema = _superset_schema(merged_paths)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     writer = pq.ParquetWriter(out_path, schema)
@@ -288,7 +279,7 @@ def _collect_one_region(
             writer.write_table(tbl)
     writer.close()
 
-    logger.info("Region %s: done (%d source files)", region.id, len(merged_paths))
+    logger.info("Region %s: done (%d years)", region.id, len(merged_paths))
     return actual_tile_id
 
 
@@ -472,7 +463,6 @@ def ensure_training_pixels(
     _n_sort_workers = max(1, math.ceil((_os.cpu_count() or 4) / max_region_workers))
 
     def _do_region(tile_id, region, tile_regions) -> None:
-        start, end = _tile_date_window(tile_regions)
         # STAC search is per-tile and cached; the lock ensures only one worker
         # per tile does the live search — the rest load from the pickle.
         with tile_stac_locks[tile_id]:
@@ -481,8 +471,6 @@ def ensure_training_pixels(
             region=region,
             tile_id=tile_id,
             tile_items=tile_items,
-            start=start,
-            end=end,
             cloud_max=cloud_max,
             apply_nbar=apply_nbar,
             max_concurrent=max_concurrent,

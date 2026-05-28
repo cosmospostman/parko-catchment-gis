@@ -306,7 +306,11 @@ def _compute_band_stats_worker(
     from analysis.constants import ensure_float32_bands
     from tam.core.dataset import S1_FEATURE_COLS as _S1_COLS, despeckle_s1 as _despeckle, prepare_s1_frame as _prep_s1, prepare_s2_frame as _prep_s2
 
-    df = ensure_float32_bands(_pl.from_arrow(_pq.read_table(pixel_df_path)))
+    # Only load columns needed for stats — skip point_id, date, year, doy.
+    _schema = _pq.read_schema(pixel_df_path)
+    _keep = set(feature_cols) | set(s1_feature_cols) | {"source", "scl_purity", "vh", "vv"}
+    _read_cols = [f.name for f in _schema if f.name in _keep]
+    df = ensure_float32_bands(_pl.read_parquet(pixel_df_path, columns=_read_cols))
     _gc.collect()
 
     _s1_col_set = set(s1_feature_cols)

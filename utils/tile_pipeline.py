@@ -33,6 +33,7 @@ def fetch_tile_local(
     n_workers: int | None = None,
     items=None,
     calibration_out: Path | None = None,
+    point_id_prefix: str = "px",
 ) -> Path | None:
     """Fetch one tile×year locally using the same pipeline as the proxy VM.
 
@@ -117,6 +118,7 @@ def fetch_tile_local(
         resume_from_strip=resume_from,
         items=items,
         calibration_out=calibration_out,
+        point_id_prefix=point_id_prefix,
     ):
         dest     = tile_tmp / f"strip_{strip_idx:04d}.parquet"
         dest_tmp = tile_tmp / f"strip_{strip_idx:04d}.tmp"

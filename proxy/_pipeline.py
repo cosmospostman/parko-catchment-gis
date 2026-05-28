@@ -297,7 +297,7 @@ def compute_strips(
     strips_meta = {
         "utm_crs": utm_crs, "xs": xs, "y0_snap": y0_snap, "y1": y1,
         "block_m": block_m, "r": r, "polygon_geometry": polygon_geometry,
-        "first_lower": first_lower,
+        "first_lower": first_lower, "point_id_prefix": "px",
     }
     return strips, strips_meta
 
@@ -345,7 +345,8 @@ def make_strip_points(strip: dict, meta: dict) -> list[tuple[str, float, float]]
         return []
 
     j_offset = round((lower - first_lower) / r)
-    pids = [f"px_{int(i):04d}_{int(j + j_offset):04d}" for i, j in zip(ii_flat, jj_flat)]
+    pfx = meta.get("point_id_prefix", "px")
+    pids = [f"{pfx}_{int(i):04d}_{int(j + j_offset):04d}" for i, j in zip(ii_flat, jj_flat)]
     return list(zip(pids, lons_arr.tolist(), lats_arr.tolist()))
 
 
@@ -585,11 +586,12 @@ def run_tile_pipeline_v2(
     cloud_max: int = 20,
     apply_nbar: bool = True,
     strip_height_px: int = 1024,
-    max_concurrent: int = 128,
+    max_concurrent: int = 64,
     n_workers: int | None = None,
     resume_from_strip: int = 0,
     items=None,
     calibration_out: Path | None = None,
+    point_id_prefix: str = "px",
 ) -> Iterator[tuple[int, Path]]:
     """Two-pool network→disk / disk→extract pipeline for memory-constrained machines.
 
@@ -626,6 +628,13 @@ def run_tile_pipeline_v2(
 
     fetch_workers   = int(os.environ.get("FETCH_WORKERS",   "16"))
     extract_workers = int(os.environ.get("EXTRACT_WORKERS", str(min(4, os.cpu_count() or 4))))
+    # Prefetch depth: how many strips to fetch ahead concurrently.
+    # Depth-2 saturates the network during extraction but doubles peak memory.
+    # On machines with ≤8 GB RAM, depth-1 avoids OOM; override with PREFETCH_DEPTH=2
+    # on larger instances.
+    _mem_gb = _system_memory_gb()
+    _default_prefetch = 1 if _mem_gb <= 10 else 2
+    prefetch_depth = int(os.environ.get("PREFETCH_DEPTH", str(_default_prefetch)))
 
     bbox_wgs84 = list(polygon_geometry.bounds)
     start_date = f"{year}-01-01"
@@ -664,6 +673,7 @@ def run_tile_pipeline_v2(
         bbox_wgs84, strip_height_px, polygon_geometry,
         cog_utm_crs=cog_utm_crs, cog_y_top=cog_y_top,
     )
+    strips_meta["point_id_prefix"] = point_id_prefix
     logger.info("[v2 tile %s %d] %d strips of %d px", tile_id, year, len(strips), strip_height_px)
 
     if not strips:
@@ -796,12 +806,12 @@ def run_tile_pipeline_v2(
             except _FutureTimeout:
                 pass
 
-    with _TPE(max_workers=2) as prefetch_pool:
+    with _TPE(max_workers=prefetch_depth) as prefetch_pool:
         pts_queue:   _deque = _deque()
         fetch_futs:  _deque = _deque()
 
         try:
-            for k in range(min(2, len(active_strips))):
+            for k in range(min(prefetch_depth, len(active_strips))):
                 pts = make_strip_points(active_strips[k], strips_meta)
                 pts_queue.append(pts)
                 fetch_futs.append(prefetch_pool.submit(_fetch_strip_to_tiff, active_strips[k]))
@@ -815,9 +825,8 @@ def run_tile_pipeline_v2(
                 logger.info("[v2 tile %s %d] [strip %04d] Pool A done; starting Pool B (%d pts, %d items)",
                             tile_id, year, strip_idx, len(strip_pts), len(items))
 
-                # Submit Pool A for strip i+2 before Pool B starts so the network
-                # stays busy throughout extraction.
-                next_k = i + 2
+                # Submit Pool A for the next strip so the network stays busy.
+                next_k = i + prefetch_depth
                 if next_k < len(active_strips):
                     pts = make_strip_points(active_strips[next_k], strips_meta)
                     pts_queue.append(pts)

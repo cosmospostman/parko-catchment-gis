@@ -410,11 +410,6 @@ async def fetch_patches_to_tiff(
     Returns a list of all written .tif paths.
     """
     import os
-    # Header cache: rasterio.open() fetches the GeoTIFF IFD via HTTP; without
-    # caching this fires once per (item, band) open call.  Safe for read-only S3
-    # COG access — the 409-conflict risk from CPL_VSIL_CURL_CACHE_SIZE only
-    # applies to multipart write operations, not pure GETs.
-    os.environ.setdefault("CPL_VSIL_CURL_CACHE_SIZE", "134217728")  # 128 MB
     loop = asyncio.get_running_loop()
     sem = asyncio.Semaphore(max_concurrent)
     # Thread count is capped independently of the asyncio semaphore.  The semaphore
@@ -547,8 +542,8 @@ async def fetch_patches_to_tiff(
 
     await asyncio.gather(*[tracked(t) for t in spectral_tasks])
 
-    fetch_executor.shutdown(wait=False)
-    write_executor.shutdown(wait=False)
+    fetch_executor.shutdown(wait=True)
+    write_executor.shutdown(wait=True)
     _log = logger.warning if errors > 0 and fetched == 0 and cached == 0 else logger.info
     _log(
         "fetch_patches_to_tiff complete: %d fetched, %d cached, "

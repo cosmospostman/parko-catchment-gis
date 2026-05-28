@@ -1,24 +1,32 @@
-"""Fetch-proxy pipeline benchmark harness.
+"""Fetch pipeline benchmark harness.
 
-Synthesises realistic data and benchmarks each stage of the VM-side pipeline
-(DuckDB merge, per-scene extraction, compression ratio, workstation concat)
-plus a discrete-event pipeline simulation, and end-to-end workstation benches
-for both the proxy path and the all-workstation (location.py) path.
+Synthesises realistic data and benchmarks each stage of the fetch pipeline —
+both the proxy (VM) path and the single-machine (workstation) path — including
+memory-boundedness verification for the local extract phase.
 
 Benchmark sections
 ------------------
-bench_duckdb_merge        — VM: N-way sort-merge of per-scene parquets
-bench_compression_ratio   — sorted+dict vs unsorted ZSTD ratio
-bench_local_extract       — WS-only: extract_item_to_df (S2 CPU bottleneck) + sort + merge_tile
-                            Uses a MemoryChipStore mock — no HTTP, no NBAR angles.
-                            Covers: location.fetch() → collect(phases={"extract"})
-                            → sort_parquet_by_pixel → merge_tile
-bench_local_s1_extract    — WS-only: _extract_s1_from_store (S1 extract) + _sort_s1_shards
-                            Uses a MemoryChipStore mock — no HTTP, no COG reads.
-                            Covers: collect_s1_for_tile() post-fetch extract + sort path
-bench_local_sort          — WS-only: sort_parquet_by_pixel 1-pass vs 2-pass + merge_tile
-bench_workstation_concat  — WS: merge_strips() throughput (proxy path)
-bench_workstation_e2e     — WS: frame decode → strip write → merge_strips, with RSS tracking
+bench_duckdb_merge          — VM: N-way sort-merge of per-scene parquets
+bench_compression_ratio     — sorted+dict vs unsorted ZSTD ratio
+bench_local_extract         — WS-only: extract_item_to_df (S2 CPU bottleneck) + sort + merge_tile
+                              Uses a MemoryChipStore mock — no HTTP, no NBAR angles.
+                              Covers: location.fetch() → collect(phases={"extract"})
+                              → sort_parquet_by_pixel → merge_tile
+bench_local_fetch_memory    — WS-only: RSS profile of the full local extract pipeline.
+                              Samples RSS at every shard flush and after sort+merge_tile.
+                              Verifies memory-boundedness: peak Δ-RSS ≤ O(one shard buffer).
+bench_local_s1_extract      — WS-only: _extract_s1_from_store (S1 extract) + _sort_s1_shards
+                              Uses a MemoryChipStore mock — no HTTP, no COG reads.
+                              Covers: collect_s1_for_tile() post-fetch extract + sort path
+bench_local_sort            — WS-only: sort_parquet_by_pixel 1-pass vs 2-pass + merge_tile
+bench_workstation_concat    — WS: merge_strips() throughput (proxy path)
+bench_workstation_e2e       — WS: frame decode → strip write → merge_strips, with RSS tracking
+sim_local_fetch             — discrete-event simulation of the workstation two-pool fetch model:
+                              Phase A (all years' patch fetches in parallel, network-bound) racing
+                              Phase B (extract capped at max_extract_years, memory-bound).
+                              Reports peak concurrent extractors, peak memory estimate, and
+                              whether Phase A ever stalls waiting for a Phase B slot.
+sim_pipeline                — discrete-event simulation of the VM proxy strip pipeline
 
 What is NOT covered
 -------------------
@@ -27,14 +35,17 @@ What is NOT covered
 - collect_s1_for_tile fetch phase — MPC COG reads (network-bound, not CPU-benchmarkable locally)
 
 Run:
-    python scripts/bench_proxy.py
-    python scripts/bench_proxy.py --n-pixels 57000 --n-items 90 --extract-workers 4
-    python scripts/bench_proxy.py --assert-extract-items-s 5
-    python scripts/bench_proxy.py --assert-merge-s 30 --assert-compression-ratio 5
-    python scripts/bench_proxy.py --assert-concat-mb-s 30
-    python scripts/bench_proxy.py --assert-ws-frame-mb-s 200
-    python scripts/bench_proxy.py --assert-ws-rss-gb 2.0
-    python scripts/bench_proxy.py --sim-fetch-s 80 --sim-extract-s 60 --sim-merge-s 30 --sim-stream-s 147
+    python scripts/bench_fetch.py
+    python scripts/bench_fetch.py --n-pixels 57000 --n-items 90 --extract-workers 4
+    python scripts/bench_fetch.py --assert-extract-items-s 5
+    python scripts/bench_fetch.py --assert-merge-s 30 --assert-compression-ratio 5
+    python scripts/bench_fetch.py --assert-concat-mb-s 30
+    python scripts/bench_fetch.py --assert-ws-frame-mb-s 200
+    python scripts/bench_fetch.py --assert-ws-rss-gb 2.0
+    python scripts/bench_fetch.py --assert-local-rss-gb 3.0
+    python scripts/bench_fetch.py --sim-fetch-s 120 --sim-extract-s 300 --sim-merge-s 30
+    python scripts/bench_fetch.py --sim-fetch-s 120 --sim-extract-s 300 --sim-merge-s 30 --sim-n-years 5 --sim-max-extract 2 --sim-mem-per-extract 4.0
+    python scripts/bench_fetch.py --sim-fetch-s 80 --sim-extract-s 60 --sim-merge-s 30 --sim-stream-s 147
 
 Exit codes: 0 = ok, 1 = assertion failure (--assert-*).
 """
@@ -739,6 +750,227 @@ def bench_local_extract(tmp: Path, n_pixels: int, n_items: int, n_workers: int =
 
 
 # ---------------------------------------------------------------------------
+# bench_local_fetch_memory — RSS profile of the full local extract pipeline
+# ---------------------------------------------------------------------------
+
+class _LocalMemResult(NamedTuple):
+    peak_rss_gb: float        # peak RSS observed across the whole pipeline
+    peak_delta_gb: float      # peak Δ-RSS from baseline (before extract starts)
+    shard_flush_peak_gb: float  # peak RSS sampled immediately after each shard flush
+    n_flushes: int            # number of shard flushes observed
+
+
+def bench_local_fetch_memory(
+    tmp: Path,
+    n_pixels: int,
+    n_items: int,
+    n_workers: int = 4,
+) -> _LocalMemResult:
+    """RSS profile of the full workstation-only local extract pipeline.
+
+    Mirrors bench_local_extract but samples RSS at each shard flush and after
+    sort_parquet_by_pixel / merge_tile to verify memory-boundedness.
+
+    Expected behaviour:
+      - Peak Δ-RSS ≤ O(one shard buffer) — the sliding-window executor holds
+        at most n_workers items' band arrays simultaneously, but they are
+        released as each item completes. The shard buffer (flushed every
+        SHARD_BUF_SIZE rows) is the dominant allocation; it should be
+        ~n_workers × n_pixels × n_bands × 4 bytes = a few hundred MB at most.
+      - RSS does not grow monotonically — it should plateau and drop after
+        each flush as the Arrow table is handed to ParquetWriter and freed.
+      - sort_parquet_by_pixel and merge_tile add at most ~1× shard size of
+        working memory (Polars LazyFrame + DuckDB spill buffer).
+
+    Use --assert-local-rss-gb to gate on peak RSS in CI.
+    """
+    from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+    import pyarrow.parquet as pq
+    from utils.pixel_collector import extract_item_to_df
+    from utils.parquet_utils import sort_parquet_by_pixel, merge_tile
+
+    print(f"\n[bench_local_fetch_memory]  n_pixels={n_pixels}  n_items={n_items}  n_workers={n_workers}")
+
+    point_ids = [f"px_{i:06d}_0000" for i in range(n_pixels)]
+    lons = np.linspace(145.41, 145.50, n_pixels, dtype=np.float64)
+    lats = np.full(n_pixels, -22.81, dtype=np.float64)
+    point_coords = {pid: (float(lon), float(lat)) for pid, lon, lat in zip(point_ids, lons, lats)}
+
+    import types
+    from datetime import datetime as _dt
+    _base_dt = _dt(2022, 1, 1)
+    item_ids = [f"S2A_55HBU_{2022*10000 + i:08d}_0_L2A" for i in range(n_items)]
+    items = []
+    for iid in item_ids:
+        stub = types.SimpleNamespace(
+            id=iid,
+            datetime=_base_dt,
+            properties={"s2:mgrs_tile": "55HBU"},
+        )
+        items.append(stub)
+
+    store = _make_mock_store(item_ids, n_pixels, point_coords)
+
+    shard_dir = tmp / "mem_extract"
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    shard_path = shard_dir / "shard_0000.parquet"
+
+    # --- RSS sampling state --------------------------------------------------
+    gc.collect()
+    baseline_rss = rss_gb()
+    rss_samples: list[float] = [baseline_rss]
+    flush_rss_samples: list[float] = []
+
+    # Monkey-patch ParquetWriter.write_table to sample RSS after each flush.
+    _orig_write_table = pq.ParquetWriter.write_table
+
+    def _patched_write_table(self, table, *args, **kwargs):
+        result = _orig_write_table(self, table, *args, **kwargs)
+        r = rss_gb()
+        rss_samples.append(r)
+        flush_rss_samples.append(r)
+        return result
+
+    # --- Extract phase -------------------------------------------------------
+    writer: pq.ParquetWriter | None = None
+    shard_buf: list[pa.Table] = []
+    shard_buf_rows = 0
+    SHARD_BUF_SIZE = 500_000
+    total_rows = 0
+
+    def _flush(force: bool = False) -> None:
+        nonlocal writer, shard_buf_rows
+        if not shard_buf or (not force and shard_buf_rows < SHARD_BUF_SIZE):
+            return
+        merged = pa.concat_tables(shard_buf)
+        shard_buf.clear()
+        shard_buf_rows = 0
+        if writer is None:
+            return
+        writer.write_table(merged)  # triggers _patched_write_table
+
+    def _process(item):
+        return extract_item_to_df(
+            item, store, point_ids,
+            lons, lats,
+            apply_nbar=False,
+            utm_crs="EPSG:32755",
+        )
+
+    probe("local_mem:extract_start", rows=n_pixels * n_items,
+          extra=f"baseline RSS={baseline_rss:.2f} GB")
+
+    t_extract = time.perf_counter()
+    pending = list(items)
+    in_flight: dict = {}
+    try:
+        pq.ParquetWriter.write_table = _patched_write_table
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            while pending or in_flight:
+                while pending and len(in_flight) < n_workers:
+                    item = pending.pop(0)
+                    in_flight[pool.submit(_process, item)] = item
+
+                done_futs, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+                for fut in done_futs:
+                    in_flight.pop(fut)
+                    df = fut.result()
+                    if df is not None and len(df) > 0:
+                        tbl = df.to_arrow()
+                        if writer is None:
+                            writer = pq.ParquetWriter(shard_path, tbl.schema, compression="none")
+                        shard_buf.append(tbl)
+                        shard_buf_rows += len(tbl)
+                        total_rows += len(tbl)
+                        if shard_buf_rows >= SHARD_BUF_SIZE:
+                            _flush()
+                            gc.collect()
+                            rss_samples.append(rss_gb())
+
+        if writer is not None:
+            _flush(force=True)
+            writer.close()
+    finally:
+        pq.ParquetWriter.write_table = _orig_write_table
+
+    extract_elapsed = time.perf_counter() - t_extract
+    rss_samples.append(rss_gb())  # post-extract, pre-sort
+
+    probe("local_mem:extract_done", rows=total_rows,
+          extra=f"RSS={rss_samples[-1]:.2f} GB  Δ={rss_samples[-1]-baseline_rss:+.2f} GB  "
+                f"{len(flush_rss_samples)} flushes")
+    print(f"  extract: {extract_elapsed:.2f}s  {total_rows:,} rows  "
+          f"RSS after={rss_samples[-1]:.2f} GB  Δ={rss_samples[-1]-baseline_rss:+.2f} GB")
+    if flush_rss_samples:
+        print(f"  flush RSS:  min={min(flush_rss_samples):.2f} GB  "
+              f"max={max(flush_rss_samples):.2f} GB  "
+              f"({len(flush_rss_samples)} flushes)")
+
+    if not shard_path.exists():
+        print("  (no shard written — all items filtered, skipping sort+merge)")
+        peak = max(rss_samples)
+        return _LocalMemResult(
+            peak_rss_gb=peak,
+            peak_delta_gb=peak - baseline_rss,
+            shard_flush_peak_gb=max(flush_rss_samples) if flush_rss_samples else 0.0,
+            n_flushes=len(flush_rss_samples),
+        )
+
+    # --- Sort phase ----------------------------------------------------------
+    gc.collect()
+    rss_samples.append(rss_gb())
+    sorted_path = shard_dir / "shard_0000_sorted.parquet"
+    shard_sz = shard_path.stat().st_size
+
+    t_sort = time.perf_counter()
+    sort_parquet_by_pixel(shard_path, sorted_path, row_group_size=5_000_000, _skip_dict_rewrite=True)
+    sort_elapsed = time.perf_counter() - t_sort
+    rss_samples.append(rss_gb())
+
+    probe("local_mem:sort_done", extra=f"RSS={rss_samples[-1]:.2f} GB  Δ={rss_samples[-1]-baseline_rss:+.2f} GB")
+    print(f"  sort:    {sort_elapsed:.2f}s  {shard_sz/1e6:.0f}→{sorted_path.stat().st_size/1e6:.0f} MB  "
+          f"RSS after={rss_samples[-1]:.2f} GB  Δ={rss_samples[-1]-baseline_rss:+.2f} GB")
+
+    # --- Merge phase ---------------------------------------------------------
+    gc.collect()
+    rss_samples.append(rss_gb())
+    s1_path = shard_dir / "s1.parquet"
+    _make_realistic_strip_parquet(s1_path, n_pixels // 4, n_items // 4, northing_offset=0)
+    merged_path = shard_dir / "merged.parquet"
+
+    t_merge = time.perf_counter()
+    merge_tile(sorted_path, s1_path, merged_path)
+    merge_elapsed = time.perf_counter() - t_merge
+    rss_samples.append(rss_gb())
+
+    probe("local_mem:merge_done",
+          rows=pq.ParquetFile(merged_path).metadata.num_rows,
+          extra=f"RSS={rss_samples[-1]:.2f} GB  Δ={rss_samples[-1]-baseline_rss:+.2f} GB")
+    print(f"  merge:   {merge_elapsed:.2f}s  out={merged_path.stat().st_size/1e6:.0f} MB  "
+          f"RSS after={rss_samples[-1]:.2f} GB  Δ={rss_samples[-1]-baseline_rss:+.2f} GB")
+
+    peak_rss = max(rss_samples)
+    peak_delta = peak_rss - baseline_rss
+    shard_flush_peak = max(flush_rss_samples) if flush_rss_samples else 0.0
+
+    print(f"\n  Memory summary:")
+    print(f"    baseline RSS:        {baseline_rss:.2f} GB")
+    print(f"    peak RSS:            {peak_rss:.2f} GB")
+    print(f"    peak Δ-RSS:          {peak_delta:+.2f} GB")
+    print(f"    peak flush RSS:      {shard_flush_peak:.2f} GB")
+    print(f"    shard size (uncompressed): {shard_sz/1e6:.0f} MB")
+    expected_floor = (n_workers * n_pixels * (len(BANDS) + 2) * 4) / 1e9
+    print(f"    expected floor (n_workers × pixels × bands × 4B): ~{expected_floor*1e3:.0f} MB")
+
+    return _LocalMemResult(
+        peak_rss_gb=peak_rss,
+        peak_delta_gb=peak_delta,
+        shard_flush_peak_gb=shard_flush_peak,
+        n_flushes=len(flush_rss_samples),
+    )
+
+
+# ---------------------------------------------------------------------------
 # bench_local_s1_extract — _extract_s1_from_store + _sort_s1_shards
 # ---------------------------------------------------------------------------
 
@@ -1011,6 +1243,139 @@ def bench_local_sort(tmp: Path, n_pixels: int, n_dates: int) -> None:
 # sim_pipeline — discrete-event simulation
 # ---------------------------------------------------------------------------
 
+def sim_local_fetch(
+    fetch_s: float,
+    extract_s: float,
+    merge_s: float,
+    n_years: int = 3,
+    max_extract_years: int = 2,
+    n_tiles: int = 1,
+    memory_per_extract_gb: float = 4.0,
+) -> None:
+    """Discrete-event simulation of the workstation-only fetch pipeline.
+
+    Models fetch_spec()'s two-pool architecture:
+      Phase A — all years' .npz patch fetches run in parallel (network-bound,
+                low memory); one worker per year.
+      Phase B — extraction is capped at max_extract_years concurrent workers
+                (memory-bound); each worker holds ~memory_per_extract_gb of
+                band arrays + shard buffer simultaneously.
+
+    For each year the stages are sequential: fetch → extract → merge_tile.
+    Phase A and Phase B overlap: a year transitions to Phase B as soon as its
+    own Phase A fetch completes, without waiting for other years.
+
+    Reports:
+      - Timeline per year: when each stage starts/ends
+      - Peak concurrent extractors (must stay ≤ max_extract_years)
+      - Peak memory estimate: concurrent extractors × memory_per_extract_gb
+      - Network idle time: how long Phase A fetch workers sit idle waiting for
+        Phase B to free a slot (should be 0 — Phase A is never the bottleneck)
+      - Total wall time
+
+    Use --sim-fetch-s / --sim-extract-s / --sim-merge-s to plug in measured
+    values from bench_local_extract and bench_local_sort.
+    """
+    print(
+        f"\n[sim_local_fetch]  fetch={fetch_s}s  extract={extract_s}s  merge={merge_s}s"
+        f"  years={n_years}  max_extract={max_extract_years}  tiles={n_tiles}"
+        f"  mem/extractor={memory_per_extract_gb:.1f} GB"
+    )
+
+    # Simple discrete-event model: advance time by processing completions in
+    # chronological order.  Each year moves through three stages; Phase B is
+    # gated by a semaphore of max_extract_years slots.
+
+    import heapq
+
+    FETCH   = "fetch"
+    EXTRACT = "extract"
+    MERGE   = "merge"
+
+    # Event: (time, year, stage_just_completed)
+    events: list[tuple[float, int, str]] = []
+
+    fetch_start: dict[int, float]   = {}
+    fetch_end:   dict[int, float]   = {}
+    extract_start: dict[int, float] = {}
+    extract_end:   dict[int, float] = {}
+    merge_start:   dict[int, float] = {}
+    merge_end:     dict[int, float] = {}
+
+    # All years start Phase A fetch immediately (parallel, uncapped).
+    for yr in range(n_years):
+        fetch_start[yr] = 0.0
+        heapq.heappush(events, (fetch_s * n_tiles, yr, FETCH))
+
+    extract_slots = max_extract_years  # available Phase B slots
+    extract_queue: list[tuple[float, int]] = []  # (fetch_done_time, year) waiting for a slot
+
+    peak_concurrent_extractors = 0
+    current_extractors = 0
+    network_idle_s = 0.0  # time a year spends waiting for a Phase B slot after fetch done
+
+    while events:
+        t, yr, completed = heapq.heappop(events)
+
+        if completed == FETCH:
+            fetch_end[yr] = t
+            if extract_slots > 0:
+                # Start extraction immediately
+                extract_slots -= 1
+                current_extractors += 1
+                peak_concurrent_extractors = max(peak_concurrent_extractors, current_extractors)
+                extract_start[yr] = t
+                heapq.heappush(events, (t + extract_s * n_tiles, yr, EXTRACT))
+            else:
+                # Queue until a slot opens
+                heapq.heappush(extract_queue, (t, yr))
+
+        elif completed == EXTRACT:
+            extract_end[yr] = t
+            extract_slots += 1
+            current_extractors -= 1
+            # Release next queued year if any
+            if extract_queue:
+                wait_since, next_yr = heapq.heappop(extract_queue)
+                network_idle_s += t - wait_since
+                extract_slots -= 1
+                current_extractors += 1
+                peak_concurrent_extractors = max(peak_concurrent_extractors, current_extractors)
+                extract_start[next_yr] = t
+                heapq.heappush(events, (t + extract_s * n_tiles, next_yr, EXTRACT))
+            # Start merge for this year
+            merge_start[yr] = t
+            heapq.heappush(events, (t + merge_s * n_tiles, yr, MERGE))
+
+        elif completed == MERGE:
+            merge_end[yr] = t
+
+    total_wall = max(merge_end.values())
+    peak_mem_gb = peak_concurrent_extractors * memory_per_extract_gb
+
+    print(f"\n  {'Year':<6} {'fetch':>12} {'extract':>16} {'merge':>16} {'done':>8}")
+    print(f"  {'----':<6} {'----------':>12} {'-------------':>16} {'-------------':>16} {'----':>8}")
+    for yr in range(n_years):
+        fs, fe = fetch_start[yr], fetch_end[yr]
+        xs, xe = extract_start.get(yr, float('nan')), extract_end.get(yr, float('nan'))
+        ms, me = merge_start.get(yr, float('nan')), merge_end.get(yr, float('nan'))
+        wait = xs - fe if yr in extract_start else float('nan')
+        wait_s = f"  (waited {wait:.0f}s)" if wait > 1 else ""
+        print(f"  {yr:<6} [{fs:.0f}–{fe:.0f}s]{'':<4} [{xs:.0f}–{xe:.0f}s]{'':<4} [{ms:.0f}–{me:.0f}s]{wait_s}")
+
+    print(f"\n  Peak concurrent extractors : {peak_concurrent_extractors} / {max_extract_years}")
+    print(f"  Peak memory estimate       : {peak_mem_gb:.1f} GB  ({peak_concurrent_extractors} × {memory_per_extract_gb:.1f} GB/extractor)")
+    print(f"  Phase A idle (waiting for B): {network_idle_s:.0f}s  {'✓ network never stalled' if network_idle_s < 1 else '✗ Phase B is the bottleneck'}")
+    print(f"  Total wall time            : {total_wall:.0f}s  ({total_wall/3600:.2f}h)")
+
+    saturated = network_idle_s < 1
+    mem_ok = peak_mem_gb <= peak_concurrent_extractors * memory_per_extract_gb
+    if saturated:
+        print(f"  → Phase A saturates Phase B ✓  (no fetch stalls)")
+    else:
+        print(f"  → Phase B is bottleneck ✗  increase max_extract_years or reduce extract time")
+
+
 def sim_pipeline(
     fetch_s: float,
     extract_s: float,
@@ -1102,6 +1467,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--assert-ws-rss-gb",      type=float, default=None,
                    help="Fail if peak RSS during merge_strips > N GB "
                         "(expected <2 GB — O(row-group) memory, each RG ≤250 MB uncompressed)")
+    p.add_argument("--assert-local-rss-gb",   type=float, default=None,
+                   help="Fail if peak Δ-RSS during local extract pipeline > N GB "
+                        "(expected ≤O(n_workers × shard_buf) — memory-bounded sliding window)")
     p.add_argument("--assert-extract-items-s", type=float, default=None,
                    help="Fail if extract_item_to_df throughput < N items/s "
                         "(no HTTP overhead — pure CPU: SCL filter, NBAR-off band arrays, polars→arrow)")
@@ -1112,11 +1480,29 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-s1-items",    type=int, default=60,
                    help="S1 items for the S1 extract bench (default 60, ~one year of 6-day revisit)")
 
-    p.add_argument("--sim-fetch-s",   type=float, default=None)
-    p.add_argument("--sim-extract-s", type=float, default=None)
-    p.add_argument("--sim-merge-s",   type=float, default=None)
-    p.add_argument("--sim-stream-s",  type=float, default=None)
-    p.add_argument("--sim-n-strips",  type=int,   default=10)
+    p.add_argument("--local-only", action="store_true",
+                   help="Skip proxy/VM benches (duckdb_merge, compression_ratio, "
+                        "workstation_concat, workstation_e2e, sim_pipeline). "
+                        "Runs only: bench_local_extract, bench_local_fetch_memory, "
+                        "bench_local_s1_extract, bench_local_sort.")
+
+    p.add_argument("--sim-fetch-s",         type=float, default=None,
+                   help="Phase A fetch time per year (proxy VM sim)")
+    p.add_argument("--sim-extract-s",       type=float, default=None,
+                   help="Phase B extract time per year (proxy VM sim / local sim)")
+    p.add_argument("--sim-merge-s",         type=float, default=None,
+                   help="merge_tile time per year (proxy VM sim / local sim)")
+    p.add_argument("--sim-stream-s",        type=float, default=None,
+                   help="Stream time per strip (proxy VM sim only)")
+    p.add_argument("--sim-n-strips",        type=int,   default=10)
+    p.add_argument("--sim-n-years",         type=int,   default=3,
+                   help="Years to simulate in sim_local_fetch (default 3)")
+    p.add_argument("--sim-max-extract",     type=int,   default=2,
+                   help="max_extract_years cap in sim_local_fetch (default 2, matches 16 GB budget)")
+    p.add_argument("--sim-n-tiles",         type=int,   default=1,
+                   help="Tiles per year in sim_local_fetch (default 1)")
+    p.add_argument("--sim-mem-per-extract", type=float, default=4.0,
+                   help="GB held per concurrent extractor in sim_local_fetch (default 4.0)")
 
     return p.parse_args()
 
@@ -1125,25 +1511,23 @@ def main() -> None:
     args = parse_args()
     failures: list[str] = []
 
-    with tempfile.TemporaryDirectory(prefix="bench_proxy_") as _tmp:
+    with tempfile.TemporaryDirectory(prefix="bench_fetch_") as _tmp:
         tmp = Path(_tmp)
 
-        # --- DuckDB merge bench ---
-        merge_elapsed = bench_duckdb_merge(tmp / "merge", args.n_scenes, args.n_pixels)
-        if args.assert_merge_s and merge_elapsed > args.assert_merge_s:
-            failures.append(
-                f"merge took {merge_elapsed:.1f}s > {args.assert_merge_s}s"
-            )
+        if not args.local_only:
+            # --- DuckDB merge bench ---
+            merge_elapsed = bench_duckdb_merge(tmp / "merge", args.n_scenes, args.n_pixels)
+            if args.assert_merge_s and merge_elapsed > args.assert_merge_s:
+                failures.append(
+                    f"merge took {merge_elapsed:.1f}s > {args.assert_merge_s}s"
+                )
 
-        # --- Compression ratio bench ---
-        ratio = bench_compression_ratio(tmp / "compression", n_points=1_000, n_dates=args.n_dates)
-        if args.assert_compression_ratio and ratio < args.assert_compression_ratio:
-            failures.append(
-                f"compression ratio {ratio:.1f}× < {args.assert_compression_ratio}×"
-            )
-
-        # --- Build strips once, share between concat and e2e benches ---
-        strip_paths = make_strips(tmp / "ws", args.n_strips, args.n_pixels, args.ws_n_dates)
+            # --- Compression ratio bench ---
+            ratio = bench_compression_ratio(tmp / "compression", n_points=1_000, n_dates=args.n_dates)
+            if args.assert_compression_ratio and ratio < args.assert_compression_ratio:
+                failures.append(
+                    f"compression ratio {ratio:.1f}× < {args.assert_compression_ratio}×"
+                )
 
         # --- Local extract bench (CPU-only extract_item_to_df path) ---
         extract_items_s = bench_local_extract(tmp / "local_extract", args.n_pixels, args.n_items, args.extract_workers)
@@ -1152,31 +1536,55 @@ def main() -> None:
                 f"extract {extract_items_s:.1f} items/s < {args.assert_extract_items_s} items/s"
             )
 
+        # --- Local fetch memory bench (RSS profile of full extract pipeline) ---
+        local_mem = bench_local_fetch_memory(tmp / "local_mem", args.n_pixels, args.n_items, args.extract_workers)
+        if args.assert_local_rss_gb and local_mem.peak_delta_gb > args.assert_local_rss_gb:
+            failures.append(
+                f"local extract peak Δ-RSS {local_mem.peak_delta_gb:.2f} GB > {args.assert_local_rss_gb} GB"
+            )
+
         # --- S1 extract bench (_extract_s1_from_store + _sort_s1_shards) ---
         bench_local_s1_extract(tmp / "local_s1_extract", args.n_pixels, args.n_s1_items)
 
         # --- Local sort bench (workstation-only path) ---
         bench_local_sort(tmp / "local_sort", args.n_pixels, args.ws_n_dates)
 
-        # --- Workstation concat bench ---
-        mb_s = bench_workstation_concat(tmp / "concat", strip_paths, args.n_pixels, args.ws_n_dates)
-        if args.assert_concat_mb_s and mb_s < args.assert_concat_mb_s:
-            failures.append(
-                f"concat {mb_s:.0f} MB/s < {args.assert_concat_mb_s} MB/s"
+        if not args.local_only:
+            # --- Build strips once, share between concat and e2e benches ---
+            strip_paths = make_strips(tmp / "ws", args.n_strips, args.n_pixels, args.ws_n_dates)
+
+            # --- Workstation concat bench ---
+            mb_s = bench_workstation_concat(tmp / "concat", strip_paths, args.n_pixels, args.ws_n_dates)
+            if args.assert_concat_mb_s and mb_s < args.assert_concat_mb_s:
+                failures.append(
+                    f"concat {mb_s:.0f} MB/s < {args.assert_concat_mb_s} MB/s"
+                )
+
+            # --- Workstation end-to-end bench ---
+            ws = bench_workstation_e2e(tmp / "ws_e2e", strip_paths, args.n_pixels, args.ws_n_dates)
+            if args.assert_ws_frame_mb_s and ws.frame_mb_s < args.assert_ws_frame_mb_s:
+                failures.append(
+                    f"ws frame decode {ws.frame_mb_s:.0f} MB/s < {args.assert_ws_frame_mb_s} MB/s"
+                )
+            if args.assert_ws_rss_gb and ws.peak_rss_gb > args.assert_ws_rss_gb:
+                failures.append(
+                    f"ws merge peak RSS {ws.peak_rss_gb:.2f} GB > {args.assert_ws_rss_gb} GB"
+                )
+
+        # --- Local fetch simulation (workstation two-pool model) ---
+        if all(v is not None for v in [args.sim_fetch_s, args.sim_extract_s, args.sim_merge_s]) \
+                and args.sim_stream_s is None:
+            sim_local_fetch(
+                fetch_s=args.sim_fetch_s,
+                extract_s=args.sim_extract_s,
+                merge_s=args.sim_merge_s,
+                n_years=args.sim_n_years,
+                max_extract_years=args.sim_max_extract,
+                n_tiles=args.sim_n_tiles,
+                memory_per_extract_gb=args.sim_mem_per_extract,
             )
 
-        # --- Workstation end-to-end bench ---
-        ws = bench_workstation_e2e(tmp / "ws_e2e", strip_paths, args.n_pixels, args.ws_n_dates)
-        if args.assert_ws_frame_mb_s and ws.frame_mb_s < args.assert_ws_frame_mb_s:
-            failures.append(
-                f"ws frame decode {ws.frame_mb_s:.0f} MB/s < {args.assert_ws_frame_mb_s} MB/s"
-            )
-        if args.assert_ws_rss_gb and ws.peak_rss_gb > args.assert_ws_rss_gb:
-            failures.append(
-                f"ws merge peak RSS {ws.peak_rss_gb:.2f} GB > {args.assert_ws_rss_gb} GB"
-            )
-
-        # --- Pipeline simulation ---
+        # --- Proxy VM pipeline simulation ---
         if all(v is not None for v in [args.sim_fetch_s, args.sim_extract_s,
                                         args.sim_merge_s, args.sim_stream_s]):
             sim_pipeline(
@@ -1186,8 +1594,6 @@ def main() -> None:
                 stream_s=args.sim_stream_s,
                 n_strips=args.sim_n_strips,
             )
-        elif args.sim_fetch_s or args.sim_extract_s or args.sim_merge_s or args.sim_stream_s:
-            print("\n[sim_pipeline] skipped — supply all four --sim-*-s flags to run")
 
     print("\n" + "=" * 80)
     if failures:
