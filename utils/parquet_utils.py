@@ -342,8 +342,8 @@ def merge_strips(
         )
         for p in strip_paths:
             pf = pq.ParquetFile(p)
-            for rg in range(pf.metadata.num_row_groups):
-                writer.write_table(pf.read_row_group(rg))
+            for batch in pf.iter_batches():
+                writer.write_table(pa.Table.from_batches([batch]))
         writer.close()
         tmp_path.replace(out_path)
     except Exception:
