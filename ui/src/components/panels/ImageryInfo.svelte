@@ -1,11 +1,13 @@
 <script lang="ts">
   import { imageryInfo } from '../../stores/imageryInfo.svelte.ts';
   import { layerVisibility } from '../../stores/layerVisibility.svelte.ts';
+  import ToggleButton from '../shared/ToggleButton.svelte';
 
   interface Props {
     onLayerChange: (layer: string) => void;
+    bboxOpen: boolean;
   }
-  let { onLayerChange }: Props = $props();
+  let { onLayerChange, bboxOpen = $bindable(false) }: Props = $props();
 
   const LAYERS = [
     { value: 'LatestStateProgram_QGovSISPUsers', label: 'Latest aerial (QGlobe)' },
@@ -26,18 +28,42 @@
     </select>
   </div>
   <div class="irow">
-    <span class="ikey">S2 tiles</span>
-    <label class="toggle-label">
-      <input type="checkbox" bind:checked={layerVisibility.s2tiles} />
-    </label>
-  </div>
-  <div class="irow">
     <span class="ikey">captured</span>
     <span class="ival">{imageryInfo.date || ''}{#if !imageryInfo.date}<span class="dim">loading…</span>{/if}</span>
   </div>
   <div class="irow">
     <span class="ikey">dataset</span>
     <span class="ival mono">{imageryInfo.name || ''}{#if !imageryInfo.name}<span class="dim">—</span>{/if}</span>
+  </div>
+  <div class="toggle-row">
+    <button
+      class="icon-btn"
+      class:active={bboxOpen}
+      title="BBox tool"
+      type="button"
+      onclick={() => { bboxOpen = !bboxOpen; }}
+      aria-label="Toggle BBox tool"
+    >
+      <i class="ph ph-selection-plus"></i>
+    </button>
+    <ToggleButton
+      label="S2 tiles"
+      palette="secondary"
+      active={layerVisibility.s2tiles}
+      onclick={() => { layerVisibility.s2tiles = !layerVisibility.s2tiles; }}
+    />
+    <ToggleButton
+      label="Catchments"
+      palette="blue"
+      active={layerVisibility.catchments}
+      onclick={() => { layerVisibility.catchments = !layerVisibility.catchments; }}
+    />
+    <ToggleButton
+      label="Sightings"
+      palette="orange"
+      active={layerVisibility.sightings}
+      onclick={() => { layerVisibility.sightings = !layerVisibility.sightings; }}
+    />
   </div>
 </div>
 
@@ -87,6 +113,32 @@
   .ival { font-size: 12px; color: #b0b0b0; line-height: 1.3; word-break: break-word; }
   .ival.mono { font-family: monospace; font-size: 11px; }
   .dim { color: #444; font-style: italic; }
-  .toggle-label { display: flex; align-items: center; cursor: pointer; }
-  .toggle-label input { accent-color: #a78bfa; cursor: pointer; }
+  .toggle-row {
+    display: flex;
+    gap: 6px;
+    margin-top: 8px;
+    align-items: stretch;
+  }
+  .toggle-row :global(.toggle-btn) { flex: 1; }
+
+  .icon-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    flex-shrink: 0;
+    background: none;
+    border: 1px solid #444;
+    border-radius: 4px;
+    color: #666;
+    font-size: 15px;
+    cursor: pointer;
+    transition: background 0.1s, color 0.1s, border-color 0.1s;
+  }
+  .icon-btn:hover { border-color: #666; color: #aaa; }
+  .icon-btn.active {
+    background: var(--primary-dark);
+    border-color: var(--primary-border);
+    color: var(--primary-accent);
+  }
 </style>

@@ -31,6 +31,7 @@
   let mapContainer: HTMLDivElement;
   let map: MapLibreMap | null = null;
   let popup: Popup | null = null;
+  let sightingsLayerReady = $state(false);
 
   // Write our map instance into the context object provided by App.
   const mapCtx = getContext<MapContext>(MAP_KEY);
@@ -248,16 +249,20 @@
       sightings.features = geojson.features ?? [];
       sightings.totalCount = sightings.features.length;
 
+      const sightingStyle = getComputedStyle(document.documentElement);
+      const dotFill   = sightingStyle.getPropertyValue('--orange-mid').trim();
+      const dotStroke = sightingStyle.getPropertyValue('--orange-accent').trim();
       map!.addSource('sightings', { type: 'geojson', data: geojson });
       map!.addLayer({
         id: 'sightings-layer', type: 'circle', source: 'sightings',
         layout: { visibility: layerVisibility.sightings ? 'visible' : 'none' },
         paint: {
-          'circle-radius': 4, 'circle-color': '#f97316', 'circle-opacity': 0.75,
-          'circle-stroke-width': 0.5, 'circle-stroke-color': '#fff',
+          'circle-radius': 4, 'circle-color': dotFill, 'circle-opacity': 0.9,
+          'circle-stroke-width': 1, 'circle-stroke-color': dotStroke,
         },
       });
       map!.moveLayer('sightings-layer');
+      sightingsLayerReady = true;
 
       map!.on('click', 'sightings-layer', (e) => {
         const feat = e.features?.[0];
@@ -270,14 +275,17 @@
   }
 
   $effect(() => {
-    if (!map || !locationsStore.mapReady) return;
-    if (!map.getLayer('sightings-layer')) return;
-    const since = sightings.yearFilter;
-    const minYear = 1900;
-    if (since <= minYear) {
-      map.setFilter('sightings-layer', null);
+    if (!sightingsLayerReady) return;
+    const lo = sightings.yearMin;
+    const hi = sightings.yearMax;
+    if (lo <= 1900 && hi >= 2026) {
+      map!.setFilter('sightings-layer', null);
     } else {
-      map.setFilter('sightings-layer', ['>=', ['to-number', ['get', 'year']], since]);
+      map!.setFilter('sightings-layer', [
+        'all',
+        ['>=', ['to-number', ['get', 'year']], lo],
+        ['<=', ['to-number', ['get', 'year']], hi],
+      ]);
     }
   });
 
@@ -287,12 +295,14 @@
   async function loadCatchments() {
     try {
       const geojson = await fetchCatchments();
+      const style = getComputedStyle(document.documentElement);
+      const catchColor = style.getPropertyValue('--blue-accent').trim();
       map!.addSource('catchments', { type: 'geojson', data: geojson });
       const vis = layerVisibility.catchments ? 'visible' : 'none';
       map!.addLayer({ id: 'catchments-fill', type: 'fill', source: 'catchments',
-        layout: { visibility: vis }, paint: { 'fill-color': '#38bdf8', 'fill-opacity': 0.08 } });
+        layout: { visibility: vis }, paint: { 'fill-color': catchColor, 'fill-opacity': 0.08 } });
       map!.addLayer({ id: 'catchments-line', type: 'line', source: 'catchments',
-        layout: { visibility: vis }, paint: { 'line-color': '#38bdf8', 'line-width': 2, 'line-dasharray': [4, 3] } });
+        layout: { visibility: vis }, paint: { 'line-color': catchColor, 'line-width': 2, 'line-dasharray': [4, 3] } });
     } catch (err) { console.error('Failed to load catchments:', err); }
   }
 
@@ -311,12 +321,14 @@
         fetchJson('/sentinel2_tile_labels.geojson'),
       ]);
       const vis = layerVisibility.s2tiles ? 'visible' : 'none';
+      const s2Color = getComputedStyle(document.documentElement).getPropertyValue('--secondary-muted').trim();
+      const s2LabelColor = getComputedStyle(document.documentElement).getPropertyValue('--secondary-muted').trim();
       map!.addSource('s2tiles', { type: 'geojson', data: tiles });
       map!.addSource('s2tiles-centroids', { type: 'geojson', data: labels });
       map!.addLayer({ id: 's2tiles-fill', type: 'fill', source: 's2tiles',
-        layout: { visibility: vis }, paint: { 'fill-color': '#a78bfa', 'fill-opacity': 0.04 } });
+        layout: { visibility: vis }, paint: { 'fill-color': s2Color, 'fill-opacity': 0.04 } });
       map!.addLayer({ id: 's2tiles-line', type: 'line', source: 's2tiles',
-        layout: { visibility: vis }, paint: { 'line-color': '#a78bfa', 'line-width': 1, 'line-opacity': 0.6 } });
+        layout: { visibility: vis }, paint: { 'line-color': s2Color, 'line-width': 1, 'line-opacity': 0.6 } });
       map!.addLayer({ id: 's2tiles-label', type: 'symbol', source: 's2tiles-centroids',
         minzoom: 6,
         layout: {
@@ -324,7 +336,7 @@
           'text-field': ['get', 'name'], 'text-size': 11,
           'text-font': ['Noto Sans Regular'], 'text-anchor': 'center', 'text-allow-overlap': false,
         },
-        paint: { 'text-color': '#a78bfa', 'text-opacity': 0.8, 'text-halo-color': '#111', 'text-halo-width': 1 } });
+        paint: { 'text-color': s2LabelColor, 'text-opacity': 0.8, 'text-halo-color': '#111', 'text-halo-width': 1 } });
       locationsStore.s2tilesReady = true;
     } catch (err) { console.error('Failed to load S2 tiles:', err); }
   }

@@ -1,10 +1,48 @@
 :root {
-  --primary-dark:   #1e0a3c;
-  --primary-mid:    #2e1065;
-  --primary-border: #4c1d95;
-  --primary-accent: #7c3aed;
-  --primary-light:  #ede9fe;
+  --primary-dark:   #003d38;
+  --primary-mid:    #005f58;
+  --primary-border: #00857a;
+  --primary-accent: #00cfbe;
+  --primary-light:  #ccf5f2;
+
+  --secondary-dark:   #1e0a3c;
+  --secondary-mid:    #2e1065;
+  --secondary-border: #4c1d95;
+  --secondary-accent: #7c3aed;
+  --secondary-muted:  #a78bfa;
+  --secondary-light:  #ede9fe;
+
+  --blue-dark:   #082f49;
+  --blue-mid:    #0c4a6e;
+  --blue-border: #0284c7;
+  --blue-accent: #38bdf8;
+  --blue-light:  #e0f2fe;
+
+  --orange-dark:   #431407;
+  --orange-mid:    #7c2d12;
+  --orange-border: #c2410c;
+  --orange-accent: #f97316;
+  --orange-light:  #ffedd5;
 }
+
+@font-face {
+  font-family: "Phosphor";
+  src: url("/phosphor/Phosphor.woff2") format("woff2"),
+       url("/phosphor/Phosphor.woff") format("woff");
+  font-weight: normal;
+  font-style: normal;
+  font-display: block;
+}
+.ph {
+  font-family: "Phosphor" !important;
+  font-style: normal;
+  font-weight: normal;
+  font-variant: normal;
+  text-transform: none;
+  line-height: 1;
+  -webkit-font-smoothing: antialiased;
+}
+.ph.ph-selection-plus:before { content: "\e69c"; }
 
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -53,5 +91,5 @@ body {
 .role-presence  { background: #14532d; color: #86efac; }
 .role-absence   { background: #7f1d1d; color: #fca5a5; }
 .role-survey    { background: #713f12; color: #fde68a; }
-.role-location  { background: var(--primary-dark); color: var(--primary-accent); }
-.role-score-bbox { background: #3b0764; color: #d8b4fe; }
+.role-location  { background: var(--secondary-dark); color: var(--secondary-accent); }
+.role-score-bbox { background: var(--secondary-dark); color: var(--secondary-light); }

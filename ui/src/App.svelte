@@ -5,6 +5,8 @@
   import Sidebar from './components/Sidebar.svelte';
   import TrainingRegionsCard from './components/panels/TrainingRegionsCard.svelte';
   import ScoreCard from './components/shared/ScoreCard.svelte';
+  import SightingsCard from './components/panels/SightingsCard.svelte';
+  import BBoxCard from './components/panels/BBoxCard.svelte';
   import { MAP_KEY } from './lib/mapContext.ts';
   import { layerVisibility } from './stores/layerVisibility.svelte.ts';
   import { trainingSelection } from './stores/trainingSelection.svelte.ts';
@@ -18,6 +20,7 @@
 
   let mapView: MapView | null = $state(null);
   let trainingCardOpen = $state(false);
+  let bboxOpen = $state(false);
 
   function handleLayerChange(layer: string) {
     mapView?.setActiveLayer(layer);
@@ -42,12 +45,18 @@
 </script>
 
 <div class="layout">
-  <Sidebar onLayerChange={handleLayerChange} bind:trainingCardOpen={trainingCardOpen} />
+  <Sidebar onLayerChange={handleLayerChange} bind:trainingCardOpen bind:bboxOpen />
   <div class="map-wrapper">
     <MapView bind:this={mapView} ontrainingclick={handleTrainingClick} />
     <div class="map-cards">
+      {#if bboxOpen}
+        <BBoxCard onclose={() => { bboxOpen = false; }} />
+      {/if}
       {#if trainingCardOpen}
         <TrainingRegionsCard onclose={closeTrainingCard} />
+      {/if}
+      {#if layerVisibility.sightings}
+        <SightingsCard />
       {/if}
       {#if ranking.location && ranking.stem}
         {@const runs = locationsStore.rankings[ranking.location] ?? []}

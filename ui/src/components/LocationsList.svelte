@@ -95,7 +95,7 @@
   }
 
   .loc-item:hover { background: #2a2a2a; }
-  .loc-item.active > .loc-row { color: var(--primary-accent, #4ade80); }
+  .loc-item.active > .loc-row { color: var(--primary-accent); }
 
   .loc-row {
     display: flex;
@@ -164,6 +164,6 @@
 
   .run-item.run-active .run-chip {
     background: #1a3a2a;
-    color: var(--primary-accent, #4ade80);
+    color: var(--primary-accent);
   }
 </style>

@@ -1,7 +1,4 @@
 <script lang="ts">
-  import BBoxPanel from './panels/BBoxPanel.svelte';
-  import Catchments from './panels/Catchments.svelte';
-  import ALASightings from './panels/ALASightings.svelte';
   import ImageryInfo from './panels/ImageryInfo.svelte';
   import LocationsList from './LocationsList.svelte';
   import { locationsStore } from '../stores/locations.svelte.ts';
@@ -9,8 +6,9 @@
   interface Props {
     onLayerChange: (layer: string) => void;
     trainingCardOpen: boolean;
+    bboxOpen: boolean;
   }
-  let { onLayerChange, trainingCardOpen = $bindable(false) }: Props = $props();
+  let { onLayerChange, trainingCardOpen = $bindable(false), bboxOpen = $bindable(false) }: Props = $props();
 
   const trainingCount = $derived(
     locationsStore.geojson?.features.filter(f => f.properties.parent_id === 'training').length ?? 0
@@ -22,7 +20,6 @@
     <img src="/logo-560.png" alt="Parkinsonia Navigator 2026" class="logo" />
   </div>
   <div class="scroll-area">
-    <BBoxPanel />
     <button
       class="sidebar-row"
       class:active={trainingCardOpen}
@@ -31,12 +28,10 @@
     >
       Training regions{trainingCount > 0 ? ` (${trainingCount})` : ''}
     </button>
-    <Catchments />
-    <ALASightings />
     <LocationsList />
   </div>
   <div class="bottom-panels">
-    <ImageryInfo {onLayerChange} />
+    <ImageryInfo {onLayerChange} bind:bboxOpen />
   </div>
 </aside>
 
@@ -91,5 +86,5 @@
   }
 
   .sidebar-row:hover { background: #2e2e2e; }
-  .sidebar-row.active { color: var(--primary-accent, #4ade80); }
+  .sidebar-row.active { color: var(--primary-accent); }
 </style>

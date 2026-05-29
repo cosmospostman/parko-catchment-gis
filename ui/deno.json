@@ -1,6 +1,7 @@
 {
   "nodeModulesDir": "auto",
   "imports": {
+    "@phosphor-icons/web": "npm:@phosphor-icons/web@^2.1.2",
     "@std/yaml": "jsr:@std/yaml",
     "@std/path": "jsr:@std/path",
     "@std/http/file-server": "jsr:@std/http/file-server",
