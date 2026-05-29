@@ -36,6 +36,7 @@ def fetch_tile_local(
     items=None,
     calibration_out: Path | None = None,
     point_id_prefix: str = "px",
+    work_dir: Path | None = None,
 ) -> list[Path] | None:
     """Fetch one tile×year locally using the same pipeline as the proxy VM.
 
@@ -53,6 +54,9 @@ def fetch_tile_local(
         Shapely geometry defining the area of interest.
     out_dir:
         Root output directory.  Strips land at out_dir/year/tile_id/strip_NNNN.parquet.
+    work_dir:
+        Root directory for temporary working data (_work, .tmp files).  Defaults
+        to out_dir so behaviour is unchanged when not specified.
     items:
         Optional pre-fetched STAC item list (training pipeline).
     calibration_out:
@@ -75,8 +79,10 @@ def fetch_tile_local(
 
     tile_dir.mkdir(parents=True, exist_ok=True)
 
+    _work_root = (work_dir / str(year) / tile_id) if work_dir is not None else tile_dir
+
     # Clean up incomplete writes from a prior interrupted run.
-    for p in tile_dir.glob("strip_????.tmp"):
+    for p in _work_root.glob("strip_????.tmp"):
         p.unlink(missing_ok=True)
 
     # Determine resume point from contiguous existing strips.
@@ -95,7 +101,7 @@ def fetch_tile_local(
 
     received_strips: list[Path] = list(complete_strips)
 
-    pipeline_tmp = tile_dir / "_work"
+    pipeline_tmp = _work_root / "_work"
     pipeline_tmp.mkdir(parents=True, exist_ok=True)
 
     for strip_idx, strip_path in run_tile_pipeline(
@@ -114,7 +120,7 @@ def fetch_tile_local(
         point_id_prefix=point_id_prefix,
     ):
         dest     = tile_dir / f"strip_{strip_idx:04d}.parquet"
-        dest_tmp = tile_dir / f"strip_{strip_idx:04d}.tmp"
+        dest_tmp = _work_root / f"strip_{strip_idx:04d}.tmp"
         shutil.copy2(strip_path, dest_tmp)
         dest_tmp.replace(dest)
         strip_path.unlink(missing_ok=True)

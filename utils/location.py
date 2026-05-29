@@ -262,6 +262,7 @@ class Location:
         proxy_url: Optional[str] = None,
         tiles: Optional[list[str]] = None,
         output_dir: Optional[Path] = None,
+        work_dir: Optional[Path] = None,
     ) -> list[Path]:
         """Fetch Sentinel-2 and Sentinel-1 pixel observations for this location.
 
@@ -295,7 +296,8 @@ class Location:
         _max_extract = _params["max_extract_years"]
         _strip_px    = _params["strip_height_px"] or 1024
 
-        out_dir = (output_dir / self.id) if output_dir is not None else (_PROJECT_ROOT / "data" / "pixels" / self.id)
+        out_dir  = (output_dir / self.id) if output_dir is not None else (_PROJECT_ROOT / "data" / "pixels" / self.id)
+        _work_dir = (work_dir / self.id) if work_dir is not None else None
 
         _cal_out: Path | None = None
         if len(self.tile_ids()) > 1:
@@ -326,6 +328,7 @@ class Location:
                         strip_height_px=_strip_px,
                         n_workers=n_workers,
                         calibration_out=_cal_out,
+                        work_dir=_work_dir,
                     ): year
                     for year in years
                 }

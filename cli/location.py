@@ -690,6 +690,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     print(file=sys.stderr)
 
     output_dir = Path(args.output_dir) if args.output_dir else None
+    work_dir   = Path(args.work_dir) if getattr(args, "work_dir", None) else None
 
     t0 = time.monotonic()
     try:
@@ -701,6 +702,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
             proxy_url=getattr(args, "proxy", None),
             tiles=getattr(args, "tiles", None),
             output_dir=output_dir,
+            work_dir=work_dir,
         )
     except KeyboardInterrupt:
         print(file=sys.stderr)
@@ -984,9 +986,12 @@ def main() -> None:
                     help="Proxy VM URL (e.g. http://localhost:8765). "
                          "Routes extraction to the VM; only compressed parquet is transferred.")
     pf.add_argument("--output-dir", type=str, default="/mnt/external/mitchell", metavar="DIR",
-                    help="Root directory for output tile parquets (default: /mnt/external/mitchell). "
-                         "Parquets are written to <DIR>/<location_id>/<year>/<tile_id>.parquet. "
-                         "Temporary working data stays under /data/pixels/<id>.")
+                    help="Root directory for final strip parquets (default: /mnt/external/mitchell). "
+                         "Strips are written to <DIR>/<location_id>/<year>/<tile_id>/strip_NNNN.parquet.")
+    pf.add_argument("--work-dir", type=str, default="/data/mitchell", metavar="DIR",
+                    help="Root directory for temporary working data (default: /data/mitchell). "
+                         "Should be on fast local storage (NVMe). "
+                         "Defaults to --output-dir if not set.")
 
     pv = sub.add_parser("validate", help="Validate parquet data quality for a location")
     pv.add_argument("id", help="Location id (e.g. longreach, flinders0)")
