@@ -30,10 +30,9 @@ def search_sentinel2(
 ) -> List[Any]:
     """Search a STAC endpoint for Sentinel-2 items.
 
-    mgrs_tile, if supplied, filters client-side on item.properties["s2:mgrs_tile"]
-    so only scenes from that exact MGRS tile are returned (no adjacent-tile overlap).
-    Client-side filtering is used because earth-search v1 uses CQL2 and silently
-    returns 0 results when the legacy `query` extension receives unknown fields.
+    mgrs_tile, if supplied, filters client-side on item.properties["grid:code"]
+    (earth-search v1 encodes the MGRS tile as "MGRS-<tile>" in grid:code rather
+    than s2:mgrs_tile) so only scenes from that exact tile are returned.
     """
     import pystac_client
 
@@ -51,9 +50,11 @@ def search_sentinel2(
     logger.info("S2 STAC search: %d items found (pre-filter)", len(items))
 
     if mgrs_tile is not None:
+        # earth-search v1 uses grid:code = "MGRS-<tile>" rather than s2:mgrs_tile
+        target = f"MGRS-{mgrs_tile}"
         items = [
             it for it in items
-            if it.properties.get("s2:mgrs_tile") == mgrs_tile
+            if it.properties.get("grid:code") == target
         ]
         logger.info("S2 STAC search: %d items after mgrs_tile=%s filter", len(items), mgrs_tile)
 
