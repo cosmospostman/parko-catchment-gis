@@ -26,16 +26,25 @@ def search_sentinel2(
     endpoint: str,
     collection: str,
     max_items: Optional[int] = None,
+    mgrs_tile: Optional[str] = None,
 ) -> List[Any]:
-    """Search a STAC endpoint for Sentinel-2 items."""
+    """Search a STAC endpoint for Sentinel-2 items.
+
+    mgrs_tile, if supplied, is passed as a server-side filter on s2:mgrs_tile
+    so only scenes from that exact MGRS tile are returned (no adjacent-tile overlap).
+    """
     import pystac_client
+
+    query: Dict[str, Any] = {"eo:cloud_cover": {"lt": cloud_cover_max}}
+    if mgrs_tile is not None:
+        query["s2:mgrs_tile"] = {"eq": mgrs_tile}
 
     catalog = pystac_client.Client.open(endpoint)
     search = catalog.search(
         collections=[collection],
         bbox=bbox,
         datetime=f"{start}/{end}",
-        query={"eo:cloud_cover": {"lt": cloud_cover_max}},
+        query=query,
         max_items=max_items,
     )
     items = list(search.items())

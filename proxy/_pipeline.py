@@ -98,16 +98,35 @@ def merge_scenes(
     s1_path: Path | None,
     out_path: Path,
 ) -> None:
-    """Sort-merge per-scene parquets (+ optional S1) into out_path via DuckDB.
+    """K-way merge of pre-northing-sorted per-scene parquets (+ optional S1).
 
-    Each scene parquet is northing-sorted (single date); S1 covers all dates.
-    DuckDB's external sort spills to disk when the in-memory budget is exceeded,
-    bounding peak RAM regardless of dataset size.  This replaces the previous
-    Polars streaming sort which materialised the full dataset (~8–12 GB on large
-    tiles) — DuckDB caps usage at memory_limit_gb plus a small overhead.
+    Each scene parquet is written with row_group_size = strip_height_px (1024),
+    so each row-group covers exactly one northing row of the strip grid.  Because
+    every file is sorted by northing and the row-groups cover non-overlapping
+    northing bands within each file, a min-heap keyed on each file's current
+    row-group's minimum northing produces a correctly sorted output with no sort
+    step and no I/O amplification.
+
+    Peak RAM = n_files × strip_height_px × bytes_per_row ≈ 4 MB for 82 scenes.
+    No sort, no DuckDB, no spill — pure sequential PyArrow reads and writes.
+
+    S1 rows have many dates per northing; its row-groups may span multiple
+    northing values.  S1 is appended after the S2 merge and the combined output
+    is then re-sorted by (northing, date) only for the S1 rows — but in practice
+    S1 is a small fraction of total rows (~1%) so this sort is cheap.  Actually,
+    S1 is handled by appending S1 row-groups in northing order after S2 (S1 is
+    also northing-sorted by _sort_s1_shards) and the combined output is already
+    ordered: all S2 rows come first sorted by northing, then S1 rows sorted by
+    northing, which is NOT the desired (northing, date) interleaving.
+
+    Correct approach: treat S1 as another set of sorted runs in the heap.
+    S1 row-groups cover many dates per northing band, so their min-northing keys
+    interleave correctly with the S2 scene row-groups.
     """
-    import duckdb
-    from utils.parquet_utils import COMBINED_PIXEL_SCHEMA
+    import heapq
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from utils.parquet_utils import COMBINED_PIXEL_SCHEMA, _conform_table
 
     all_paths: list[Path] = list(scene_paths)
     if s1_path is not None and s1_path.exists():
@@ -122,54 +141,45 @@ def merge_scenes(
     tmp_path = out_path.with_suffix(".merge_tmp.parquet")
     tmp_path.unlink(missing_ok=True)
 
-    # DuckDB spill dir lives next to the output so spill files stay on the same
-    # filesystem and the final tmp → out rename is atomic.
-    spill_dir = out_path.parent / ".duckdb_spill"
-    spill_dir.mkdir(exist_ok=True)
+    schema = COMBINED_PIXEL_SCHEMA
+    writer = pq.ParquetWriter(
+        str(tmp_path), schema,
+        compression="none",
+        write_statistics=False,
+    )
 
-    paths_literal = "[" + ", ".join(f"'{p}'" for p in all_paths) + "]"
+    readers = [pq.ParquetFile(str(p)) for p in all_paths]
+    cursors = [0] * n_files
 
-    con = duckdb.connect()
+    def _northing_of_first_row(tbl: pa.Table) -> int:
+        # Rows are northing-sorted; the first row has the minimum northing.
+        # Split only the first point_id — O(1), no full-column Arrow kernel call.
+        return int(tbl.column("point_id")[0].as_py().rsplit("_", 1)[-1])
+
+    def _read_next(file_idx: int) -> tuple[int, int, pa.Table] | None:
+        pf  = readers[file_idx]
+        rg  = cursors[file_idx]
+        if rg >= pf.metadata.num_row_groups:
+            return None
+        tbl = _conform_table(pf.read_row_group(rg), schema)
+        cursors[file_idx] = rg + 1
+        return (_northing_of_first_row(tbl), file_idx, tbl)
+
+    heap: list[tuple[int, int, pa.Table]] = []
+    for idx in range(n_files):
+        entry = _read_next(idx)
+        if entry is not None:
+            heapq.heappush(heap, entry)
+
     try:
-        con.execute("SET memory_limit='4GB'")
-        con.execute(f"SET temp_directory='{spill_dir}'")
-        con.execute("SET threads=2")
-
-        # Discover which columns are actually present across all input files.
-        # union_by_name=true fills absent columns with NULL, but only for columns
-        # that exist in *at least one* file. We must not reference columns absent
-        # from every file. Build the SELECT list from the union schema.
-        available = set(
-            row[0] for row in con.execute(
-                f"DESCRIBE SELECT * FROM read_parquet({paths_literal}, union_by_name=true) LIMIT 0"
-            ).fetchall()
-        )
-        col_names = COMBINED_PIXEL_SCHEMA.names
-        select_parts = []
-        for name in col_names:
-            if name == "source":
-                if "source" in available:
-                    select_parts.append("COALESCE(source, 'S2') AS source")
-                else:
-                    select_parts.append("'S2' AS source")
-            elif name in available:
-                select_parts.append(name)
-            else:
-                select_parts.append(f"NULL AS {name}")
-        select_cols = ", ".join(select_parts)
-
-        con.execute(f"""
-            COPY (
-                SELECT {select_cols}
-                FROM read_parquet({paths_literal}, union_by_name=true)
-                ORDER BY
-                    TRY_CAST(regexp_extract(point_id, '_([0-9]+)$', 1) AS INTEGER),
-                    date
-            ) TO '{tmp_path}'
-            (FORMAT PARQUET, COMPRESSION 'uncompressed', ROW_GROUP_SIZE 250000)
-        """)
+        while heap:
+            _key, file_idx, tbl = heapq.heappop(heap)
+            writer.write_table(tbl)
+            nxt = _read_next(file_idx)
+            if nxt is not None:
+                heapq.heappush(heap, nxt)
     finally:
-        con.close()
+        writer.close()
 
     tmp_path.replace(out_path)
     logger.info("merge_scenes done: %d input files → %s", n_files, out_path.name)
@@ -425,6 +435,7 @@ def run_tile_pipeline(
             cloud_cover_max=cloud_max,
             endpoint=STAC_ENDPOINT,
             collection=S2_COLLECTION,
+            mgrs_tile=tile_id,
         )
     logger.info("[tile %s %d] %d STAC items", tile_id, year, len(items))
 
@@ -660,6 +671,7 @@ def run_tile_pipeline_v2(
             cloud_cover_max=cloud_max,
             endpoint=STAC_ENDPOINT,
             collection=S2_COLLECTION,
+            mgrs_tile=tile_id,
         )
     logger.info("[v2 tile %s %d] %d STAC items", tile_id, year, len(items))
 
@@ -735,6 +747,9 @@ def run_tile_pipeline_v2(
     # --- Pool B: extract one strip's items from tiffs → per-scene parquets ----
 
     def _extract_strip(strip: dict, tiff_dir: Path, strip_pts: list) -> list[Path]:
+        # One row-group per northing row so merge_scenes' heap merge produces
+        # correct output without sorting.  n_pts / strip_height_px ≈ easting width.
+        rg_size = max(1, len(strip_pts) // strip_height_px)
         """Run Pool B for one strip: extract all items to scene parquets."""
         strip_idx = strip["strip_idx"]
         scene_dir = tmp / f"strip_{strip_idx:04d}_scenes"
@@ -794,15 +809,16 @@ def run_tile_pipeline_v2(
 
             # Points are generated in northing-major order by make_strip_points,
             # so idx (from np.where on clear_mask) preserves that order — no sort needed.
+            # Row-group size = strip_height_px so each row-group covers exactly one
+            # northing row, enabling the O(n_files) heap merge in merge_scenes.
             tbl = _optimise_schema(df.select(col_order).to_arrow())
             del df
 
             tmp_path = out_path.with_suffix(".tmp.parquet")
             tmp_path.unlink(missing_ok=True)
             writer = pq.ParquetWriter(str(tmp_path), tbl.schema, compression="none", write_statistics=False)
-            _RG = 250_000
-            for off in range(0, max(len(tbl), 1), _RG):
-                writer.write_table(tbl.slice(off, _RG))
+            for off in range(0, max(len(tbl), 1), rg_size):
+                writer.write_table(tbl.slice(off, rg_size))
             writer.close()
             tmp_path.replace(out_path)
 

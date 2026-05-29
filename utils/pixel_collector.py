@@ -293,15 +293,19 @@ def _extract_item_from_tiffs(
     angles = None
     if apply_nbar:
         from utils.granule_angles import get_item_angles
-        from utils.nbar import c_factor as compute_cf
+        from utils.nbar import c_factor_rad as compute_cf_rad
         angles = get_item_angles(item, lons, lats, utm_crs=utm_crs, bands=list(BANDS), utm_xy=utm_xy)
         if angles is not None:
+            # Convert degrees → radians once per scene; reused across all bands.
+            _first = next(iter(angles.values()))
+            sza_rad = np.deg2rad(_first["sza"])
             for band in BANDS:
                 if band not in angles or band_arrays[band] is None:
                     continue
                 a = angles[band]
-                raa = a["saa"] - a["vaa"]
-                cf = compute_cf(a["sza"], a["vza"], raa, band)
+                vza_rad = np.deg2rad(a["vza"])
+                raa_rad = np.deg2rad(a["saa"] - a["vaa"])
+                cf = compute_cf_rad(sza_rad, vza_rad, raa_rad, band)
                 corrected = np.clip(band_arrays[band] * cf, 0.0, 1.0)
                 band_arrays[band] = np.where(np.isnan(cf), band_arrays[band], corrected)
 
@@ -333,7 +337,7 @@ def _extract_item_from_tiffs(
         return None
 
     return pl.DataFrame({
-        "point_id":    list(np.array(point_ids)[idx]),
+        "point_id":    [point_ids[i] for i in idx],
         "lon":         lons[idx].astype(np.float64),
         "lat":         lats[idx].astype(np.float64),
         "date":        pl.Series([item_date] * n_clear),

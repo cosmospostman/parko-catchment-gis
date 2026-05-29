@@ -25,7 +25,6 @@ from functools import lru_cache
 import numpy as np
 import requests
 from pyproj import Transformer
-from scipy.interpolate import RegularGridInterpolator
 
 logger = logging.getLogger(__name__)
 
@@ -221,21 +220,34 @@ def get_item_angles(
         to_utm = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
         px_e, px_n = to_utm.transform(lons, lats)
 
-    # Clip query points to the grid extent (avoids extrapolation errors on edge pixels)
-    px_e_clipped = np.clip(px_e, grid_eastings[0],  grid_eastings[-1])
-    px_n_clipped = np.clip(px_n, grid_northings[-1], grid_northings[0])
+    # Precompute fractional grid indices once for all N points.
+    # grid_northings is descending so we flip to ascending for np.interp.
+    n_n = len(grid_northings)
+    n_e = len(grid_eastings)
+    grid_northings_asc = grid_northings[::-1]  # ascending copy
+
+    # np.interp clamps to [0, n-1] when out-of-bounds — equivalent to nearest
+    # extrapolation, matching the old fill_value=None behaviour.
+    i_f = np.interp(px_n, grid_northings_asc, np.arange(n_n, dtype=np.float64))
+    j_f = np.interp(px_e, grid_eastings,      np.arange(n_e, dtype=np.float64))
+
+    i0 = np.clip(np.floor(i_f).astype(np.intp), 0, n_n - 2)
+    j0 = np.clip(np.floor(j_f).astype(np.intp), 0, n_e - 2)
+    di = (i_f - i0).astype(np.float32)
+    dj = (j_f - j0).astype(np.float32)
+    di1 = 1.0 - di
+    dj1 = 1.0 - dj
 
     def _interp(grid_2d: np.ndarray) -> np.ndarray:
-        # RegularGridInterpolator expects axes in ascending order.
-        # northings are descending, so flip rows and the axis.
-        interp = RegularGridInterpolator(
-            (grid_northings[::-1], grid_eastings),
-            grid_2d[::-1, :],
-            method="linear",
-            bounds_error=False,
-            fill_value=None,  # nearest extrapolation outside bounds
+        # grid_2d is row-major with rows in descending-northing order; flip to
+        # ascending so row index 0 corresponds to the smallest northing (south).
+        g = grid_2d[::-1, :].astype(np.float32)
+        return (
+            g[i0,   j0  ] * di1 * dj1 +
+            g[i0+1, j0  ] * di  * dj1 +
+            g[i0,   j0+1] * di1 * dj  +
+            g[i0+1, j0+1] * di  * dj
         )
-        return interp(np.column_stack([px_n_clipped, px_e_clipped])).astype(np.float32)
 
     # Solar angles are granule-wide (single grid)
     sza_all = _interp(parsed["sun_zen"])

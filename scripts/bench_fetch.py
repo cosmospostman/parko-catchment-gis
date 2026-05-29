@@ -115,28 +115,49 @@ def probe(tag: str, rows: int | None = None, extra: str = "") -> None:
 # Synthetic data helpers
 # ---------------------------------------------------------------------------
 
-def _make_scene_parquet(path: Path, scene_id: str, n_points: int, n_dates: int = 1) -> Path:
-    """Write one per-scene parquet (sorted by northing, ZSTD, dict on point_id)."""
+def _make_scene_parquet(
+    path: Path, scene_id: str, n_points: int, n_dates: int = 1,
+    rg_size: int | None = None,
+) -> Path:
+    """Write one per-scene parquet (sorted by northing, ZSTD, dict on point_id).
+
+    rg_size: row-group size.  Use n_points // strip_height_px so each row-group
+    covers exactly one northing row — required by the merge_scenes heap merge.
+    Defaults to n_points (one row-group) when None.
+    """
     from datetime import timedelta
+
+    # Build northing-major point_ids: px_{easting:04d}_{northing:04d}
+    # With rg_size rows per group, easting cycles 0..rg_size-1 within each northing.
+    _rg = rg_size or n_points
     _base = date(2022, 1, 1)
-    rows = []
-    for d_idx in range(n_dates):
-        d = _base + timedelta(days=d_idx)
-        for i in range(n_points):
-            rows.append({
-                "point_id": f"px_{i:04d}_0000",
-                "lon":       float(145.41 + i * 0.0001),
-                "lat":       float(-22.81 + i * 0.0001),
-                "date":      d,
-                "item_id":   scene_id,
-                "tile_id":   "55HBU",
-                "source":    "S2",
-                "scl_purity": 100,
-                "scl":        4,
-                "aot":        80,
-                "view_zenith": 90,
-                "sun_zenith":  80,
-            })
+
+    # Build northing-major point_ids vectorised — no Python row loops.
+    # Northing index = point_index // _rg, easting = point_index % _rg.
+    pt_idx    = np.arange(n_points, dtype=np.int32)
+    northings = pt_idx // _rg
+    eastings  = pt_idx % _rg
+
+    # Repeat each point across n_dates (northing-major, date-minor)
+    northings = np.tile(northings, n_dates)
+    eastings  = np.tile(eastings,  n_dates)
+    n_rows    = n_points * n_dates
+
+    point_ids = pa.array(
+        [f"px_{e:04d}_{n:04d}" for e, n in zip(eastings.tolist(), northings.tolist())],
+        type=pa.string(),
+    )
+
+    date_epoch = date(1970, 1, 1).toordinal()
+    import datetime as _dt_mod
+    dates_arr = pa.array(
+        np.tile(
+            np.array([(_base + _dt_mod.timedelta(days=d)).toordinal() - date_epoch
+                      for d in range(n_dates)], dtype=np.int32),
+            n_points,
+        ),
+        type=pa.date32(),
+    )
 
     schema_fields = [
         pa.field("point_id",    pa.string()),
@@ -154,12 +175,26 @@ def _make_scene_parquet(path: Path, scene_id: str, n_points: int, n_dates: int =
     ]
     for band in BANDS:
         schema_fields.append(pa.field(band, pa.uint16()))
-
     schema = pa.schema(schema_fields)
-    tbl = pa.Table.from_pylist(rows, schema=schema)
+
+    arrays = {
+        "point_id":    point_ids,
+        "lon":         pa.array(np.full(n_rows, 145.41, dtype=np.float32)),
+        "lat":         pa.array(np.full(n_rows, -22.81, dtype=np.float32)),
+        "date":        dates_arr,
+        "item_id":     pa.array([scene_id] * n_rows, pa.string()),
+        "tile_id":     pa.array(["55HBU"] * n_rows, pa.string()),
+        "source":      pa.array(["S2"] * n_rows, pa.string()),
+        "scl_purity":  pa.array(np.full(n_rows, 100, dtype=np.int8)),
+        "scl":         pa.array(np.full(n_rows, 4,   dtype=np.int8)),
+        "aot":         pa.array(np.full(n_rows, 80,  dtype=np.uint8)),
+        "view_zenith": pa.array(np.full(n_rows, 90,  dtype=np.uint8)),
+        "sun_zenith":  pa.array(np.full(n_rows, 80,  dtype=np.uint8)),
+        **{band: pa.array(np.full(n_rows, 1000, dtype=np.uint16)) for band in BANDS},
+    }
+    tbl = pa.table(arrays, schema=schema)
     path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(tbl, path, compression="zstd",
-                   use_dictionary=["point_id", "item_id", "tile_id"])
+    pq.write_table(tbl, path, compression="none", row_group_size=_rg)
     return path
 
 
@@ -221,17 +256,30 @@ def _make_sorted_parquet(path: Path, n_points: int, n_dates: int) -> Path:
 # bench_duckdb_merge
 # ---------------------------------------------------------------------------
 
-def bench_duckdb_merge(tmp: Path, n_scenes: int, n_pixels: int) -> float:
-    from proxy._pipeline import merge_scenes
+def bench_merge(tmp: Path, n_scenes: int, n_pixels: int, strip_height: int = 1024) -> float:
+    """Benchmark merge_scenes with realistic row-group sizing.
 
-    print(f"\n[bench_duckdb_merge]  n_scenes={n_scenes}  n_pixels={n_pixels}")
+    Each scene parquet uses row_group_size = n_pixels // strip_height so that
+    each row-group covers exactly one northing row — the invariant the heap merge
+    relies on.  Verifies sort correctness after merging.
+    """
+    from proxy._pipeline import merge_scenes
+    import pyarrow.compute as pc
+
+    rg_size = max(1, n_pixels // strip_height)
+    print(f"\n[bench_merge]  n_scenes={n_scenes}  n_pixels={n_pixels}  "
+          f"strip_height={strip_height}  rg_size={rg_size}")
     scene_dir = tmp / "scenes"
     scene_paths = []
     t_make = time.perf_counter()
     for i in range(n_scenes):
-        p = _make_scene_parquet(scene_dir / f"scene_{i:04d}.parquet", f"scene_{i:04d}", n_pixels)
+        p = _make_scene_parquet(
+            scene_dir / f"scene_{i:04d}.parquet", f"scene_{i:04d}",
+            n_pixels, rg_size=rg_size,
+        )
         scene_paths.append(p)
-    print(f"  scene parquets created in {time.perf_counter() - t_make:.1f}s")
+    print(f"  scene parquets created in {time.perf_counter() - t_make:.1f}s  "
+          f"({pq.ParquetFile(scene_paths[0]).metadata.num_row_groups} rg/scene)")
 
     total_rows = sum(pq.ParquetFile(p).metadata.num_rows for p in scene_paths)
     probe("merge:start", rows=total_rows)
@@ -244,7 +292,18 @@ def bench_duckdb_merge(tmp: Path, n_scenes: int, n_pixels: int) -> float:
     actual_rows = pq.ParquetFile(out).metadata.num_rows
     size_mb = out.stat().st_size / 1e6
     probe("merge:done", rows=actual_rows, extra=f"{size_mb:.0f}MB  {elapsed:.1f}s")
-    print(f"  DuckDB merge: {elapsed:.1f}s  ({total_rows:,} rows → {size_mb:.0f} MB)")
+    print(f"  heap merge: {elapsed:.1f}s  ({total_rows:,} rows → {size_mb:.0f} MB)")
+
+    # Verify sort order — northing extracted from point_id must be non-decreasing.
+    result = pq.read_table(out)
+    struct_col = pc.extract_regex(result.column("point_id"), pattern=r"_(?P<n>[0-9]+)$")
+    northings = pc.cast(pc.struct_field(struct_col, "n"), pa.int32(), safe=False)
+    diffs = pc.subtract(northings[1:], northings[:-1])
+    n_violations = pc.sum(pc.cast(pc.less(diffs, 0), pa.int32())).as_py()
+    if n_violations == 0:
+        print(f"  sort order: OK (northing non-decreasing)")
+    else:
+        print(f"  sort order: FAIL ({n_violations} out-of-order northing transitions)")
 
     gc.collect()
     return elapsed
@@ -1442,6 +1501,10 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Fetch-proxy pipeline benchmark")
     p.add_argument("--n-scenes",   type=int, default=85,   help="S2 scenes per strip (default 85)")
     p.add_argument("--strip-px",   type=int, default=1024, help="Strip height in pixels (default 1024)")
+    p.add_argument("--merge-strip-height", type=int, default=None,
+                   help="Northing rows in the bench_merge test strip (default: strip-px). "
+                        "Set to n_pixels//strip_width to get realistic rg_size. "
+                        "E.g. --n-pixels 330200 --merge-strip-height 50 → rg_size=6604.")
     p.add_argument("--n-pixels",   type=int, default=57_000, help="Pixels per strip (default 57000)")
     p.add_argument("--n-strips",   type=int, default=11,   help="Strips per tile for concat bench (default 11)")
     p.add_argument("--n-dates",    type=int, default=90,   help="Dates per pixel for compression bench (default 90)")
@@ -1515,8 +1578,9 @@ def main() -> None:
         tmp = Path(_tmp)
 
         if not args.local_only:
-            # --- DuckDB merge bench ---
-            merge_elapsed = bench_duckdb_merge(tmp / "merge", args.n_scenes, args.n_pixels)
+            # --- Heap merge bench ---
+            merge_strip_height = args.merge_strip_height or args.strip_px
+            merge_elapsed = bench_merge(tmp / "merge", args.n_scenes, args.n_pixels, merge_strip_height)
             if args.assert_merge_s and merge_elapsed > args.assert_merge_s:
                 failures.append(
                     f"merge took {merge_elapsed:.1f}s > {args.assert_merge_s}s"

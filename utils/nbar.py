@@ -121,6 +121,29 @@ def c_factor(
     vza = np.deg2rad(vza_deg)
     raa = np.deg2rad(raa_deg)
 
+    return _c_factor_rad(sza, vza, raa, coef)
+
+
+def c_factor_rad(
+    sza_rad: np.ndarray,
+    vza_rad: np.ndarray,
+    raa_rad: np.ndarray,
+    band: str,
+) -> np.ndarray:
+    """Like c_factor() but accepts inputs already in radians.
+
+    Use this when processing multiple bands with shared angle arrays to avoid
+    redundant deg2rad conversions.
+    """
+    return _c_factor_rad(sza_rad, vza_rad, raa_rad, BRDF_COEFFICIENTS[band])
+
+
+def _c_factor_rad(
+    sza: np.ndarray,
+    vza: np.ndarray,
+    raa: np.ndarray,
+    coef: dict,
+) -> np.ndarray:
     target_sza = np.full_like(sza, np.deg2rad(TARGET_SZA_DEG))
     target_vza = np.zeros_like(sza)
     target_raa = np.zeros_like(sza)
@@ -128,7 +151,6 @@ def c_factor(
     brdf_target = _brdf(target_sza, target_vza, target_raa, **coef)
     brdf_obs    = _brdf(sza, vza, raa, **coef)
 
-    # Guard against degenerate BRDF (near-zero denominator)
     safe_denom = np.where(brdf_obs < 1e-6, 1.0, brdf_obs)
     cf = brdf_target / safe_denom
 

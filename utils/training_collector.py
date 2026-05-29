@@ -167,6 +167,7 @@ def _fetch_tile_items(
         cloud_cover_max=cloud_max,
         endpoint=_STAC_ENDPOINT,
         collection=_S2_COLLECTION,
+        mgrs_tile=tile_id,
     )
     if not raw:
         raise RuntimeError(f"No STAC items found for tile {tile_id} — check bboxes and date range")
