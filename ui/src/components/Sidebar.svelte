@@ -2,8 +2,6 @@
   import BBoxPanel from './panels/BBoxPanel.svelte';
   import Catchments from './panels/Catchments.svelte';
   import ALASightings from './panels/ALASightings.svelte';
-  import S1Renderer from './panels/S1Renderer.svelte';
-  import NoiseFilter from './panels/NoiseFilter.svelte';
   import ImageryInfo from './panels/ImageryInfo.svelte';
   import LocationsList from './LocationsList.svelte';
   import { locationsStore } from '../stores/locations.svelte.ts';
@@ -21,7 +19,7 @@
 
 <aside class="sidebar">
   <div class="sidebar-header">
-    <h1>🌿 Parko GIS</h1>
+    <img src="/logo-560.png" alt="Parkinsonia Navigator 2026" class="logo" />
   </div>
   <div class="scroll-area">
     <BBoxPanel />
@@ -35,8 +33,6 @@
     </button>
     <Catchments />
     <ALASightings />
-    <S1Renderer />
-    <NoiseFilter />
     <LocationsList />
   </div>
   <div class="bottom-panels">
@@ -57,19 +53,15 @@
   }
 
   .sidebar-header {
-    padding: 10px 14px;
     border-bottom: 1px solid #333;
-    display: flex;
-    align-items: center;
-    gap: 8px;
     flex-shrink: 0;
   }
 
-  .sidebar-header h1 {
-    font-size: 14px;
-    font-weight: 600;
-    letter-spacing: 0.02em;
-    color: #f0f0f0;
+  .logo {
+    width: 100%;
+    display: block;
+    user-select: none;
+    pointer-events: none;
   }
 
   .scroll-area {

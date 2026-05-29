@@ -3,6 +3,5 @@ export const layerVisibility = $state({
   catchments: false,
   s2tiles: false,
   sightings: false,
-  s1: true,
   noise: false,
 });

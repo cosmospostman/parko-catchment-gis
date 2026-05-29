@@ -213,12 +213,6 @@
 
   $effect(() => {
     if (!map || !locationsStore.mapReady) return;
-    const vis = layerVisibility.s1 ? 'visible' : 'none';
-    if (map.getLayer('s1-layer')) map.setLayoutProperty('s1-layer', 'visibility', vis);
-  });
-
-  $effect(() => {
-    if (!map || !locationsStore.mapReady) return;
     const vis = layerVisibility.noise ? 'visible' : 'none';
     if (map.getLayer('noise-pixels')) map.setLayoutProperty('noise-pixels', 'visibility', vis);
   });
