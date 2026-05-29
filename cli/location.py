@@ -85,12 +85,7 @@ class _ProgressState:
 
     def __init__(self) -> None:
         self._lock = _threading.Lock()
-        # slot key → (items_done, items_total, rows, workers_active, workers_max, kind)
-        # kind: "item" | "concat"
         self._slots: dict[tuple, dict] = {}
-        # count of distinct units that have ever registered (for the N/M display)
-        self._total_units: int = 0
-        self._completed_units: int = 0
 
     def update_item(
         self,
@@ -103,8 +98,6 @@ class _ProgressState:
     ) -> None:
         key = (_threading.get_ident(), shard_i)
         with self._lock:
-            if key not in self._slots:
-                self._total_units += 1
             self._slots[key] = dict(
                 kind="item", label=label,
                 shard_i=shard_i, shard_n=shard_n,
@@ -117,56 +110,36 @@ class _ProgressState:
     def update_chips(self, label: str, done: int, total: int) -> None:
         key = (_threading.get_ident(), -2)
         with self._lock:
-            if key not in self._slots:
-                self._total_units += 1
-            self._slots[key] = dict(
-                kind="chips", label=label, done=done, total=total,
-            )
+            self._slots[key] = dict(kind="chips", label=label, done=done, total=total)
 
     def update_concat(self, label: str, rg_i: int, rg_n: int, rows: int) -> None:
         key = (_threading.get_ident(), -1)
         with self._lock:
-            if key not in self._slots:
-                self._total_units += 1
-            self._slots[key] = dict(
-                kind="concat", label=label, rg_i=rg_i, rg_n=rg_n, rows=rows,
-            )
+            self._slots[key] = dict(kind="concat", label=label, rg_i=rg_i, rg_n=rg_n, rows=rows)
 
     def complete_unit(self, shard_i: int) -> None:
         key = (_threading.get_ident(), shard_i)
         with self._lock:
             self._slots.pop(key, None)
-            self._completed_units += 1
 
     def clear_chips(self) -> None:
-        """Retire the chips slot for the current thread (fetch phase done)."""
-        key = (_threading.get_ident(), -2)
         with self._lock:
-            self._slots.pop(key, None)
+            self._slots.pop((_threading.get_ident(), -2), None)
 
     def clear_concat(self) -> None:
-        """Retire the concat slot for the current thread (merge phase done)."""
-        key = (_threading.get_ident(), -1)
         with self._lock:
-            self._slots.pop(key, None)
+            self._slots.pop((_threading.get_ident(), -1), None)
 
     def snapshot(self) -> dict:
         with self._lock:
-            return dict(
-                slots=dict(self._slots),
-                total_units=self._total_units,
-                completed_units=self._completed_units,
-            )
+            return dict(slots=dict(self._slots))
 
     def set_total(self, n: int) -> None:
-        with self._lock:
-            self._total_units = max(self._total_units, n)
+        pass
 
     def reset(self) -> None:
         with self._lock:
             self._slots.clear()
-            self._total_units = 0
-            self._completed_units = 0
 
 
 _progress = _ProgressState()
@@ -232,6 +205,34 @@ class _FetchFormatter(logging.Formatter):
         (re.compile(r"fetch_spec \S+ year \d+: tile (\d+)/(\d+) — (\S+)"),
          "tile", _MAG, 0),
 
+        # ── Per-tile pipeline (proxy/_pipeline.py) ───────────────────────────
+        (re.compile(r"\[(?:v2 tile )?(\S+) (\d+)\] (?:\[strip \d+\] )?STAC search"),
+         "stac", _CYAN, 0),
+        (re.compile(r"\[(?:v2 tile )?(\S+) (\d+)\] (?:\[strip \d+\] )?(\d+) STAC items"),
+         "stac", _CYAN, 0),
+        (re.compile(r"\[(?:v2 tile )?(\S+) (\d+)\] (\d+) strips of (\d+) px"),
+         "strips", _MAG, 0),
+        (re.compile(r"\[(?:v2 tile )?(\S+) (\d+)\] \[strip \d+\] skipping"),
+         "cache", _GREEN, 0),
+        (re.compile(r"\[(?:v2 tile )?(\S+) (\d+)\] \[strip \d+\] (?:Pool A )?fetch"),
+         "fetch", _BLUE, 0),
+        (re.compile(r"\[(?:v2 tile )?(\S+) (\d+)\] \[strip \d+\] Pool A done"),
+         "extract", _MAG, 0),
+        (re.compile(r"\[(?:v2 tile )?(\S+) (\d+)\] \[strip \d+\] no scene data"),
+         "empty", _DIM, 0),
+        (re.compile(r"\[(?:v2 tile )?(\S+) (\d+)\] \[strip \d+\] ready →"),
+         "strip", _GREEN, 0),
+
+        # ── Per-tile pipeline (tile_pipeline.py) ─────────────────────────────
+        (re.compile(r"\[(\S+) (\d+)\] already done"),
+         "cache", _GREEN, 0),
+        (re.compile(r"\[(\S+) (\d+)\] resuming from strip"),
+         "resume", _CYAN, 0),
+        (re.compile(r"\[(\S+) (\d+)\] strip \d+ written"),
+         "strip", _GREEN, 0),
+        (re.compile(r"\[(\S+) (\d+)\] merging \d+ strips →"),
+         "merge", _CYAN, 0),
+
         # ── Phase B (extract) ────────────────────────────────────────────────
         (re.compile(r"fetch_spec \S+: Phase A complete"),
          "done", _GREEN, 0),
@@ -291,35 +292,38 @@ class _FetchFormatter(logging.Formatter):
         secs = time.monotonic() - self._start
         return f"{secs:5.0f}s" if secs < 3600 else f"{secs/3600:5.1f}h"
 
+    # Matches [v2 tile TILE YEAR] [strip NNNN] or [TILE YEAR] [strip NNNN]
+    _PAT_TILE_CTX  = re.compile(r"^\[(?:v2 tile )?(\w+) (\d{4})\](?: \[strip (\d+)\])?")
+
     def _render(self, label: str, colour: str, msg: str, indent: int) -> str:
         elapsed = self._c(self._elapsed(), self._DIM)
-        prefix  = self._c(f"[{label:>7}]", colour + self._BOLD)
-        pad     = "  " * indent
-        return f"  {elapsed}  {prefix}  {pad}{msg}"
+
+        # Extract tile/year/strip context from the message and strip it from body.
+        m = self._PAT_TILE_CTX.match(msg)
+        if m:
+            tile, year, strip = m.group(1), m.group(2), m.group(3)
+            ctx_str = f"{tile} {year}" + (f" strip {int(strip):04d}" if strip else "")
+            ctx     = self._c(f"[{ctx_str:<22}]", self._DIM)
+            body    = msg[m.end():].lstrip()
+        else:
+            ctx  = self._c(f"{'':24}", self._DIM)
+            body = msg
+
+        prefix = self._c(f"[{label:>7}]", colour + self._BOLD)
+        return f"  {elapsed}  {ctx}  {prefix}  {body}"
 
     def render_progress(self, snap: dict) -> str:
         """Render one consolidated \r progress line from a _ProgressState snapshot."""
         slots = snap["slots"]
-        total_u = snap["total_units"]
-        done_u  = snap["completed_units"]
-        active  = len(slots)
 
         elapsed = self._c(self._elapsed(), self._DIM)
 
         if not slots:
             return ""
 
-        # Separate item-extraction slots from concat slots
-        item_slots  = [s for s in slots.values() if s["kind"] == "item"]
+        item_slots   = [s for s in slots.values() if s["kind"] == "item"]
         concat_slots = [s for s in slots.values() if s["kind"] == "concat"]
-
-        # Unit indicators: ◉ = done, ● = active, ○ = queued
-        queued = max(0, total_u - done_u - active)
-        units_str = "◉" * done_u + "●" * active + "○" * queued
-        units_col = self._c(f"[{units_str}]", self._MAG)
-
-        # Determine dominant kind for this render — prefer whatever is active
-        chip_slots  = [s for s in slots.values() if s["kind"] == "chips"]
+        chip_slots   = [s for s in slots.values() if s["kind"] == "chips"]
 
         if concat_slots:
             label    = concat_slots[0]["label"]
@@ -333,7 +337,7 @@ class _FetchFormatter(logging.Formatter):
             label_col = self._c(label, self._GREEN + self._BOLD)
             rows_str  = self._c(f"{rows:,} rows", self._DIM)
             rg_str    = self._c(f"{rg_done}/{rg_total} rg", self._RESET)
-            return f"  {elapsed}  {prefix}  {label_col}  {bar_col} {pct:>4}  {rg_str}  {rows_str}  {units_col}"
+            return f"  {elapsed}  {prefix}  {label_col}  {bar_col} {pct:>4}  {rg_str}  {rows_str}"
 
         if chip_slots:
             label     = chip_slots[0]["label"]
@@ -345,7 +349,7 @@ class _FetchFormatter(logging.Formatter):
             bar_col   = self._c(bar, self._BLUE)
             label_col = self._c(label, self._BLUE + self._BOLD)
             patch_str = self._c(f"{done}/{total} patches", self._RESET)
-            return f"  {elapsed}  {prefix}  {label_col}  {bar_col} {pct:>4}  {patch_str}  {units_col}"
+            return f"  {elapsed}  {prefix}  {label_col}  {bar_col} {pct:>4}  {patch_str}"
 
         # Item-extraction phase: aggregate items and workers across all active shards
         label      = item_slots[0]["label"] if item_slots else "S2 scenes"
@@ -367,9 +371,9 @@ class _FetchFormatter(logging.Formatter):
             worker_dots = "●" * min(w_active, w_max) + "○" * max(0, w_max - w_active)
             workers_col = self._c(f"[{worker_dots}]", self._CYAN)
             return (f"  {elapsed}  {prefix}  {label_col}  {bar_col} {pct:>4}  {items_str}"
-                    f"  {workers_col}  {rows_str}  {units_col}")
+                    f"  {workers_col}  {rows_str}")
         return (f"  {elapsed}  {prefix}  {label_col}  {bar_col} {pct:>4}  {items_str}"
-                f"  {rows_str}  {units_col}")
+                f"  {rows_str}")
 
     def format(self, record: logging.LogRecord) -> str:
         msg = record.getMessage()
@@ -399,7 +403,16 @@ class _FetchFormatter(logging.Formatter):
         # Unmatched — dim pass-through
         elapsed = self._c(self._elapsed(), self._DIM)
         prefix  = self._c("[   info]", self._DIM)
-        return f"  {elapsed}  {prefix}  {self._c(msg, self._DIM)}"
+        m = self._PAT_TILE_CTX.match(msg)
+        if m:
+            tile, year, strip = m.group(1), m.group(2), m.group(3)
+            ctx_str = f"{tile} {year}" + (f" strip {int(strip):04d}" if strip else "")
+            ctx  = self._c(f"[{ctx_str:<22}]", self._DIM)
+            body = msg[m.end():].lstrip()
+        else:
+            ctx  = self._c(f"{'':24}", self._DIM)
+            body = msg
+        return f"  {elapsed}  {ctx}  {prefix}  {self._c(body, self._DIM)}"
 
 
 class _FetchHandler(logging.StreamHandler):
@@ -676,6 +689,8 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     print(f"  {_DIM}{'─' * 60}{_RESET}", file=sys.stderr)
     print(file=sys.stderr)
 
+    output_dir = Path(args.output_dir) if args.output_dir else None
+
     t0 = time.monotonic()
     try:
         written = loc.fetch(
@@ -685,6 +700,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
             n_workers=args.workers,
             proxy_url=getattr(args, "proxy", None),
             tiles=getattr(args, "tiles", None),
+            output_dir=output_dir,
         )
     except KeyboardInterrupt:
         print(file=sys.stderr)
@@ -967,6 +983,10 @@ def main() -> None:
     pf.add_argument("--proxy", type=str, default=None, metavar="URL",
                     help="Proxy VM URL (e.g. http://localhost:8765). "
                          "Routes extraction to the VM; only compressed parquet is transferred.")
+    pf.add_argument("--output-dir", type=str, default="/mnt/external/mitchell", metavar="DIR",
+                    help="Root directory for output tile parquets (default: /mnt/external/mitchell). "
+                         "Parquets are written to <DIR>/<location_id>/<year>/<tile_id>.parquet. "
+                         "Temporary working data stays under /data/pixels/<id>.")
 
     pv = sub.add_parser("validate", help="Validate parquet data quality for a location")
     pv.add_argument("id", help="Location id (e.g. longreach, flinders0)")

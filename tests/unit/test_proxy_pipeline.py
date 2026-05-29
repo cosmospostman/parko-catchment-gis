@@ -120,7 +120,10 @@ def _synthetic_scene_parquet(tmp: Path, scene_id: str, n_points: int, n_dates: i
     tbl = pa.Table.from_pylist(rows, schema=schema)
     tmp.mkdir(parents=True, exist_ok=True)
     out = tmp / f"{scene_id}.parquet"
-    pq.write_table(tbl, out, compression="zstd")
+    # One row-group per northing value so the heap merge in merge_scenes sees
+    # non-overlapping northing bands per row-group (matching production invariant).
+    # Sorted as (northing, date) → n_dates rows share the same northing.
+    pq.write_table(tbl, out, compression="zstd", row_group_size=n_dates)
     return out
 
 
@@ -227,7 +230,7 @@ def test_duckdb_merge_sorted_output(tmp_path):
 
     (tmp_path / "scenes").mkdir()
     scene_paths = [
-        _synthetic_scene_parquet(tmp_path / "scenes", f"scene_{i:04d}", n_points=6, n_dates=2)
+        _synthetic_scene_parquet(tmp_path / "scenes", f"scene_{i:04d}", n_points=6, n_dates=1)
         for i in range(3)
     ]
     out = tmp_path / "strip.parquet"

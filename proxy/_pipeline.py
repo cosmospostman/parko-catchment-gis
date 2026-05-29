@@ -144,7 +144,7 @@ def merge_scenes(
     schema = COMBINED_PIXEL_SCHEMA
     writer = pq.ParquetWriter(
         str(tmp_path), schema,
-        compression="none",
+        compression="zstd",
         write_statistics=False,
     )
 
@@ -625,8 +625,12 @@ def run_tile_pipeline_v2(
     tifs, samples pixel values, and writes per-scene parquets.
     Peak RAM during extract = O(n_points × n_bands × 4 bytes) per worker (~MB).
 
-    Depth-2 prefetch: Pool A for strip i+2 runs concurrently with Pool B for
-    strip i, keeping the network link saturated throughout extraction.
+    Stage pipeline (declared via StageSpec; concurrency × ram_gb = budget):
+
+        fetch_tiffs    ×2  0.40 GB  — Pool A: network → GeoTIFFs on disk
+        extract_scenes ×1  4.00 GB  — Pool B: tiffs → per-scene parquets
+        collect_s1     ×1  0.50 GB  — async S1 fetch + extract
+        merge_scenes   ×2  0.05 GB  — k-way heap merge → sorted strip parquet
 
     Same signature and yield contract as run_tile_pipeline().
     """
@@ -634,8 +638,10 @@ def run_tile_pipeline_v2(
     import shutil
     import os
     from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _as_completed
+    from dataclasses import dataclass, field
 
     from utils.stac import search_sentinel2
+    from utils.pipeline_types import Pipeline, StageSpec
     from utils.pixel_collector import (
         collect, STAC_ENDPOINT, S2_COLLECTION, FETCH_BANDS, BAND_ALIAS,
         _extract_item_from_tiffs, _TILE_ID_RE,
@@ -648,12 +654,7 @@ def run_tile_pipeline_v2(
     # Must be called before any ThreadPoolExecutor so worker threads inherit the env.
     setup_gdal_env()
 
-    fetch_workers   = int(os.environ.get("FETCH_WORKERS",   "16"))
     extract_workers = int(os.environ.get("EXTRACT_WORKERS", "2"))
-    # Prefetch depth: how many strips to fetch ahead concurrently.
-    # Depth-2 saturates the network during extraction but doubles peak memory.
-    # On machines with ≤12 GB RAM, depth-1 avoids OOM; override with PREFETCH_DEPTH=2
-    # on larger instances.
     _mem_gb = _system_memory_gb()
     _default_prefetch = 1 if _mem_gb <= 20 else 2
     prefetch_depth = int(os.environ.get("PREFETCH_DEPTH", str(_default_prefetch)))
@@ -721,37 +722,48 @@ def run_tile_pipeline_v2(
         + ["scl_purity", "scl", "aot", "view_zenith", "sun_zenith"]
     )
 
-    # --- Pool A: fetch one strip's patches to disk ----------------------------
+    # --- Per-strip work item travelling through the pipeline ------------------
 
-    def _fetch_strip_to_tiff(strip: dict) -> Path:
-        """Run Pool A for one strip: write all item×band tifs, return the tiff_dir."""
-        strip_idx = strip["strip_idx"]
-        tiff_dir = tmp / f"strip_{strip_idx:04d}_tiffs"
+    @dataclass
+    class _StripWork:
+        strip:       dict
+        pts:         list          = field(default_factory=list)
+        tiff_dir:    Path | None   = None
+        scene_paths: list[Path]    = field(default_factory=list)
+        s1_path:     Path | None   = None
+
+    # --- Stage functions (module-level in spirit; capture only run-scoped constants) ---
+
+    def _stage_fetch_tiffs(work: _StripWork) -> _StripWork:
+        """Pool A: fetch all item×band GeoTIFFs to disk for one strip."""
+        strip_idx = work.strip["strip_idx"]
+        tiff_dir  = tmp / f"strip_{strip_idx:04d}_tiffs"
         tiff_dir.mkdir(parents=True, exist_ok=True)
-        logger.info("[v2 tile %s %d] [strip %04d] Pool A fetch → %s",
+        logger.info("[v2 tile %s %d] [strip %04d] fetch_tiffs → %s",
                     tile_id, year, strip_idx, tiff_dir.name)
-        asyncio.run(_fetch_strip_async(strip, tiff_dir))
-        return tiff_dir
 
-    async def _fetch_strip_async(strip: dict, tiff_dir: Path) -> None:
-        from utils.fetch import fetch_patches_to_tiff
-        await fetch_patches_to_tiff(
-            items=items,
-            bands=FETCH_BANDS,
-            bbox_wgs84=strip["bbox"],
-            out_dir=tiff_dir,
-            max_concurrent=max_concurrent,
-            band_alias=BAND_ALIAS,
-        )
+        async def _fetch_async() -> None:
+            from utils.fetch import fetch_patches_to_tiff
+            await fetch_patches_to_tiff(
+                items=items,
+                bands=FETCH_BANDS,
+                bbox_wgs84=work.strip["bbox"],
+                out_dir=tiff_dir,
+                max_concurrent=max_concurrent,
+                band_alias=BAND_ALIAS,
+            )
 
-    # --- Pool B: extract one strip's items from tiffs → per-scene parquets ----
+        asyncio.run(_fetch_async())
+        work.tiff_dir = tiff_dir
+        return work
 
-    def _extract_strip(strip: dict, tiff_dir: Path, strip_pts: list) -> list[Path]:
-        # One row-group per northing row so merge_scenes' heap merge produces
-        # correct output without sorting.  n_pts / strip_height_px ≈ easting width.
-        rg_size = max(1, len(strip_pts) // strip_height_px)
-        """Run Pool B for one strip: extract all items to scene parquets."""
-        strip_idx = strip["strip_idx"]
+    def _stage_extract_scenes(work: _StripWork) -> _StripWork | None:
+        """Pool B: sample pixel values from tiffs → per-scene parquets."""
+        strip_idx = work.strip["strip_idx"]
+        tiff_dir  = work.tiff_dir
+        strip_pts = work.pts
+        rg_size   = max(1, len(strip_pts) // strip_height_px)
+
         scene_dir = tmp / f"strip_{strip_idx:04d}_scenes"
         scene_dir.mkdir(parents=True, exist_ok=True)
 
@@ -759,27 +771,23 @@ def run_tile_pipeline_v2(
         lons      = np.array([lon for _, lon, _ in strip_pts], dtype=np.float64)
         lats      = np.array([lat for _, _, lat in strip_pts], dtype=np.float64)
 
-        # Pre-compute WGS84→UTM once per strip; shared read-only across all
-        # _extract_one workers so each scene skips a 6M-point transform call.
         _utm = cog_utm_crs or "EPSG:32755"
         from pyproj import Transformer as _Transformer
-        _strip_utm_xy: tuple[np.ndarray, np.ndarray] = _Transformer.from_crs(
+        _strip_utm_xy = _Transformer.from_crs(
             "EPSG:4326", _utm, always_xy=True
         ).transform(lons, lats)
 
-        # Eagerly fetch granule_metadata XMLs for all items while Pool A tiffs
-        # are still being written (or just before Pool B starts).  Each XML is
-        # ~200 KB; 258 items × 8 workers ≈ a few seconds of parallel I/O that
-        # would otherwise be paid serially inside each _extract_one call.
         if apply_nbar:
             from utils.granule_angles import prefetch_granule_xmls
             prefetch_granule_xmls(items, max_workers=8)
 
         n_items = len(items)
+        logger.info("[v2 tile %s %d] [strip %04d] extract_scenes (%d pts, %d items)",
+                    tile_id, year, strip_idx, len(strip_pts), n_items)
 
         def _extract_one(item_idx: int, item) -> Path | None:
-            scene_id  = item.id
-            out_path  = scene_dir / f"scene_{item_idx:04d}.parquet"
+            scene_id      = item.id
+            out_path      = scene_dir / f"scene_{item_idx:04d}.parquet"
             item_tiff_dir = tiff_dir / scene_id
 
             if out_path.exists() and out_path.stat().st_size > 0:
@@ -790,7 +798,6 @@ def run_tile_pipeline_v2(
                     out_path.unlink(missing_ok=True)
 
             if not item_tiff_dir.exists():
-                # Item was cloud-filtered or had no data in fetch phase
                 return None
 
             _prof_path = Path(os.environ.get("PROFILE_SCENE", ""))
@@ -817,7 +824,6 @@ def run_tile_pipeline_v2(
                     utm_crs=_utm,
                     utm_xy=_strip_utm_xy,
                 )
-            # Free the tiff dir for this item immediately after sampling
             shutil.rmtree(item_tiff_dir, ignore_errors=True)
 
             if df is None or len(df) == 0:
@@ -825,10 +831,6 @@ def run_tile_pipeline_v2(
                             strip_idx, item_idx + 1, n_items, scene_id)
                 return None
 
-            # Points are generated in northing-major order by make_strip_points,
-            # so idx (from np.where on clear_mask) preserves that order — no sort needed.
-            # Row-group size = strip_height_px so each row-group covers exactly one
-            # northing row, enabling the O(n_files) heap merge in merge_scenes.
             tbl = _optimise_schema(df.select(col_order).to_arrow())
             del df
 
@@ -852,99 +854,82 @@ def run_tile_pipeline_v2(
                 if result is not None:
                     scene_paths.append(result)
 
-        # Free the large per-strip arrays captured by _extract_one before returning
-        # to the caller, which will immediately call collect_s1_for_tile + merge_scenes.
         del _strip_utm_xy, lons, lats, point_ids
         import gc; gc.collect()
 
-        return scene_paths
+        shutil.rmtree(tiff_dir, ignore_errors=True)
+        work.tiff_dir    = None
+        work.scene_paths = scene_paths
 
-    # --- Main loop with depth-2 prefetch -------------------------------------
+        if not scene_paths:
+            logger.info("[v2 tile %s %d] [strip %04d] no scene data — skipping",
+                        tile_id, year, strip_idx)
+            return None  # drops this strip from the pipeline
 
-    from collections import deque as _deque
-    from concurrent.futures import TimeoutError as _FutureTimeout
+        return work
 
-    def _await(fut):
-        """Block until future completes, waking every 0.25 s so Ctrl-C lands."""
-        while True:
-            try:
-                return fut.result(timeout=0.25)
-            except _FutureTimeout:
-                pass
+    def _stage_collect_s1(work: _StripWork) -> _StripWork:
+        """Async S1 fetch + extract for one strip."""
+        strip_idx = work.strip["strip_idx"]
+        scene_dir = tmp / f"strip_{strip_idx:04d}_scenes"
+        work.s1_path = collect_s1_for_tile(
+            s2_path=None,
+            bbox_wgs84=work.strip["bbox"],
+            start=start_date,
+            end=end_date,
+            out_path=scene_dir / "s1_strip.parquet",
+            cache_dir=scene_dir / "s1_cache",
+            max_concurrent=max_concurrent,
+            points=work.pts,
+        )
+        # pts held until S1 is done; free now before merge.
+        del work.pts
+        import gc; gc.collect()
+        return work
 
-    with _TPE(max_workers=prefetch_depth) as prefetch_pool:
-        pts_queue:   _deque = _deque()
-        fetch_futs:  _deque = _deque()
+    def _stage_merge(work: _StripWork) -> _StripWork:
+        """K-way heap merge of scene parquets + S1 → sorted strip parquet."""
+        strip_idx = work.strip["strip_idx"]
+        scene_dir = tmp / f"strip_{strip_idx:04d}_scenes"
+        strip_out = tmp / f"strip_{strip_idx:04d}_sorted.parquet"
+        merge_scenes(work.scene_paths, work.s1_path, strip_out)
+        shutil.rmtree(scene_dir, ignore_errors=True)
+        logger.info("[v2 tile %s %d] [strip %04d] ready → %s",
+                    tile_id, year, strip_idx, strip_out.name)
+        work.scene_paths = []
+        work.s1_path     = None
+        return work
 
-        try:
-            for k in range(min(prefetch_depth, len(active_strips))):
-                pts = make_strip_points(active_strips[k], strips_meta)
-                pts_queue.append(pts)
-                fetch_futs.append(prefetch_pool.submit(_fetch_strip_to_tiff, active_strips[k]))
+    # --- Pipeline declaration -------------------------------------------------
+    #
+    # Memory budget per stage (concurrency × ram_gb):
+    #   fetch_tiffs    ×prefetch_depth  × 0.40 GB
+    #   extract_scenes ×1               × 4.00 GB
+    #   collect_s1     ×1               × 0.50 GB
+    #   merge_scenes   ×1               × 0.05 GB
+    #
+    # At prefetch_depth=1: 0.40 + 4.00 + 0.50 + 0.05 = 4.95 GB declared.
+    # At prefetch_depth=2: 0.80 + 4.00 + 0.50 + 0.05 = 5.35 GB declared.
+    # (Plus ~0.8 GB strip_pts held transiently — not modelled here.)
 
-            for i, strip in enumerate(active_strips):
-                strip_idx  = strip["strip_idx"]
-                strip_bbox = strip["bbox"]
-                strip_pts  = pts_queue.popleft()
+    fetch_pipeline = Pipeline(
+        [
+            StageSpec("fetch_tiffs",    fn=_stage_fetch_tiffs,    concurrency=prefetch_depth, ram_gb=0.40),
+            StageSpec("extract_scenes", fn=_stage_extract_scenes, concurrency=1,              ram_gb=4.00),
+            StageSpec("collect_s1",     fn=_stage_collect_s1,     concurrency=1,              ram_gb=0.50),
+            StageSpec("merge_scenes",   fn=_stage_merge,          concurrency=1,              ram_gb=0.05),
+        ],
+        ram_budget_gb=_mem_gb * 0.6,
+        name=f"fetch_tile_{tile_id}_{year}",
+    )
 
-                tiff_dir = _await(fetch_futs.popleft())
-                logger.info("[v2 tile %s %d] [strip %04d] Pool A done; starting Pool B (%d pts, %d items)",
-                            tile_id, year, strip_idx, len(strip_pts), len(items))
+    # Attach pre-generated strip points before feeding into the pipeline.
+    def _strip_inputs() -> Iterator[_StripWork]:
+        for strip in active_strips:
+            pts = make_strip_points(strip, strips_meta)
+            yield _StripWork(strip=strip, pts=pts)
 
-                # Pool B: extract all items from tiffs → scene parquets
-                scene_paths = _extract_strip(strip, tiff_dir, strip_pts)
-
-                # Clean up remaining tiff subdirs (any items that weren't cloud-filtered
-                # but produced no clear pixels and thus weren't cleaned up in _extract_one)
-                shutil.rmtree(tiff_dir, ignore_errors=True)
-
-                if not scene_paths:
-                    logger.info("[v2 tile %s %d] [strip %04d] no scene data — skipping",
-                                tile_id, year, strip_idx)
-                    # No merge needed — safe to start next prefetch now.
-                    next_k = i + prefetch_depth
-                    if next_k < len(active_strips):
-                        pts = make_strip_points(active_strips[next_k], strips_meta)
-                        pts_queue.append(pts)
-                        fetch_futs.append(prefetch_pool.submit(_fetch_strip_to_tiff, active_strips[next_k]))
-                    continue
-
-                # S1 extraction
-                scene_dir = tmp / f"strip_{strip_idx:04d}_scenes"
-                s1_path = collect_s1_for_tile(
-                    s2_path=None,
-                    bbox_wgs84=strip_bbox,
-                    start=start_date,
-                    end=end_date,
-                    out_path=scene_dir / "s1_strip.parquet",
-                    cache_dir=scene_dir / "s1_cache",
-                    max_concurrent=max_concurrent,
-                    points=strip_pts,
-                )
-
-                # strip_pts is no longer needed — free ~800 MB before the merge.
-                del strip_pts
-                import gc; gc.collect()
-
-                strip_out = tmp / f"strip_{strip_idx:04d}_sorted.parquet"
-                merge_scenes(scene_paths, s1_path, strip_out)
-
-                shutil.rmtree(scene_dir, ignore_errors=True)
-
-                # merge_scenes is done — memory is free, safe to start next prefetch.
-                next_k = i + prefetch_depth
-                if next_k < len(active_strips):
-                    pts = make_strip_points(active_strips[next_k], strips_meta)
-                    pts_queue.append(pts)
-                    fetch_futs.append(prefetch_pool.submit(_fetch_strip_to_tiff, active_strips[next_k]))
-
-                logger.info("[v2 tile %s %d] [strip %04d] ready → %s",
-                            tile_id, year, strip_idx, strip_out.name)
-                yield strip_idx, strip_out
-
-        except KeyboardInterrupt:
-            logger.warning("[v2 tile %s %d] interrupted — cancelling pending fetches", tile_id, year)
-            for fut in fetch_futs:
-                fut.cancel()
-            prefetch_pool.shutdown(wait=False, cancel_futures=True)
-            raise
+    for work in fetch_pipeline.run(_strip_inputs()):
+        strip_idx = work.strip["strip_idx"]
+        strip_out = tmp / f"strip_{strip_idx:04d}_sorted.parquet"
+        yield strip_idx, strip_out

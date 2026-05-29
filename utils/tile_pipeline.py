@@ -4,11 +4,14 @@ fetch_tile_local() runs the same pipeline as the proxy VM — tile-first,
 1024-px COG-block-aligned strips — but writes strip parquets directly to
 disk instead of streaming them over HTTP.
 
-The mechanics are identical to proxy/client.py's receive-and-write loop:
-  - done-sentinel check (skip if already complete)
-  - contiguous-strip resume scan
-  - atomic .tmp → rename write per strip
-  - merge_strips() to assemble the final tile parquet
+Output layout:
+  out_dir/<year>/<tile_id>/strip_NNNN.parquet   — one file per strip
+  out_dir/<year>/<tile_id>/.done                — sentinel when all strips complete
+
+Strip-level resume: existing strip_NNNN.parquet files in the tile dir are
+included automatically; processing resumes from the first gap.
+
+Tile-level resume: if the .done sentinel exists the function returns immediately.
 """
 
 from __future__ import annotations
@@ -25,7 +28,6 @@ def fetch_tile_local(
     year: int,
     polygon_geometry,
     out_dir: Path,
-    tmp_dir: Path,
     cloud_max: int = 20,
     apply_nbar: bool = True,
     strip_height_px: int = 1024,
@@ -34,18 +36,12 @@ def fetch_tile_local(
     items=None,
     calibration_out: Path | None = None,
     point_id_prefix: str = "px",
-) -> Path | None:
+) -> list[Path] | None:
     """Fetch one tile×year locally using the same pipeline as the proxy VM.
 
-    Writes strip shards to *tmp_dir*/<tile_id>/<year>/ during processing,
-    merges them into *out_dir*/<year>/<tile_id>.parquet on completion, and
-    writes a .done sentinel to mark the tile as complete.
-
-    Strip-level resume: existing strip_NNNN.parquet files in the tmp dir are
-    included in the final merge; processing resumes from the first gap.
-
-    Tile-level resume: if <out_dir>/<year>/<tile_id>.parquet and its .done
-    sentinel both exist the function returns immediately without any I/O.
+    Writes strip parquets to *out_dir*/<year>/<tile_id>/strip_NNNN.parquet and
+    touches a .done sentinel on completion.  No merge step — callers consume
+    strips directly.
 
     Parameters
     ----------
@@ -56,9 +52,7 @@ def fetch_tile_local(
     polygon_geometry:
         Shapely geometry defining the area of interest.
     out_dir:
-        Root output directory.  Final parquet lands at out_dir/year/tile_id.parquet.
-    tmp_dir:
-        Scratch root.  Strip shards land at tmp_dir/tile_id/year/strip_NNNN.parquet.
+        Root output directory.  Strips land at out_dir/year/tile_id/strip_NNNN.parquet.
     items:
         Optional pre-fetched STAC item list (training pipeline).
     calibration_out:
@@ -66,28 +60,27 @@ def fetch_tile_local(
 
     Returns
     -------
-    Path | None
-        The written output path, or None if no strips produced data.
+    list[Path] | None
+        Sorted list of written strip paths, or None if no strips produced data.
     """
     from proxy._pipeline import run_tile_pipeline_v2 as run_tile_pipeline
-    from utils.parquet_utils import merge_strips
 
-    out_path      = out_dir / str(year) / f"{tile_id}.parquet"
-    done_sentinel = out_path.with_suffix(".done")
+    tile_dir      = out_dir / str(year) / tile_id
+    done_sentinel = tile_dir / ".done"
 
-    if done_sentinel.exists() and out_path.exists():
-        logger.info("[%s %d] already done — skipping", tile_id, year)
-        return out_path
+    if done_sentinel.exists():
+        strips = sorted(tile_dir.glob("strip_????.parquet"))
+        logger.info("[%s %d] already done (%d strips) — skipping", tile_id, year, len(strips))
+        return strips or None
 
-    tile_tmp = tmp_dir / tile_id / str(year)
-    tile_tmp.mkdir(parents=True, exist_ok=True)
+    tile_dir.mkdir(parents=True, exist_ok=True)
 
     # Clean up incomplete writes from a prior interrupted run.
-    for p in tile_tmp.glob("strip_????.tmp"):
+    for p in tile_dir.glob("strip_????.tmp"):
         p.unlink(missing_ok=True)
 
     # Determine resume point from contiguous existing strips.
-    complete_strips = sorted(tile_tmp.glob("strip_????.parquet"))
+    complete_strips = sorted(tile_dir.glob("strip_????.parquet"))
     resume_from = 0
     if complete_strips:
         expected = 0
@@ -102,7 +95,7 @@ def fetch_tile_local(
 
     received_strips: list[Path] = list(complete_strips)
 
-    pipeline_tmp = tile_tmp / "_work"
+    pipeline_tmp = tile_dir / "_work"
     pipeline_tmp.mkdir(parents=True, exist_ok=True)
 
     for strip_idx, strip_path in run_tile_pipeline(
@@ -120,8 +113,8 @@ def fetch_tile_local(
         calibration_out=calibration_out,
         point_id_prefix=point_id_prefix,
     ):
-        dest     = tile_tmp / f"strip_{strip_idx:04d}.parquet"
-        dest_tmp = tile_tmp / f"strip_{strip_idx:04d}.tmp"
+        dest     = tile_dir / f"strip_{strip_idx:04d}.parquet"
+        dest_tmp = tile_dir / f"strip_{strip_idx:04d}.tmp"
         shutil.copy2(strip_path, dest_tmp)
         dest_tmp.replace(dest)
         strip_path.unlink(missing_ok=True)
@@ -135,20 +128,9 @@ def fetch_tile_local(
         pass
 
     if not received_strips:
-        logger.warning("[%s %d] no strips — skipping merge", tile_id, year)
+        logger.warning("[%s %d] no strips — nothing written", tile_id, year)
         return None
 
     received_strips.sort(key=lambda p: int(p.stem.split("_")[1]))
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    logger.info("[%s %d] merging %d strips → %s", tile_id, year, len(received_strips), out_path)
-    merge_strips(received_strips, out_path)
     done_sentinel.touch()
-
-    for p in received_strips:
-        p.unlink(missing_ok=True)
-    try:
-        tile_tmp.rmdir()
-    except OSError:
-        pass
-
-    return out_path
+    return received_strips

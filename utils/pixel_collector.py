@@ -276,27 +276,44 @@ def _extract_item_from_tiffs(
     clear_mask = np.isin(scl_int, list(SCL_CLEAR_VALUES))
     if not clear_mask.any():
         return None
-    scl_purity = clear_mask.astype(np.float32)
+
+    idx = np.where(clear_mask)[0]
+    n_clear = len(idx)
+
+    # Slice all full-N arrays down to clear pixels immediately so NBAR and
+    # zenith interpolation work on n_clear points rather than n (6+ M on
+    # wide strips), cutting per-scene RAM by the cloudy fraction.
+    scl_purity_c = np.ones(n_clear, dtype=np.int8)
+    scl_int_c    = scl_int[idx].astype(np.int8)
+    del scl_vals, scl_int, clear_mask
 
     aot_vals = all_sampled[AOT_BAND]
     if aot_vals is not None:
-        aot_quality = np.clip(1.0 - aot_vals * 0.001, 0.0, 1.0)
+        aot_quality_c = np.round(
+            np.clip(1.0 - aot_vals[idx] * 0.001, 0.0, 1.0) * 100
+        ).astype(np.uint8)
+        del aot_vals
     else:
-        aot_quality = np.ones(n, dtype=np.float32)
+        aot_quality_c = np.full(n_clear, 100, dtype=np.uint8)
 
     band_arrays: dict[str, np.ndarray] = {}
     for band in BANDS:
         vals = all_sampled[band]
-        band_arrays[band] = vals / 10000.0 if vals is not None else np.full(n, np.nan, dtype=np.float32)
+        band_arrays[band] = vals[idx] / 10000.0 if vals is not None else np.full(n_clear, np.nan, dtype=np.float32)
+    del all_sampled
+
+    # Slice coordinate arrays to clear pixels for NBAR and zenith.
+    lons_c  = lons[idx]
+    lats_c  = lats[idx]
+    utm_xy_c = (utm_xy[0][idx], utm_xy[1][idx]) if utm_xy is not None else None
 
     # NBAR c-factor correction
     angles = None
     if apply_nbar:
         from utils.granule_angles import get_item_angles
         from utils.nbar import c_factor_rad as compute_cf_rad
-        angles = get_item_angles(item, lons, lats, utm_crs=utm_crs, bands=list(BANDS), utm_xy=utm_xy)
+        angles = get_item_angles(item, lons_c, lats_c, utm_crs=utm_crs, bands=list(BANDS), utm_xy=utm_xy_c)
         if angles is not None:
-            # Convert degrees → radians once per scene; reused across all bands.
             _first = next(iter(angles.values()))
             sza_rad = np.deg2rad(_first["sza"])
             for band in BANDS:
@@ -320,35 +337,28 @@ def _extract_item_from_tiffs(
         sun_zenith_col  = np.where(np.isnan(sza_mean), 1.0, np.clip(1.0 - sza_mean / 90.0, 0.0, 1.0))
         view_zenith_col = np.where(np.isnan(vza_mean), 1.0, np.clip(1.0 - vza_mean / 90.0, 0.0, 1.0))
     else:
-        sun_zenith_col  = np.ones(n, dtype=np.float32)
-        view_zenith_col = np.ones(n, dtype=np.float32)
-
-    idx = np.where(clear_mask)[0]
-    n_clear = len(idx)
-    if n_clear == 0:
-        return None
-
-    band_data = {band: band_arrays[band][idx] for band in BANDS}
+        sun_zenith_col  = np.ones(n_clear, dtype=np.float32)
+        view_zenith_col = np.ones(n_clear, dtype=np.float32)
 
     all_nan_mask = np.ones(n_clear, dtype=bool)
-    for arr in band_data.values():
+    for arr in band_arrays.values():
         all_nan_mask &= np.isnan(arr)
     if all_nan_mask.all():
         return None
 
     return pl.DataFrame({
         "point_id":    [point_ids[i] for i in idx],
-        "lon":         lons[idx].astype(np.float64),
-        "lat":         lats[idx].astype(np.float64),
+        "lon":         lons_c.astype(np.float64),
+        "lat":         lats_c.astype(np.float64),
         "date":        pl.Series([item_date] * n_clear),
         "item_id":     [item_id] * n_clear,
         "tile_id":     [tile_id] * n_clear,
-        "scl_purity":  scl_purity[idx].astype(np.int8),
-        "scl":         scl_int[idx].astype(np.int8),
-        "aot":         np.round(aot_quality[idx] * 100).astype(np.uint8),
-        "view_zenith": np.round(view_zenith_col[idx] * 100).astype(np.uint8),
-        "sun_zenith":  np.round(sun_zenith_col[idx] * 100).astype(np.uint8),
-        **{band: _band_to_uint16(arr) for band, arr in band_data.items()},
+        "scl_purity":  scl_purity_c,
+        "scl":         scl_int_c,
+        "aot":         aot_quality_c,
+        "view_zenith": np.round(view_zenith_col * 100).astype(np.uint8),
+        "sun_zenith":  np.round(sun_zenith_col * 100).astype(np.uint8),
+        **{band: _band_to_uint16(arr) for band, arr in band_arrays.items()},
     })
 
 

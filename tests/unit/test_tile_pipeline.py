@@ -12,11 +12,11 @@ TP-3  run_tile_pipeline passes the strip sub-bbox (not the full tile bbox)
       to collect() and collect_s1_for_tile().
 TP-4  run_tile_pipeline uses a per-strip cache_dir under tmp/strip_NNNN_scenes/cache/.
 TP-5  run_tile_pipeline cleans up scene_dir after each strip is yielded.
-TP-6  fetch_tile_local done-sentinel: no pipeline calls when .done + parquet exist.
-TP-7  fetch_tile_local resume: pre-existing strips included in merge;
-      resume_from_strip set to first gap.
-TP-8  fetch_tile_local writes each strip atomically (.tmp → rename) and calls
-      merge_strips on completion.
+TP-6  fetch_tile_local done-sentinel: no pipeline calls when .done sentinel exists.
+TP-7  fetch_tile_local resume: pre-existing strips counted; resume_from_strip
+      set to first gap; new strips appended.
+TP-8  fetch_tile_local writes each strip atomically (.tmp → rename) directly
+      into out_dir/year/tile_id/; no merge step.
 TP-9  proxy/server.py _run_pipeline wrapper: 0x02 frames emitted per strip,
       progress frames present; run_tile_pipeline called with correct args.
 TP-10 Integration: run_tile_pipeline with a real MemoryChipStore and
@@ -328,24 +328,21 @@ def test_run_tile_pipeline_cleans_scene_dir(tmp_path):
 def test_fetch_tile_local_done_sentinel_skips(tmp_path):
     from utils.tile_pipeline import fetch_tile_local
 
-    out_dir = tmp_path / "out"
-    out_path = out_dir / "2022" / "55HBU.parquet"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    _write_strip_parquet(out_path)
-    out_path.with_suffix(".done").touch()
-
-    pipeline_called = []
+    tile_dir = tmp_path / "out" / "2022" / "55HBU"
+    tile_dir.mkdir(parents=True, exist_ok=True)
+    strip = tile_dir / "strip_0000.parquet"
+    _write_strip_parquet(strip)
+    (tile_dir / ".done").touch()
 
     with patch("proxy._pipeline.run_tile_pipeline_v2", side_effect=lambda *a, **kw: iter([])) as mock_pipeline:
         result = fetch_tile_local(
             tile_id="55HBU", year=2022,
             polygon_geometry=_make_polygon(),
-            out_dir=out_dir,
-            tmp_dir=tmp_path / "tmp",
+            out_dir=tmp_path / "out",
         )
 
     mock_pipeline.assert_not_called()
-    assert result == out_path
+    assert result == [strip]
 
 
 # ---------------------------------------------------------------------------
@@ -355,87 +352,65 @@ def test_fetch_tile_local_done_sentinel_skips(tmp_path):
 def test_fetch_tile_local_resume(tmp_path):
     from utils.tile_pipeline import fetch_tile_local
 
-    out_dir = tmp_path / "out"
-    tmp_dir = tmp_path / "tmp"
-    tile_tmp = tmp_dir / "55HBU" / "2022"
-    tile_tmp.mkdir(parents=True, exist_ok=True)
+    tile_dir = tmp_path / "out" / "2022" / "55HBU"
+    tile_dir.mkdir(parents=True, exist_ok=True)
 
     # Two strips already complete
     for i in (0, 1):
-        _write_strip_parquet(tile_tmp / f"strip_{i:04d}.parquet")
+        _write_strip_parquet(tile_dir / f"strip_{i:04d}.parquet")
 
     resume_args: list[int] = []
 
     def fake_pipeline(tile_id, year, polygon_geometry, tmp, resume_from_strip=0, **kw):
         resume_args.append(resume_from_strip)
-        # Yield one more strip (idx 2)
         strip_path = tmp / "strip_0002_sorted.parquet"
         _write_strip_parquet(strip_path)
         yield 2, strip_path
 
-    merge_calls: list = []
-
-    def fake_merge(strip_paths, out_path):
-        merge_calls.append(list(strip_paths))
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        _write_strip_parquet(out_path)
-
-    with patch("proxy._pipeline.run_tile_pipeline_v2", side_effect=fake_pipeline), \
-         patch("utils.parquet_utils.merge_strips", side_effect=fake_merge):
-        fetch_tile_local(
+    with patch("proxy._pipeline.run_tile_pipeline_v2", side_effect=fake_pipeline):
+        result = fetch_tile_local(
             tile_id="55HBU", year=2022,
             polygon_geometry=_make_polygon(),
-            out_dir=out_dir, tmp_dir=tmp_dir,
+            out_dir=tmp_path / "out",
         )
 
     assert resume_args == [2], f"expected resume_from_strip=2, got {resume_args}"
-    assert len(merge_calls) == 1
-    merged = merge_calls[0]
-    assert len(merged) == 3  # strips 0, 1, 2
+    assert result is not None
+    assert len(result) == 3  # strips 0, 1, 2
+    assert all(p.name.startswith("strip_") for p in result)
 
 
 # ---------------------------------------------------------------------------
-# TP-8  fetch_tile_local atomic write and merge_strips call
+# TP-8  fetch_tile_local atomic write, no merge, .done sentinel written
 # ---------------------------------------------------------------------------
 
-def test_fetch_tile_local_atomic_write_and_merge(tmp_path):
+def test_fetch_tile_local_atomic_write_no_merge(tmp_path):
     from utils.tile_pipeline import fetch_tile_local
 
     out_dir = tmp_path / "out"
-    tmp_dir = tmp_path / "tmp"
-
-    written_tmps: list[Path] = []
 
     def fake_pipeline(tile_id, year, polygon_geometry, tmp, **kw):
         strip_path = tmp / "strip_0000_sorted.parquet"
         _write_strip_parquet(strip_path)
         yield 0, strip_path
 
-    merge_inputs: list = []
-
-    def fake_merge(strip_paths, out_path):
-        merge_inputs.append(list(strip_paths))
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        _write_strip_parquet(out_path)
-
-    with patch("proxy._pipeline.run_tile_pipeline_v2", side_effect=fake_pipeline), \
-         patch("utils.parquet_utils.merge_strips", side_effect=fake_merge):
+    with patch("proxy._pipeline.run_tile_pipeline_v2", side_effect=fake_pipeline):
         result = fetch_tile_local(
             tile_id="55HBU", year=2022,
             polygon_geometry=_make_polygon(),
-            out_dir=out_dir, tmp_dir=tmp_dir,
+            out_dir=out_dir,
         )
 
-    assert result is not None
-    assert result.exists()
-    # .done sentinel must have been written
-    assert result.with_suffix(".done").exists()
-    # merge_strips called once with a list of Paths
-    assert len(merge_inputs) == 1
-    assert all(isinstance(p, Path) for p in merge_inputs[0])
-    # No leftover .tmp files
-    tile_tmp = tmp_dir / "55HBU" / "2022"
-    assert not list(tile_tmp.glob("*.tmp"))
+    assert result is not None and len(result) == 1
+    strip = result[0]
+    assert strip == out_dir / "2022" / "55HBU" / "strip_0000.parquet"
+    assert strip.exists()
+    # .done sentinel written
+    assert (out_dir / "2022" / "55HBU" / ".done").exists()
+    # no leftover .tmp files
+    assert not list((out_dir / "2022" / "55HBU").glob("*.tmp"))
+    # _work/ cleaned up
+    assert not (out_dir / "2022" / "55HBU" / "_work").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -541,7 +516,9 @@ def _synthetic_scene_parquet(out_dir: Path, scene_id: str, n_points: int) -> Pat
     tbl = pa.Table.from_pylist(rows, schema=schema)
     out = out_dir / f"{scene_id}.parquet"
     out_dir.mkdir(parents=True, exist_ok=True)
-    pq.write_table(tbl, out, compression="zstd")
+    # One row-group per northing so merge_scenes' heap merge sees non-overlapping
+    # northing bands per row-group (matching production invariant).
+    pq.write_table(tbl, out, compression="zstd", row_group_size=1)
     return out
 
 
