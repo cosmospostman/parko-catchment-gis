@@ -793,12 +793,30 @@ def run_tile_pipeline_v2(
                 # Item was cloud-filtered or had no data in fetch phase
                 return None
 
-            df = _extract_item_from_tiffs(
-                item, item_tiff_dir, point_ids, lons, lats,
-                apply_nbar=apply_nbar,
-                utm_crs=_utm,
-                utm_xy=_strip_utm_xy,
-            )
+            _prof_path = Path(os.environ.get("PROFILE_SCENE", ""))
+            if _prof_path.name and not _prof_path.exists():
+                import cProfile, pstats, io as _io
+                _pr = cProfile.Profile()
+                try:
+                    df = _pr.runcall(
+                        _extract_item_from_tiffs,
+                        item, item_tiff_dir, point_ids, lons, lats,
+                        apply_nbar=apply_nbar,
+                        utm_crs=_utm,
+                        utm_xy=_strip_utm_xy,
+                    )
+                finally:
+                    _s = _io.StringIO()
+                    pstats.Stats(_pr, stream=_s).sort_stats("cumulative").print_stats(30)
+                    _prof_path.write_text(_s.getvalue())
+                    logger.info("Profile written to %s", _prof_path)
+            else:
+                df = _extract_item_from_tiffs(
+                    item, item_tiff_dir, point_ids, lons, lats,
+                    apply_nbar=apply_nbar,
+                    utm_crs=_utm,
+                    utm_xy=_strip_utm_xy,
+                )
             # Free the tiff dir for this item immediately after sampling
             shutil.rmtree(item_tiff_dir, ignore_errors=True)
 

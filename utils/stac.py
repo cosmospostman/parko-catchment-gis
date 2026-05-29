@@ -99,7 +99,6 @@ def _search_sentinel1_geoparquet(
     import adlfs
     import duckdb
     import pystac
-    import planetary_computer
 
     # Get a fresh SAS token via the PC SAS token API directly (avoids STAC catalog endpoint)
     import requests

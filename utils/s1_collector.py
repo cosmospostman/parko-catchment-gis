@@ -344,11 +344,12 @@ def _extract_s1_from_store(
     point_ids: list[str],
     lons: np.ndarray,
     lats: np.ndarray,
-) -> "tuple[list, list, list, list, list, list, list] | None":
+) -> "tuple[list[str], np.ndarray, np.ndarray, object, np.ndarray, np.ndarray, str | None] | None":
     """Extract per-pixel VH/VV for one S1 item from a CachedNpzChipStore.
 
-    Returns a 7-tuple (point_ids, lons, lats, dates, vh_vals, vv_vals, orbits)
-    for pixels with at least one non-NaN value, or None if nothing valid.
+    Returns a 7-tuple (point_ids, lons, lats, date, vh_vals, vv_vals, orbit_state)
+    where lons/lats/vh/vv are numpy arrays and date/orbit_state are scalars.
+    Returns None if nothing valid.
     """
     item_id = item.id
     _dt = item.datetime
@@ -376,15 +377,14 @@ def _extract_s1_from_store(
     if idx.size == 0:
         return None
 
-    n_keep = idx.size
     return (
         [point_ids[i] for i in idx],
-        lons[idx].tolist(),
-        lats[idx].tolist(),
-        [date] * n_keep,
-        vh_vals[idx].tolist(),
-        vv_vals[idx].tolist(),
-        [orbit_state] * n_keep,
+        lons[idx],
+        lats[idx],
+        date,
+        vh_vals[idx],
+        vv_vals[idx],
+        orbit_state,
     )
 
 
@@ -394,7 +394,7 @@ def _collect_s1_shards(
     bbox_wgs84: list[float],
     points: list[tuple[str, float, float]],
     resolved_cache: Path,
-    point_shard_size: int = 50_000,
+    point_shard_size: int = 500_000,
     max_concurrent: int = 32,
     phases: "set[str] | None" = None,
 ) -> list[Path]:
@@ -485,43 +485,61 @@ def _collect_s1_shards(
         total_rows = 0
         log_interval = max(1, len(items) // 10)
 
-        buf_pid:   list = []
-        buf_lon:   list = []
-        buf_lat:   list = []
-        buf_date:  list = []
-        buf_vh:    list = []
-        buf_vv:    list = []
-        buf_orbit: list = []
-        _FLUSH_ROWS = 50_000
+        # Accumulate per-item results as numpy arrays; flush to parquet in
+        # batches.  Avoids converting arrays → Python lists → pa.array().
+        acc_pid:   list[list[str]]   = []
+        acc_lon:   list[np.ndarray]  = []
+        acc_lat:   list[np.ndarray]  = []
+        acc_date:  list[np.ndarray]  = []
+        acc_vh:    list[np.ndarray]  = []
+        acc_vv:    list[np.ndarray]  = []
+        acc_orbit: list[np.ndarray]  = []
+        acc_rows = 0
+        _FLUSH_ROWS = 500_000
 
         def _flush() -> None:
-            if not buf_pid:
+            nonlocal acc_rows
+            if not acc_pid:
                 return
+            all_pids  = [p for chunk in acc_pid   for p in chunk]
+            all_lons  = np.concatenate(acc_lon)
+            all_lats  = np.concatenate(acc_lat)
+            all_dates = np.concatenate(acc_date)
+            all_vhs   = np.concatenate(acc_vh)
+            all_vvs   = np.concatenate(acc_vv)
+            all_orbits = np.concatenate(acc_orbit)
             tbl = pa.table({
-                "point_id": pa.array(buf_pid,  pa.string()),
-                "lon":      pa.array(buf_lon,  pa.float64()),
-                "lat":      pa.array(buf_lat,  pa.float64()),
-                "date":     pa.array(buf_date, pa.timestamp("ms")),
-                "source":   pa.repeat("S1", len(buf_pid)).cast(pa.string()),
-                "vh":       pa.array(buf_vh,   pa.float32()),
-                "vv":       pa.array(buf_vv,   pa.float32()),
-                "orbit":    pa.array(buf_orbit, pa.string()),
+                "point_id": pa.array(all_pids,            pa.string()),
+                "lon":      pa.array(all_lons,            pa.float64()),
+                "lat":      pa.array(all_lats,            pa.float64()),
+                "date":     pa.array(all_dates,           pa.timestamp("ms")),
+                "source":   pa.repeat("S1", len(all_pids)).cast(pa.string()),
+                "vh":       pa.array(all_vhs,             pa.float32()),
+                "vv":       pa.array(all_vvs,             pa.float32()),
+                "orbit":    pa.array(all_orbits,          pa.string()),
             })
             writer.write_table(tbl)
-            buf_pid.clear(); buf_lon.clear(); buf_lat.clear(); buf_date.clear()
-            buf_vh.clear();  buf_vv.clear();  buf_orbit.clear()
+            acc_pid.clear(); acc_lon.clear(); acc_lat.clear(); acc_date.clear()
+            acc_vh.clear();  acc_vv.clear();  acc_orbit.clear()
+            acc_rows = 0
 
         for i, item in enumerate(items):
             result = _extract_s1_from_store(item, store, point_ids, lons, lats)
             store.release_item(item.id)
             if result is None:
                 continue
-            pids, i_lons, i_lats, dates, vhs, vvs, orbits = result
-            buf_pid.extend(pids);   buf_lon.extend(i_lons);   buf_lat.extend(i_lats)
-            buf_date.extend(dates); buf_vh.extend(vhs);       buf_vv.extend(vvs)
-            buf_orbit.extend(orbits)
-            total_rows += len(pids)
-            if len(buf_pid) >= _FLUSH_ROWS:
+            pids, i_lons, i_lats, date, vhs, vvs, orbit_state = result
+            n_item = len(pids)
+            acc_pid.append(pids)
+            acc_lon.append(i_lons)
+            acc_lat.append(i_lats)
+            acc_date.append(np.full(n_item, np.datetime64(date, "ms")))
+            acc_vh.append(vhs)
+            acc_vv.append(vvs)
+            acc_orbit.append(np.full(n_item, orbit_state if orbit_state is not None else "", dtype=object))
+            acc_rows += n_item
+            total_rows += n_item
+            if acc_rows >= _FLUSH_ROWS:
                 _flush()
             if (i + 1) % log_interval == 0 or (i + 1) == len(items):
                 if use_sharding:

@@ -93,6 +93,22 @@ def _brdf(
     return fiso + fvol * _kvol(sza, vza, raa) + fgeo * _kgeo(sza, vza, raa)
 
 
+# BRDF(target geometry) is a scalar per band — precomputed once at module load.
+# Target is sza=45°, vza=0, raa=0 for every pixel and every scene.
+def _brdf_scalar(sza_rad: float, vza_rad: float, raa_rad: float,
+                 fiso: float, fvol: float, fgeo: float) -> float:
+    s = np.array([sza_rad])
+    v = np.array([vza_rad])
+    r = np.array([raa_rad])
+    return float(_brdf(s, v, r, fiso, fvol, fgeo)[0])
+
+_TARGET_SZA_RAD = np.deg2rad(TARGET_SZA_DEG)
+BRDF_TARGET: dict[str, float] = {
+    band: _brdf_scalar(_TARGET_SZA_RAD, 0.0, 0.0, **coef)
+    for band, coef in BRDF_COEFFICIENTS.items()
+}
+
+
 # ---------------------------------------------------------------------------
 # C-factor
 # ---------------------------------------------------------------------------
@@ -121,7 +137,7 @@ def c_factor(
     vza = np.deg2rad(vza_deg)
     raa = np.deg2rad(raa_deg)
 
-    return _c_factor_rad(sza, vza, raa, coef)
+    return _c_factor_rad(sza, vza, raa, coef, band=band)
 
 
 def c_factor_rad(
@@ -135,7 +151,7 @@ def c_factor_rad(
     Use this when processing multiple bands with shared angle arrays to avoid
     redundant deg2rad conversions.
     """
-    return _c_factor_rad(sza_rad, vza_rad, raa_rad, BRDF_COEFFICIENTS[band])
+    return _c_factor_rad(sza_rad, vza_rad, raa_rad, BRDF_COEFFICIENTS[band], band=band)
 
 
 def _c_factor_rad(
@@ -143,12 +159,10 @@ def _c_factor_rad(
     vza: np.ndarray,
     raa: np.ndarray,
     coef: dict,
+    band: str = "",
 ) -> np.ndarray:
-    target_sza = np.full_like(sza, np.deg2rad(TARGET_SZA_DEG))
-    target_vza = np.zeros_like(sza)
-    target_raa = np.zeros_like(sza)
-
-    brdf_target = _brdf(target_sza, target_vza, target_raa, **coef)
+    # Target BRDF is a precomputed scalar — no N-element array needed.
+    brdf_target = BRDF_TARGET[band] if band else _brdf_scalar(_TARGET_SZA_RAD, 0.0, 0.0, **coef)
     brdf_obs    = _brdf(sza, vza, raa, **coef)
 
     safe_denom = np.where(brdf_obs < 1e-6, 1.0, brdf_obs)
