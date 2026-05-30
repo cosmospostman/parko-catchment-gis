@@ -409,7 +409,7 @@ def make_strips(tmp: Path, n_strips: int, n_pixels: int, n_dates: int) -> list[P
     strip_paths = []
     t_make = time.perf_counter()
     for i in range(n_strips):
-        p = strip_dir / f"strip_{i:04d}.parquet"
+        p = strip_dir / f"BENCH_strip_{i:02d}.parquet"
         _make_realistic_strip_parquet(p, n_pixels, n_dates, northing_offset=i * n_pixels)
         strip_paths.append(p)
     print(f"\n[make_strips]  {n_strips} strips × {n_pixels} px × {n_dates} dates  "
@@ -522,8 +522,8 @@ def bench_workstation_e2e(
 
     t_write = time.perf_counter()
     for i, payload in enumerate(decoded):
-        strip_path = receive_dir / f"strip_{i:04d}.parquet"
-        tmp_path   = receive_dir / f"strip_{i:04d}.tmp"
+        strip_path = receive_dir / f"BENCH_strip_{i:02d}.parquet"
+        tmp_path   = receive_dir / f"BENCH_strip_{i:02d}.tmp"
         tmp_path.write_bytes(payload)
         if tmp_path.stat().st_size != len(payload):
             raise RuntimeError(f"strip {i}: size mismatch after write")

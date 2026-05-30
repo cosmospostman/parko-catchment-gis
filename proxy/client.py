@@ -47,7 +47,7 @@ def fetch_tiles(
     Returns list of written output paths.
 
     Strip-level resume: for each (tile, year), scans tmp_dir for already-
-    complete strip_NNNN.parquet files and resumes from the first gap.
+    complete <tile_id>_strip_NN.parquet files and resumes from the first gap.
 
     Tile-level resume: skips if <out_dir>/<year>/<tile_id>.parquet exists and
     has a sibling .done sentinel.
@@ -68,24 +68,28 @@ def fetch_tiles(
             tile_tmp = tmp_dir / tile_id / str(year)
             tile_tmp.mkdir(parents=True, exist_ok=True)
 
-            # Determine resume strip
-            complete_strips = sorted(tile_tmp.glob("strip_????.parquet"))
+            # Determine resume strip.
+            # Strip indices are absolute COG block rows so the first strip on
+            # disk may not be strip_00 — find the lowest present and walk forward.
+            complete_strips = sorted(tile_tmp.glob(f"{tile_id}_strip_??.parquet"),
+                                     key=lambda p: int(p.stem.split("_")[-1]))
             resume_from = 0
             if complete_strips:
-                # Find highest contiguous complete strip
-                expected = 0
-                for p in complete_strips:
-                    idx = int(p.stem.split("_")[1])
+                indices = [int(p.stem.split("_")[-1]) for p in complete_strips]
+                expected = indices[0]
+                for idx in indices:
                     if idx == expected:
                         expected += 1
+                    else:
+                        break
                 resume_from = expected
                 logger.info(
                     "[%s %d] resuming from strip %d (%d already complete)",
-                    tile_id, year, resume_from, resume_from,
+                    tile_id, year, resume_from, len(complete_strips),
                 )
 
             # Delete any leftover .tmp files (incomplete from prior run)
-            for p in tile_tmp.glob("strip_????.tmp"):
+            for p in tile_tmp.glob(f"{tile_id}_strip_??.tmp"):
                 p.unlink(missing_ok=True)
 
             request_body = {
@@ -106,7 +110,7 @@ def fetch_tiles(
             t0 = time.monotonic()
 
             received_strips: list[Path] = list(complete_strips)
-            strip_counter = resume_from
+            pending_strip_idx: int | None = None  # set by 0x01 frame, consumed by 0x02
 
             with httpx.stream(
                 "POST", url,
@@ -128,6 +132,7 @@ def fetch_tiles(
                     if frame_type == 0x01:
                         try:
                             msg = json.loads(payload.decode())
+                            pending_strip_idx = int(msg["strip"])
                             logger.info(
                                 "[%s %d] strip %s  stage=%s  t=%.1fs",
                                 tile_id, year, msg.get("strip"), msg.get("stage"), msg.get("t", 0),
@@ -136,8 +141,12 @@ def fetch_tiles(
                             pass
 
                     elif frame_type == 0x02:
-                        strip_path = tile_tmp / f"strip_{strip_counter:04d}.parquet"
-                        tmp_path   = tile_tmp / f"strip_{strip_counter:04d}.tmp"
+                        if pending_strip_idx is None:
+                            raise RuntimeError("received 0x02 data frame without preceding 0x01 index frame")
+                        strip_idx  = pending_strip_idx
+                        pending_strip_idx = None
+                        strip_path = tile_tmp / f"{tile_id}_strip_{strip_idx:02d}.parquet"
+                        tmp_path   = tile_tmp / f"{tile_id}_strip_{strip_idx:02d}.tmp"
 
                         tmp_path.write_bytes(payload)
                         # Verify byte count matches frame LENGTH field
@@ -145,7 +154,7 @@ def fetch_tiles(
                         if written_bytes != len(payload):
                             tmp_path.unlink(missing_ok=True)
                             raise RuntimeError(
-                                f"strip {strip_counter}: byte count mismatch "
+                                f"strip {strip_idx}: byte count mismatch "
                                 f"(frame={len(payload)}, disk={written_bytes})"
                             )
                         tmp_path.replace(strip_path)
@@ -153,10 +162,9 @@ def fetch_tiles(
                         mb = len(payload) / 1e6
                         elapsed = time.monotonic() - t0
                         logger.info(
-                            "[%s %d] strip %04d received — %.0f MB  (%.0f s elapsed)",
-                            tile_id, year, strip_counter, mb, elapsed,
+                            "[%s %d] strip %02d received — %.0f MB  (%.0f s elapsed)",
+                            tile_id, year, strip_idx, mb, elapsed,
                         )
-                        strip_counter += 1
 
                     else:
                         logger.warning("unknown frame type 0x%02x — ignoring", frame_type)
@@ -166,7 +174,7 @@ def fetch_tiles(
                 continue
 
             # Sort strips by index for merge
-            received_strips.sort(key=lambda p: int(p.stem.split("_")[1]))
+            received_strips.sort(key=lambda p: int(p.stem.split("_")[-1]))
 
             out_path.parent.mkdir(parents=True, exist_ok=True)
             logger.info("[%s %d] merging %d strips → %s", tile_id, year, len(received_strips), out_path)

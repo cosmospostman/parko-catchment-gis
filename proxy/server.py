@@ -137,7 +137,7 @@ async def _run_pipeline(req: TileRequest, loop: asyncio.AbstractEventLoop) -> As
                 raise item
             strip_idx, strip_path = item
             yield progress_frame(strip_idx, "stream", time.monotonic() - t_start)
-            logger.info("[strip %04d] streaming %s ...", strip_idx, strip_path.name)
+            logger.info("[strip %02d] streaming %s ...", strip_idx, strip_path.name)
             yield write_frame(0x02, strip_path.read_bytes())
             strip_path.unlink(missing_ok=True)
 

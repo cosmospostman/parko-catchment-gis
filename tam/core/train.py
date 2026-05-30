@@ -1541,6 +1541,22 @@ def train_tam(
     finally:
         if _ds_tmp_dir is not None:
             _ds_tmp_dir.cleanup()
+        # Explicitly delete DataLoader references so worker processes and their
+        # multiprocessing.Connection objects are closed before GC runs.
+        # Without this, a session-scoped test fixture triggers
+        # PytestUnraisableExceptionWarning (OSError: Bad file descriptor).
+        try:
+            del train_loader
+        except NameError:
+            pass
+        try:
+            del val_loader
+        except NameError:
+            pass
+        try:
+            del _gate_val_loader
+        except NameError:
+            pass
 
     return _raw_model, best_val_auc
 

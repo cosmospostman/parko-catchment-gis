@@ -189,12 +189,13 @@ def merge_scenes(
 # Strip geometry helpers
 # ---------------------------------------------------------------------------
 
-def read_cog_transform(href: str) -> tuple[str, float]:
-    """Read the UTM CRS EPSG string and top-edge northing from a COG href.
+def read_cog_transform(href: str) -> tuple[str, float, int]:
+    """Read the UTM CRS, top-edge northing, and block height from a COG href.
 
     Opens only the GeoTIFF header via a range request (~2 kB).  No pixel data
-    is read.  Returns (crs_epsg_str, y_top) where y_top is src.transform.f —
-    the UTM northing of pixel row 0 (the top edge of the raster).
+    is read.  Returns (crs_epsg_str, y_top, block_height_px) where y_top is
+    src.transform.f — the UTM northing of pixel row 0 (the top edge of the
+    raster) — and block_height_px is the COG's internal tile height.
 
     Used by compute_strips to snap strip boundaries to the COG block grid.
     """
@@ -203,7 +204,9 @@ def read_cog_transform(href: str) -> tuple[str, float]:
         crs_str = src.crs.to_epsg()
         epsg = f"EPSG:{crs_str}" if crs_str else src.crs.to_string()
         y_top = src.transform.f
-    return epsg, y_top
+        profile = src.profile
+        block_height = profile.get("blockysize", 1024)
+    return epsg, y_top, block_height
 
 
 def compute_strips(
@@ -264,7 +267,13 @@ def compute_strips(
         current += block_m
 
     strips = []
-    strip_idx = 0
+
+    # Strips run north-to-south (descending y) to match COG block row order.
+    # strip_idx is the absolute COG block row: row 0 = top of tile (highest northing).
+    # When cog_y_top is known this is exact; without it we use first_lower as the
+    # tile-top approximation, giving indices that are still consistent within a run.
+    cog_y_top_eff = cog_y_top if (cog_utm_crs is not None and cog_y_top is not None) else first_lower + len(strip_lowers) * block_m
+    first_block_row = round((cog_y_top_eff - strip_lowers[-1] - block_m) / block_m)
 
     # Shapely vectorised contains for polygon masking — prepare once.
     if polygon_geometry is not None:
@@ -273,7 +282,8 @@ def compute_strips(
     else:
         _use_vectorised = False
 
-    for lower in strip_lowers:
+    for lower in reversed(strip_lowers):
+        strip_idx = round((cog_y_top_eff - lower - block_m) / block_m)
         upper = lower + block_m
         ys = np.arange(lower, upper, r)
         # Filter ys to those within the bbox.
@@ -309,7 +319,6 @@ def compute_strips(
         ]
         # Store y_lower so points can be regenerated on demand via make_strip_points().
         strips.append({"strip_idx": strip_idx, "bbox": strip_bbox, "y_lower": lower})
-        strip_idx += 1
 
     # Stash grid params on the list object so make_strip_points() can regenerate
     # points for any strip without re-running the full bbox computation.
@@ -446,23 +455,24 @@ def run_tile_pipeline(
     # the COG's 1024-px block grid, eliminating block over-fetch waste.
     cog_utm_crs: str | None = None
     cog_y_top: float | None = None
+    cog_block_height: int = strip_height_px
     for item in items:
         href_obj = item.assets.get("red") or item.assets.get("B04")
         if href_obj is not None:
             try:
-                cog_utm_crs, cog_y_top = read_cog_transform(href_obj.href)
-                logger.info("[tile %s %d] COG origin: crs=%s y_top=%.1f",
-                            tile_id, year, cog_utm_crs, cog_y_top)
+                cog_utm_crs, cog_y_top, cog_block_height = read_cog_transform(href_obj.href)
+                logger.info("[tile %s %d] COG origin: crs=%s y_top=%.1f block_height=%d px",
+                            tile_id, year, cog_utm_crs, cog_y_top, cog_block_height)
             except Exception as exc:
                 logger.warning("[tile %s %d] Could not read COG transform (%s) — using geographic fallback",
                                tile_id, year, exc)
             break
 
     strips, strips_meta = compute_strips(
-        bbox_wgs84, strip_height_px, polygon_geometry,
+        bbox_wgs84, cog_block_height, polygon_geometry,
         cog_utm_crs=cog_utm_crs, cog_y_top=cog_y_top,
     )
-    logger.info("[tile %s %d] %d strips of %d px", tile_id, year, len(strips), strip_height_px)
+    logger.info("[tile %s %d] %d strips of %d px", tile_id, year, len(strips), cog_block_height)
 
     if not strips:
         return
@@ -475,10 +485,10 @@ def run_tile_pipeline(
 
     def _fetch_strip(strip: dict, pts: list) -> dict:
         """Run the fetch-only phase for one strip (S2 + S1); returns the strip dict."""
-        s_dir = tmp / f"strip_{strip['strip_idx']:04d}_scenes"
+        s_dir = tmp / f"strip_{strip['strip_idx']:02d}_scenes"
         s_dir.mkdir(parents=True, exist_ok=True)
         s_cache = s_dir / "cache"
-        logger.info("[tile %s %d] [strip %04d] prefetch %d items ...",
+        logger.info("[tile %s %d] [strip %02d] prefetch %d items ...",
                     tile_id, year, strip["strip_idx"], len(items))
         list(collect(
             bbox_wgs84=strip["bbox"],
@@ -514,7 +524,7 @@ def run_tile_pipeline(
 
     for s in strips:
         if s["strip_idx"] < resume_from_strip:
-            logger.info("[tile %s %d] [strip %04d] skipping (resume_from_strip=%d)",
+            logger.info("[tile %s %d] [strip %02d] skipping (resume_from_strip=%d)",
                         tile_id, year, s["strip_idx"], resume_from_strip)
 
     if not active_strips:
@@ -541,7 +551,7 @@ def run_tile_pipeline(
 
             # Wait for this strip's fetch to complete.
             fetch_futs.popleft().result()
-            logger.info("[tile %s %d] [strip %04d] fetch done; starting extract (%d pts, %d items)",
+            logger.info("[tile %s %d] [strip %02d] fetch done; starting extract (%d pts, %d items)",
                         tile_id, year, strip_idx, len(strip_pts), len(items))
 
             # Submit fetch for strip i+2 immediately (before CPU-bound extract/merge)
@@ -552,7 +562,7 @@ def run_tile_pipeline(
                 pts_queue.append(pts)
                 fetch_futs.append(prefetch_pool.submit(_fetch_strip, active_strips[next_k], pts))
 
-            scene_dir   = tmp / f"strip_{strip_idx:04d}_scenes"
+            scene_dir   = tmp / f"strip_{strip_idx:02d}_scenes"
             strip_cache = scene_dir / "cache"
 
             scene_paths = [
@@ -575,7 +585,7 @@ def run_tile_pipeline(
             ]
 
             if not scene_paths:
-                logger.info("[tile %s %d] [strip %04d] no scene data — skipping", tile_id, year, strip_idx)
+                logger.info("[tile %s %d] [strip %02d] no scene data — skipping", tile_id, year, strip_idx)
                 shutil.rmtree(scene_dir, ignore_errors=True)
                 continue
 
@@ -591,12 +601,12 @@ def run_tile_pipeline(
                 phases={"extract"},
             )
 
-            strip_out = tmp / f"strip_{strip_idx:04d}_sorted.parquet"
+            strip_out = tmp / f"strip_{strip_idx:02d}_sorted.parquet"
             merge_scenes(scene_paths, s1_path, strip_out)
 
             shutil.rmtree(scene_dir, ignore_errors=True)
 
-            logger.info("[tile %s %d] [strip %04d] ready → %s", tile_id, year, strip_idx, strip_out.name)
+            logger.info("[tile %s %d] [strip %02d] ready → %s", tile_id, year, strip_idx, strip_out.name)
             yield strip_idx, strip_out
 
 
@@ -681,24 +691,25 @@ def run_tile_pipeline_v2(
 
     cog_utm_crs: str | None = None
     cog_y_top: float | None = None
+    cog_block_height: int = strip_height_px
     for item in items:
         href_obj = item.assets.get("red") or item.assets.get("B04")
         if href_obj is not None:
             try:
-                cog_utm_crs, cog_y_top = read_cog_transform(href_obj.href)
-                logger.info("[v2 tile %s %d] COG origin: crs=%s y_top=%.1f",
-                            tile_id, year, cog_utm_crs, cog_y_top)
+                cog_utm_crs, cog_y_top, cog_block_height = read_cog_transform(href_obj.href)
+                logger.info("[v2 tile %s %d] COG origin: crs=%s y_top=%.1f block_height=%d px",
+                            tile_id, year, cog_utm_crs, cog_y_top, cog_block_height)
             except Exception as exc:
                 logger.warning("[v2 tile %s %d] Could not read COG transform (%s) — using geographic fallback",
                                tile_id, year, exc)
             break
 
     strips, strips_meta = compute_strips(
-        bbox_wgs84, strip_height_px, polygon_geometry,
+        bbox_wgs84, cog_block_height, polygon_geometry,
         cog_utm_crs=cog_utm_crs, cog_y_top=cog_y_top,
     )
     strips_meta["point_id_prefix"] = point_id_prefix
-    logger.info("[v2 tile %s %d] %d strips of %d px", tile_id, year, len(strips), strip_height_px)
+    logger.info("[v2 tile %s %d] %d strips of %d px", tile_id, year, len(strips), cog_block_height)
 
     if not strips:
         return
@@ -706,7 +717,7 @@ def run_tile_pipeline_v2(
     active_strips = [s for s in strips if s["strip_idx"] >= resume_from_strip]
     for s in strips:
         if s["strip_idx"] < resume_from_strip:
-            logger.info("[v2 tile %s %d] [strip %04d] skipping (resume_from_strip=%d)",
+            logger.info("[v2 tile %s %d] [strip %02d] skipping (resume_from_strip=%d)",
                         tile_id, year, s["strip_idx"], resume_from_strip)
 
     if not active_strips:
@@ -737,9 +748,9 @@ def run_tile_pipeline_v2(
     def _stage_fetch_tiffs(work: _StripWork) -> _StripWork:
         """Pool A: fetch all item×band GeoTIFFs to disk for one strip."""
         strip_idx = work.strip["strip_idx"]
-        tiff_dir  = tmp / f"strip_{strip_idx:04d}_tiffs"
+        tiff_dir  = tmp / f"strip_{strip_idx:02d}_tiffs"
         tiff_dir.mkdir(parents=True, exist_ok=True)
-        logger.info("[v2 tile %s %d] [strip %04d] fetch_tiffs → %s",
+        logger.info("[v2 tile %s %d] [strip %02d] fetch_tiffs → %s",
                     tile_id, year, strip_idx, tiff_dir.name)
 
         async def _fetch_async() -> None:
@@ -764,7 +775,7 @@ def run_tile_pipeline_v2(
         strip_pts = work.pts
         rg_size   = max(1, len(strip_pts) // strip_height_px)
 
-        scene_dir = tmp / f"strip_{strip_idx:04d}_scenes"
+        scene_dir = tmp / f"strip_{strip_idx:02d}_scenes"
         scene_dir.mkdir(parents=True, exist_ok=True)
 
         point_ids = [pid      for pid, _, _   in strip_pts]
@@ -782,7 +793,7 @@ def run_tile_pipeline_v2(
             prefetch_granule_xmls(items, max_workers=8)
 
         n_items = len(items)
-        logger.info("[v2 tile %s %d] [strip %04d] extract_scenes (%d pts, %d items)",
+        logger.info("[v2 tile %s %d] [strip %02d] extract_scenes (%d pts, %d items)",
                     tile_id, year, strip_idx, len(strip_pts), n_items)
 
         def _extract_one(item_idx: int, item) -> Path | None:
@@ -827,7 +838,7 @@ def run_tile_pipeline_v2(
             shutil.rmtree(item_tiff_dir, ignore_errors=True)
 
             if df is None or len(df) == 0:
-                logger.info("[v2] [strip %04d] scene %d/%d %s — no clear pixels",
+                logger.info("[v2] [strip %02d] scene %d/%d %s — no clear pixels",
                             strip_idx, item_idx + 1, n_items, scene_id)
                 return None
 
@@ -842,7 +853,7 @@ def run_tile_pipeline_v2(
             writer.close()
             tmp_path.replace(out_path)
 
-            logger.info("[v2] [strip %04d] scene %d/%d %s — %d rows",
+            logger.info("[v2] [strip %02d] scene %d/%d %s — %d rows",
                         strip_idx, item_idx + 1, n_items, scene_id, len(tbl))
             return out_path
 
@@ -862,7 +873,7 @@ def run_tile_pipeline_v2(
         work.scene_paths = scene_paths
 
         if not scene_paths:
-            logger.info("[v2 tile %s %d] [strip %04d] no scene data — skipping",
+            logger.info("[v2 tile %s %d] [strip %02d] no scene data — skipping",
                         tile_id, year, strip_idx)
             return None  # drops this strip from the pipeline
 
@@ -871,7 +882,7 @@ def run_tile_pipeline_v2(
     def _stage_collect_s1(work: _StripWork) -> _StripWork:
         """Async S1 fetch + extract for one strip."""
         strip_idx = work.strip["strip_idx"]
-        scene_dir = tmp / f"strip_{strip_idx:04d}_scenes"
+        scene_dir = tmp / f"strip_{strip_idx:02d}_scenes"
         work.s1_path = collect_s1_for_tile(
             s2_path=None,
             bbox_wgs84=work.strip["bbox"],
@@ -890,11 +901,11 @@ def run_tile_pipeline_v2(
     def _stage_merge(work: _StripWork) -> _StripWork:
         """K-way heap merge of scene parquets + S1 → sorted strip parquet."""
         strip_idx = work.strip["strip_idx"]
-        scene_dir = tmp / f"strip_{strip_idx:04d}_scenes"
-        strip_out = tmp / f"strip_{strip_idx:04d}_sorted.parquet"
+        scene_dir = tmp / f"strip_{strip_idx:02d}_scenes"
+        strip_out = tmp / f"strip_{strip_idx:02d}_sorted.parquet"
         merge_scenes(work.scene_paths, work.s1_path, strip_out)
         shutil.rmtree(scene_dir, ignore_errors=True)
-        logger.info("[v2 tile %s %d] [strip %04d] ready → %s",
+        logger.info("[v2 tile %s %d] [strip %02d] ready → %s",
                     tile_id, year, strip_idx, strip_out.name)
         work.scene_paths = []
         work.s1_path     = None
@@ -931,5 +942,5 @@ def run_tile_pipeline_v2(
 
     for work in fetch_pipeline.run(_strip_inputs()):
         strip_idx = work.strip["strip_idx"]
-        strip_out = tmp / f"strip_{strip_idx:04d}_sorted.parquet"
+        strip_out = tmp / f"strip_{strip_idx:02d}_sorted.parquet"
         yield strip_idx, strip_out

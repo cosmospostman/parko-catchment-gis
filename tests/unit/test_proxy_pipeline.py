@@ -385,8 +385,8 @@ def test_atomic_strip_write(tmp_path):
     assert ft == 0x02
 
     tmp_path.mkdir(parents=True, exist_ok=True)
-    tmp_file  = tmp_path / "strip_0000.tmp"
-    out_file  = tmp_path / "strip_0000.parquet"
+    tmp_file  = tmp_path / "55HBU_strip_00.tmp"
+    out_file  = tmp_path / "55HBU_strip_00.parquet"
 
     tmp_file.write_bytes(payload)
     assert tmp_file.stat().st_size == len(payload)
@@ -404,16 +404,17 @@ def test_atomic_strip_write(tmp_path):
 def test_resume_skips_complete_strips(tmp_path):
     """Client identifies the correct resume_from_strip based on existing files."""
     # Simulate strips 0, 1, 2 present; strip 3 absent → resume from 3
-    tile_tmp = tmp_path / "tile" / "2022"
+    tile_id = "55HBU"
+    tile_tmp = tmp_path / tile_id / "2022"
     tile_tmp.mkdir(parents=True)
     for i in range(3):
-        (tile_tmp / f"strip_{i:04d}.parquet").touch()
+        (tile_tmp / f"{tile_id}_strip_{i:02d}.parquet").touch()
 
-    complete = sorted(tile_tmp.glob("strip_????.parquet"))
+    complete = sorted(tile_tmp.glob(f"{tile_id}_strip_??.parquet"))
     resume_from = 0
     expected = 0
     for p in complete:
-        idx = int(p.stem.split("_")[1])
+        idx = int(p.stem.split("_")[-1])
         if idx == expected:
             expected += 1
     resume_from = expected
@@ -422,15 +423,16 @@ def test_resume_skips_complete_strips(tmp_path):
 
 def test_resume_gap_handled(tmp_path):
     """If strips 0 and 2 exist but 1 is missing, resume starts at 1."""
-    tile_tmp = tmp_path / "tile" / "2022"
+    tile_id = "55HBU"
+    tile_tmp = tmp_path / tile_id / "2022"
     tile_tmp.mkdir(parents=True)
-    (tile_tmp / "strip_0000.parquet").touch()
-    (tile_tmp / "strip_0002.parquet").touch()  # gap at 1
+    (tile_tmp / f"{tile_id}_strip_00.parquet").touch()
+    (tile_tmp / f"{tile_id}_strip_02.parquet").touch()  # gap at 1
 
-    complete = sorted(tile_tmp.glob("strip_????.parquet"))
+    complete = sorted(tile_tmp.glob(f"{tile_id}_strip_??.parquet"))
     expected = 0
     for p in complete:
-        idx = int(p.stem.split("_")[1])
+        idx = int(p.stem.split("_")[-1])
         if idx == expected:
             expected += 1
         else:
@@ -480,7 +482,7 @@ def test_workstation_merge_row_count(tmp_path):
     strip_paths = []
     offset = 0
     for i, n in enumerate(strip_rows):
-        p = _make_strip_parquet(tmp_path / f"strip_{i:04d}.parquet", n, offset)
+        p = _make_strip_parquet(tmp_path / f"strip_{i:02d}.parquet", n, offset)
         strip_paths.append(p)
         offset += n
 
@@ -877,15 +879,15 @@ def test_cs10_strips_contiguous():
         f"expected ≥2 strips with strip_height_px={strip_px} over {_CS_BBOX}, got {len(strips)}"
     )
 
-    # Collect per-strip northing ranges
+    # Collect per-strip northing ranges — strips are ordered N→S (descending northing)
     ranges: list[tuple[float, float]] = []
     for s in strips:
         ys = _utm_northings(make_strip_points(s, meta), _CS_CRS)
         ranges.append((min(ys), max(ys)))
 
     for i in range(len(ranges) - 1):
-        y_max_i   = ranges[i][1]
-        y_min_i1  = ranges[i + 1][0]
-        gap = y_min_i1 - y_max_i
+        y_min_i   = ranges[i][0]
+        y_max_i1  = ranges[i + 1][1]
+        gap = y_min_i - y_max_i1  # positive when strip i is fully above strip i+1
         assert gap >= -10.0, f"strips {i} and {i+1} overlap by {-gap:.1f} m"
         assert gap <= block_m + 10.0, f"gap between strips {i} and {i+1} is {gap:.1f} m > block_m"

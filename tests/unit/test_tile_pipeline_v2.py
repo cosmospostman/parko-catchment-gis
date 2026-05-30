@@ -305,7 +305,7 @@ def test_run_tile_pipeline_v2_yields_strips(tmp_path):
     def fake_merge(scene_paths, s1_path, out_path):
         _write_strip_parquet(out_path)
 
-    with patch("proxy._pipeline.read_cog_transform", return_value=("EPSG:32755", 7_600_000.0)), \
+    with patch("proxy._pipeline.read_cog_transform", return_value=("EPSG:32755", 7_600_000.0, 1024)), \
          patch("proxy._pipeline.compute_strips", return_value=([_strip], _meta)), \
          patch("utils.s1_collector.collect_s1_for_tile", return_value=None), \
          patch("proxy._pipeline.merge_scenes", side_effect=fake_merge), \
@@ -340,7 +340,7 @@ def test_run_tile_pipeline_v2_resume(tmp_path):
     def fake_asyncio_run(coro):
         coro.close()
 
-    with patch("proxy._pipeline.read_cog_transform", return_value=("EPSG:32755", 7_600_000.0)), \
+    with patch("proxy._pipeline.read_cog_transform", return_value=("EPSG:32755", 7_600_000.0, 1024)), \
          patch("proxy._pipeline.compute_strips", return_value=(strips, meta)), \
          patch("asyncio.run", side_effect=fake_asyncio_run), \
          patch("utils.pixel_collector._extract_item_from_tiffs", return_value=None), \
@@ -356,7 +356,7 @@ def test_run_tile_pipeline_v2_resume(tmp_path):
         ))
 
     # Strip 0 should have been skipped — tiff_dir for strip_0000 never created
-    assert not (tmp_path / "work" / "strip_0000_tiffs").exists()
+    assert not (tmp_path / "work" / "strip_00_tiffs").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -369,7 +369,7 @@ def test_run_tile_pipeline_v2_cleans_tiff_dir(tmp_path):
     polygon = _make_polygon()
     _strip, _meta = _make_strip_and_meta()
 
-    tiff_dir_path = tmp_path / "work" / "strip_0000_tiffs"
+    tiff_dir_path = tmp_path / "work" / "strip_00_tiffs"
 
     def fake_asyncio_run(coro):
         # Simulate Pool A: create the tiff_dir so cleanup can be verified
@@ -379,7 +379,7 @@ def test_run_tile_pipeline_v2_cleans_tiff_dir(tmp_path):
     def fake_merge(scene_paths, s1_path, out_path):
         _write_strip_parquet(out_path)
 
-    with patch("proxy._pipeline.read_cog_transform", return_value=("EPSG:32755", 7_600_000.0)), \
+    with patch("proxy._pipeline.read_cog_transform", return_value=("EPSG:32755", 7_600_000.0, 1024)), \
          patch("proxy._pipeline.compute_strips", return_value=([_strip], _meta)), \
          patch("asyncio.run", side_effect=fake_asyncio_run), \
          patch("utils.pixel_collector._extract_item_from_tiffs", return_value=None), \

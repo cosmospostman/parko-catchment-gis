@@ -5,10 +5,10 @@ fetch_tile_local() runs the same pipeline as the proxy VM — tile-first,
 disk instead of streaming them over HTTP.
 
 Output layout:
-  out_dir/<year>/<tile_id>/strip_NNNN.parquet   — one file per strip
-  out_dir/<year>/<tile_id>/.done                — sentinel when all strips complete
+  out_dir/<year>/<tile_id>/<tile_id>_strip_NN.parquet   — one file per strip
+  out_dir/<year>/<tile_id>/.done                        — sentinel when all strips complete
 
-Strip-level resume: existing strip_NNNN.parquet files in the tile dir are
+Strip-level resume: existing <tile_id>_strip_NN.parquet files in the tile dir are
 included automatically; processing resumes from the first gap.
 
 Tile-level resume: if the .done sentinel exists the function returns immediately.
@@ -40,8 +40,8 @@ def fetch_tile_local(
 ) -> list[Path] | None:
     """Fetch one tile×year locally using the same pipeline as the proxy VM.
 
-    Writes strip parquets to *out_dir*/<year>/<tile_id>/strip_NNNN.parquet and
-    touches a .done sentinel on completion.  No merge step — callers consume
+    Writes strip parquets to *out_dir*/<year>/<tile_id>/<tile_id>_strip_NN.parquet
+    and touches a .done sentinel on completion.  No merge step — callers consume
     strips directly.
 
     Parameters
@@ -53,7 +53,7 @@ def fetch_tile_local(
     polygon_geometry:
         Shapely geometry defining the area of interest.
     out_dir:
-        Root output directory.  Strips land at out_dir/year/tile_id/strip_NNNN.parquet.
+        Root output directory.  Strips land at out_dir/year/tile_id/<tile_id>_strip_NN.parquet.
     work_dir:
         Root directory for temporary working data (_work, .tmp files).  Defaults
         to out_dir so behaviour is unchanged when not specified.
@@ -73,7 +73,7 @@ def fetch_tile_local(
     done_sentinel = tile_dir / ".done"
 
     if done_sentinel.exists():
-        strips = sorted(tile_dir.glob("strip_????.parquet"))
+        strips = sorted(tile_dir.glob(f"{tile_id}_strip_??.parquet"))
         logger.info("[%s %d] already done (%d strips) — skipping", tile_id, year, len(strips))
         return strips or None
 
@@ -82,22 +82,27 @@ def fetch_tile_local(
     _work_root = (work_dir / str(year) / tile_id) if work_dir is not None else tile_dir
 
     # Clean up incomplete writes from a prior interrupted run.
-    for p in _work_root.glob("strip_????.tmp"):
+    for p in _work_root.glob(f"{tile_id}_strip_??.tmp"):
         p.unlink(missing_ok=True)
 
     # Determine resume point from contiguous existing strips.
-    complete_strips = sorted(tile_dir.glob("strip_????.parquet"))
+    # Strip indices are absolute COG block rows (north-to-south), so the
+    # first strip on disk may not be strip_00.  Find the lowest index present
+    # and walk forward from there to find the first gap.
+    complete_strips = sorted(tile_dir.glob(f"{tile_id}_strip_??.parquet"),
+                             key=lambda p: int(p.stem.split("_")[-1]))
     resume_from = 0
     if complete_strips:
-        expected = 0
-        for p in complete_strips:
-            if int(p.stem.split("_")[1]) == expected:
+        indices = [int(p.stem.split("_")[-1]) for p in complete_strips]
+        expected = indices[0]
+        for idx in indices:
+            if idx == expected:
                 expected += 1
             else:
                 break
         resume_from = expected
         logger.info("[%s %d] resuming from strip %d (%d already complete)",
-                    tile_id, year, resume_from, resume_from)
+                    tile_id, year, resume_from, len(complete_strips))
 
     received_strips: list[Path] = list(complete_strips)
 
@@ -119,13 +124,13 @@ def fetch_tile_local(
         calibration_out=calibration_out,
         point_id_prefix=point_id_prefix,
     ):
-        dest     = tile_dir / f"strip_{strip_idx:04d}.parquet"
-        dest_tmp = _work_root / f"strip_{strip_idx:04d}.tmp"
+        dest     = tile_dir / f"{tile_id}_strip_{strip_idx:02d}.parquet"
+        dest_tmp = _work_root / f"{tile_id}_strip_{strip_idx:02d}.tmp"
         shutil.copy2(strip_path, dest_tmp)
         dest_tmp.replace(dest)
         strip_path.unlink(missing_ok=True)
         received_strips.append(dest)
-        logger.info("[%s %d] strip %04d written (%.1f MB)",
+        logger.info("[%s %d] strip %02d written (%.1f MB)",
                     tile_id, year, strip_idx, dest.stat().st_size / 1e6)
 
     try:
@@ -137,6 +142,6 @@ def fetch_tile_local(
         logger.warning("[%s %d] no strips — nothing written", tile_id, year)
         return None
 
-    received_strips.sort(key=lambda p: int(p.stem.split("_")[1]))
+    received_strips.sort(key=lambda p: int(p.stem.split("_")[-1]))
     done_sentinel.touch()
     return received_strips

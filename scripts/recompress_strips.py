@@ -34,5 +34,5 @@ if __name__ == "__main__":
     src_dir  = Path(sys.argv[1])
     dest_dir = Path(sys.argv[2])
     dest_dir.mkdir(parents=True, exist_ok=True)
-    for strip in sorted(src_dir.glob("strip_????.parquet")):
+    for strip in sorted(src_dir.glob("*_strip_??.parquet")):
         recompress(strip, dest_dir)

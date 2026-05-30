@@ -987,7 +987,7 @@ def main() -> None:
                          "Routes extraction to the VM; only compressed parquet is transferred.")
     pf.add_argument("--output-dir", type=str, default="/mnt/external/mitchell", metavar="DIR",
                     help="Root directory for final strip parquets (default: /mnt/external/mitchell). "
-                         "Strips are written to <DIR>/<location_id>/<year>/<tile_id>/strip_NNNN.parquet.")
+                         "Strips are written to <DIR>/<location_id>/<year>/<tile_id>/strip_NN.parquet.")
     pf.add_argument("--work-dir", type=str, default="/data/mitchell", metavar="DIR",
                     help="Root directory for temporary working data (default: /data/mitchell). "
                          "Should be on fast local storage (NVMe). "

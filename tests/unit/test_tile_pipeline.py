@@ -10,7 +10,7 @@ TP-1  run_tile_pipeline yields (strip_idx, path) for each non-empty strip;
 TP-2  run_tile_pipeline skips strips before resume_from_strip.
 TP-3  run_tile_pipeline passes the strip sub-bbox (not the full tile bbox)
       to collect() and collect_s1_for_tile().
-TP-4  run_tile_pipeline uses a per-strip cache_dir under tmp/strip_NNNN_scenes/cache/.
+TP-4  run_tile_pipeline uses a per-strip cache_dir under tmp/strip_NN_scenes/cache/.
 TP-5  run_tile_pipeline cleans up scene_dir after each strip is yielded.
 TP-6  fetch_tile_local done-sentinel: no pipeline calls when .done sentinel exists.
 TP-7  fetch_tile_local resume: pre-existing strips counted; resume_from_strip
@@ -138,7 +138,7 @@ def test_run_tile_pipeline_yields_strips(tmp_path):
          patch("utils.pixel_collector.collect", side_effect=fake_collect), \
          patch("utils.s1_collector.collect_s1_for_tile", side_effect=fake_s1), \
          patch("proxy._pipeline.merge_scenes", side_effect=_fake_merge_scenes), \
-         patch("proxy._pipeline.read_cog_transform", return_value=("EPSG:32755", 7_600_000.0)), \
+         patch("proxy._pipeline.read_cog_transform", return_value=("EPSG:32755", 7_600_000.0, 1024)), \
          patch("proxy._pipeline.compute_strips", return_value=([_strip], _meta)):
         from proxy._pipeline import run_tile_pipeline
         results = list(run_tile_pipeline(
@@ -177,7 +177,7 @@ def test_run_tile_pipeline_resume_skips_strips(tmp_path):
     with patch("utils.pixel_collector.collect", side_effect=fake_collect), \
          patch("utils.s1_collector.collect_s1_for_tile", return_value=None), \
          patch("proxy._pipeline.merge_scenes", side_effect=_fake_merge_scenes), \
-         patch("proxy._pipeline.read_cog_transform", return_value=("EPSG:32755", 7_600_000.0)), \
+         patch("proxy._pipeline.read_cog_transform", return_value=("EPSG:32755", 7_600_000.0, 1024)), \
          patch("proxy._pipeline.compute_strips", return_value=(strips, _meta)):
         from proxy._pipeline import run_tile_pipeline
         results = list(run_tile_pipeline(
@@ -224,7 +224,7 @@ def test_run_tile_pipeline_uses_strip_bbox(tmp_path):
     with patch("utils.pixel_collector.collect", side_effect=fake_collect), \
          patch("utils.s1_collector.collect_s1_for_tile", side_effect=fake_s1), \
          patch("proxy._pipeline.merge_scenes", side_effect=_fake_merge_scenes), \
-         patch("proxy._pipeline.read_cog_transform", return_value=("EPSG:32755", 7_600_000.0)), \
+         patch("proxy._pipeline.read_cog_transform", return_value=("EPSG:32755", 7_600_000.0, 1024)), \
          patch("proxy._pipeline.compute_strips", return_value=([_strip], _meta)):
         from proxy._pipeline import run_tile_pipeline
         list(run_tile_pipeline(
@@ -240,7 +240,7 @@ def test_run_tile_pipeline_uses_strip_bbox(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# TP-4  each strip gets its own cache_dir under strip_NNNN_scenes/cache/
+# TP-4  each strip gets its own cache_dir under strip_NN_scenes/cache/
 # ---------------------------------------------------------------------------
 
 def test_run_tile_pipeline_per_strip_cache(tmp_path):
@@ -264,7 +264,7 @@ def test_run_tile_pipeline_per_strip_cache(tmp_path):
     with patch("utils.pixel_collector.collect", side_effect=fake_collect), \
          patch("utils.s1_collector.collect_s1_for_tile", return_value=None), \
          patch("proxy._pipeline.merge_scenes", side_effect=_fake_merge_scenes), \
-         patch("proxy._pipeline.read_cog_transform", return_value=("EPSG:32755", 7_600_000.0)), \
+         patch("proxy._pipeline.read_cog_transform", return_value=("EPSG:32755", 7_600_000.0, 1024)), \
          patch("proxy._pipeline.compute_strips", return_value=(strips, _meta)):
         from proxy._pipeline import run_tile_pipeline
         list(run_tile_pipeline(
@@ -307,7 +307,7 @@ def test_run_tile_pipeline_cleans_scene_dir(tmp_path):
     with patch("utils.pixel_collector.collect", side_effect=fake_collect), \
          patch("utils.s1_collector.collect_s1_for_tile", return_value=None), \
          patch("proxy._pipeline.merge_scenes", side_effect=_fake_merge_scenes), \
-         patch("proxy._pipeline.read_cog_transform", return_value=("EPSG:32755", 7_600_000.0)), \
+         patch("proxy._pipeline.read_cog_transform", return_value=("EPSG:32755", 7_600_000.0, 1024)), \
          patch("proxy._pipeline.compute_strips", return_value=([_strip], _meta)):
         from proxy._pipeline import run_tile_pipeline
         results = list(run_tile_pipeline(
@@ -330,7 +330,7 @@ def test_fetch_tile_local_done_sentinel_skips(tmp_path):
 
     tile_dir = tmp_path / "out" / "2022" / "55HBU"
     tile_dir.mkdir(parents=True, exist_ok=True)
-    strip = tile_dir / "strip_0000.parquet"
+    strip = tile_dir / "55HBU_strip_00.parquet"
     _write_strip_parquet(strip)
     (tile_dir / ".done").touch()
 
@@ -357,7 +357,7 @@ def test_fetch_tile_local_resume(tmp_path):
 
     # Two strips already complete
     for i in (0, 1):
-        _write_strip_parquet(tile_dir / f"strip_{i:04d}.parquet")
+        _write_strip_parquet(tile_dir / f"55HBU_strip_{i:02d}.parquet")
 
     resume_args: list[int] = []
 
@@ -377,7 +377,7 @@ def test_fetch_tile_local_resume(tmp_path):
     assert resume_args == [2], f"expected resume_from_strip=2, got {resume_args}"
     assert result is not None
     assert len(result) == 3  # strips 0, 1, 2
-    assert all(p.name.startswith("strip_") for p in result)
+    assert all(p.name.startswith("55HBU_strip_") for p in result)
 
 
 # ---------------------------------------------------------------------------
@@ -403,7 +403,7 @@ def test_fetch_tile_local_atomic_write_no_merge(tmp_path):
 
     assert result is not None and len(result) == 1
     strip = result[0]
-    assert strip == out_dir / "2022" / "55HBU" / "strip_0000.parquet"
+    assert strip == out_dir / "2022" / "55HBU" / "55HBU_strip_00.parquet"
     assert strip.exists()
     # .done sentinel written
     assert (out_dir / "2022" / "55HBU" / ".done").exists()
@@ -545,7 +545,7 @@ def test_run_tile_pipeline_integration(tmp_path):
 
     with patch("utils.pixel_collector.collect", side_effect=fake_collect), \
          patch("utils.s1_collector.collect_s1_for_tile", return_value=None), \
-         patch("proxy._pipeline.read_cog_transform", return_value=("EPSG:32755", 7_600_000.0)), \
+         patch("proxy._pipeline.read_cog_transform", return_value=("EPSG:32755", 7_600_000.0, 1024)), \
          patch("proxy._pipeline.compute_strips", return_value=([_strip], _meta)):
         from proxy._pipeline import run_tile_pipeline
         results = list(run_tile_pipeline(
