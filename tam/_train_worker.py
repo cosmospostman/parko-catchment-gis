@@ -35,10 +35,15 @@ torch.backends.cuda.matmul.allow_tf32 = True
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+_out_dir = Path(sys.argv[2]) if len(sys.argv) >= 3 else Path(".")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(_out_dir / "train.log", mode="a"),
+    ],
 )
 logger = logging.getLogger(__name__)
 
