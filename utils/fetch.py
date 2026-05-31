@@ -488,7 +488,6 @@ async def fetch_patches_to_tiff(
 
     # Phase 1: SCL patches
     n_scl = len(item_specs)
-    logger.info("fetch_patches_to_tiff: phase 1 — fetching %d SCL patches", n_scl)
     scl_done = 0
 
     async def fetch_scl_tracked(item, scl_asset_key):
@@ -497,13 +496,14 @@ async def fetch_patches_to_tiff(
             return None
         result = await _fetch_and_write(item, SCL_BAND, scl_asset_key)
         scl_done += 1
-        logger.info("  S2 chips  fetch %d/%d SCL done", scl_done, n_scl)
+        print(f"    fetch S2: {scl_done}/{n_scl} SCL\r", end="", flush=True)
         return result
 
     scl_paths = await asyncio.gather(*[
         fetch_scl_tracked(item, scl_asset_key)
         for (item, scl_asset_key, _) in item_specs
     ])
+    print(f"    fetch S2: {n_scl}/{n_scl} SCL")
 
     # Phase 2: spectral patches for non-clouded items
     spectral_tasks: list[tuple[asyncio.Task]] = []
@@ -525,22 +525,19 @@ async def fetch_patches_to_tiff(
             spectral_tasks.append(asyncio.ensure_future(_fetch_and_write(item, band, asset_key)))
 
     n_spectral = len(spectral_tasks)
-    logger.info(
-        "fetch_patches_to_tiff: phase 2 — fetching %d spectral patches (%d items cloud-filtered)",
-        n_spectral, filtered,
-    )
     completed = 0
 
     async def tracked(task):
         nonlocal completed
         path = await task
         completed += 1
-        logger.info("  S2 chips  fetch %d/%d spectral done", completed, n_spectral)
+        print(f"    fetch S2: {completed}/{n_spectral} spectral\r", end="", flush=True)
         if path is not None:
             async with written_lock:
                 written.append(path)
 
     await asyncio.gather(*[tracked(t) for t in spectral_tasks])
+    print(f"    fetch S2: {n_spectral}/{n_spectral} spectral")
 
     fetch_executor.shutdown(wait=True)
     write_executor.shutdown(wait=True)

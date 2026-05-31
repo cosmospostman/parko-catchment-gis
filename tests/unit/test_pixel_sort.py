@@ -118,20 +118,24 @@ def test_overlapping_groups_not_sorted(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# PS-4  Overlap in an unsampled middle pair is missed when n_pairs > n_check
-#        (documents the known limitation)
+# PS-4  Overlap in an unsampled middle pair is caught by the distant-pair check
+#
+# Previously n_check=2 could miss overlap at pair 5 (false positive). The
+# distant-pair check (rg0 vs rg_mid) now catches disjoint-pixel layouts and
+# flags them as unsorted regardless of n_check.  Both low and high n_check
+# should now correctly return False for a file with a real overlap.
 # ---------------------------------------------------------------------------
 
-def test_is_pixel_sorted_misses_overlap_beyond_n_check(tmp_path):
-    # 20 row groups → 19 pairs. n_check=2 samples pairs {0, 10, 18} — pair 5
-    # is never checked.  Place the overlap exactly at pair 5 (groups[5]/groups[6]).
+def test_is_pixel_sorted_catches_overlap_regardless_of_n_check(tmp_path):
+    # 20 row groups, overlap only at pair 5 (groups[5] and groups[6] both = "px5").
+    # The distant-pair check (rg0=["px0"] vs rg10=["px10"]) finds no shared pixels
+    # and correctly returns False — indicating the file is not pixel-sorted.
     n_groups = 20
     groups = [[f"px{i}"] for i in range(n_groups)]
     groups[6] = ["px5"]  # groups[5]=["px5"], groups[6]=["px5"] → overlap at pair 5
     p = _write_parquet(tmp_path / "mid_overlap.parquet", groups)
-    # n_check=2 misses pair 5 → false positive
-    assert is_pixel_sorted(p, n_check=2) is True   # known gap
-    # n_check=19 checks all pairs → overlap detected
+    # distant-pair check detects disjoint layout → correctly not pixel-sorted
+    assert is_pixel_sorted(p, n_check=2) is False
     assert is_pixel_sorted(p, n_check=19) is False
 
 
@@ -518,3 +522,72 @@ def test_merge_sorted_parquets_northing_key(tmp_path):
         assert s1_northings == {"0000"}, (
             f"S1 rows appeared at unexpected northings {s1_northings} for prefix={prefix!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# PS-15  merge_scenes output is pixel-sorted
+#
+# Verifies the end-to-end guarantee: merge_scenes now calls sort_parquet_by_pixel
+# internally so callers never need to sort the output themselves.
+# ---------------------------------------------------------------------------
+
+def test_merge_scenes_output_is_pixel_sorted(tmp_path):
+    """merge_scenes must write pixel-sorted output.
+
+    Creates 3 synthetic scene parquets (each covers 4 pixels, 1 date) and
+    asserts that the merged output passes is_pixel_sorted().
+    """
+    import datetime
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from proxy._pipeline import merge_scenes
+    from utils.parquet_utils import is_pixel_sorted, COMBINED_PIXEL_SCHEMA
+
+    schema = COMBINED_PIXEL_SCHEMA
+
+    def _make_scene(path: Path, date_val: datetime.date, pids: list[str]) -> Path:
+        n = len(pids)
+        nulls_f32 = pa.array([None] * n, pa.float32())
+        nulls_u16 = pa.array([None] * n, pa.uint16())
+        nulls_i8  = pa.array([None] * n, pa.int8())
+        nulls_u8  = pa.array([None] * n, pa.uint8())
+        tbl = pa.table({
+            "point_id":    pa.array(pids, pa.string()),
+            "lon":         pa.array([0.0] * n, pa.float32()),
+            "lat":         pa.array([0.0] * n, pa.float32()),
+            "date":        pa.array([date_val] * n, pa.date32()),
+            "item_id":     pa.array(["item"] * n, pa.string()),
+            "tile_id":     pa.array(["54LWH"] * n, pa.string()),
+            "B02": nulls_u16, "B03": nulls_u16, "B04": nulls_u16,
+            "B05": nulls_u16, "B06": nulls_u16, "B07": nulls_u16,
+            "B08": nulls_u16, "B8A": nulls_u16, "B11": nulls_u16,
+            "B12": nulls_u16,
+            "scl_purity": pa.array([100] * n, pa.int8()),
+            "scl":        nulls_i8,
+            "aot":        nulls_u8,
+            "view_zenith": nulls_u8,
+            "sun_zenith":  nulls_u8,
+            "source":     pa.array([None] * n, pa.string()),
+            "vh":         nulls_f32,
+            "vv":         nulls_f32,
+            "orbit":      pa.array([None] * n, pa.string()),
+        }, schema=schema)
+        pq.write_table(tbl, path)
+        return path
+
+    # 4 pixels on a 2×2 grid (easting 0/1, northing 0/1)
+    pids = ["px_0000_0000", "px_0001_0000", "px_0000_0001", "px_0001_0001"]
+    dates = [datetime.date(2025, 1, 1), datetime.date(2025, 4, 1), datetime.date(2025, 7, 1)]
+
+    scene_paths = [
+        _make_scene(tmp_path / f"scene_{i:02d}.parquet", d, pids)
+        for i, d in enumerate(dates)
+    ]
+
+    out_path = tmp_path / "merged.parquet"
+    merge_scenes(scene_paths, s1_path=None, out_path=out_path)
+
+    assert out_path.exists(), "merge_scenes did not write output"
+    assert is_pixel_sorted(out_path), (
+        "merge_scenes output is not pixel-sorted — sort step missing or broken"
+    )

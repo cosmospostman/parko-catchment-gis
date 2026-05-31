@@ -354,6 +354,19 @@ def merge_strips(
     return out_path
 
 
+def merge_chunks(
+    chunk_paths: "list[Path]",
+    out_path: Path,
+) -> Path:
+    """Concatenate chunk parquets (in row-major order) into a single output parquet.
+
+    Chunks must be sorted by (chunk_row, chunk_col) before calling.
+    Within each row-band northing order is preserved; row-bands are ordered
+    north-to-south.  Delegates to merge_strips — implementation is identical.
+    """
+    return merge_strips(chunk_paths, out_path)
+
+
 def merge_tile(
     s2_path: Path,
     s1_path: "Path | None",
@@ -444,24 +457,28 @@ def _optimise_schema(tbl: "pa.Table") -> "pa.Table":
 
 
 def is_pixel_sorted(path: Path, n_check: int = 20) -> bool:
-    """Return True if ``path`` is pixel-sorted (no point_id overlap between adjacent row groups).
+    """Return True if ``path`` is pixel-sorted (all obs for each pixel are contiguous).
 
-    Checks ``n_check`` adjacent pairs sampled evenly across the file. Files
-    written by this module are always sorted on write, so this is a safety-net
-    check rather than the primary enforcement. n_check=20 gives one sample per
-    ~70 row groups on a 1380-rg file, which is sufficient to catch gross
-    violations while remaining fast (< 1 s on typical tile parquets).
+    Two checks:
+    1. Adjacent-pair check: no point_id overlap between n_check sampled adjacent
+       row group pairs (necessary condition for pixel-sorted).
+    2. Distant-pair check: row groups 0 and n_rg//2 share at least one point_id.
+       In a pixel-sorted file the same pixels appear throughout; in a date-sorted
+       file each row group is a disjoint spatial slice so distant groups never share
+       pixels — this distinguishes the two layouts.
 
     Note: point_id strings like ``px_{xi}_{yi}`` are NOT in lexicographic order
     so min/max Parquet statistics cannot be used for this check.
     """
     import pyarrow.parquet as pq
+    import pyarrow.compute as pc
 
     pf = pq.ParquetFile(path)
     n_rg = pf.metadata.num_row_groups
     if n_rg <= 1:
         return True
 
+    # Adjacent-pair check
     n_pairs = n_rg - 1
     if n_pairs <= n_check:
         pair_indices = list(range(n_pairs))
@@ -470,12 +487,20 @@ def is_pixel_sorted(path: Path, n_check: int = 20) -> bool:
         pair_indices = sorted({0, n_pairs - 1} | {round(i * step) for i in range(n_check)})
         pair_indices = [i for i in pair_indices if i < n_pairs]
 
-    import pyarrow.compute as pc
     for i in pair_indices:
         ids_a = pc.unique(pf.read_row_group(i,     columns=["point_id"]).column("point_id").combine_chunks())
         ids_b = pc.unique(pf.read_row_group(i + 1, columns=["point_id"]).column("point_id").combine_chunks())
         if pc.any(pc.is_in(ids_a, value_set=ids_b)).as_py():
             return False
+
+    # Distant-pair check: pixel-sorted files have the same pixel set throughout;
+    # date-sorted files have disjoint spatial slices so distant groups never overlap.
+    if n_rg >= 4:
+        ids_first = pc.unique(pf.read_row_group(0,        columns=["point_id"]).column("point_id").combine_chunks())
+        ids_mid   = pc.unique(pf.read_row_group(n_rg // 2, columns=["point_id"]).column("point_id").combine_chunks())
+        if not pc.any(pc.is_in(ids_first, value_set=ids_mid)).as_py():
+            return False
+
     return True
 
 
@@ -517,6 +542,7 @@ def sort_parquet_by_pixel(
     ram_budget_gb: float = 8.0,  # kept for call-site compatibility, unused
     read_workers: int = 6,       # kept for call-site compatibility, unused
     _skip_dict_rewrite: bool = False,
+    sequential_read: bool = False,
 ) -> None:
     """Write a copy of ``src`` sorted by ``(point_id, date, scl_purity desc)``.
 
@@ -524,6 +550,11 @@ def sort_parquet_by_pixel(
     and spills to disk only if the sort exceeds available RAM — no manual multi-pass
     bucketing required.  A PyArrow rewrite pass is applied afterwards to restore
     dictionary encoding on string columns and the float32/date32 schema optimisations.
+
+    sequential_read: pass parallel='none' to scan_parquet so row groups are read
+        in a single sequential pass.  Use this when src is on a rotational or
+        external HDD where concurrent random reads across 38k row groups would
+        thrash the heads.  The sort and write stages still use all CPU threads.
 
     _skip_dict_rewrite: skip the second-pass PyArrow rewrite.  Use this when dst
     is a transient intermediate file that will be immediately consumed and deleted
@@ -539,7 +570,8 @@ def sort_parquet_by_pixel(
         # list.get(-1) extracts the last "_"-delimited segment (northing), which is
         # correct for both "px_0042_0031" and "rupert_ck_presence_1_0042_0031".
         # For IDs with no underscores (edge-case test data) we fall back to 0.
-        schema_cols = pl.scan_parquet(src).collect_schema().names()
+        _parallel = "none" if sequential_read else "auto"
+        schema_cols = pl.scan_parquet(src, parallel=_parallel).collect_schema().names()
         cast_exprs = [
             *(
                 [pl.col("lon").cast(pl.Float32), pl.col("lat").cast(pl.Float32)]
@@ -557,7 +589,7 @@ def sort_parquet_by_pixel(
 
         sort_dst = dst if _skip_dict_rewrite else tmp
         (
-            pl.scan_parquet(src)
+            pl.scan_parquet(src, parallel=_parallel)
             .with_columns(cast_exprs)
             .sort(sort_cols, descending=sort_desc)
             .drop("_northing")

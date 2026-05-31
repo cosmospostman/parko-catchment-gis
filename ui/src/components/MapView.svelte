@@ -1,5 +1,6 @@
 <script lang="ts">
   import { getContext } from 'svelte';
+  import maplibregl from 'maplibre-gl';
   import type { Map as MapLibreMap, MapMouseEvent, Popup } from 'maplibre-gl';
   import { MAP_KEY } from '../lib/mapContext.ts';
   import type { MapContext } from '../lib/mapContext.ts';
@@ -21,7 +22,7 @@
   } from '../lib/geo.ts';
   import { buildS2Grid } from '../lib/s2grid.ts';
 
-  declare const maplibregl: typeof import('maplibre-gl');
+  import { Protocol } from 'pmtiles';
 
   interface Props {
     ontrainingclick?: (bbox: string, subRole: string | null) => void;
@@ -72,6 +73,10 @@
   // Map init
   // ---------------------------------------------------------------------------
   $effect(() => {
+    // Register PMTiles protocol once
+    const pmtilesProto = new Protocol();
+    maplibregl.addProtocol('pmtiles', pmtilesProto.tile.bind(pmtilesProto));
+
     map = new maplibregl.Map({
       container: mapContainer,
       style: { version: 8, sources: {}, layers: [], glyphs: 'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf' },
@@ -221,22 +226,37 @@
   // ---------------------------------------------------------------------------
   // Reactive ranking layer
   // ---------------------------------------------------------------------------
-  $effect(() => {
-    if (!map || !locationsStore.mapReady) return;
-    const { location, stem, opacity, cmap, cutoff } = ranking;
-    try { if (map.getLayer('ranking-layer')) map.removeLayer('ranking-layer'); } catch {}
-    try { if (map.getSource('ranking')) map.removeSource('ranking'); } catch {}
-    if (!location || !stem) return;
-    const url = `/ranking-tile/${location}/${stem}/{z}/{x}/{y}?cmap=${cmap}&cutoff=${cutoff}`;
-    map.addSource('ranking', { type: 'raster', tiles: [url], tileSize: 256 });
-    map.addLayer({ id: 'ranking-layer', type: 'raster', source: 'ranking',
-      paint: { 'raster-opacity': opacity } }, 'loc-fill-location');
-  });
+  // PMTiles ranking layer — source rebuilt only when location/stem changes;
+  // colormap, cutoff, opacity updated via setPaintProperty (no tile re-fetch).
+  let _rankingKey = $state('');
 
   $effect(() => {
     if (!map || !locationsStore.mapReady) return;
-    if (map.getLayer('ranking-layer')) {
-      map.setPaintProperty('ranking-layer', 'raster-opacity', ranking.opacity);
+    const { location, stem, opacity } = ranking;
+    const key = `${location}/${stem}`;
+
+    if (key !== _rankingKey) {
+      // Location/stem changed — rebuild source
+      try { if (map.getLayer('ranking-layer')) map.removeLayer('ranking-layer'); } catch {}
+      try { if (map.getSource('ranking')) map.removeSource('ranking'); } catch {}
+      _rankingKey = key;
+      if (!location || !stem) return;
+      (map as any).addSource('ranking', {
+        type: 'raster',
+        url: `pmtiles:///pmtiles/${location}/${stem}`,
+        tileSize: 256,
+      });
+      map.addLayer({
+        id: 'ranking-layer',
+        type: 'raster',
+        source: 'ranking',
+        paint: { 'raster-opacity': opacity },
+      } as any, 'loc-fill-location');
+    } else {
+      // Just update paint properties
+      if (map.getLayer('ranking-layer')) {
+        map.setPaintProperty('ranking-layer', 'raster-opacity', opacity);
+      }
     }
   });
 

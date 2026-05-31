@@ -17,6 +17,7 @@ import gc
 import json
 import logging
 import os
+import signal
 import sys
 from pathlib import Path
 
@@ -27,9 +28,26 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from tam.utils import label_pixels, save_pixel_ranking, summarise
-from utils.parquet_utils import ensure_pixel_sorted
 from tam.core.config import TAMConfig
 from tam.core.score import score_location_years, score_tiles_chunked
+import re as _re
+from tam.core.pixel_source import PixelSource, ChunkPixelSource, point_ids_in_geometry
+
+_CHUNK_PAT = _re.compile(r"_r\d{2}_c\d{2}$")
+
+
+def _tile_id_from_stem(stem: str) -> str:
+    """Extract tile_id from a parquet file stem (chunk or flat naming)."""
+    m = _CHUNK_PAT.search(stem)
+    return stem[:m.start()] if m else stem
+
+
+_CHUNK_KEY_RE = _re.compile(r"_r(\d{2})_c(\d{2})$")
+
+
+def _chunk_key_stem(stem: str) -> tuple[int, int]:
+    m = _CHUNK_KEY_RE.search(stem)
+    return (int(m.group(1)), int(m.group(2))) if m else (9999, 9999)
 from tam.core.train import load_tam, train_tam
 from utils.location import get as get_location
 
@@ -512,7 +530,8 @@ def _cmd_score(args: argparse.Namespace) -> None:
     checkpoint_dir = Path(args.checkpoint)
     loc = get_location(args.location)
 
-    tile_paths_by_year = loc.parquet_tile_paths()
+    pixel_dir = Path(args.pixel_dir) if getattr(args, "pixel_dir", None) else None
+    tile_paths_by_year = loc.parquet_tile_paths(base_dir=pixel_dir)
     if not tile_paths_by_year:
         logger.error("No tile parquets found for %s — run `python cli/location.py fetch %s --years ...` first", loc.id, loc.id)
         sys.exit(1)
@@ -533,55 +552,65 @@ def _cmd_score(args: argparse.Namespace) -> None:
 
     logger.info("Location: %s  years: %s  checkpoint: %s", loc.name, years, checkpoint_dir)
 
-    # Load pixel coords from all tile parquets of the first year.
-    first_year = years[0]
-    coords_cache = loc.coords_cache_path(first_year)
-    first_year_parquets = tile_paths_by_year[first_year]
+    # Pixel coord resolution and label assignment are only needed for the CSV scoring
+    # path. Skip entirely when writing parquet shards.
+    if not getattr(args, "out_parquet", False):
+        first_year = years[0]
+        coords_cache = loc.coords_cache_path(first_year)
+        first_year_parquets = tile_paths_by_year[first_year]
 
-    if coords_cache.exists():
-        logger.info("Loading pixel coords from cache ...")
-        pixel_coords = pl.read_parquet(coords_cache)
-    else:
-        logger.info("Resolving pixel coords from %d tile parquet(s) for year %d ...", len(first_year_parquets), first_year)
-        coord_chunks = []
-        for tile_parquet in first_year_parquets:
-            pf_coords = pq.ParquetFile(tile_parquet)
-            n_rg_coords = pf_coords.metadata.num_row_groups
+        if coords_cache.exists():
+            logger.info("Loading pixel coords from cache ...")
+            pixel_coords = pl.read_parquet(coords_cache)
+        else:
+            logger.info("Resolving pixel coords from %d tile parquet(s) for year %d ...", len(first_year_parquets), first_year)
+            coord_chunks = []
+            for tile_parquet in first_year_parquets:
+                pf_coords = pq.ParquetFile(tile_parquet)
+                n_rg_coords = pf_coords.metadata.num_row_groups
 
-            def _read_coord_rg(rg: int, _path: Path = tile_parquet) -> pl.DataFrame:
-                pf = pq.ParquetFile(_path)
-                chunk = pl.from_arrow(pf.read_row_group(rg, columns=["point_id", "lon", "lat"]))
-                return chunk.unique(subset=["point_id"])
+                def _read_coord_rg(rg: int, _path: Path = tile_parquet) -> pl.DataFrame:
+                    pf = pq.ParquetFile(_path)
+                    chunk = pl.from_arrow(pf.read_row_group(rg, columns=["point_id", "lon", "lat"]))
+                    return chunk.unique(subset=["point_id"])
 
-            n_done = 0
-            with ThreadPoolExecutor(max_workers=8) as ex:
-                futures = {ex.submit(_read_coord_rg, rg): rg for rg in range(n_rg_coords)}
-                for fut in as_completed(futures):
-                    chunk = fut.result()
-                    if not chunk.is_empty():
-                        coord_chunks.append(chunk)
-                    n_done += 1
-                    if n_done % 100 == 0:
-                        logger.info("  coords %d/%d row groups (%s)", n_done, n_rg_coords, tile_parquet.name)
+                n_done = 0
+                with ThreadPoolExecutor(max_workers=8) as ex:
+                    futures = {ex.submit(_read_coord_rg, rg): rg for rg in range(n_rg_coords)}
+                    for fut in as_completed(futures):
+                        chunk = fut.result()
+                        if not chunk.is_empty():
+                            coord_chunks.append(chunk)
+                        n_done += 1
+                        if n_done % 100 == 0:
+                            logger.info("  coords %d/%d row groups (%s)", n_done, n_rg_coords, tile_parquet.name)
 
-        pixel_coords = (
-            pl.concat(coord_chunks)
-            .group_by("point_id")
-            .agg([pl.col("lon").first(), pl.col("lat").first()])
-        )
-        pixel_coords.write_parquet(coords_cache)
-        logger.info("Cached pixel coords to %s", coords_cache)
+            pixel_coords = (
+                pl.concat(coord_chunks)
+                .group_by("point_id")
+                .agg([pl.col("lon").first(), pl.col("lat").first()])
+            )
+            pixel_coords.write_parquet(coords_cache)
+            logger.info("Cached pixel coords to %s", coords_cache)
 
-    logger.info("Unique pixels: %d", len(pixel_coords))
+        logger.info("Unique pixels: %d", len(pixel_coords))
+        labelled = label_pixels(pixel_coords, loc)
 
-    labelled = label_pixels(pixel_coords, loc)
+        # Flat list of (year, path) — one entry per tile per year.
+        year_parquets = [
+            (y, p)
+            for y, paths in sorted(tile_paths_by_year.items())
+            for p in paths
+        ]
 
-    # Flat list of (year, path) — one entry per tile per year.
-    year_parquets = [
-        (y, ensure_pixel_sorted(p))
-        for y, paths in sorted(tile_paths_by_year.items())
-        for p in paths
-    ]
+    from tam.core.score import _stop_event as _score_stop
+    _score_stop.clear()
+
+    _prev_sigint = signal.getsignal(signal.SIGINT)
+    def _handle_sigint(sig, frame):
+        logger.warning("Interrupted — stopping scoring pipeline ...")
+        _score_stop.set()
+    signal.signal(signal.SIGINT, _handle_sigint)
 
     logger.info("Loading checkpoint from %s ...", checkpoint_dir)
     model, band_mean, band_std, global_feat_mean, global_feat_std = load_tam(checkpoint_dir, device=args.device)
@@ -627,12 +656,59 @@ def _cmd_score(args: argparse.Namespace) -> None:
         feature_cols = None
 
     if getattr(args, "out_parquet", False):
-        # Build {tile_id: [(year, pixel-sorted-path), ...]} for score_tiles_chunked
-        tile_year_map: dict[str, list[tuple[int, Path]]] = {}
+        # Build {tile_id: [(year, source), ...]} for score_tiles_chunked
+        # Chunk files are grouped by tile_id and wrapped in ChunkPixelSource (row-major order).
+        tile_year_map: dict[str, list[tuple[int, PixelSource | Path]]] = {}
+        _loc_geom = loc.geometry  # None for bbox-only locations
+        # Cache of point_id sets per tile (same geometry applies across all years).
+        _tile_point_ids: dict[str, set[str] | None] = {}
+
+        def _point_ids_from_grid(tile_id: str, loc_geom) -> set[str]:
+            """Reconstruct point_ids inside loc_geom for tile_id from first principles.
+
+            Mirrors the fetch pipeline exactly: intersect the tile polygon with the
+            location geometry, derive bbox from that intersection, regenerate the 10 m
+            pixel grid, then filter by geometry — no parquet read required.
+            """
+            from shapely import contains_xy as _contains_xy
+            from utils.location import _tile_polygon
+            from utils.pixel_collector import make_pixel_grid
+            import numpy as _np
+
+            tile_poly = _tile_polygon(tile_id)
+            fetch_geom = tile_poly.intersection(loc_geom) if tile_poly is not None else loc_geom
+            if fetch_geom.is_empty:
+                return set()
+            bbox = list(fetch_geom.bounds)
+            points = make_pixel_grid(bbox)
+            pids   = [p for p, _, _ in points]
+            lons   = _np.array([lo for _, lo, _ in points])
+            lats   = _np.array([la for _, _, la in points])
+            mask   = _contains_xy(loc_geom, lons, lats)
+            return {pid for pid, m in zip(pids, mask) if m}
+
         for y, paths in sorted(tile_paths_by_year.items()):
+            by_tile: dict[str, list[Path]] = {}
             for p in paths:
-                tid = p.stem  # e.g. "54LWH"
-                tile_year_map.setdefault(tid, []).append((y, ensure_pixel_sorted(p)))
+                tid = _tile_id_from_stem(p.stem)
+                by_tile.setdefault(tid, []).append(p)
+            for tid, tile_paths in by_tile.items():
+                chunk_files = [p for p in tile_paths if _CHUNK_PAT.search(p.stem)]
+                non_chunk   = [p for p in tile_paths if not _CHUNK_PAT.search(p.stem)]
+                if chunk_files:
+                    chunk_files.sort(key=lambda p: _chunk_key_stem(p.stem))
+                    # Compute point_id mask once per tile (geometry is year-independent).
+                    if tid not in _tile_point_ids:
+                        if _loc_geom is not None:
+                            logger.info("Computing point_id mask for tile %s ...", tid)
+                            _tile_point_ids[tid] = _point_ids_from_grid(tid, _loc_geom)
+                            logger.info("  → %d pixels inside geometry", len(_tile_point_ids[tid]))
+                        else:
+                            _tile_point_ids[tid] = None
+                    source: PixelSource | Path = ChunkPixelSource(chunk_files, point_ids=_tile_point_ids[tid])
+                else:
+                    source = non_chunk[0]
+                tile_year_map.setdefault(tid, []).append((y, source))
 
         parquet_out_dir = (
             PROJECT_ROOT / "outputs" / "scores" / loc.id / checkpoint_dir.name / str(end_year)
@@ -641,52 +717,77 @@ def _cmd_score(args: argparse.Namespace) -> None:
             "Scoring %d tiles → parquet shards in %s ...",
             len(tile_year_map), parquet_out_dir,
         )
-        final_paths = score_tiles_chunked(
-            tile_year_parquets=tile_year_map,
+
+        # coords_by_tile: map tile_id → first-year parquet path for lon/lat lookup
+        coords_by_tile: dict[str, Path] = {}
+        for y, paths in sorted(tile_paths_by_year.items()):
+            for p in paths:
+                tid = _tile_id_from_stem(p.stem)
+                if tid not in coords_by_tile:
+                    coords_by_tile[tid] = p
+
+        pmtiles_out = Path(args.pmtiles) if getattr(args, "pmtiles", None) else None
+
+        try:
+            final_paths = score_tiles_chunked(
+                tile_year_parquets=tile_year_map,
+                model=model,
+                band_mean=band_mean,
+                band_std=band_std,
+                out_dir=parquet_out_dir,
+                scl_purity_min=args.scl_purity,
+                device=args.device,
+                end_year=end_year,
+                decay=args.decay,
+                batch_size=args.batch_size,
+                n_tile_workers=getattr(args, "n_tile_workers", 1),
+                s1_only=s1_only,
+                mixed=mixed,
+                s1_despeckle_window=s1_despeckle_window,
+                s2_feature_cols=s2_feature_cols_cfg if mixed else None,
+                s1_feature_cols=s1_feature_cols_cfg if mixed else None,
+                pmtiles_out=pmtiles_out,
+                coords_by_tile=coords_by_tile if pmtiles_out else None,
+            )
+        except KeyboardInterrupt:
+            signal.signal(signal.SIGINT, _prev_sigint)
+            raise
+        finally:
+            signal.signal(signal.SIGINT, _prev_sigint)
+        logger.info("Done — %d tile parquets in %s", len(final_paths), parquet_out_dir)
+        return
+
+    logger.info("Scoring %d tile-year parquets ...", len(year_parquets))
+    try:
+        scores = score_location_years(
+            year_parquets=year_parquets,
             model=model,
             band_mean=band_mean,
             band_std=band_std,
-            out_dir=parquet_out_dir,
             scl_purity_min=args.scl_purity,
             device=args.device,
             end_year=end_year,
             decay=args.decay,
             batch_size=args.batch_size,
-            n_tile_workers=getattr(args, "n_tile_workers", 1),
+            n_total_pixels=len(pixel_coords),
             s1_only=s1_only,
             mixed=mixed,
+            pixel_zscore=pixel_zscore,
             s1_despeckle_window=s1_despeckle_window,
+            feature_cols=feature_cols,
             s2_feature_cols=s2_feature_cols_cfg if mixed else None,
             s1_feature_cols=s1_feature_cols_cfg if mixed else None,
+            summary_feature_cols=summary_feature_cols,
+            global_feat_mean=global_feat_mean,
+            global_feat_std=global_feat_std,
+            gate_threshold=args.gate_threshold,
+            T_gate=args.t_gate,
         )
-        logger.info("Done — %d tile parquets in %s", len(final_paths), parquet_out_dir)
-        return
-
-    logger.info("Scoring %d tile-year parquets ...", len(year_parquets))
-    scores = score_location_years(
-        year_parquets=year_parquets,
-        model=model,
-        band_mean=band_mean,
-        band_std=band_std,
-        scl_purity_min=args.scl_purity,
-        device=args.device,
-        end_year=end_year,
-        decay=args.decay,
-        batch_size=args.batch_size,
-        n_total_pixels=len(pixel_coords),
-        s1_only=s1_only,
-        mixed=mixed,
-        pixel_zscore=pixel_zscore,
-        s1_despeckle_window=s1_despeckle_window,
-        feature_cols=feature_cols,
-        s2_feature_cols=s2_feature_cols_cfg if mixed else None,
-        s1_feature_cols=s1_feature_cols_cfg if mixed else None,
-        summary_feature_cols=summary_feature_cols,
-        global_feat_mean=global_feat_mean,
-        global_feat_std=global_feat_std,
-        gate_threshold=args.gate_threshold,
-        T_gate=args.t_gate,
-    )
+    except KeyboardInterrupt:
+        signal.signal(signal.SIGINT, _prev_sigint)
+        raise
+    finally:
+        signal.signal(signal.SIGINT, _prev_sigint)
     scored = (
         pixel_coords
         .join(scores.select(["point_id", "prob_tam"]), on="point_id", how="left")
@@ -787,6 +888,8 @@ if __name__ == "__main__":
     p_score.add_argument("--out",          default=None, help="Output CSV path (overrides default in checkpoint dir)")
     p_score.add_argument("--out-parquet", action="store_true", help="Write tile-sharded parquet instead of CSV")
     p_score.add_argument("--n-tile-workers", type=int, default=1, help="Parallel tile workers for parquet output (default: 1)")
+    p_score.add_argument("--pmtiles", default=None, help="Directory to write per-tile .pmtiles archives (requires --out-parquet)")
+    p_score.add_argument("--pixel-dir", default=None, help="Override pixel parquet directory (default: data/pixels/<location>)")
     _add_common_score_args(p_score)
 
     args = parser.parse_args()

@@ -90,19 +90,25 @@ def _write_strip_parquet(path: Path, n_rows: int = 5) -> None:
     pq.write_table(tbl, path, compression="zstd")
 
 
-def _make_strip_and_meta(strip_idx=0, y_lower=7_480_000.0):
+def _make_strip_and_meta(chunk_row=0, chunk_col=0, y_lower=7_480_000.0):
     meta = {
         "utm_crs": "EPSG:32755",
-        "xs": np.array([500000.0, 500010.0]),
         "y0_snap": 7_480_000.0,
-        "y1": 7_481_024.0,
-        "block_m": 10240.0,
+        "y1":      7_481_024.0,
+        "x0_snap": 500_000.0,
+        "x1":      500_020.0,
+        "block_h_m": 10240.0,
+        "block_w_m": 10240.0,
         "r": 10.0,
         "polygon_geometry": None,
-        "first_lower": 7_480_000.0,
+        "first_y_lower": 7_480_000.0,
+        "first_x_left":  500_000.0,
     }
-    strip = {"strip_idx": strip_idx, "bbox": _BBOX, "y_lower": y_lower}
-    return strip, meta
+    chunk = {
+        "chunk_row": chunk_row, "chunk_col": chunk_col,
+        "bbox": _BBOX, "y_lower": y_lower, "x_left_chunk": 500_000.0,
+    }
+    return chunk, meta
 
 
 # ---------------------------------------------------------------------------
@@ -296,17 +302,16 @@ def test_run_tile_pipeline_v2_yields_strips(tmp_path):
 
     item = _make_item("S2A_55HBU_20220601_0_L2A")
     polygon = _make_polygon()
-    _strip, _meta = _make_strip_and_meta()
+    _chunk, _meta = _make_strip_and_meta()
 
     def fake_asyncio_run(coro):
-        # Consume the coroutine without executing real network calls
         coro.close()
 
     def fake_merge(scene_paths, s1_path, out_path):
         _write_strip_parquet(out_path)
 
-    with patch("proxy._pipeline.read_cog_transform", return_value=("EPSG:32755", 7_600_000.0, 1024)), \
-         patch("proxy._pipeline.compute_strips", return_value=([_strip], _meta)), \
+    with patch("proxy._pipeline.read_cog_transform", return_value=("EPSG:32755", 7_600_000.0, 500_000.0, 1024, 1024)), \
+         patch("proxy._pipeline.compute_chunks", return_value=([_chunk], _meta)), \
          patch("utils.s1_collector.collect_s1_for_tile", return_value=None), \
          patch("proxy._pipeline.merge_scenes", side_effect=fake_merge), \
          patch("asyncio.run", side_effect=fake_asyncio_run), \
@@ -319,7 +324,7 @@ def test_run_tile_pipeline_v2_yields_strips(tmp_path):
             items=[item],
         ))
 
-    # No clear pixels → no strips yielded; just verify no exceptions
+    # No clear pixels → no chunks yielded; just verify no exceptions
     assert isinstance(results, list)
 
 
@@ -331,17 +336,17 @@ def test_run_tile_pipeline_v2_resume(tmp_path):
     from proxy._pipeline import run_tile_pipeline_v2
 
     polygon = _make_polygon()
-    strips = [
-        {"strip_idx": 0, "bbox": _BBOX, "y_lower": 7_480_000.0},
-        {"strip_idx": 1, "bbox": _BBOX, "y_lower": 7_490_240.0},
+    chunks = [
+        {"chunk_row": 0, "chunk_col": 0, "bbox": _BBOX, "y_lower": 7_480_000.0, "x_left_chunk": 500_000.0},
+        {"chunk_row": 1, "chunk_col": 0, "bbox": _BBOX, "y_lower": 7_490_240.0, "x_left_chunk": 500_000.0},
     ]
     _, meta = _make_strip_and_meta()
 
     def fake_asyncio_run(coro):
         coro.close()
 
-    with patch("proxy._pipeline.read_cog_transform", return_value=("EPSG:32755", 7_600_000.0, 1024)), \
-         patch("proxy._pipeline.compute_strips", return_value=(strips, meta)), \
+    with patch("proxy._pipeline.read_cog_transform", return_value=("EPSG:32755", 7_600_000.0, 500_000.0, 1024, 1024)), \
+         patch("proxy._pipeline.compute_chunks", return_value=(chunks, meta)), \
          patch("asyncio.run", side_effect=fake_asyncio_run), \
          patch("utils.pixel_collector._extract_item_from_tiffs", return_value=None), \
          patch("utils.s1_collector.collect_s1_for_tile", return_value=None), \
@@ -352,11 +357,11 @@ def test_run_tile_pipeline_v2_resume(tmp_path):
             polygon_geometry=polygon,
             tmp=tmp_path / "work",
             items=[_make_item("S2A_55HBU_20220601_0_L2A")],
-            resume_from_strip=1,
+            resume_from_chunk=(1, 0),
         ))
 
-    # Strip 0 should have been skipped — tiff_dir for strip_0000 never created
-    assert not (tmp_path / "work" / "strip_00_tiffs").exists()
+    # Chunk (0,0) should have been skipped — tiff_dir for chunk_000_000 never created
+    assert not (tmp_path / "work" / "chunk_000_000_tiffs").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -367,9 +372,9 @@ def test_run_tile_pipeline_v2_cleans_tiff_dir(tmp_path):
     from proxy._pipeline import run_tile_pipeline_v2
 
     polygon = _make_polygon()
-    _strip, _meta = _make_strip_and_meta()
+    _chunk, _meta = _make_strip_and_meta()
 
-    tiff_dir_path = tmp_path / "work" / "strip_00_tiffs"
+    tiff_dir_path = tmp_path / "work" / "chunk_00_00_tiffs"
 
     def fake_asyncio_run(coro):
         # Simulate Pool A: create the tiff_dir so cleanup can be verified
@@ -379,8 +384,8 @@ def test_run_tile_pipeline_v2_cleans_tiff_dir(tmp_path):
     def fake_merge(scene_paths, s1_path, out_path):
         _write_strip_parquet(out_path)
 
-    with patch("proxy._pipeline.read_cog_transform", return_value=("EPSG:32755", 7_600_000.0, 1024)), \
-         patch("proxy._pipeline.compute_strips", return_value=([_strip], _meta)), \
+    with patch("proxy._pipeline.read_cog_transform", return_value=("EPSG:32755", 7_600_000.0, 500_000.0, 1024, 1024)), \
+         patch("proxy._pipeline.compute_chunks", return_value=([_chunk], _meta)), \
          patch("asyncio.run", side_effect=fake_asyncio_run), \
          patch("utils.pixel_collector._extract_item_from_tiffs", return_value=None), \
          patch("utils.s1_collector.collect_s1_for_tile", return_value=None), \

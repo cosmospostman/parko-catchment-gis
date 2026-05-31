@@ -1,15 +1,15 @@
 """utils/tile_pipeline.py — Local (non-proxy) tile fetch pipeline.
 
 fetch_tile_local() runs the same pipeline as the proxy VM — tile-first,
-1024-px COG-block-aligned strips — but writes strip parquets directly to
+COG-block-aligned 2D chunks — but writes chunk parquets directly to
 disk instead of streaming them over HTTP.
 
 Output layout:
-  out_dir/<year>/<tile_id>/<tile_id>_strip_NN.parquet   — one file per strip
-  out_dir/<year>/<tile_id>/.done                        — sentinel when all strips complete
+  out_dir/<year>/<tile_id>/<tile_id>_r{row:02d}_c{col:02d}.parquet  — one file per chunk
+  out_dir/<year>/<tile_id>/.done                                     — sentinel when all chunks complete
 
-Strip-level resume: existing <tile_id>_strip_NN.parquet files in the tile dir are
-included automatically; processing resumes from the first gap.
+Chunk-level resume: existing <tile_id>_r??_c??.parquet files in the tile dir are
+included automatically; processing resumes from the chunk after the last complete one.
 
 Tile-level resume: if the .done sentinel exists the function returns immediately.
 """
@@ -17,10 +17,19 @@ Tile-level resume: if the .done sentinel exists the function returns immediately
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+_CHUNK_RE = re.compile(r"_r(\d{2})_c(\d{2})$")
+
+
+def _chunk_key(stem: str) -> tuple[int, int]:
+    """Return (chunk_row, chunk_col) from a parquet file stem, or (9999,9999) if not a chunk file."""
+    m = _CHUNK_RE.search(stem)
+    return (int(m.group(1)), int(m.group(2))) if m else (9999, 9999)
 
 
 def fetch_tile_local(
@@ -28,9 +37,10 @@ def fetch_tile_local(
     year: int,
     polygon_geometry,
     out_dir: Path,
-    cloud_max: int = 20,
+    cloud_max: int = 80,
     apply_nbar: bool = True,
-    strip_height_px: int = 1024,
+    chunk_height_px: int = 1024,
+    chunk_width_px: int = 1024,
     max_concurrent: int = 128,
     n_workers: int | None = None,
     items=None,
@@ -40,9 +50,9 @@ def fetch_tile_local(
 ) -> list[Path] | None:
     """Fetch one tile×year locally using the same pipeline as the proxy VM.
 
-    Writes strip parquets to *out_dir*/<year>/<tile_id>/<tile_id>_strip_NN.parquet
+    Writes chunk parquets to *out_dir*/<year>/<tile_id>/<tile_id>_r{row:02d}_c{col:02d}.parquet
     and touches a .done sentinel on completion.  No merge step — callers consume
-    strips directly.
+    chunks directly.
 
     Parameters
     ----------
@@ -53,7 +63,7 @@ def fetch_tile_local(
     polygon_geometry:
         Shapely geometry defining the area of interest.
     out_dir:
-        Root output directory.  Strips land at out_dir/year/tile_id/<tile_id>_strip_NN.parquet.
+        Root output directory.  Chunks land at out_dir/year/tile_id/<tile_id>_r{row:02d}_c{col:02d}.parquet.
     work_dir:
         Root directory for temporary working data (_work, .tmp files).  Defaults
         to out_dir so behaviour is unchanged when not specified.
@@ -65,7 +75,7 @@ def fetch_tile_local(
     Returns
     -------
     list[Path] | None
-        Sorted list of written strip paths, or None if no strips produced data.
+        Sorted list of written chunk paths (row-major order), or None if no chunks produced data.
     """
     from proxy._pipeline import run_tile_pipeline_v2 as run_tile_pipeline
 
@@ -73,75 +83,69 @@ def fetch_tile_local(
     done_sentinel = tile_dir / ".done"
 
     if done_sentinel.exists():
-        strips = sorted(tile_dir.glob(f"{tile_id}_strip_??.parquet"))
-        logger.info("[%s %d] already done (%d strips) — skipping", tile_id, year, len(strips))
-        return strips or None
+        chunks = sorted(tile_dir.glob(f"{tile_id}_r??_c??.parquet"),
+                        key=lambda p: _chunk_key(p.stem))
+        logger.info("[%s %d] already done (%d chunks) — skipping", tile_id, year, len(chunks))
+        return chunks or None
 
     tile_dir.mkdir(parents=True, exist_ok=True)
 
     _work_root = (work_dir / str(year) / tile_id) if work_dir is not None else tile_dir
 
     # Clean up incomplete writes from a prior interrupted run.
-    for p in _work_root.glob(f"{tile_id}_strip_??.tmp"):
+    for p in _work_root.glob(f"{tile_id}_r??_c??.tmp"):
         p.unlink(missing_ok=True)
 
-    # Determine resume point from contiguous existing strips.
-    # Strip indices are absolute COG block rows (north-to-south), so the
-    # first strip on disk may not be strip_00.  Find the lowest index present
-    # and walk forward from there to find the first gap.
-    complete_strips = sorted(tile_dir.glob(f"{tile_id}_strip_??.parquet"),
-                             key=lambda p: int(p.stem.split("_")[-1]))
-    resume_from = 0
-    if complete_strips:
-        indices = [int(p.stem.split("_")[-1]) for p in complete_strips]
-        expected = indices[0]
-        for idx in indices:
-            if idx == expected:
-                expected += 1
-            else:
-                break
-        resume_from = expected
-        logger.info("[%s %d] resuming from strip %d (%d already complete)",
-                    tile_id, year, resume_from, len(complete_strips))
+    # Determine resume point from existing chunk files.
+    # Resume from the chunk after the last completed one (row-major order).
+    complete_chunks = sorted(tile_dir.glob(f"{tile_id}_r??_c??.parquet"),
+                             key=lambda p: _chunk_key(p.stem))
+    resume_from_chunk: tuple[int, int] = (0, 0)
+    if complete_chunks:
+        last_row, last_col = _chunk_key(complete_chunks[-1].stem)
+        resume_from_chunk = (last_row, last_col + 1)
+        logger.info("[%s %d] resuming from chunk (%d, %d) (%d already complete)",
+                    tile_id, year, resume_from_chunk[0], resume_from_chunk[1], len(complete_chunks))
 
-    received_strips: list[Path] = list(complete_strips)
+    received_chunks: list[Path] = list(complete_chunks)
 
     pipeline_tmp = _work_root / "_work"
     pipeline_tmp.mkdir(parents=True, exist_ok=True)
 
-    for strip_idx, strip_path in run_tile_pipeline(
+    for chunk_row, chunk_col, chunk_path in run_tile_pipeline(
         tile_id=tile_id,
         year=year,
         polygon_geometry=polygon_geometry,
         tmp=pipeline_tmp,
         cloud_max=cloud_max,
         apply_nbar=apply_nbar,
-        strip_height_px=strip_height_px,
+        chunk_height_px=chunk_height_px,
+        chunk_width_px=chunk_width_px,
         max_concurrent=max_concurrent,
         n_workers=n_workers,
-        resume_from_strip=resume_from,
+        resume_from_chunk=resume_from_chunk,
         items=items,
         calibration_out=calibration_out,
         point_id_prefix=point_id_prefix,
     ):
-        dest     = tile_dir / f"{tile_id}_strip_{strip_idx:02d}.parquet"
-        dest_tmp = _work_root / f"{tile_id}_strip_{strip_idx:02d}.tmp"
-        shutil.copy2(strip_path, dest_tmp)
+        dest     = tile_dir / f"{tile_id}_r{chunk_row:02d}_c{chunk_col:02d}.parquet"
+        dest_tmp = dest.with_suffix(".tmp")
+        shutil.copy2(chunk_path, dest_tmp)
         dest_tmp.replace(dest)
-        strip_path.unlink(missing_ok=True)
-        received_strips.append(dest)
-        logger.info("[%s %d] strip %02d written (%.1f MB)",
-                    tile_id, year, strip_idx, dest.stat().st_size / 1e6)
+        chunk_path.unlink(missing_ok=True)
+        received_chunks.append(dest)
+        logger.info("[%s %d] chunk (%d,%d) written (%.1f MB)",
+                    tile_id, year, chunk_row, chunk_col, dest.stat().st_size / 1e6)
 
     try:
         shutil.rmtree(pipeline_tmp)
     except Exception:
         pass
 
-    if not received_strips:
-        logger.warning("[%s %d] no strips — nothing written", tile_id, year)
+    if not received_chunks:
+        logger.warning("[%s %d] no chunks — nothing written", tile_id, year)
         return None
 
-    received_strips.sort(key=lambda p: int(p.stem.split("_")[-1]))
+    received_chunks.sort(key=lambda p: _chunk_key(p.stem))
     done_sentinel.touch()
-    return received_strips
+    return received_chunks

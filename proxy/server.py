@@ -51,12 +51,13 @@ class TileRequest(BaseModel):
     tile_id: str
     year: int
     polygon_wkb_b64: str
-    cloud_max: int = 20
+    cloud_max: int = 80
     apply_nbar: bool = True
-    strip_height_px: int = 1024
+    chunk_height_px: int = 1024
+    chunk_width_px: int = 1024
     max_concurrent: int = int(os.environ.get("PROXY_MAX_CONCURRENT", "32"))
     n_workers: int | None = None
-    resume_from_strip: int = 0
+    resume_from_chunk: list[int] = [0, 0]  # [row, col]; JSON has no tuples
 
 
 # ---------------------------------------------------------------------------
@@ -115,10 +116,11 @@ async def _run_pipeline(req: TileRequest, loop: asyncio.AbstractEventLoop) -> As
                     tmp=tmp,
                     cloud_max=req.cloud_max,
                     apply_nbar=req.apply_nbar,
-                    strip_height_px=req.strip_height_px,
+                    chunk_height_px=req.chunk_height_px,
+                    chunk_width_px=req.chunk_width_px,
                     max_concurrent=req.max_concurrent,
                     n_workers=n_workers,
-                    resume_from_strip=req.resume_from_strip,
+                    resume_from_chunk=tuple(req.resume_from_chunk),
                 ):
                     q.put(item)
             except Exception as exc:
@@ -135,15 +137,15 @@ async def _run_pipeline(req: TileRequest, loop: asyncio.AbstractEventLoop) -> As
                 break
             if isinstance(item, Exception):
                 raise item
-            strip_idx, strip_path = item
-            yield progress_frame(strip_idx, "stream", time.monotonic() - t_start)
-            logger.info("[strip %02d] streaming %s ...", strip_idx, strip_path.name)
-            yield write_frame(0x02, strip_path.read_bytes())
-            strip_path.unlink(missing_ok=True)
+            chunk_row, chunk_col, chunk_path = item
+            yield progress_frame(chunk_row, chunk_col, "stream", time.monotonic() - t_start)
+            logger.info("[chunk %02d_%02d] streaming %s ...", chunk_row, chunk_col, chunk_path.name)
+            yield write_frame(0x02, chunk_path.read_bytes())
+            chunk_path.unlink(missing_ok=True)
 
         t.join()
 
-    logger.info("[tile %s %d] all strips complete (%.0f s total)",
+    logger.info("[tile %s %d] all chunks complete (%.0f s total)",
                 req.tile_id, req.year, time.monotonic() - t_start)
 
 

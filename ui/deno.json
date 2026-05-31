@@ -12,7 +12,8 @@
     "@floating-ui/dom": "npm:@floating-ui/dom@^1.6",
     "vite": "npm:vite@^5",
     "@sveltejs/vite-plugin-svelte": "npm:@sveltejs/vite-plugin-svelte@^4",
-    "maplibre-gl": "npm:maplibre-gl@^4"
+    "maplibre-gl": "npm:maplibre-gl@^5",
+    "pmtiles": "npm:pmtiles@^3"
   },
   "tasks": {
     "dev": "deno run -A npm:vite --config vite.config.ts --host",

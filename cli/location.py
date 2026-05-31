@@ -206,32 +206,30 @@ class _FetchFormatter(logging.Formatter):
          "tile", _MAG, 0),
 
         # ── Per-tile pipeline (proxy/_pipeline.py) ───────────────────────────
-        (re.compile(r"\[(?:v2 tile )?(\S+) (\d+)\] (?:\[strip \d+\] )?STAC search"),
+        (re.compile(r"\[(?:v2 tile )?(\S+) (\d+)\] (?:\[chunk \d+_\d+\] )?STAC search"),
          "stac", _CYAN, 0),
-        (re.compile(r"\[(?:v2 tile )?(\S+) (\d+)\] (?:\[strip \d+\] )?(\d+) STAC items"),
+        (re.compile(r"\[(?:v2 tile )?(\S+) (\d+)\] (?:\[chunk \d+_\d+\] )?(\d+) STAC items"),
          "stac", _CYAN, 0),
-        (re.compile(r"\[(?:v2 tile )?(\S+) (\d+)\] (\d+) strips of (\d+) px"),
-         "strips", _MAG, 0),
-        (re.compile(r"\[(?:v2 tile )?(\S+) (\d+)\] \[strip \d+\] skipping"),
+        (re.compile(r"\[(?:v2 tile )?(\S+) (\d+)\] (\d+) chunks \((\d+)x(\d+) px each\)"),
+         "chunks", _MAG, 0),
+        (re.compile(r"\[(?:v2 tile )?(\S+) (\d+)\] \[chunk \d+_\d+\] skipping"),
          "cache", _GREEN, 0),
-        (re.compile(r"\[(?:v2 tile )?(\S+) (\d+)\] \[strip \d+\] (?:Pool A )?fetch"),
+        (re.compile(r"\[(?:v2 tile )?(\S+) (\d+)\] \[chunk \d+_\d+\] fetch_tiffs"),
          "fetch", _BLUE, 0),
-        (re.compile(r"\[(?:v2 tile )?(\S+) (\d+)\] \[strip \d+\] Pool A done"),
+        (re.compile(r"\[(?:v2 tile )?(\S+) (\d+)\] \[chunk \d+_\d+\] extract_scenes"),
          "extract", _MAG, 0),
-        (re.compile(r"\[(?:v2 tile )?(\S+) (\d+)\] \[strip \d+\] no scene data"),
+        (re.compile(r"\[(?:v2 tile )?(\S+) (\d+)\] \[chunk \d+_\d+\] no scene data"),
          "empty", _DIM, 0),
-        (re.compile(r"\[(?:v2 tile )?(\S+) (\d+)\] \[strip \d+\] ready →"),
-         "strip", _GREEN, 0),
+        (re.compile(r"\[(?:v2 tile )?(\S+) (\d+)\] \[chunk \d+_\d+\] ready →"),
+         "chunk", _GREEN, 0),
 
         # ── Per-tile pipeline (tile_pipeline.py) ─────────────────────────────
         (re.compile(r"\[(\S+) (\d+)\] already done"),
          "cache", _GREEN, 0),
-        (re.compile(r"\[(\S+) (\d+)\] resuming from strip"),
+        (re.compile(r"\[(\S+) (\d+)\] resuming from chunk"),
          "resume", _CYAN, 0),
-        (re.compile(r"\[(\S+) (\d+)\] strip \d+ written"),
-         "strip", _GREEN, 0),
-        (re.compile(r"\[(\S+) (\d+)\] merging \d+ strips →"),
-         "merge", _CYAN, 0),
+        (re.compile(r"\[(\S+) (\d+)\] chunk \(\d+,\d+\) written"),
+         "chunk", _GREEN, 0),
 
         # ── Phase B (extract) ────────────────────────────────────────────────
         (re.compile(r"fetch_spec \S+: Phase A complete"),
@@ -292,17 +290,17 @@ class _FetchFormatter(logging.Formatter):
         secs = time.monotonic() - self._start
         return f"{secs:5.0f}s" if secs < 3600 else f"{secs/3600:5.1f}h"
 
-    # Matches [v2 tile TILE YEAR] [strip NNNN] or [TILE YEAR] [strip NNNN]
-    _PAT_TILE_CTX  = re.compile(r"^\[(?:v2 tile )?(\w+) (\d{4})\](?: \[strip (\d+)\])?")
+    # Matches [v2 tile TILE YEAR] [chunk ROW_COL] or [TILE YEAR] [chunk ROW_COL]
+    _PAT_TILE_CTX  = re.compile(r"^\[(?:v2 tile )?(\w+) (\d{4})\](?: \[chunk (\d+_\d+)\])?")
 
     def _render(self, label: str, colour: str, msg: str, indent: int) -> str:
         elapsed = self._c(self._elapsed(), self._DIM)
 
-        # Extract tile/year/strip context from the message and strip it from body.
+        # Extract tile/year/chunk context from the message and strip it from body.
         m = self._PAT_TILE_CTX.match(msg)
         if m:
-            tile, year, strip = m.group(1), m.group(2), m.group(3)
-            ctx_str = f"{tile} {year}" + (f" strip {int(strip):04d}" if strip else "")
+            tile, year, chunk = m.group(1), m.group(2), m.group(3)
+            ctx_str = f"{tile} {year}" + (f" chunk {chunk}" if chunk else "")
             ctx     = self._c(f"[{ctx_str:<22}]", self._DIM)
             body    = msg[m.end():].lstrip()
         else:
@@ -405,8 +403,8 @@ class _FetchFormatter(logging.Formatter):
         prefix  = self._c("[   info]", self._DIM)
         m = self._PAT_TILE_CTX.match(msg)
         if m:
-            tile, year, strip = m.group(1), m.group(2), m.group(3)
-            ctx_str = f"{tile} {year}" + (f" strip {int(strip):04d}" if strip else "")
+            tile, year, chunk = m.group(1), m.group(2), m.group(3)
+            ctx_str = f"{tile} {year}" + (f" chunk {chunk}" if chunk else "")
             ctx  = self._c(f"[{ctx_str:<22}]", self._DIM)
             body = msg[m.end():].lstrip()
         else:
@@ -985,13 +983,14 @@ def main() -> None:
     pf.add_argument("--proxy", type=str, default=None, metavar="URL",
                     help="Proxy VM URL (e.g. http://localhost:8765). "
                          "Routes extraction to the VM; only compressed parquet is transferred.")
-    pf.add_argument("--output-dir", type=str, default="/mnt/external/mitchell", metavar="DIR",
-                    help="Root directory for final strip parquets (default: /mnt/external/mitchell). "
-                         "Strips are written to <DIR>/<location_id>/<year>/<tile_id>/strip_NN.parquet.")
-    pf.add_argument("--work-dir", type=str, default="/data/mitchell", metavar="DIR",
-                    help="Root directory for temporary working data (default: /data/mitchell). "
-                         "Should be on fast local storage (NVMe). "
-                         "Defaults to --output-dir if not set.")
+    pf.add_argument("--output-dir", type=str, default=None, metavar="DIR",
+                    help="Root directory for final chunk parquets "
+                         "(default: data/pixels/<id>/<year>/<tile_id>/). "
+                         "Chunks are written to <DIR>/<location_id>/<year>/<tile_id>/.")
+    pf.add_argument("--work-dir", type=str, default=None, metavar="DIR",
+                    help="Root directory for temporary working data "
+                         "(default: same as --output-dir). "
+                         "Should be on fast local NVMe — intermediate files are deleted after each chunk.")
 
     pv = sub.add_parser("validate", help="Validate parquet data quality for a location")
     pv.add_argument("id", help="Location id (e.g. longreach, flinders0)")

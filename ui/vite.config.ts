@@ -28,6 +28,7 @@ export default defineConfig({
       '/wms': 'http://localhost:3000',
       '/s1-tile': 'http://localhost:3000',
       '/ranking-tile': 'http://localhost:3000',
+      '/pmtiles': 'http://localhost:3000',
       '/sentinel2_tiles.geojson': 'http://localhost:3000',
       '/sentinel2_tile_labels.geojson': 'http://localhost:3000',
     },

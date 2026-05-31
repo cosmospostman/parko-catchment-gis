@@ -41,44 +41,48 @@ TARGET_VZA_DEG = 0.0
 # Kernel functions (inputs in radians, vectorised over N pixels)
 # ---------------------------------------------------------------------------
 
+def _kvol_from_trig(
+    cos_sza: np.ndarray, sin_sza: np.ndarray,
+    cos_vza: np.ndarray, sin_vza: np.ndarray,
+    cos_raa: np.ndarray,
+) -> np.ndarray:
+    """RossThick kernel from precomputed trig values."""
+    cos_phase = np.clip(cos_sza * cos_vza + sin_sza * sin_vza * cos_raa, -1.0, 1.0)
+    phase = np.arccos(cos_phase)
+    return ((np.pi / 2.0 - phase) * cos_phase + np.sin(phase)) / (cos_sza + cos_vza) - np.pi / 4.0
+
+
+def _kgeo_from_trig(
+    cos_sza: np.ndarray, sin_sza: np.ndarray,
+    cos_vza: np.ndarray, sin_vza: np.ndarray,
+    cos_raa: np.ndarray, sin_raa: np.ndarray,
+    tan_sza: np.ndarray, tan_vza: np.ndarray,
+) -> np.ndarray:
+    """LiSparse-R kernel from precomputed trig values."""
+    sec_sza = 1.0 / cos_sza
+    sec_vza = 1.0 / cos_vza
+    d2 = tan_sza**2 + tan_vza**2 - 2.0 * tan_sza * tan_vza * cos_raa
+    cos_t = np.clip(
+        2.0 * np.sqrt(np.maximum(d2 + (tan_sza * tan_vza * sin_raa) ** 2, 0.0))
+        / (sec_sza + sec_vza),
+        -1.0, 1.0,
+    )
+    t = np.arccos(cos_t)
+    overlap = np.maximum((1.0 / np.pi) * (t - np.sin(t) * cos_t) * (sec_sza + sec_vza), 0.0)
+    cos_xi = np.clip(cos_sza * cos_vza + sin_sza * sin_vza * cos_raa, -1.0, 1.0)
+    return overlap - sec_sza - sec_vza + 0.5 * (1.0 + cos_xi) * (sec_sza + sec_vza - overlap)
+
+
 def _kvol(sza: np.ndarray, vza: np.ndarray, raa: np.ndarray) -> np.ndarray:
     """RossThick volumetric scattering kernel."""
-    cos_phase = (
-        np.cos(sza) * np.cos(vza)
-        + np.sin(sza) * np.sin(vza) * np.cos(raa)
-    )
-    # Clamp to [-1, 1] to guard against floating-point noise
-    cos_phase = np.clip(cos_phase, -1.0, 1.0)
-    phase = np.arccos(cos_phase)
-    return ((np.pi / 2.0 - phase) * np.cos(phase) + np.sin(phase)) / (
-        np.cos(sza) + np.cos(vza)
-    ) - np.pi / 4.0
+    return _kvol_from_trig(np.cos(sza), np.sin(sza), np.cos(vza), np.sin(vza), np.cos(raa))
 
 
 def _kgeo(sza: np.ndarray, vza: np.ndarray, raa: np.ndarray) -> np.ndarray:
     """LiSparse-R geometric scattering kernel."""
-    # Crown relative height/width ratio b/r = 1, h/b = 2 (standard LiSparse)
-    tan_sza = np.tan(sza)
-    tan_vza = np.tan(vza)
-    cos_raa = np.cos(raa)
-
-    # Overlap (shadow) calculation
-    d2 = tan_sza**2 + tan_vza**2 - 2.0 * tan_sza * tan_vza * cos_raa
-    d = np.sqrt(np.maximum(d2, 0.0))
-
-    cos_t_num = 2.0 * np.sqrt(d2 + (tan_sza * tan_vza * np.sin(raa)) ** 2)
-    cos_t = np.clip(cos_t_num / (1.0 / np.cos(sza) + 1.0 / np.cos(vza)), -1.0, 1.0)
-    t = np.arccos(cos_t)
-    overlap = (1.0 / np.pi) * (t - np.sin(t) * np.cos(t)) * (
-        1.0 / np.cos(sza) + 1.0 / np.cos(vza)
-    )
-    overlap = np.maximum(overlap, 0.0)
-
-    cos_xi = np.cos(sza) * np.cos(vza) + np.sin(sza) * np.sin(vza) * cos_raa
-    cos_xi = np.clip(cos_xi, -1.0, 1.0)
-
-    return overlap - 1.0 / np.cos(sza) - 1.0 / np.cos(vza) + 0.5 * (1.0 + cos_xi) * (
-        1.0 / np.cos(sza) + 1.0 / np.cos(vza) - overlap
+    return _kgeo_from_trig(
+        np.cos(sza), np.sin(sza), np.cos(vza), np.sin(vza),
+        np.cos(raa), np.sin(raa), np.tan(sza), np.tan(vza),
     )
 
 
@@ -161,11 +165,44 @@ def _c_factor_rad(
     coef: dict,
     band: str = "",
 ) -> np.ndarray:
-    # Target BRDF is a precomputed scalar — no N-element array needed.
     brdf_target = BRDF_TARGET[band] if band else _brdf_scalar(_TARGET_SZA_RAD, 0.0, 0.0, **coef)
-    brdf_obs    = _brdf(sza, vza, raa, **coef)
+    kvol, kgeo  = compute_kernels(sza, vza, raa)
+    brdf_obs    = coef["fiso"] + coef["fvol"] * kvol + coef["fgeo"] * kgeo
+    safe_denom  = np.where(brdf_obs < 1e-6, 1.0, brdf_obs)
+    return np.clip(brdf_target / safe_denom, 0.5, 2.0)
 
+
+def compute_kernels(
+    sza_rad: np.ndarray,
+    vza_rad: np.ndarray,
+    raa_rad: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return (kvol, kgeo) from shared trig — each trig function called once.
+
+    Use when the same (sza, vza, raa) geometry is needed for both kernels,
+    e.g. in c_factor_rad() or when building a vectorised per-band correction.
+    """
+    cos_sza = np.cos(sza_rad); sin_sza = np.sin(sza_rad)
+    cos_vza = np.cos(vza_rad); sin_vza = np.sin(vza_rad)
+    cos_raa = np.cos(raa_rad); sin_raa = np.sin(raa_rad)
+    tan_sza = sin_sza / cos_sza
+    tan_vza = sin_vza / cos_vza
+    kvol = _kvol_from_trig(cos_sza, sin_sza, cos_vza, sin_vza, cos_raa)
+    kgeo = _kgeo_from_trig(cos_sza, sin_sza, cos_vza, sin_vza, cos_raa, sin_raa, tan_sza, tan_vza)
+    return kvol, kgeo
+
+
+def c_factor_from_kernels(
+    kvol: np.ndarray,
+    kgeo: np.ndarray,
+    band: str,
+) -> np.ndarray:
+    """C-factor from precomputed kernel arrays.
+
+    Pair with compute_kernels() to avoid recomputing trig when both kernels
+    share the same (sza, vza, raa) geometry.
+    """
+    coef = BRDF_COEFFICIENTS[band]
+    brdf_obs = coef["fiso"] + coef["fvol"] * kvol + coef["fgeo"] * kgeo
     safe_denom = np.where(brdf_obs < 1e-6, 1.0, brdf_obs)
-    cf = brdf_target / safe_denom
-
-    return np.clip(cf, 0.5, 2.0)
+    return np.clip(BRDF_TARGET[band] / safe_denom, 0.5, 2.0)

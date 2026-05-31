@@ -130,7 +130,7 @@ EXPERIMENT = Experiment(
         "patience":              15,
         "band_noise_std":        0.05,
         "obs_dropout_min":       4,
-        "p_gate":                0.3,
+        "p_gate":                0.0,
         "T_gate":                8,
         "doy_density_norm":      True,
         "doy_phase_shift":       False,

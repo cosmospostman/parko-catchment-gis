@@ -182,27 +182,37 @@ class Location:
         """Canonical pixel observation parquet: data/pixels/<id>/<year>/<tile_id>.parquet"""
         return self.parquet_year_dir(year) / f"{tile_id}.parquet"
 
-    def parquet_tile_paths(self) -> dict[int, list[Path]]:
+    def parquet_tile_paths(self, base_dir: Path | None = None) -> dict[int, list[Path]]:
         """Return {year: [tile_parquet_paths]} for all fetched data."""
-        base = _PROJECT_ROOT / "data" / "pixels" / self.id
+        base = base_dir if base_dir is not None else _PROJECT_ROOT / "data" / "pixels" / self.id
         result: dict[int, list[Path]] = {}
         if not base.is_dir():
             return result
+        def _is_pixel_parquet(p: Path) -> bool:
+            return (p.suffix == ".parquet"
+                    and not p.stem.startswith("_collect_")
+                    and not p.stem.endswith("-by-pixel")
+                    and not p.stem.endswith(".coords")
+                    and not p.stem.endswith(".s1")
+                    and not p.stem.endswith(".s2")
+                    and "coords" not in p.stem)
+
         for child in base.iterdir():
             if not (child.is_dir() and child.name.isdigit()):
                 continue
             year = int(child.name)
-            paths = sorted(
-                p for p in child.iterdir()
-                if p.suffix == ".parquet" and not p.stem.startswith("_collect_")
-                and not p.stem.endswith("-by-pixel")
-                and not p.stem.endswith(".coords")
-                and not p.stem.endswith(".s1")
-                and not p.stem.endswith(".s2")
-                and "coords" not in p.stem
-            )
-            if paths:
-                result[year] = paths
+            # Flat layout: <year>/<tile>.parquet
+            # Tiled layout: <year>/<tile_id>/<tile_id>_strip_NN.parquet
+            candidates: list[Path] = []
+            for entry in child.iterdir():
+                if entry.is_file() and _is_pixel_parquet(entry):
+                    candidates.append(entry)
+                elif entry.is_dir():
+                    candidates.extend(
+                        p for p in entry.iterdir() if p.is_file() and _is_pixel_parquet(p)
+                    )
+            if candidates:
+                result[year] = sorted(candidates)
         return result
 
     def parquet_years(self) -> list[int]:
@@ -255,7 +265,7 @@ class Location:
     def fetch(
         self,
         years: list[int],
-        cloud_max: int = 30,
+        cloud_max: int = 80,
         cache_dir: Optional[Path] = None,
         apply_nbar: bool = True,
         n_workers: Optional[int] = None,
@@ -294,7 +304,7 @@ class Location:
 
         _params      = _budget_params(_system_memory_gb())
         _max_extract = _params["max_extract_years"]
-        _strip_px    = _params["strip_height_px"] or 1024
+        _chunk_px    = _params["strip_height_px"] or 1024
 
         out_dir  = (output_dir / self.id) if output_dir is not None else (_PROJECT_ROOT / "data" / "pixels" / self.id)
         _work_dir = (work_dir / self.id) if work_dir is not None else None
@@ -313,19 +323,23 @@ class Location:
             if tile_filter and tile_id not in tile_filter:
                 continue
             tile_polygon = _tile_polygon(tile_id)
-            tile_geom = tile_polygon.intersection(location_geom) if tile_polygon else location_geom
-            if tile_geom.is_empty:
-                continue
+            if tile_polygon is not None:
+                tile_fetch_geom = tile_polygon.intersection(location_geom)
+                if tile_fetch_geom.is_empty:
+                    continue
+            else:
+                tile_fetch_geom = location_geom
 
             with ThreadPoolExecutor(max_workers=_max_extract) as pool:
                 futs = {
                     pool.submit(
                         fetch_tile_local,
-                        tile_id, year, tile_geom,
+                        tile_id, year, tile_fetch_geom,
                         out_dir,
                         cloud_max=cloud_max,
                         apply_nbar=apply_nbar,
-                        strip_height_px=_strip_px,
+                        chunk_height_px=_chunk_px,
+                        chunk_width_px=_chunk_px,
                         n_workers=n_workers,
                         calibration_out=_cal_out,
                         work_dir=_work_dir,
@@ -512,4 +526,37 @@ def training_pixel_summary(resolution_m: float = 10.0) -> None:
 
 
 if __name__ == "__main__":
-    training_pixel_summary()
+    import argparse as _argparse
+
+    _parser = _argparse.ArgumentParser(description="Location utilities")
+    _sub = _parser.add_subparsers(dest="cmd")
+
+    _p_summary = _sub.add_parser("summary", help="Print training pixel summary")
+
+    _p_fetch = _sub.add_parser("fetch", help="Fetch pixel observations for a location")
+    _p_fetch.add_argument("location", help="Location ID (e.g. mitchell-river)")
+    _p_fetch.add_argument("--years", nargs="+", type=int, required=True, help="Years to fetch")
+    _p_fetch.add_argument("--tiles", nargs="+", default=None, help="Restrict to specific tile IDs")
+    _p_fetch.add_argument("--output-dir", default=None, help="Root output directory (default: data/pixels/<id>)")
+    _p_fetch.add_argument("--work-dir", default=None, help="Root work directory for temp files (default: output-dir)")
+    _p_fetch.add_argument("--cloud-max", type=int, default=30, help="Max cloud cover %% (default: 30)")
+    _p_fetch.add_argument("--proxy", default=None, help="Proxy URL (e.g. http://192.168.1.10:8765)")
+
+    _args = _parser.parse_args()
+
+    if _args.cmd == "fetch":
+        _loc = get(_args.location)
+        _out = Path(_args.output_dir) if _args.output_dir else None
+        _work = Path(_args.work_dir) if _args.work_dir else None
+        _written = _loc.fetch(
+            years=_args.years,
+            tiles=_args.tiles,
+            cloud_max=_args.cloud_max,
+            output_dir=_out,
+            work_dir=_work,
+            proxy_url=_args.proxy,
+        )
+        for p in _written:
+            print(p)
+    else:
+        training_pixel_summary()

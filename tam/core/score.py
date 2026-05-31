@@ -6,6 +6,7 @@ import contextlib
 import logging
 import os
 from pathlib import Path
+import threading
 from queue import Queue
 from threading import Thread
 from typing import NamedTuple
@@ -18,12 +19,14 @@ import torch
 
 from tam.core.dataset import ALL_FEATURE_COLS, BAND_COLS, MAX_SEQ_LEN, S1_FEATURE_COLS, despeckle_s1, lin_to_db, prepare_s1_frame, prepare_s2_frame, subsample_obs_indices
 from tam.core.model import TAMClassifier
+from tam.core.pixel_source import PixelSource, ParquetPixelSource, ChunkPixelSource
 
 logger = logging.getLogger(__name__)
 
 _N_FEATURES = len(ALL_FEATURE_COLS)
 _N_FEATURES_S1 = len(S1_FEATURE_COLS)
 _SENTINEL = object()
+_stop_event = threading.Event()  # set to request graceful shutdown of scoring pipeline
 
 # Precomputed offset for fast numpy year/doy extraction (no pd.to_datetime)
 _EPOCH_D = np.datetime64("1970-01-01", "D")
@@ -32,20 +35,20 @@ _EPOCH_D = np.datetime64("1970-01-01", "D")
 _BAND_INDICES = {c: i for i, c in enumerate(ALL_FEATURE_COLS)}
 
 
-def _compute_pixel_s1_stats(parquet: Path) -> tuple[dict, dict, dict, dict]:
+def _compute_pixel_s1_stats(source: PixelSource | Path) -> tuple[dict, dict, dict, dict]:
     """One-pass pre-read to compute per-pixel VH/VV mean/std for z-scoring.
 
     Returns (pids, vh_mean, vv_mean, vh_std, vv_std) as parallel arrays indexed
     by unique point_id. Called once before the main scoring pipeline when
     pixel_zscore=True so that _extract_s1_features can normalise on the fly.
     """
-    import pyarrow.parquet as pq
-    pf = pq.ParquetFile(parquet)
-    available = set(pf.schema_arrow.names)
+    if isinstance(source, Path):
+        source = ParquetPixelSource(source)
+    available = set(source.schema.names)
     read_cols = [c for c in ["point_id", "source", "vh", "vv"] if c in available]
     chunks = []
-    for rg in range(pf.metadata.num_row_groups):
-        chunk = pl.from_arrow(pf.read_row_group(rg, columns=read_cols))
+    for rg in range(source.num_row_groups):
+        chunk = pl.from_arrow(source.read_row_group(rg, columns=read_cols))
         if "source" in chunk.columns:
             chunk = chunk.filter(pl.col("source") == "S1")
         chunk = chunk.drop_nulls(subset=["vh", "vv"])
@@ -135,20 +138,20 @@ def _compute_pixel_s1_stats_mixed(
     )
 
 
-def _compute_s1_despeckle_lookup(parquet: Path, window: int) -> pl.DataFrame:
+def _compute_s1_despeckle_lookup(source: PixelSource | Path, window: int) -> pl.DataFrame:
     """One-pass pre-read to compute despeckled linear vh/vv per pixel.
 
     Returns a DataFrame with columns [point_id, date, vh, vv] where vh/vv are
     the temporally smoothed values. Only called when s1_only=True and
     s1_despeckle_window >= 2.
     """
-    import pyarrow.parquet as pq
-    pf = pq.ParquetFile(parquet)
-    available = set(pf.schema_arrow.names)
+    if isinstance(source, Path):
+        source = ParquetPixelSource(source)
+    available = set(source.schema.names)
     read_cols = [c for c in ["point_id", "date", "source", "vh", "vv"] if c in available]
     chunks = []
-    for rg in range(pf.metadata.num_row_groups):
-        chunk = pl.from_arrow(pf.read_row_group(rg, columns=read_cols))
+    for rg in range(source.num_row_groups):
+        chunk = pl.from_arrow(source.read_row_group(rg, columns=read_cols))
         if "source" in chunk.columns:
             chunk = chunk.filter(pl.col("source") == "S1")
         if "vh" not in chunk.columns or "vv" not in chunk.columns:
@@ -375,7 +378,7 @@ def _extract_mixed_pa(
             tbl = tbl.filter(keep_pa)
             # Filter is_s1_pa in-sync with the table so we don't re-evaluate source.
             is_s1_pa = is_s1_pa.filter(keep_pa)
-        is_s1_bool = is_s1_pa.to_numpy(zero_copy_only=False)
+        is_s1_bool = _pac.fill_null(is_s1_pa, False).to_numpy(zero_copy_only=False)
     else:
         if "scl_purity" in schema_names:
             tbl = tbl.filter(_pac.greater_equal(tbl.column("scl_purity").combine_chunks(), scl_purity_min))
@@ -1175,7 +1178,7 @@ def _flush_to_writer(writer: "pq.ParquetWriter", pids_list: list, years_list: li
 
 
 def score_pixels_chunked(
-    parquet: Path,
+    source: PixelSource | Path,
     model: TAMClassifier,
     band_mean: np.ndarray,
     band_std: np.ndarray,
@@ -1212,6 +1215,7 @@ def score_pixels_chunked(
     progress_log_interval: int = 50_000,
     gate_threshold: float = 0.0,
     T_gate: int = 8,
+    n_pixels_before: int = 0,
 ) -> pl.DataFrame:
     """Score all pixels in a single-year parquet with a three-stage concurrent pipeline.
 
@@ -1229,7 +1233,15 @@ def score_pixels_chunked(
     from concurrent.futures import ThreadPoolExecutor
     from tam.core._preprocess_numba import warmup as _numba_warmup
 
+    if isinstance(source, Path):
+        source = ParquetPixelSource(source)
+
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    if device.startswith("cuda") and torch.cuda.is_available():
+        _gpu_name = torch.cuda.get_device_name(device)
+        logger.info("Device: %s (%s)", device, _gpu_name)
+    else:
+        logger.info("Device: %s (no CUDA)", device)
     pin = False  # pin_memory cost (325ms first alloc) far exceeds H2D transfer savings
     if device.startswith("cuda") and torch.cuda.is_available():
         torch.set_float32_matmul_precision("high")  # TF32: ~2× attention throughput on Ampere+
@@ -1238,13 +1250,15 @@ def score_pixels_chunked(
 
     logger.info("Warming up numba kernels ...")
     _numba_warmup()
+    logger.info("Numba ready")
 
     # Warm up GPU: pre-pin memory (CUDA allocator caches pinned pages after first call)
     # so the first real batch doesn't pay ~2s in OS page-fault costs during H2D.
     if device.startswith("cuda") and torch.cuda.is_available():
         _n_feat  = model.n_bands if hasattr(model, "n_bands") else 14
         _T_full  = getattr(model, "_max_seq_len", MAX_SEQ_LEN)
-        for _T_w in (T_gate, _T_full):
+        _warmup_shapes = [_T_full] + ([T_gate] if gate_threshold > 0.0 else [])
+        for _T_w in _warmup_shapes:
             _ = torch.zeros(batch_size, _T_w, _n_feat).pin_memory()
             _ = torch.zeros(batch_size, _T_w, dtype=torch.int64).pin_memory()
             _ = torch.zeros(batch_size, _T_w, dtype=torch.bool).pin_memory()
@@ -1256,17 +1270,16 @@ def score_pixels_chunked(
     _vh_mean = _vh_std = _vv_mean = _vv_std = None
     if s1_only and pixel_zscore:
         logger.info("Computing per-pixel S1 z-score stats (pre-pass) ...")
-        _vh_mean, _vh_std, _vv_mean, _vv_std = _compute_pixel_s1_stats(parquet)
+        _vh_mean, _vh_std, _vv_mean, _vv_std = _compute_pixel_s1_stats(source)
         logger.info("Z-score stats computed for %d pixels", len(_vh_mean))
 
     _despeckle_lookup = None
     if s1_only and s1_despeckle_window >= 2:
         logger.info("Computing S1 despeckle lookup (window=%d, pre-pass) ...", s1_despeckle_window)
-        _despeckle_lookup = _compute_s1_despeckle_lookup(parquet, s1_despeckle_window)
+        _despeckle_lookup = _compute_s1_despeckle_lookup(source, s1_despeckle_window)
         logger.info("Despeckle lookup computed for %d S1 rows", len(_despeckle_lookup))
 
-    pf = pq.ParquetFile(parquet)
-    n_rg = pf.metadata.num_row_groups
+    n_rg = source.num_row_groups
     tile_prefix = f"_{tile_id}_" if tile_id else None
 
     _s2_band_cols = [c for c in (s2_feature_cols or feature_cols or BAND_COLS) if c not in ("NDVI", "NDWI", "EVI")]
@@ -1291,7 +1304,7 @@ def score_pixels_chunked(
             + _s2_band_cols
         )
     # Only read columns that exist in this parquet
-    available = set(pf.schema_arrow.names)
+    available = set(source.schema.names)
     read_cols = [c for c in read_cols if c in available]
 
     # Two-stage read pipeline:
@@ -1301,7 +1314,7 @@ def score_pixels_chunked(
     #   raw_q: parser thread → prep workers.  Holds target_chunk_rows-sized Polars
     #          slices with year/doy columns already attached.
     #   prep_q: prep workers → GPU.
-    n_io_prefetch = 4  # row groups to buffer in IO thread ahead of parser
+    n_io_prefetch = 8  # row groups to buffer in IO thread ahead of parser
     io_q:   Queue = Queue(maxsize=n_io_prefetch)
     raw_q:  Queue = Queue(maxsize=n_prep_workers * 4)
     prep_q: Queue = Queue(maxsize=n_prep_workers * 8)
@@ -1312,7 +1325,7 @@ def score_pixels_chunked(
     def _io_reader() -> None:
         try:
             for rg in range(n_rg):
-                tbl = pf.read_row_group(rg, columns=read_cols)
+                tbl = source.read_row_group(rg, columns=read_cols)
                 io_q.put(tbl)
         except Exception:
             logger.exception("IO reader thread crashed")
@@ -1400,6 +1413,12 @@ def score_pixels_chunked(
                 tbl = io_q.get()
                 if tbl is _SENTINEL:
                     break
+                # geometry filter (point_id set membership) — done here in the
+                # parser thread so the IO thread stays purely on disk reads
+                if hasattr(source, "filter_table"):
+                    tbl = source.filter_table(tbl)
+                    if tbl.num_rows == 0:
+                        continue
                 # tile_id filter in PyArrow before conversion
                 if tile_prefix and "item_id" in tbl.schema.names:
                     item_ids = tbl.column("item_id")
@@ -1533,6 +1552,11 @@ def score_pixels_chunked(
         except Exception:
             logger.exception("Writer thread crashed")
 
+    logger.info(
+        "Pipeline starting: %d row groups, %d prep workers, batch=%d%s",
+        n_rg, n_prep_workers, batch_size,
+        f", total={n_total_pixels:,} px" if n_total_pixels else "",
+    )
     io_thread     = Thread(target=_io_reader, daemon=True)
     reader_thread = Thread(target=_reader,    daemon=True)
     io_thread.start()
@@ -1605,25 +1629,28 @@ def score_pixels_chunked(
             B_ = len(merged.pids)
             T_full = merged.bands.shape[1]
             n_feat = merged.bands.shape[2]
-            gate_t = min(T_gate, T_full)
 
-            # --- Gate tensor prep (CPU Numba, GIL-releasing) ---
-            bands_np  = merged.bands.numpy()
-            doy_np    = merged.doy.numpy()
-            mask_np   = merged.mask.numpy()
-            is_s1_np  = (merged.is_s1.numpy().astype(bool) if merged.is_s1 is not None
-                         else np.zeros((B_, T_full), dtype=bool))
+            if gate_threshold > 0.0:
+                # --- Gate tensor prep (CPU Numba, GIL-releasing) ---
+                gate_t = min(T_gate, T_full)
+                bands_np  = merged.bands.numpy()
+                doy_np    = merged.doy.numpy()
+                mask_np   = merged.mask.numpy()
+                is_s1_np  = (merged.is_s1.numpy().astype(bool) if merged.is_s1 is not None
+                             else np.zeros((B_, T_full), dtype=bool))
 
-            gate_bands_np   = np.zeros((B_, gate_t, n_feat), dtype=np.float32)
-            gate_doy_np     = np.zeros((B_, gate_t),         dtype=np.int64)
-            gate_is_s1_np   = np.zeros((B_, gate_t),         dtype=bool)
-            gate_mask_np    = np.ones( (B_, gate_t),         dtype=bool)
-            _tb = _time.monotonic()
-            _bgt(bands_np, doy_np, mask_np, is_s1_np, np.int64(gate_t),
-                 gate_bands_np, gate_doy_np, gate_mask_np, gate_is_s1_np)
-            _t_xfer_bgt_total += _time.monotonic() - _tb
-            gate_n_obs_np = (np.clip((~gate_mask_np).sum(axis=1), 1, None)
-                             .astype(np.float32) / T_full)
+                gate_bands_np   = np.zeros((B_, gate_t, n_feat), dtype=np.float32)
+                gate_doy_np     = np.zeros((B_, gate_t),         dtype=np.int64)
+                gate_is_s1_np   = np.zeros((B_, gate_t),         dtype=bool)
+                gate_mask_np    = np.ones( (B_, gate_t),         dtype=bool)
+                _tb = _time.monotonic()
+                _bgt(bands_np, doy_np, mask_np, is_s1_np, np.int64(gate_t),
+                     gate_bands_np, gate_doy_np, gate_mask_np, gate_is_s1_np)
+                _t_xfer_bgt_total += _time.monotonic() - _tb
+                gate_n_obs_np = (np.clip((~gate_mask_np).sum(axis=1), 1, None)
+                                 .astype(np.float32) / T_full)
+            else:
+                gate_bands_np = gate_doy_np = gate_mask_np = gate_n_obs_np = gate_is_s1_np = None
 
             # H2D on transfer_stream so the copy engine runs in parallel with
             # whatever the compute engine is doing.  pin_memory() enables async DMA.
@@ -1635,12 +1662,15 @@ def score_pixels_chunked(
                     t = arr if isinstance(arr, torch.Tensor) else torch.from_numpy(arr)
                     return (t.pin_memory().to(device, non_blocking=True)
                             if use_cuda else t.to(device))
-                gate_bands_dev  = _to_dev(gate_bands_np)
-                gate_doy_dev    = _to_dev(gate_doy_np)
-                gate_mask_dev   = _to_dev(gate_mask_np)
-                gate_n_obs_dev  = _to_dev(gate_n_obs_np)
-                gate_is_s1_dev  = (_to_dev(gate_is_s1_np)
-                                   if merged.is_s1 is not None else None)
+                if gate_threshold > 0.0:
+                    gate_bands_dev  = _to_dev(gate_bands_np)
+                    gate_doy_dev    = _to_dev(gate_doy_np)
+                    gate_mask_dev   = _to_dev(gate_mask_np)
+                    gate_n_obs_dev  = _to_dev(gate_n_obs_np)
+                    gate_is_s1_dev  = (_to_dev(gate_is_s1_np)
+                                       if merged.is_s1 is not None else None)
+                else:
+                    gate_bands_dev = gate_doy_dev = gate_mask_dev = gate_n_obs_dev = gate_is_s1_dev = None
                 bands_dev  = _to_dev(merged.bands)
                 doy_dev    = _to_dev(merged.doy)
                 mask_dev   = _to_dev(merged.mask)
@@ -1696,6 +1726,8 @@ def score_pixels_chunked(
             if tb is _SENTINEL:
                 result_q.put(_SENTINEL)
                 break
+            if _n_gpu_calls == 0:
+                logger.info("First batch on GPU (B=%d) — pipeline is running", tb.B)
             _ts = _time.monotonic()
             chunk = _gpu_forward(tb, model, gate_threshold, compute_stream)
             _dt = _time.monotonic() - _ts
@@ -1741,7 +1773,13 @@ def score_pixels_chunked(
             )
         _t_merge_total += _time.monotonic() - _tm
         _tx = _time.monotonic()
-        xfer_q.put(merged)   # blocks if xfer_q is full — natural backpressure
+        while True:
+            try:
+                xfer_q.put(merged, timeout=0.2)
+                break
+            except _queue.Full:
+                if _stop_event.is_set():
+                    raise KeyboardInterrupt
         _t_xfer_wait_total += _time.monotonic() - _tx
 
     def _collect_results() -> None:
@@ -1766,77 +1804,118 @@ def score_pixels_chunked(
                 dt_interval = _t_now - _t_last_logged
                 rate = (n_scored - n_last_logged) / dt_interval if dt_interval > 0 else 0.0
                 if n_total_pixels:
+                    global_scored = n_pixels_before + n_scored
+                    global_total  = n_pixels_before + n_total_pixels
                     logger.info(
-                        "[%s yr=%s] %.1f%% (%d/%d px) @ %.0f px/s",
-                        tile_id or "?", end_year or "?",
-                        100.0 * n_scored / n_total_pixels, n_scored, n_total_pixels, rate,
+                        "[%s] %.1f%% of %s px (%s px/s)",
+                        tile_id or "?",
+                        100.0 * global_scored / global_total,
+                        f"{global_total:,}", f"{rate:,.0f}",
                     )
                 else:
                     logger.info(
-                        "[%s yr=%s] %d px scored @ %.0f px/s",
-                        tile_id or "?", end_year or "?", n_scored, rate,
+                        "[%s] %s px scored (%s px/s)",
+                        tile_id or "?",
+                        f"{n_scored:,}", f"{rate:,.0f}",
                     )
                 n_last_logged = n_scored
                 _t_last_logged = _t_now
 
-    while sentinels_seen < n_prep_workers:
-        _t_get_start = _time.monotonic()
-        item = prep_q.get()
-        _t_idle_total += _time.monotonic() - _t_get_start
-        if item is _SENTINEL:
-            sentinels_seen += 1
-            if sentinels_seen == n_prep_workers and _acc:
-                _flush_acc()
-                _acc.clear(); _acc_px = 0
-            continue
-        _acc.append(item)
-        _acc_px += len(item.pids)
-        if _acc_px < batch_size:
-            continue
-        _flush_acc()
-        _acc.clear(); _acc_px = 0
-        _collect_results()
+    def _drain_and_join_threads() -> None:
+        """Poison all queues so blocked worker threads unblock, then join them."""
+        # io_q: one sentinel unblocks _reader
+        # raw_q: one sentinel per preprocessor worker so each unblocks its raw_q.get()
+        # prep_q / xfer_q / gpu_ready_q: one sentinel each for the downstream consumers
+        for q, n in ((io_q, 1), (raw_q, n_prep_workers), (prep_q, 1), (xfer_q, 1), (gpu_ready_q, 1)):
+            for _ in range(n):
+                try:
+                    q.put_nowait(_SENTINEL)
+                except Exception:
+                    pass
+        for t in (xfer_thread, gpu_thread, io_thread, reader_thread):
+            t.join(timeout=2.0)
+        prep_pool.shutdown(wait=False)
 
-    xfer_q.put(_SENTINEL)
+    try:
+        while sentinels_seen < n_prep_workers:
+            if _stop_event.is_set():
+                raise KeyboardInterrupt
+            _t_get_start = _time.monotonic()
+            while True:
+                try:
+                    item = prep_q.get(timeout=0.2)
+                    break
+                except _queue.Empty:
+                    if _stop_event.is_set():
+                        raise KeyboardInterrupt
+            _t_idle_total += _time.monotonic() - _t_get_start
+            if item is _SENTINEL:
+                sentinels_seen += 1
+                if sentinels_seen == n_prep_workers and _acc:
+                    _flush_acc()
+                    _acc.clear(); _acc_px = 0
+                continue
+            _acc.append(item)
+            _acc_px += len(item.pids)
+            if _acc_px < batch_size:
+                continue
+            _flush_acc()
+            _acc.clear(); _acc_px = 0
+            _collect_results()
 
-    # Drain result_q until GPU thread signals done.
-    while True:
-        res = result_q.get()
-        if res is _SENTINEL:
-            break
-        chunk, px_count = res
-        n_total_gate_cut += chunk[3]
-        if out_writer is not None:
-            out_q.put(chunk)
-        else:
-            all_pids.append(chunk[0]); all_years.append(chunk[1]); all_probs.append(chunk[2])
-        n_scored += px_count
-        if n_scored - n_last_logged >= progress_log_interval:
-            _t_now = _time.monotonic()
-            dt_interval = _t_now - _t_last_logged
-            rate = (n_scored - n_last_logged) / dt_interval if dt_interval > 0 else 0.0
-            if n_total_pixels:
-                logger.info(
-                    "[%s yr=%s] %.1f%% (%d/%d px) @ %.0f px/s",
-                    tile_id or "?", end_year or "?",
-                    100.0 * n_scored / n_total_pixels, n_scored, n_total_pixels, rate,
-                )
+        xfer_q.put(_SENTINEL)
+
+        # Drain result_q until GPU thread signals done.
+        while True:
+            while True:
+                try:
+                    res = result_q.get(timeout=0.2)
+                    break
+                except _queue.Empty:
+                    if _stop_event.is_set():
+                        raise KeyboardInterrupt
+            if res is _SENTINEL:
+                break
+            chunk, px_count = res
+            n_total_gate_cut += chunk[3]
+            if out_writer is not None:
+                out_q.put(chunk)
             else:
-                logger.info(
-                    "[%s yr=%s] %d px scored @ %.0f px/s",
-                    tile_id or "?", end_year or "?", n_scored, rate,
-                )
-            n_last_logged = n_scored
-            _t_last_logged = _t_now
+                all_pids.append(chunk[0]); all_years.append(chunk[1]); all_probs.append(chunk[2])
+            n_scored += px_count
+            if n_scored - n_last_logged >= progress_log_interval:
+                _t_now = _time.monotonic()
+                dt_interval = _t_now - _t_last_logged
+                rate = (n_scored - n_last_logged) / dt_interval if dt_interval > 0 else 0.0
+                if n_total_pixels:
+                    global_scored = n_pixels_before + n_scored
+                    global_total  = n_pixels_before + n_total_pixels
+                    logger.info(
+                        "[%s] %.1f%% (%s/%s px) @ %s px/s",
+                        tile_id or "?",
+                        100.0 * global_scored / global_total,
+                        f"{global_scored:,}", f"{global_total:,}", f"{rate:,.0f}",
+                    )
+                else:
+                    logger.info(
+                        "[%s] %s px scored @ %s px/s",
+                        tile_id or "?",
+                        f"{n_scored:,}", f"{rate:,.0f}",
+                    )
+                n_last_logged = n_scored
+                _t_last_logged = _t_now
 
-    xfer_thread.join()
-    gpu_thread.join()
+        xfer_thread.join()
+        gpu_thread.join()
 
-    io_thread.join()
-    reader_thread.join()
-    for f in prep_futures:
-        f.result()
-    prep_pool.shutdown(wait=False)
+        io_thread.join()
+        reader_thread.join()
+        for f in prep_futures:
+            f.result()
+        prep_pool.shutdown(wait=False)
+    except KeyboardInterrupt:
+        _drain_and_join_threads()
+        raise
 
     _t_total = _time.monotonic() - _t0
     _t_other  = max(0.0, _t_total - _t_idle_total - _t_merge_total - _t_score_total)
@@ -1945,7 +2024,7 @@ def score_location_years(
         logger.info("Scoring year %d — %s", year, path.name)
         _tile_id = tile_id or path.stem.split("-by-pixel")[0].split(".s1")[0].split(".s2")[0]
         score_pixels_chunked(
-            parquet=path,
+            source=path,
             model=model,
             band_mean=band_mean,
             band_std=band_std,
@@ -2001,7 +2080,7 @@ def _get_staging_schema() -> "pa.Schema":
 
 
 def score_tile_year(
-    parquet: Path,
+    source: PixelSource | Path,
     tile_id: str,
     year: int,
     model: TAMClassifier,
@@ -2017,6 +2096,7 @@ def score_tile_year(
     mixed: bool = True,
     s1_despeckle_window: int = 0,
     n_total_pixels: int | None = None,
+    n_pixels_before: int = 0,
     s2_feature_cols: list[str] | None = None,
     s1_feature_cols: list[str] | None = None,
     global_feat_mean: np.ndarray | None = None,
@@ -2053,10 +2133,10 @@ def score_tile_year(
     _s1_cols = s1_feature_cols or list(V10_S1_FEATURE_COLS)
 
     # Pixel z-score stats are computed per-chunk inside _preprocess — no pre-pass needed.
-    logger.info("[%s yr=%d] Scoring ...", tile_id, year)
+    logger.info("[%s %d] Scoring ...", tile_id, year)
     with pq.ParquetWriter(tmp_path, schema=_get_staging_schema(), **_STAGING_WRITE_OPTS) as staging_writer:
         score_pixels_chunked(
-            parquet=parquet,
+            source=source,
             model=model,
             band_mean=band_mean,
             band_std=band_std,
@@ -2079,11 +2159,12 @@ def score_tile_year(
             s1_feature_cols=_s1_cols,
             s1_despeckle_window=s1_despeckle_window,
             n_total_pixels=n_total_pixels,
+            n_pixels_before=n_pixels_before,
             out_writer=staging_writer,
         )
 
     tmp_path.rename(out_path)   # atomic on POSIX; only visible once complete
-    logger.info("[%s yr=%d] Wrote staging %s", tile_id, year, out_path.name)
+    logger.info("[%s %d] Wrote staging %s", tile_id, year, out_path.name)
     return out_path
 
 
@@ -2097,14 +2178,15 @@ def _score_tile_worker(args: tuple) -> tuple[str, list[Path]]:
         staging_dir, scl_purity_min, min_obs_per_year,
         batch_size, n_prep_workers, device, n_tile_workers, s1_only, mixed,
         s1_despeckle_window, s2_feature_cols, s1_feature_cols,
+        n_tile_pixels, n_pixels_before,
     ) = args
 
     torch.set_num_threads(max(1, (os.cpu_count() or 1) // n_tile_workers))
 
     paths = []
-    for year, parquet in year_parquets:
+    for year, source in year_parquets:
         p = score_tile_year(
-            parquet=parquet,
+            source=source,
             tile_id=tile_id,
             year=year,
             model=model,
@@ -2121,6 +2203,8 @@ def _score_tile_worker(args: tuple) -> tuple[str, list[Path]]:
             s1_despeckle_window=s1_despeckle_window,
             s2_feature_cols=s2_feature_cols,
             s1_feature_cols=s1_feature_cols,
+            n_total_pixels=n_tile_pixels,
+            n_pixels_before=n_pixels_before,
         )
         paths.append(p)
     return tile_id, paths
@@ -2147,6 +2231,8 @@ def score_tiles_chunked(
     s1_feature_cols: list[str] | None = None,
     gate_threshold: float = 0.0,
     T_gate: int = 8,
+    pmtiles_out: Path | None = None,
+    coords_by_tile: dict[str, Path] | None = None,
 ) -> list[Path]:
     """Score each S2 tile independently, writing one parquet per tile.
 
@@ -2188,13 +2274,32 @@ def score_tiles_chunked(
         len(tile_year_parquets), total_pairs, already_staged, total_pairs - already_staged,
     )
 
+    # Pre-compute per-tile pixel counts using the first-year source for each tile.
+    # Uses DuckDB count(distinct point_id) — fast enough even for large strip parquets.
+    pixels_by_tile: dict[str, int] = {}
+    for tid, yps in tile_year_parquets.items():
+        first_source = yps[0][1]
+        if isinstance(first_source, Path):
+            from tam.core.pixel_source import ParquetPixelSource
+            first_source = ParquetPixelSource(first_source)
+        try:
+            pixels_by_tile[tid] = first_source.num_pixels()
+        except Exception as e:
+            logger.warning("Could not count pixels for tile %s: %s", tid, e)
+            pixels_by_tile[tid] = 0
+    total_pixels = sum(pixels_by_tile.values())
+    logger.info("Total pixels across %d tiles: %s", len(tile_year_parquets), f"{total_pixels:,}")
+
     # --- Phase 1: score each (tile, year) ---
+    # n_pixels_before is 0 for multi-worker (interleaved order unknown); accumulated
+    # serially for single-worker so progress shows global % across all tiles.
     worker_args = [
         (
             tile_id, year_parquets, model, band_mean, band_std,
             staging_dir, scl_purity_min, min_obs_per_year,
             batch_size, n_prep_workers, device, n_tile_workers, s1_only, mixed,
             s1_despeckle_window, s2_feature_cols, s1_feature_cols,
+            pixels_by_tile.get(tile_id), 0,
         )
         for tile_id, year_parquets in tile_year_parquets.items()
     ]
@@ -2209,9 +2314,13 @@ def score_tiles_chunked(
                 staging_by_tile[tile_id] = paths
                 logger.info("Tile %s complete (%d year files)", tile_id, len(paths))
     else:
+        pixels_before = 0
         for args in worker_args:
+            # Inject current accumulated pixel offset so inner progress shows global %.
+            args = args[:-1] + (pixels_before,)
             tile_id, paths = _score_tile_worker(args)
             staging_by_tile[tile_id] = paths
+            pixels_before += pixels_by_tile.get(tile_id, 0)
             logger.info("Tile %s complete (%d year files)", tile_id, len(paths))
 
     # --- Phase 2: aggregate per tile and write final parquet ---
@@ -2250,6 +2359,25 @@ def score_tiles_chunked(
         pq.write_table(tbl, final_path, **_FINAL_WRITE_OPTS)
         logger.info("Wrote %s (%d pixels)", final_path.name, len(agg))
         final_paths.append(final_path)
+
+        if pmtiles_out is not None and coords_by_tile is not None:
+            _coords_path = coords_by_tile.get(tile_id)
+            if _coords_path is not None:
+                from utils.raster import rasterize_tile_to_pmtiles
+                _tile_pmtiles = pmtiles_out.parent / f"{pmtiles_out.stem}_{tile_id}{pmtiles_out.suffix}" \
+                    if pmtiles_out.suffix else pmtiles_out / f"{tile_id}.pmtiles"
+                # If pmtiles_out has an extension, use it as a per-tile path template;
+                # otherwise treat it as a directory.
+                if pmtiles_out.suffix:
+                    # Single-tile scenario: use pmtiles_out directly if only one tile
+                    _tile_pmtiles = pmtiles_out.parent / f"{pmtiles_out.stem}_{tile_id}.pmtiles"
+                else:
+                    _tile_pmtiles = pmtiles_out / f"{tile_id}.pmtiles"
+                logger.info("Rasterising %s → %s", tile_id, _tile_pmtiles)
+                rasterize_tile_to_pmtiles(final_path, _coords_path, tile_id, _tile_pmtiles)
+                logger.info("Wrote PMTiles %s", _tile_pmtiles.name)
+            else:
+                logger.warning("No coords path for tile %s — skipping PMTiles output", tile_id)
 
         # Clean up staging files for this tile
         for p in s_paths:

@@ -39,16 +39,6 @@ interface Grid {
 }
 
 const GRID_CACHE_MAX = 3;
-const gridCache = new Map<string, Grid>();
-const gridLoading = new Map<string, Promise<Grid | null>>(); // in-flight loads
-
-function cacheSet(key: string, grid: Grid): void {
-  gridCache.delete(key);
-  gridCache.set(key, grid);
-  if (gridCache.size > GRID_CACHE_MAX) {
-    gridCache.delete(gridCache.keys().next().value!);
-  }
-}
 
 // ---------------------------------------------------------------------------
 // UTM forward projection (WGS84 → UTM)
@@ -122,182 +112,6 @@ const BLN2_MAGIC = 0x424C4E32;
 // Export for use in loadBin size check
 const HEADER_BYTES = HEADER_BYTES_V2;
 
-function binPath(location: string, stem: string): string {
-  return join(SCORES_DIR, location, `${stem}.bin`);
-}
-
-async function buildBin(csvPath: string, outPath: string): Promise<void> {
-  console.log(`Building binary cache: ${outPath}`);
-  const t0 = performance.now();
-
-  async function streamLines(cb: (cols: string[], lineNo: number) => void): Promise<void> {
-    const file = await Deno.open(csvPath, { read: true });
-    const decoder = new TextDecoder();
-    let buf = "";
-    let lineNo = 0;
-    for await (const chunk of file.readable) {
-      buf += decoder.decode(chunk, { stream: true });
-      let nl: number;
-      while ((nl = buf.indexOf("\n")) !== -1) {
-        const line = buf.slice(0, nl).trimEnd();
-        buf = buf.slice(nl + 1);
-        cb(line.split(","), lineNo++);
-      }
-    }
-    if (buf.trimEnd()) cb(buf.trimEnd().split(","), lineNo);
-  }
-
-  // Pass 0: detect columns
-  let iId = -1, iLon = -1, iLat = -1, iProb = -1;
-  await streamLines((cols, lineNo) => {
-    if (lineNo !== 0) return;
-    iId   = cols.indexOf("point_id");
-    iLon  = cols.indexOf("lon");
-    iLat  = cols.indexOf("lat");
-    iProb = cols.findIndex((c) => c.startsWith("prob_"));
-  });
-  if (iLon < 0 || iLat < 0 || iProb < 0) throw new Error(`Missing columns in ${csvPath}`);
-
-  // Pass 1: grid dimensions and corner pixel coordinates from point_id.
-  // We need the actual lon/lat of the NW corner pixel (xi=0, yi=yiMax) to use
-  // as the grid origin, and the NE/SW corners to derive resX/resY independently.
-  // Using overall min/max lon/lat is wrong because the grid is not axis-aligned
-  // in WGS84 (UTM→WGS84 reprojection means rows/cols are slightly diagonal).
-  let xiMax = -1, yiMax = -1;
-  let lonMin = Infinity, lonMax = -Infinity, latMin = Infinity, latMax = -Infinity;
-  // Corner pixel coords: NW=(xi=0,yi=yiMax), NE=(xi=xiMax,yi=yiMax), SW=(xi=0,yi=0)
-  let lonNW = NaN, latNW = NaN, lonNE = NaN, latNE = NaN, lonSW = NaN, latSW = NaN;
-  await streamLines((cols, lineNo) => {
-    if (lineNo === 0) return;
-    const lon = parseFloat(cols[iLon]);
-    const lat = parseFloat(cols[iLat]);
-    if (isNaN(lon) || isNaN(lat)) return;
-    if (lon < lonMin) lonMin = lon;
-    if (lon > lonMax) lonMax = lon;
-    if (lat < latMin) latMin = lat;
-    if (lat > latMax) latMax = lat;
-    if (iId >= 0) {
-      const parts = cols[iId].split("_");
-      if (parts.length >= 3) {
-        const xi = parseInt(parts[1]), yi = parseInt(parts[2]);
-        if (xi > xiMax) xiMax = xi;
-        if (yi > yiMax) yiMax = yi;
-      }
-    }
-  });
-  // Second pass to get corner coords (need yiMax known first)
-  if (iId >= 0 && xiMax > 0 && yiMax > 0) {
-    await streamLines((cols, lineNo) => {
-      if (lineNo === 0) return;
-      const parts = cols[iId].split("_");
-      if (parts.length < 3) return;
-      const xi = parseInt(parts[1]), yi = parseInt(parts[2]);
-      const lon = parseFloat(cols[iLon]), lat = parseFloat(cols[iLat]);
-      if (xi === 0    && yi === yiMax) { lonNW = lon; latNW = lat; }
-      if (xi === xiMax && yi === yiMax) { lonNE = lon; latNE = lat; }
-      if (xi === 0    && yi === 0    ) { lonSW = lon; latSW = lat; }
-    });
-  }
-
-  // Use point_id grid dimensions when available; fall back to coordinate-derived grid.
-  let width: number, height: number, resX: number, resY: number;
-  let utmOriginE = 0, utmOriginN = 0, utmZone = 0, res = 10.0;
-  if (iId >= 0 && xiMax > 0 && yiMax > 0 && !isNaN(lonNW) && !isNaN(lonNE) && !isNaN(latSW)) {
-    width  = xiMax + 1;
-    height = yiMax + 1;
-    // resX/resY kept for WGS84 fallback path only
-    resX = (lonNE - lonNW) / xiMax;
-    resY = (latNW - latSW) / yiMax;
-    // Use NW corner as origin for WGS84 fallback
-    lonMin = lonNW;
-    latMax = latNW;
-    // Compute UTM origin from SW corner pixel (xi=0, yi=0)
-    // and infer zone from grid centre lon.
-    const centreLon = (lonNW + lonNE) / 2;
-    utmZone = Math.floor((centreLon + 180) / 6) + 1;
-    const south = latSW < 0;
-    if (south) utmZone = -utmZone; // negative = southern hemisphere
-    const [swE, swN] = wgs84ToUtm(latSW, lonSW, Math.abs(utmZone), south);
-    utmOriginE = swE;
-    utmOriginN = swN;
-    // Infer res from NW-SW northing span
-    const [nwE, nwN] = wgs84ToUtm(latNW, lonNW, Math.abs(utmZone), south);
-    res = Math.round((nwN - swN) / yiMax);  // should be ~10
-    if (res <= 0) res = 10;
-  } else {
-    resX = resY = 0.0001;
-    width  = Math.round((lonMax - lonMin) / resX) + 1;
-    height = Math.round((latMax - latMin) / resY) + 1;
-  }
-
-  // Count valid rows for pre-allocation
-  let count = 0;
-  await streamLines((cols, lineNo) => {
-    if (lineNo === 0) return;
-    if (!isNaN(parseFloat(cols[iProb]))) count++;
-  });
-
-  // Pass 2: fill pre-allocated typed arrays
-  // yi is stored as the raw pixel_collector yi (0 = southernmost, yiMax = northernmost).
-  const keys = new Uint32Array(count);
-  const vals = new Float32Array(count);
-  let idx = 0;
-  await streamLines((cols, lineNo) => {
-    if (lineNo === 0) return;
-    const prob = parseFloat(cols[iProb]);
-    if (isNaN(prob)) return;
-    let xi: number, yi: number;
-    if (iId >= 0 && xiMax > 0) {
-      const parts = cols[iId].split("_");
-      xi = parseInt(parts[1]);
-      yi = parseInt(parts[2]); // raw: 0 = southernmost
-    } else {
-      const lon = parseFloat(cols[iLon]);
-      const lat = parseFloat(cols[iLat]);
-      xi = Math.round((lon - lonMin) / resX);
-      yi = Math.round((lat - latMin) / resY); // latMin = SW lat
-    }
-    keys[idx] = yi * width + xi;
-    vals[idx] = prob;
-    idx++;
-  });
-
-  // Sort by key using an index array, then reorder in-place
-  const order = new Uint32Array(count);
-  for (let i = 0; i < count; i++) order[i] = i;
-  order.sort((a, b) => keys[a] - keys[b]);
-
-  const sortedKeys = new Uint32Array(count);
-  const sortedVals = new Float32Array(count);
-  for (let i = 0; i < count; i++) {
-    sortedKeys[i] = keys[order[i]];
-    sortedVals[i] = vals[order[i]];
-  }
-
-  // Write binary file (64-byte v2 header)
-  const buf = new ArrayBuffer(HEADER_BYTES_V2 + count * 8);
-  const dv  = new DataView(buf);
-  dv.setUint32(0,   BLN2_MAGIC,  true);
-  dv.setInt32(4,    utmZone,     true);
-  dv.setFloat64(8,  utmOriginE,  true);
-  dv.setFloat64(16, utmOriginN,  true);
-  dv.setFloat64(24, res,         true);
-  dv.setUint32(32,  width,       true);
-  dv.setUint32(36,  height,      true);
-  dv.setFloat64(40, lonMin,      true);
-  dv.setFloat64(48, latMin,      true);
-  dv.setFloat64(56, latMax,      true);
-  let off = HEADER_BYTES;
-  for (let i = 0; i < count; i++) {
-    dv.setUint32(off,      sortedKeys[i], true);
-    dv.setFloat32(off + 4, sortedVals[i], true);
-    off += 8;
-  }
-  const tmpPath = outPath + ".tmp";
-  await Deno.writeFile(tmpPath, new Uint8Array(buf));
-  await Deno.rename(tmpPath, outPath);
-  console.log(`Binary cache built in ${(performance.now() - t0).toFixed(0)} ms  (${count} pixels, ${width}×${height})`);
-}
 
 async function loadBin(path: string): Promise<Grid> {
   const raw = await Deno.readFile(path);
@@ -357,8 +171,8 @@ export function listRankings(): Record<string, Array<{ stem: string; label: stri
       const runs: Array<{ stem: string; label: string }> = [];
       try {
         for (const f of Deno.readDirSync(dir)) {
-          if (f.isFile && f.name.endsWith(".csv")) {
-            const stem = f.name.replace(/\.csv$/, "");
+          if (f.isFile && f.name.endsWith(".pmtiles")) {
+            const stem = f.name.replace(/\.pmtiles$/, "");
             runs.push({ stem, label: stem });
           }
         }
@@ -372,44 +186,6 @@ export function listRankings(): Record<string, Array<{ stem: string; label: stri
   return results;
 }
 
-export function loadGrid(location: string, stem: string): Promise<Grid | null> {
-  const cacheKey = `${location}/${stem}`;
-  if (gridCache.has(cacheKey)) {
-    const hit = gridCache.get(cacheKey)!;
-    gridCache.delete(cacheKey);
-    gridCache.set(cacheKey, hit);
-    return Promise.resolve(hit);
-  }
-
-  // Return existing in-flight promise if already loading
-  if (gridLoading.has(cacheKey)) return gridLoading.get(cacheKey)!;
-
-  const promise = (async () => {
-    const bin = binPath(location, stem);
-    const csv = join(SCORES_DIR, location, `${stem}.csv`);
-
-    let binExists = false;
-    try {
-      const st = Deno.statSync(bin);
-      // A valid .bin has at least the header plus one record; a header-only file
-      // means a previous buildBin was interrupted before the atomic rename.
-      binExists = st.size > HEADER_BYTES_V2;
-      if (!binExists) Deno.removeSync(bin);
-    } catch { /* absent */ }
-    if (!binExists) {
-      try { Deno.statSync(csv); } catch { return null; }
-      await buildBin(csv, bin);
-    }
-
-    const grid = await loadBin(bin);
-    cacheSet(cacheKey, grid);
-    console.log(`Grid loaded: ${location}/${stem} (${grid.keys.length} pixels)`);
-    return grid;
-  })().finally(() => gridLoading.delete(cacheKey));
-
-  gridLoading.set(cacheKey, promise);
-  return promise;
-}
 
 // ---------------------------------------------------------------------------
 // Tile bounds

@@ -9,6 +9,7 @@ import logging
 import multiprocessing
 import os
 import re
+import shutil
 import tempfile
 from collections import Counter
 from pathlib import Path
@@ -1084,6 +1085,15 @@ def train_tam(
             # Prefer /dev/shm (guaranteed tmpfs on Linux) over /tmp which may be
             # disk-backed on some systems.  Fall back to /tmp if /dev/shm is absent.
             _shm_base = Path("/dev/shm") if Path("/dev/shm").is_dir() else None
+            # Clean up any stale tam_ds_* dirs left by a previous SIGKILL/OOM crash.
+            if _shm_base and _shm_base.is_dir():
+                for _stale in _shm_base.glob("tam_ds_*"):
+                    if _stale.is_dir():
+                        try:
+                            shutil.rmtree(_stale)
+                            logger.warning("Removed stale dataset tmp dir: %s", _stale)
+                        except OSError:
+                            pass
             _ds_tmp_dir = tempfile.TemporaryDirectory(prefix="tam_ds_", dir=_shm_base)
             _ds_tmp_path = Path(_ds_tmp_dir.name)
     

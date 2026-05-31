@@ -385,8 +385,8 @@ def test_atomic_strip_write(tmp_path):
     assert ft == 0x02
 
     tmp_path.mkdir(parents=True, exist_ok=True)
-    tmp_file  = tmp_path / "55HBU_strip_00.tmp"
-    out_file  = tmp_path / "55HBU_strip_00.parquet"
+    tmp_file  = tmp_path / "55HBU_r00_c00.tmp"
+    out_file  = tmp_path / "55HBU_r00_c00.parquet"
 
     tmp_file.write_bytes(payload)
     assert tmp_file.stat().st_size == len(payload)
@@ -401,44 +401,49 @@ def test_atomic_strip_write(tmp_path):
 # Resume logic test
 # ---------------------------------------------------------------------------
 
-def test_resume_skips_complete_strips(tmp_path):
-    """Client identifies the correct resume_from_strip based on existing files."""
-    # Simulate strips 0, 1, 2 present; strip 3 absent → resume from 3
+def test_resume_skips_complete_chunks(tmp_path):
+    """Client identifies the correct resume_from_chunk based on existing chunk files."""
+    import re as _re
+    _CHUNK_RE = _re.compile(r"_r(\d{2})_c(\d{2})$")
+
+    def _chunk_key(stem):
+        m = _CHUNK_RE.search(stem)
+        return (int(m.group(1)), int(m.group(2))) if m else (9999, 9999)
+
     tile_id = "55HBU"
     tile_tmp = tmp_path / tile_id / "2022"
     tile_tmp.mkdir(parents=True)
-    for i in range(3):
-        (tile_tmp / f"{tile_id}_strip_{i:02d}.parquet").touch()
+    # Simulate chunks (0,0), (0,1), (0,2) present → resume from (0,3)
+    for col in range(3):
+        (tile_tmp / f"{tile_id}_r00_c{col:02d}.parquet").touch()
 
-    complete = sorted(tile_tmp.glob(f"{tile_id}_strip_??.parquet"))
-    resume_from = 0
-    expected = 0
-    for p in complete:
-        idx = int(p.stem.split("_")[-1])
-        if idx == expected:
-            expected += 1
-    resume_from = expected
-    assert resume_from == 3
+    complete = sorted(tile_tmp.glob(f"{tile_id}_r??_c??.parquet"),
+                      key=lambda p: _chunk_key(p.stem))
+    last_row, last_col = _chunk_key(complete[-1].stem)
+    resume_from_chunk = (last_row, last_col + 1)
+    assert resume_from_chunk == (0, 3)
 
 
-def test_resume_gap_handled(tmp_path):
-    """If strips 0 and 2 exist but 1 is missing, resume starts at 1."""
+def test_resume_after_last_chunk(tmp_path):
+    """Resume point is always last_complete + 1 in column (row-major)."""
+    import re as _re
+    _CHUNK_RE = _re.compile(r"_r(\d{2})_c(\d{2})$")
+
+    def _chunk_key(stem):
+        m = _CHUNK_RE.search(stem)
+        return (int(m.group(1)), int(m.group(2))) if m else (9999, 9999)
+
     tile_id = "55HBU"
     tile_tmp = tmp_path / tile_id / "2022"
     tile_tmp.mkdir(parents=True)
-    (tile_tmp / f"{tile_id}_strip_00.parquet").touch()
-    (tile_tmp / f"{tile_id}_strip_02.parquet").touch()  # gap at 1
+    (tile_tmp / f"{tile_id}_r00_c00.parquet").touch()
+    (tile_tmp / f"{tile_id}_r01_c00.parquet").touch()
 
-    complete = sorted(tile_tmp.glob(f"{tile_id}_strip_??.parquet"))
-    expected = 0
-    for p in complete:
-        idx = int(p.stem.split("_")[-1])
-        if idx == expected:
-            expected += 1
-        else:
-            break
-    resume_from = expected
-    assert resume_from == 1
+    complete = sorted(tile_tmp.glob(f"{tile_id}_r??_c??.parquet"),
+                      key=lambda p: _chunk_key(p.stem))
+    last_row, last_col = _chunk_key(complete[-1].stem)
+    resume_from_chunk = (last_row, last_col + 1)
+    assert resume_from_chunk == (1, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -606,30 +611,26 @@ def test_combined_pixel_schema_types():
 
 
 # ---------------------------------------------------------------------------
-# COG-aligned strip boundary tests
+# COG-aligned chunk boundary tests
 #
-# CS-1  UTM strips: every strip boundary falls on a block-row edge
-# CS-2  All points land in exactly one strip (no gaps, no duplicates)
-# CS-3  Strip contents match the geographic fallback (same point assignment)
+# CS-1  UTM chunks: every chunk boundary falls on a block-row edge (Y alignment)
+# CS-2  All points land in exactly one chunk (no gaps, no duplicates)
+# CS-3  Chunk contents match the geographic fallback (same point assignment)
 # CS-4  Block alignment holds for a non-zero cog_y_top (non-trivial offset)
-# CS-5  Works when strip_height_px is 2048 (multiple of 1024)
+# CS-5  Works when chunk_height_px is 2048 (multiple of 1024)
 # CS-6  Works when the pixel grid does not start exactly at a block boundary
-# CS-7  Geographic fallback still produces correct strip counts
+# CS-7  Geographic fallback still produces correct chunk counts
 # CS-8  Empty-geometry result when all points are outside the polygon
 # CS-9  Fallback to geographic path when cog_y_top is None
-# CS-10 Strips are contiguous: lat_max of strip N == lat_min of strip N+1 (approx)
+# CS-10 Chunks are contiguous in Y: northing max of row N ≈ northing min of row N+1
 # ---------------------------------------------------------------------------
 
 # Use a tiny real-ish bbox (NQ Australia, zone 55S) — ~500 m × 550 m, ~3 k points.
-# The strip-alignment invariants are geometric and hold at any scale; a large bbox
-# (the former 10 km × 11 km, 1.1 M points) made each CS test take 5–30 s for no
-# additional coverage.
 _CS_BBOX = [145.40, -22.845, 145.405, -22.840]
 _CS_CRS  = "EPSG:32755"
 _CS_BLOCK_M = 1024 * 10.0  # 10240 m per 1024-px block at 10 m/px
 
-# Build the pixel grid and its UTM northings once at module load — all CS tests
-# share these objects read-only, so there is no per-test grid construction cost.
+# Build the pixel grid and its UTM northings once at module load
 def _build_cs_grid():
     from utils.pixel_collector import make_pixel_grid
     from pyproj import Transformer
@@ -657,237 +658,304 @@ def _reference_y_top(bbox_wgs84: list[float], utm_crs: str, extra_m: float = 0.0
     """Return a cog_y_top above the bbox top by extra_m, snapped to block boundary."""
     from pyproj import Transformer
     to_utm = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
-    _, lat_max = bbox_wgs84[0], bbox_wgs84[3]
-    _, y_top_raw = to_utm.transform(bbox_wgs84[2], lat_max)
+    _, y_top_raw = to_utm.transform(bbox_wgs84[2], bbox_wgs84[3])
     y_top_raw += extra_m
-    # Snap up to the next block boundary so the offset is well-defined.
     return math.ceil(y_top_raw / _CS_BLOCK_M) * _CS_BLOCK_M
 
 
-# CS-1: all points in a strip fall within the same COG block
+def _reference_x_left(bbox_wgs84: list[float], utm_crs: str) -> float:
+    """Return a cog_x_left at or left of the bbox left edge, snapped to block boundary."""
+    from pyproj import Transformer
+    to_utm = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
+    x_left_raw, _ = to_utm.transform(bbox_wgs84[0], bbox_wgs84[1])
+    return math.floor(x_left_raw / _CS_BLOCK_M) * _CS_BLOCK_M
+
+
+# CS-1: all points in a chunk fall within the same COG block (Y dimension)
 def test_cs1_strip_boundaries_on_block_grid():
-    """Every point in a strip maps to the same COG block index.
+    """Every point in a chunk maps to the same COG block row index (Y alignment)."""
+    from proxy._pipeline import compute_chunks, make_chunk_points
 
-    The COG block index for a point at northing y is:
-        floor((cog_y_top - y) / block_m)
-    All points in a strip must share the same block index — this is the
-    invariant that guarantees zero over-fetch waste.
-    """
-    from proxy._pipeline import compute_strips, make_strip_points
-
-    cog_y_top = _reference_y_top(_CS_BBOX, _CS_CRS, extra_m=500.0)
-    strips, meta = compute_strips(
-        _CS_BBOX, 1024, None,
-        cog_utm_crs=_CS_CRS, cog_y_top=cog_y_top,
+    cog_y_top  = _reference_y_top(_CS_BBOX, _CS_CRS, extra_m=500.0)
+    cog_x_left = _reference_x_left(_CS_BBOX, _CS_CRS)
+    chunks, meta = compute_chunks(
+        _CS_BBOX, 1024, 1024, None,
+        cog_utm_crs=_CS_CRS, cog_y_top=cog_y_top, cog_x_left=cog_x_left,
     )
-    assert strips, "expected at least one strip"
+    assert chunks, "expected at least one chunk"
 
-    for s in strips:
-        northings = _utm_northings(make_strip_points(s, meta), _CS_CRS)
+    for c in chunks:
+        northings = _utm_northings(make_chunk_points(c, meta), _CS_CRS)
         block_indices = {math.ceil((cog_y_top - y) / _CS_BLOCK_M) - 1 for y in northings}
         assert len(block_indices) == 1, (
-            f"strip {s['strip_idx']}: points span multiple COG blocks {block_indices}"
+            f"chunk ({c['chunk_row']},{c['chunk_col']}): points span multiple COG block rows {block_indices}"
         )
 
 
-# CS-2: all points land in exactly one strip
+# CS-2: all points land in exactly one chunk
 def test_cs2_all_points_in_exactly_one_strip():
-    """No point is missing from or duplicated across strips."""
-    from proxy._pipeline import compute_strips, make_strip_points
+    """No point is missing from or duplicated across chunks."""
+    from proxy._pipeline import compute_chunks, make_chunk_points
 
-    cog_y_top = _reference_y_top(_CS_BBOX, _CS_CRS)
-    strips, meta = compute_strips(
-        _CS_BBOX, 1024, None,
-        cog_utm_crs=_CS_CRS, cog_y_top=cog_y_top,
+    cog_y_top  = _reference_y_top(_CS_BBOX, _CS_CRS)
+    cog_x_left = _reference_x_left(_CS_BBOX, _CS_CRS)
+    chunks, meta = compute_chunks(
+        _CS_BBOX, 1024, 1024, None,
+        cog_utm_crs=_CS_CRS, cog_y_top=cog_y_top, cog_x_left=cog_x_left,
     )
 
     seen: dict[str, int] = {}
-    for s in strips:
-        for pid, _, _ in make_strip_points(s, meta):
+    for c in chunks:
+        for pid, _, _ in make_chunk_points(c, meta):
             seen[pid] = seen.get(pid, 0) + 1
 
     all_ids = {pid for pid, _, _ in _CS_POINTS}
     missing = all_ids - seen.keys()
     dups = {pid for pid, cnt in seen.items() if cnt > 1}
-    assert not missing, f"{len(missing)} points missing from strips: {list(missing)[:5]}"
-    assert not dups,    f"{len(dups)} points duplicated across strips: {list(dups)[:5]}"
+    assert not missing, f"{len(missing)} points missing from chunks: {list(missing)[:5]}"
+    assert not dups,    f"{len(dups)} points duplicated across chunks: {list(dups)[:5]}"
 
 
-# CS-3: same points per strip as geographic fallback (only boundaries differ)
+# CS-3: same points in chunks as in geographic fallback
 def test_cs3_utm_and_geographic_assign_same_points():
-    """Both code paths assign the same set of point_ids to strips of similar height.
+    """Both code paths cover the same set of point_ids."""
+    from proxy._pipeline import compute_chunks, make_chunk_points
 
-    The strip *boundaries* differ (geographic uses lat, UTM uses northing) but
-    for a bbox that spans fewer than 2 block heights the total set of points in
-    all strips must be the same.
-    """
-    from proxy._pipeline import compute_strips, make_strip_points
+    cog_y_top  = _reference_y_top(_CS_BBOX, _CS_CRS)
+    cog_x_left = _reference_x_left(_CS_BBOX, _CS_CRS)
 
-    cog_y_top = _reference_y_top(_CS_BBOX, _CS_CRS)
+    chunks_utm, meta_utm = compute_chunks(
+        _CS_BBOX, 1024, 1024, None,
+        cog_utm_crs=_CS_CRS, cog_y_top=cog_y_top, cog_x_left=cog_x_left,
+    )
+    chunks_geo, meta_geo = compute_chunks(_CS_BBOX, 1024, 1024, None)
 
-    strips_utm, meta_utm = compute_strips(_CS_BBOX, 1024, None,
-                                          cog_utm_crs=_CS_CRS, cog_y_top=cog_y_top)
-    strips_geo, meta_geo = compute_strips(_CS_BBOX, 1024, None)
-
-    utm_ids = {pid for s in strips_utm for pid, _, _ in make_strip_points(s, meta_utm)}
-    geo_ids = {pid for s in strips_geo for pid, _, _ in make_strip_points(s, meta_geo)}
+    utm_ids = {pid for c in chunks_utm for pid, _, _ in make_chunk_points(c, meta_utm)}
+    geo_ids = {pid for c in chunks_geo for pid, _, _ in make_chunk_points(c, meta_geo)}
     all_ids = {pid for pid, _, _ in _CS_POINTS}
 
     assert utm_ids == all_ids, "UTM path lost some points"
     assert geo_ids == all_ids, "geographic path lost some points"
 
 
-# CS-4: alignment holds when cog_y_top has a non-trivial offset from the bbox
+# CS-4: alignment holds when cog_y_top has a non-trivial offset
 def test_cs4_alignment_with_offset_cog_origin():
-    """Block alignment is preserved when cog_y_top is not an exact multiple of block_m."""
-    from proxy._pipeline import compute_strips, make_strip_points
+    """Block Y-alignment is preserved when cog_y_top is not an exact multiple of block_m."""
+    from proxy._pipeline import compute_chunks, make_chunk_points
 
-    # Use a cog_y_top that is deliberately NOT a multiple of block_m.
-    cog_y_top = 7_813_456.78
-    strips, meta = compute_strips(
-        _CS_BBOX, 1024, None,
-        cog_utm_crs=_CS_CRS, cog_y_top=cog_y_top,
+    cog_y_top  = 7_813_456.78
+    cog_x_left = _reference_x_left(_CS_BBOX, _CS_CRS)
+    chunks, meta = compute_chunks(
+        _CS_BBOX, 1024, 1024, None,
+        cog_utm_crs=_CS_CRS, cog_y_top=cog_y_top, cog_x_left=cog_x_left,
     )
-    assert strips
+    assert chunks
 
-    for s in strips:
-        northings = _utm_northings(make_strip_points(s, meta), _CS_CRS)
+    for c in chunks:
+        northings = _utm_northings(make_chunk_points(c, meta), _CS_CRS)
         block_indices = {math.ceil((cog_y_top - y) / _CS_BLOCK_M) - 1 for y in northings}
         assert len(block_indices) == 1, (
-            f"strip {s['strip_idx']}: points span multiple COG blocks {block_indices} "
+            f"chunk ({c['chunk_row']},{c['chunk_col']}): points span multiple COG blocks {block_indices} "
             f"(cog_y_top={cog_y_top})"
         )
 
 
-# CS-5: works with strip_height_px = 2048 (2 × 1024)
+# CS-5: works with chunk_height_px = 2048
 def test_cs5_larger_strip_height():
-    """strip_height_px=2048 uses a 20480 m block_m and still aligns boundaries."""
-    from proxy._pipeline import compute_strips, make_strip_points
+    """chunk_height_px=2048 uses a 20480 m block_h_m and still aligns Y boundaries."""
+    from proxy._pipeline import compute_chunks, make_chunk_points
 
-    strip_px = 2048
-    block_m  = strip_px * 10.0
-    cog_y_top = _reference_y_top(_CS_BBOX, _CS_CRS)
-    strips, meta = compute_strips(
-        _CS_BBOX, strip_px, None,
-        cog_utm_crs=_CS_CRS, cog_y_top=cog_y_top,
+    chunk_px = 2048
+    block_m  = chunk_px * 10.0
+    cog_y_top  = _reference_y_top(_CS_BBOX, _CS_CRS)
+    cog_x_left = _reference_x_left(_CS_BBOX, _CS_CRS)
+    chunks, meta = compute_chunks(
+        _CS_BBOX, chunk_px, chunk_px, None,
+        cog_utm_crs=_CS_CRS, cog_y_top=cog_y_top, cog_x_left=cog_x_left,
     )
-    assert strips
+    assert chunks
 
-    for s in strips:
-        northings = _utm_northings(make_strip_points(s, meta), _CS_CRS)
+    for c in chunks:
+        northings = _utm_northings(make_chunk_points(c, meta), _CS_CRS)
         block_indices = {math.ceil((cog_y_top - y) / block_m) - 1 for y in northings}
         assert len(block_indices) == 1, (
-            f"strip {s['strip_idx']}: points span multiple 2048-px blocks {block_indices}"
+            f"chunk ({c['chunk_row']},{c['chunk_col']}): points span multiple 2048-px blocks {block_indices}"
         )
 
 
 # CS-6: alignment when bbox bottom is in the middle of a block
 def test_cs6_bbox_starts_mid_block():
-    """The first strip's lower boundary is below bbox_bottom, not at it.
-
-    When the bbox bottom falls in the middle of a COG block, the strip that
-    contains those pixels starts at the block boundary (below the bbox), so
-    block_m waste is still zero.
-    """
-    from proxy._pipeline import compute_strips, make_strip_points
+    """The first chunk's lower Y boundary is at the block boundary, not the bbox bottom."""
+    from proxy._pipeline import compute_chunks, make_chunk_points
     from pyproj import Transformer
 
     to_utm = Transformer.from_crs("EPSG:4326", _CS_CRS, always_xy=True)
     _, y_bbox_min = to_utm.transform(_CS_BBOX[0], _CS_BBOX[1])
 
-    # Set cog_y_top so that y_bbox_min is 3000 m into a block (not at boundary).
-    block_m = 1024 * 10.0
-    cog_y_top = y_bbox_min + 3_000.0  # 3000 m above the bbox min
+    block_m    = 1024 * 10.0
+    cog_y_top  = y_bbox_min + 3_000.0
+    cog_x_left = _reference_x_left(_CS_BBOX, _CS_CRS)
 
-    strips, meta = compute_strips(
-        _CS_BBOX, 1024, None,
-        cog_utm_crs=_CS_CRS, cog_y_top=cog_y_top,
+    chunks, meta = compute_chunks(
+        _CS_BBOX, 1024, 1024, None,
+        cog_utm_crs=_CS_CRS, cog_y_top=cog_y_top, cog_x_left=cog_x_left,
     )
-    assert strips
+    assert chunks
 
-    for s in strips:
-        northings = _utm_northings(make_strip_points(s, meta), _CS_CRS)
+    for c in chunks:
+        northings = _utm_northings(make_chunk_points(c, meta), _CS_CRS)
         block_indices = {math.ceil((cog_y_top - y) / block_m) - 1 for y in northings}
         assert len(block_indices) == 1, (
-            f"strip {s['strip_idx']}: points span multiple blocks {block_indices} "
+            f"chunk ({c['chunk_row']},{c['chunk_col']}): points span multiple blocks {block_indices} "
             f"(mid-block cog_y_top test)"
         )
 
 
-# CS-7: geographic fallback produces correct strip counts
+# CS-7: geographic fallback produces a positive chunk count
 def test_cs7_geographic_fallback_strip_count():
-    """Geographic fallback produces a positive number of strips for a valid bbox."""
-    from proxy._pipeline import compute_strips
+    """Geographic fallback produces a positive number of chunks for a valid bbox."""
+    from proxy._pipeline import compute_chunks
 
-    strips, _ = compute_strips(_CS_BBOX, 1024, None)  # no cog params → geographic
-    assert len(strips) > 0
-    # All returned strip indices are sequential starting from 0
-    for expected_idx, s in enumerate(strips):
-        assert s["strip_idx"] == expected_idx
+    chunks, _ = compute_chunks(_CS_BBOX, 1024, 1024, None)
+    assert len(chunks) > 0
+    # All chunk_row indices start from 0
+    rows = {c["chunk_row"] for c in chunks}
+    assert 0 in rows
 
 
 # CS-8: empty result when polygon excludes all points
-def test_cs8_empty_polygon_returns_no_strips():
-    """A polygon that excludes all grid points returns an empty strip list."""
-    from proxy._pipeline import compute_strips
+def test_cs8_polygon_filters_chunks_by_intersection():
+    """compute_chunks uses polygon_geometry to filter out non-intersecting chunks.
+
+    A polygon entirely outside the bbox produces zero chunks.
+    A None polygon returns all bbox chunks.
+    """
+    from proxy._pipeline import compute_chunks
     from shapely.geometry import box
 
-    # Tiny polygon well outside the bbox
-    tiny_poly = box(0.0, 0.0, 0.001, 0.001)
-    cog_y_top = _reference_y_top(_CS_BBOX, _CS_CRS)
-    strips, _ = compute_strips(
-        _CS_BBOX, 1024, tiny_poly,
-        cog_utm_crs=_CS_CRS, cog_y_top=cog_y_top,
+    tiny_poly  = box(0.0, 0.0, 0.001, 0.001)  # completely outside _CS_BBOX
+    cog_y_top  = _reference_y_top(_CS_BBOX, _CS_CRS)
+    cog_x_left = _reference_x_left(_CS_BBOX, _CS_CRS)
+    chunks_with_poly, _ = compute_chunks(
+        _CS_BBOX, 1024, 1024, tiny_poly,
+        cog_utm_crs=_CS_CRS, cog_y_top=cog_y_top, cog_x_left=cog_x_left,
     )
-    assert strips == []
+    chunks_no_poly, _ = compute_chunks(
+        _CS_BBOX, 1024, 1024, None,
+        cog_utm_crs=_CS_CRS, cog_y_top=cog_y_top, cog_x_left=cog_x_left,
+    )
+    # Polygon outside bbox → all chunks filtered out.
+    assert len(chunks_with_poly) == 0
+    # No polygon → all bbox chunks returned.
+    assert len(chunks_no_poly) > 0
 
 
 # CS-9: falls back to geographic path when cog_y_top is None
 def test_cs9_falls_back_when_cog_y_top_none():
     """Passing cog_utm_crs but no cog_y_top uses the geographic fallback."""
-    from proxy._pipeline import compute_strips, make_strip_points
+    from proxy._pipeline import compute_chunks, make_chunk_points
 
-    strips_fallback, meta_fallback = compute_strips(_CS_BBOX, 1024, None)
-    strips_no_y_top, meta_no_y_top = compute_strips(_CS_BBOX, 1024, None, cog_utm_crs=_CS_CRS, cog_y_top=None)
+    chunks_fallback, meta_fallback = compute_chunks(_CS_BBOX, 1024, 1024, None)
+    chunks_no_y_top, meta_no_y_top = compute_chunks(
+        _CS_BBOX, 1024, 1024, None, cog_utm_crs=_CS_CRS, cog_y_top=None,
+    )
 
-    # Both paths must cover the same total set of points.
-    ids_fallback = {pid for s in strips_fallback for pid, _, _ in make_strip_points(s, meta_fallback)}
-    ids_no_y_top = {pid for s in strips_no_y_top for pid, _, _ in make_strip_points(s, meta_no_y_top)}
+    ids_fallback = {pid for c in chunks_fallback for pid, _, _ in make_chunk_points(c, meta_fallback)}
+    ids_no_y_top = {pid for c in chunks_no_y_top for pid, _, _ in make_chunk_points(c, meta_no_y_top)}
     assert ids_fallback == ids_no_y_top
 
 
-# CS-10: strips are contiguous — lat_max of strip N ≈ lat_min of strip N+1
+# CS-10: chunks are contiguous in Y within each chunk column
 def test_cs10_strips_contiguous():
-    """The latitude span of consecutive strips is contiguous (no gaps).
+    """The northing span of consecutive chunk rows (same col) is contiguous (no gaps).
 
-    For the UTM path, strip N's max northing + 10 m = strip N+1's min northing.
-    We verify that no point's northing falls between two consecutive strips.
-
-    Uses strip_height_px=32 (block_m=320 m) so the ~550 m tall tiny bbox produces
-    multiple strips without enlarging the pixel grid.
+    Uses chunk_height_px=32 (block_m=320 m) so the ~550 m tall tiny bbox produces
+    multiple chunk rows.
     """
-    from proxy._pipeline import compute_strips, make_strip_points
+    from proxy._pipeline import compute_chunks, make_chunk_points
 
-    strip_px = 32
-    block_m  = strip_px * 10.0  # 320 m
+    chunk_px = 32
+    block_m  = chunk_px * 10.0
     cog_y_top_small = math.ceil(max(_CS_NORTHINGS) / block_m) * block_m + block_m
-    strips, meta = compute_strips(
-        _CS_BBOX, strip_px, None,
-        cog_utm_crs=_CS_CRS, cog_y_top=cog_y_top_small,
+    cog_x_left = _reference_x_left(_CS_BBOX, _CS_CRS)
+    chunks, meta = compute_chunks(
+        _CS_BBOX, chunk_px, chunk_px, None,
+        cog_utm_crs=_CS_CRS, cog_y_top=cog_y_top_small, cog_x_left=cog_x_left,
     )
-    assert len(strips) >= 2, (
-        f"expected ≥2 strips with strip_height_px={strip_px} over {_CS_BBOX}, got {len(strips)}"
+    assert len(chunks) >= 2, (
+        f"expected ≥2 chunks with chunk_height_px={chunk_px} over {_CS_BBOX}, got {len(chunks)}"
     )
 
-    # Collect per-strip northing ranges — strips are ordered N→S (descending northing)
-    ranges: list[tuple[float, float]] = []
-    for s in strips:
-        ys = _utm_northings(make_strip_points(s, meta), _CS_CRS)
-        ranges.append((min(ys), max(ys)))
+    # Group by chunk_col, then check Y-contiguity for each column
+    from collections import defaultdict
+    by_col: dict[int, list[dict]] = defaultdict(list)
+    for c in chunks:
+        by_col[c["chunk_col"]].append(c)
 
-    for i in range(len(ranges) - 1):
-        y_min_i   = ranges[i][0]
-        y_max_i1  = ranges[i + 1][1]
-        gap = y_min_i - y_max_i1  # positive when strip i is fully above strip i+1
-        assert gap >= -10.0, f"strips {i} and {i+1} overlap by {-gap:.1f} m"
-        assert gap <= block_m + 10.0, f"gap between strips {i} and {i+1} is {gap:.1f} m > block_m"
+    for col, col_chunks in by_col.items():
+        col_chunks_sorted = sorted(col_chunks, key=lambda c: c["chunk_row"])
+        if len(col_chunks_sorted) < 2:
+            continue
+        ranges: list[tuple[float, float]] = []
+        for c in col_chunks_sorted:
+            ys = _utm_northings(make_chunk_points(c, meta), _CS_CRS)
+            ranges.append((min(ys), max(ys)))
+        for i in range(len(ranges) - 1):
+            y_min_i  = ranges[i][0]
+            y_max_i1 = ranges[i + 1][1]
+            gap = y_min_i - y_max_i1
+            assert gap >= -10.0, f"col {col} chunks {i} and {i+1} overlap by {-gap:.1f} m"
+            assert gap <= block_m + 10.0, f"col {col} gap between chunks {i} and {i+1} is {gap:.1f} m > block_m"
+
+
+# CS-11: Mitchell River catchment × tile 54LWJ — exact chunk set
+def test_cs11_mitchell_54lwj_chunk_set():
+    """Only chunks that intersect the catchment-∩-tile polygon are fetched.
+
+    The pipeline passes tile_polygon.intersection(catchment) to fetch_tile_local,
+    so compute_chunks receives the clipped geometry — not the full tile footprint
+    and not the full catchment bbox.
+
+    This test locks down which chunks are fetched when running:
+      cli/location.py fetch mitchell --tiles 54LWJ
+
+    Expected set was computed using the geographic fallback (no COG origin).
+    Regenerate with:
+      python3 -c "
+        import json; from pathlib import Path; from shapely.geometry import shape
+        from proxy._pipeline import compute_chunks
+        from utils.location import _tile_polygon
+        gj = json.loads(Path('data/catchments/mitchell_river.geojson').read_text())
+        catchment = shape(gj['features'][0]['geometry'])
+        clipped = _tile_polygon('54LWJ').intersection(catchment)
+        chunks, _ = compute_chunks(list(clipped.bounds), 1024, 1024, clipped)
+        for c in sorted(chunks, key=lambda c: (c['chunk_row'], c['chunk_col'])):
+            print((c['chunk_row'], c['chunk_col']))
+      "
+    """
+    import json
+    from pathlib import Path
+    from shapely.geometry import shape
+    from proxy._pipeline import compute_chunks
+    from utils.location import _tile_polygon
+
+    gj = json.loads((Path(__file__).parents[2] / "data/catchments/mitchell_river.geojson").read_text())
+    catchment = shape(gj["features"][0]["geometry"])
+    clipped = _tile_polygon("54LWJ").intersection(catchment)
+    chunks, _ = compute_chunks(list(clipped.bounds), 1024, 1024, clipped)
+    actual = {(c["chunk_row"], c["chunk_col"]) for c in chunks}
+
+    # 24 chunks — bottom-right quadrant of 54LWJ where the catchment overlaps
+    expected = {
+        (0,1),
+        (1,1),(1,2),(1,3),(1,4),(1,5),
+        (2,0),(2,1),(2,2),(2,3),(2,4),(2,5),
+        (3,0),(3,1),(3,2),(3,3),(3,4),(3,5),
+        (4,0),(4,1),(4,2),(4,3),(4,4),(4,5),
+    }
+
+    assert actual == expected, (
+        f"Chunk set mismatch — "
+        f"unexpected: {sorted(actual - expected)}, "
+        f"missing: {sorted(expected - actual)}"
+    )

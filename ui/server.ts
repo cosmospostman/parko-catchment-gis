@@ -3,11 +3,12 @@ import { join, dirname, fromFileUrl } from "jsr:@std/path";
 import { serveDir } from "jsr:@std/http/file-server";
 import { ensureDirSync } from "jsr:@std/fs";
 import { encodeHex } from "jsr:@std/encoding/hex";
-import { listRankings, loadGrid, renderTile, listS1Locations, listS1Dates, loadS1Grid, getS1BinState } from "./tile_renderer.ts";
+import { listRankings, renderTile, listS1Locations, listS1Dates, loadS1Grid, getS1BinState } from "./tile_renderer.ts";
 
 const __dirname = dirname(fromFileUrl(import.meta.url));
 const LOCATIONS_DIR = join(__dirname, "..", "data", "locations");
 const WMS_CACHE_DIR = join(__dirname, "..", "data", "cache", "wms");
+const SCORES_DIR    = join(__dirname, "..", "outputs", "scores");
 const PORT = Number(Deno.env.get("PORT") ?? 3000);
 
 ensureDirSync(WMS_CACHE_DIR);
@@ -51,6 +52,7 @@ interface LocationYaml {
   score_bbox?: [number, number, number, number];
   notes?: string;
   sub_bboxes?: Record<string, SubBbox>;
+  polygon_file?: string;
 }
 
 interface TrainingRegion {
@@ -124,17 +126,50 @@ function loadLocations(): GeoJSON.FeatureCollection {
     const raw = Deno.readTextFileSync(join(LOCATIONS_DIR, entry.name));
     const loc = parseYaml(raw) as LocationYaml;
 
-    if (!loc?.bbox) continue;
+    let bbox = loc.bbox;
+    if (!bbox && loc.polygon_file) {
+      try {
+        const polyRaw = Deno.readTextFileSync(join(__dirname, "..", loc.polygon_file));
+        const polyGj = JSON.parse(polyRaw);
+        const features_: GeoJSON.Feature[] = polyGj.type === "FeatureCollection"
+          ? polyGj.features
+          : [polyGj];
+        let lonMin = Infinity, latMin = Infinity, lonMax = -Infinity, latMax = -Infinity;
+        function collectCoords(coords: unknown): void {
+          if (typeof coords[0] === "number") {
+            const [lon, lat] = coords as [number, number];
+            if (lon < lonMin) lonMin = lon;
+            if (lon > lonMax) lonMax = lon;
+            if (lat < latMin) latMin = lat;
+            if (lat > latMax) latMax = lat;
+          } else {
+            for (const c of coords as unknown[]) collectCoords(c);
+          }
+        }
+        for (const f of features_) {
+          collectCoords((f.geometry as GeoJSON.Polygon | GeoJSON.MultiPolygon).coordinates);
+        }
+        if (isFinite(lonMin)) {
+          bbox = [
+            Math.round(lonMin * 10000) / 10000,
+            Math.round(latMin * 10000) / 10000,
+            Math.round(lonMax * 10000) / 10000,
+            Math.round(latMax * 10000) / 10000,
+          ];
+        }
+      } catch { /* unreadable polygon_file — skip */ }
+    }
+    if (!bbox) continue;
 
     features.push({
       type: "Feature",
-      geometry: bboxToPolygon(loc.bbox),
+      geometry: bboxToPolygon(bbox),
       properties: {
         id: slug,
         name: loc.name ?? slug,
         notes: loc.notes ?? null,
         role: "location",
-        bbox: loc.bbox,
+        bbox,
       },
     });
 
@@ -527,26 +562,84 @@ async function handler(req: Request): Promise<Response> {
     });
   }
 
-  const rankingTileMatch = url.pathname.match(/^\/ranking-tile\/([^/]+)\/([^/]+)\/(\d+)\/(\d+)\/(\d+)$/);
-  if (rankingTileMatch) {
-    const [, location, stem, zs, xs, ys] = rankingTileMatch;
-    const z = parseInt(zs), x = parseInt(xs), y = parseInt(ys);
+  // CORS preflight for PMTiles
+  if (req.method === "OPTIONS" && url.pathname.startsWith("/pmtiles/")) {
+    return new Response(null, {
+      status: 204,
+      headers: {
+        "access-control-allow-origin": "*",
+        "access-control-allow-methods": "GET, HEAD",
+        "access-control-allow-headers": "range",
+      },
+    });
+  }
+
+  // /pmtiles/{location}/{stem} — byte-range handler for PMTiles archives
+  const pmtilesMatch = url.pathname.match(/^\/pmtiles\/([^/]+)\/([^/]+)$/);
+  if (pmtilesMatch) {
+    const [, location, stem] = pmtilesMatch;
+    // Sanitize: no path traversal
+    if (location.includes("..") || stem.includes("..")) {
+      return new Response("Forbidden", { status: 403 });
+    }
+    const filePath = join(SCORES_DIR, location, `${stem}.pmtiles`);
     try {
-      const grid = await loadGrid(location, stem);
-      if (!grid) return new Response("Unknown stem", { status: 404 });
-      const cmap = url.searchParams.get("cmap") ?? "rdylgn";
-      const cutoff = parseFloat(url.searchParams.get("cutoff") ?? "0");
-      const png = await renderTile(grid, z, x, y, cmap, cutoff);
-      return new Response(png as unknown as BodyInit, {
-        headers: {
-          "content-type": "image/png",
-          "cache-control": "public, max-age=3600",
-        },
-      });
+      const file = await Deno.open(filePath, { read: true });
+      const stat = await file.stat();
+      const rangeHeader = req.headers.get("range");
+      if (rangeHeader) {
+        const match = rangeHeader.match(/bytes=(\d+)-(\d+)/);
+        if (!match) {
+          file.close();
+          return new Response("Bad Range", { status: 416 });
+        }
+        const start = parseInt(match[1]);
+        const end   = parseInt(match[2]);
+        const length = end - start + 1;
+        await file.seek(start, Deno.SeekMode.Start);
+        const buf = new Uint8Array(length);
+        let bytesRead = 0;
+        while (bytesRead < length) {
+          const n = await file.read(buf.subarray(bytesRead));
+          if (n === null) break;
+          bytesRead += n;
+        }
+        file.close();
+        return new Response(buf.subarray(0, bytesRead), {
+          status: 206,
+          headers: {
+            "content-type": "application/octet-stream",
+            "content-range": `bytes ${start}-${end}/${stat.size}`,
+            "accept-ranges": "bytes",
+            "cache-control": "public, max-age=3600",
+            "access-control-allow-origin": "*",
+          },
+        });
+      } else {
+        // Full file (used for header fetch)
+        const buf = new Uint8Array(stat.size);
+        let bytesRead = 0;
+        while (bytesRead < stat.size) {
+          const n = await file.read(buf.subarray(bytesRead));
+          if (n === null) break;
+          bytesRead += n;
+        }
+        file.close();
+        return new Response(buf, {
+          headers: {
+            "content-type": "application/octet-stream",
+            "accept-ranges": "bytes",
+            "cache-control": "public, max-age=3600",
+            "access-control-allow-origin": "*",
+          },
+        });
+      }
     } catch (err) {
-      if (err instanceof Error && err.name === "AbortError") return new Response(null, { status: 499 });
-      console.error("Tile render error:", err);
-      return new Response("Render error", { status: 500 });
+      if ((err as NodeJS.ErrnoException).code === "ENOENT" || err instanceof Deno.errors.NotFound) {
+        return new Response("PMTiles file not found", { status: 404 });
+      }
+      console.error("PMTiles serve error:", err);
+      return new Response("Internal error", { status: 500 });
     }
   }
 

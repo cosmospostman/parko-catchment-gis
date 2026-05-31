@@ -87,7 +87,7 @@ def _budget_params(memory_budget_gb: float) -> dict:
 
 def fetch_spec(
     spec: FetchSpec,
-    cloud_max: int = 30,
+    cloud_max: int = 80,
     apply_nbar: bool = True,
     max_concurrent: int = 32,
     items=None,

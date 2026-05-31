@@ -55,7 +55,10 @@ MIN_S1_OBS_PER_YEAR: int = 4
 
 def lin_to_db(linear: np.ndarray) -> np.ndarray:
     """Convert linear-power SAR backscatter to dB; returns nan where linear <= 0."""
-    return np.where(linear > 0, 10.0 * np.log10(linear), np.nan)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        db = 10.0 * np.log10(linear)
+    db[~(linear > 0)] = np.nan
+    return db
 
 
 class TAMSample(NamedTuple):

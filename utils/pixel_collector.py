@@ -311,18 +311,28 @@ def _extract_item_from_tiffs(
     angles = None
     if apply_nbar:
         from utils.granule_angles import get_item_angles
-        from utils.nbar import c_factor_rad as compute_cf_rad
+        from utils.nbar import _kvol_from_trig, _kgeo_from_trig, c_factor_from_kernels
         angles = get_item_angles(item, lons_c, lats_c, utm_crs=utm_crs, bands=list(BANDS), utm_xy=utm_xy_c)
         if angles is not None:
             _first = next(iter(angles.values()))
+            # SZA is solar — identical for all bands. Compute its trig once.
             sza_rad = np.deg2rad(_first["sza"])
+            cos_sza = np.cos(sza_rad); sin_sza = np.sin(sza_rad)
+            tan_sza = sin_sza / cos_sza
             for band in BANDS:
                 if band not in angles or band_arrays[band] is None:
                     continue
                 a = angles[band]
                 vza_rad = np.deg2rad(a["vza"])
                 raa_rad = np.deg2rad(a["saa"] - a["vaa"])
-                cf = compute_cf_rad(sza_rad, vza_rad, raa_rad, band)
+                # VZA/RAA differ per band; trig is not duplicated between
+                # _kvol and _kgeo — each value computed once and shared.
+                cos_vza = np.cos(vza_rad); sin_vza = np.sin(vza_rad)
+                cos_raa = np.cos(raa_rad); sin_raa = np.sin(raa_rad)
+                tan_vza = sin_vza / cos_vza
+                kvol = _kvol_from_trig(cos_sza, sin_sza, cos_vza, sin_vza, cos_raa)
+                kgeo = _kgeo_from_trig(cos_sza, sin_sza, cos_vza, sin_vza, cos_raa, sin_raa, tan_sza, tan_vza)
+                cf = c_factor_from_kernels(kvol, kgeo, band)
                 corrected = np.clip(band_arrays[band] * cf, 0.0, 1.0)
                 band_arrays[band] = np.where(np.isnan(cf), band_arrays[band], corrected)
 
@@ -1308,15 +1318,13 @@ def collect(
         n = pq.ParquetFile(p).metadata.num_rows
         logger.info("Written: %s  (%d rows)", p.name, n)
 
-    from utils.parquet_utils import is_pixel_sorted
     for p in written_paths:
-        if not is_pixel_sorted(p, n_check=10):
-            logger.warning("%s is NOT pixel-sorted — sorting now ...", p.name)
-            sorting_tmp = p.with_name(p.stem + ".sorting.parquet")
-            sorting_tmp.unlink(missing_ok=True)
-            sort_parquet_by_pixel(p, sorting_tmp, row_group_size=5_000_000, ram_budget_gb=12.0, _skip_dict_rewrite=True)
-            sorting_tmp.replace(p)
-            logger.info("Pixel sort complete: %s", p.name)
+        logger.info("Pixel-sorting %s ...", p.name)
+        sorting_tmp = p.with_name(p.stem + ".sorting.parquet")
+        sorting_tmp.unlink(missing_ok=True)
+        sort_parquet_by_pixel(p, sorting_tmp, row_group_size=5_000_000, ram_budget_gb=12.0, _skip_dict_rewrite=True)
+        sorting_tmp.replace(p)
+        logger.info("Pixel sort complete: %s", p.name)
 
     print(f"\nDone.")
     print(f"  Rows   : {total_rows}")
