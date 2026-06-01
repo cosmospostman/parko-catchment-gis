@@ -410,8 +410,13 @@ def make_chunk_points(chunk: dict, meta: dict) -> list[tuple[str, float, float]]
         return []
 
     # Compute global xi (easting) and yi (northing) indices.
-    xi_offset = round((x_left_chunk - first_x_left) / r)
-    yi_offset = round((y_lower      - first_y_lower) / r)
+    # Use xs[0]/ys[0] (actual first pixel coordinate after clipping to bbox) relative
+    # to x0_snap/y0_snap (the global pixel origin) so that the first non-empty chunk
+    # always starts at xi=0/yi=0 and subsequent chunks are offset by their true pixel
+    # distance — not by their block-grid position, which overshoots when the first
+    # block is partially clipped by the location bbox.
+    xi_offset = round((xs[0] - x0_snap) / r)
+    yi_offset = round((ys[0] - y0_snap) / r)
     pfx = meta.get("point_id_prefix", "px")
     pids = [
         f"{pfx}_{int(i + xi_offset):04d}_{int(j + yi_offset):04d}"

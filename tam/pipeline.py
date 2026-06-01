@@ -687,12 +687,15 @@ def _cmd_score(args: argparse.Namespace) -> None:
             mask   = _contains_xy(loc_geom, lons, lats)
             return {pid for pid, m in zip(pids, mask) if m}
 
+        _tile_id_filter = set(getattr(args, "tile_id", None) or [])
         for y, paths in sorted(tile_paths_by_year.items()):
             by_tile: dict[str, list[Path]] = {}
             for p in paths:
                 tid = _tile_id_from_stem(p.stem)
                 by_tile.setdefault(tid, []).append(p)
             for tid, tile_paths in by_tile.items():
+                if _tile_id_filter and tid not in _tile_id_filter:
+                    continue
                 chunk_files = [p for p in tile_paths if _CHUNK_PAT.search(p.stem)]
                 non_chunk   = [p for p in tile_paths if not _CHUNK_PAT.search(p.stem)]
                 if chunk_files:
@@ -890,6 +893,7 @@ if __name__ == "__main__":
     p_score.add_argument("--n-tile-workers", type=int, default=1, help="Parallel tile workers for parquet output (default: 1)")
     p_score.add_argument("--pmtiles", default=None, help="Directory to write per-tile .pmtiles archives (requires --out-parquet)")
     p_score.add_argument("--pixel-dir", default=None, help="Override pixel parquet directory (default: data/pixels/<location>)")
+    p_score.add_argument("--tile-id", nargs="+", default=None, metavar="TILE_ID", help="Restrict scoring to these MGRS tile IDs (e.g. 54LWH)")
     _add_common_score_args(p_score)
 
     args = parser.parse_args()

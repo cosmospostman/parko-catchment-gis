@@ -17,6 +17,10 @@ test_atomic_strip_write                 — client: reads 0x02, writes .tmp, ver
 test_resume_skips_complete_strips       — client resume_from_strip logic
 test_workstation_merge_row_count        — merge_strips() on synthetic shards = correct count
 test_compression_ratio                  — sorted+dict strip ≥5× smaller than unsorted
+test_cpo1_pixel_sort_invariant          — all rows per point_id are contiguous after merge_scenes
+test_cpo2_pixel_count_sidecar_correct   — .pixel_count sidecar matches distinct point_id count
+test_cpo3_parquet_coords_consistent_with_point_id — lon/lat round-trips through xi/yi (no overhang)
+test_cpo4_multi_chunk_parquet_xi_yi_consistent_with_cog_overhang — multi-chunk parquets spatially consistent with COG overhang
 """
 
 from __future__ import annotations
@@ -1068,8 +1072,8 @@ def test_mcp2_point_id_utm_roundtrip():
 
     to_utm = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
     r = meta["r"]
-    first_x_left = meta["first_x_left"]
-    first_y_lower = meta["first_y_lower"]
+    x0_snap = meta["x0_snap"]
+    y0_snap = meta["y0_snap"]
 
     for chunk in chunks:
         for pid, lon, lat in make_chunk_points(chunk, meta):
@@ -1077,9 +1081,9 @@ def test_mcp2_point_id_utm_roundtrip():
             xi = int(parts[1])
             yi = int(parts[2])
 
-            # Reconstruct expected UTM from grid indices
-            expected_x = first_x_left  + xi * r
-            expected_y = first_y_lower + yi * r
+            # xi=0 is at x0_snap, yi=0 is at y0_snap; each step = r metres
+            expected_x = x0_snap + xi * r
+            expected_y = y0_snap + yi * r
 
             # Confirm against the stored lon/lat
             actual_x, actual_y = to_utm.transform(lon, lat)
@@ -1112,14 +1116,14 @@ def test_mcp3_xi_yi_monotonicity():
             utm_x, utm_y = to_utm.transform(lon, lat)
 
             # A western point must have a smaller xi than an eastern one.
-            # We verify by checking the sign of (xi, utm_x) is consistent.
+            # We verify by checking that xi/yi reconstruct the right UTM position.
             r = meta["r"]
-            first_x_left  = meta["first_x_left"]
-            first_y_lower = meta["first_y_lower"]
+            x0_snap = meta["x0_snap"]
+            y0_snap = meta["y0_snap"]
 
-            # xi * r should give ~utm_x offset from origin
-            xi_implied_x = first_x_left  + xi * r
-            yi_implied_y = first_y_lower + yi * r
+            # xi=0 is at x0_snap; each step = r metres
+            xi_implied_x = x0_snap + xi * r
+            yi_implied_y = y0_snap + yi * r
 
             # If xi/yi were swapped the implied position would be wrong.
             # (For a square grid xi=yi, this check may be vacuous — the tiny 1-km
@@ -1189,8 +1193,8 @@ def test_mcp6_geographic_fallback_xi_yi_correctness():
     to_utm = Transformer.from_crs("EPSG:4326", meta["utm_crs"], always_xy=True)
 
     r = meta["r"]
-    first_x_left  = meta["first_x_left"]
-    first_y_lower = meta["first_y_lower"]
+    x0_snap = meta["x0_snap"]
+    y0_snap = meta["y0_snap"]
 
     for chunk in chunks:
         for pid, lon, lat in make_chunk_points(chunk, meta):
@@ -1198,8 +1202,8 @@ def test_mcp6_geographic_fallback_xi_yi_correctness():
             xi = int(parts[1])
             yi = int(parts[2])
 
-            expected_x = first_x_left  + xi * r
-            expected_y = first_y_lower + yi * r
+            expected_x = x0_snap + xi * r
+            expected_y = y0_snap + yi * r
             actual_x, actual_y = to_utm.transform(lon, lat)
 
             assert abs(actual_x - expected_x) < 1.0, (
@@ -1208,6 +1212,82 @@ def test_mcp6_geographic_fallback_xi_yi_correctness():
             assert abs(actual_y - expected_y) < 1.0, (
                 f"{pid}: northing mismatch — stored {actual_y:.1f} vs yi-derived {expected_y:.1f}"
             )
+
+
+# MCP-7: COG-aligned chunks with partial first block (xi_offset overhang fix)
+def test_mcp7_cog_overhang_xi_yi_contiguous():
+    """xi/yi must be contiguous across chunks when the first block is partially clipped.
+
+    Reproduces the Mitchell scoring misalignment: when the bbox starts partway into
+    a COG block, first_x_left < x0_snap.  The old code used (x_left_chunk -
+    first_x_left)/r for xi_offset, which skipped the overhang pixels and left a gap.
+    The fix uses (xs[0] - x0_snap)/r so xi always runs 0, 1, 2, ... without gaps.
+    """
+    from proxy._pipeline import compute_chunks, make_chunk_points
+    from pyproj import Transformer
+
+    # Small bbox within a known UTM zone (zone 54S, EPSG:32754 — matches Mitchell)
+    utm_crs = "EPSG:32754"
+    to_wgs = Transformer.from_crs(utm_crs, "EPSG:4326", always_xy=True)
+
+    r = 10.0
+    chunk_px = 16  # small chunks so overhang is easy to trigger
+    block_m  = chunk_px * r  # 160 m per block
+
+    # Simulate a COG whose left edge is at 554_000.0 (block-aligned at 160m intervals)
+    cog_x_left = 554_000.0
+    cog_y_top  = 8_300_000.0
+
+    # Make the bbox start 40 m into the first block (overhang = 4 px)
+    bbox_x0_utm = cog_x_left + 40.0   # x0_snap will be 554_040.0
+    bbox_x1_utm = cog_x_left + 500.0  # covers ~3 full blocks
+    bbox_y0_utm = cog_y_top  - 400.0
+    bbox_y1_utm = cog_y_top  - 200.0
+
+    lon0, lat0 = to_wgs.transform(bbox_x0_utm, bbox_y0_utm)
+    lon1, lat1 = to_wgs.transform(bbox_x1_utm, bbox_y1_utm)
+    bbox = [lon0, lat0, lon1, lat1]
+
+    chunks, meta = compute_chunks(
+        bbox, chunk_px, chunk_px, None,
+        cog_utm_crs=utm_crs,
+        cog_y_top=cog_y_top,
+        cog_x_left=cog_x_left,
+    )
+
+    # Collect all point_ids from all chunks
+    all_pts = []
+    for c in chunks:
+        all_pts.extend(make_chunk_points(c, meta))
+
+    assert all_pts, "expected at least one point"
+
+    pids = [p for p, _, _ in all_pts]
+    xis = sorted({int(p.split("_")[1]) for p in pids})
+    yis = sorted({int(p.split("_")[2]) for p in pids})
+
+    # xi and yi must each form a contiguous range with no gaps
+    xi_gaps = [xis[i+1] - xis[i] for i in range(len(xis)-1) if xis[i+1] - xis[i] > 1]
+    assert not xi_gaps, f"xi has gaps: {xi_gaps}  (xi range: {xis[0]}..{xis[-1]})"
+
+    yi_gaps = [yis[i+1] - yis[i] for i in range(len(yis)-1) if yis[i+1] - yis[i] > 1]
+    assert not yi_gaps, f"yi has gaps: {yi_gaps}  (yi range: {yis[0]}..{yis[-1]})"
+
+    # xi=0 must correspond to the actual x0_snap easting
+    to_utm = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
+    x0_snap = meta["x0_snap"]
+    for pid, lon, lat in all_pts:
+        xi = int(pid.split("_")[1])
+        yi = int(pid.split("_")[2])
+        ux, uy = to_utm.transform(lon, lat)
+        expected_x = x0_snap + xi * r
+        expected_y = meta["y0_snap"] + yi * r
+        assert abs(ux - expected_x) < 1.0, (
+            f"{pid}: easting {ux:.1f} != x0_snap+xi*r={expected_x:.1f}"
+        )
+        assert abs(uy - expected_y) < 1.0, (
+            f"{pid}: northing {uy:.1f} != y0_snap+yi*r={expected_y:.1f}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1349,8 +1429,6 @@ def test_cpo3_parquet_coords_consistent_with_point_id(tmp_path):
     to_utm = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
 
     r = meta["r"]
-    first_x_left  = meta["first_x_left"]
-    first_y_lower = meta["first_y_lower"]
 
     # Build a lookup: point_id → (expected_x, expected_y) from make_chunk_points
     expected: dict[str, tuple[float, float]] = {}
@@ -1360,13 +1438,13 @@ def test_cpo3_parquet_coords_consistent_with_point_id(tmp_path):
             expected[pid] = (utm_x, utm_y)
 
     # Simulate what fetch writes: write a parquet with the same pids/lons/lats
-    rows = [{"point_id": pid, "lon": lon, "lat": lat}
-            for chunk in chunks
-            for pid, lon, lat in make_chunk_points(chunk, meta)]
+    all_pts = [(pid, lon, lat)
+               for chunk in chunks
+               for pid, lon, lat in make_chunk_points(chunk, meta)]
     tbl = pa.Table.from_pydict({
-        "point_id": pa.array([r["point_id"] for r in rows]),
-        "lon":      pa.array([r["lon"] for r in rows], type=pa.float64()),
-        "lat":      pa.array([r["lat"] for r in rows], type=pa.float64()),
+        "point_id": pa.array([p for p, _, _ in all_pts]),
+        "lon":      pa.array([ln for _, ln, _ in all_pts], type=pa.float64()),
+        "lat":      pa.array([lt for _, _, lt in all_pts], type=pa.float64()),
     })
     out = tmp_path / "chunk_test.parquet"
     pq.write_table(tbl, out)
@@ -1377,17 +1455,112 @@ def test_cpo3_parquet_coords_consistent_with_point_id(tmp_path):
     lons_back = tbl2.column("lon").to_pylist()
     lats_back = tbl2.column("lat").to_pylist()
 
+    x0_snap = meta["x0_snap"]
+    y0_snap = meta["y0_snap"]
+
     for pid, lon, lat in zip(pids_back, lons_back, lats_back):
         parts = pid.split("_")
         xi = int(parts[1])
         yi = int(parts[2])
-        xi_x = first_x_left  + xi * r
-        yi_y = first_y_lower + yi * r
+        xi_x = x0_snap + xi * r
+        yi_y = y0_snap + yi * r
         actual_x, actual_y = to_utm.transform(lon, lat)
 
         assert abs(actual_x - xi_x) < 1.0, (
-            f"{pid}: stored lon→easting {actual_x:.1f} ≠ xi-derived {xi_x:.1f}"
+            f"{pid}: stored lon→easting {actual_x:.1f} ≠ x0_snap+xi*r={xi_x:.1f}"
         )
         assert abs(actual_y - yi_y) < 1.0, (
-            f"{pid}: stored lat→northing {actual_y:.1f} ≠ yi-derived {yi_y:.1f}"
+            f"{pid}: stored lat→northing {actual_y:.1f} ≠ y0_snap+yi*r={yi_y:.1f}"
+        )
+
+
+# CPO-4: multi-chunk fetch with COG overhang → parquets are spatially consistent
+def test_cpo4_multi_chunk_parquet_xi_yi_consistent_with_cog_overhang(tmp_path):
+    """Fetch pipeline writes one parquet per chunk; xi/yi must be globally consistent.
+
+    Reproduces the conditions that caused the Mitchell scoring misalignment:
+    a COG whose left edge is west of the bbox, so first_x_left < x0_snap (COG
+    overhang).  Each chunk's parquet is written independently then read back;
+    xi/yi decoded from point_ids must map to the correct UTM coordinate and the
+    full grid must be contiguous with no gaps between chunks.
+    """
+    from proxy._pipeline import compute_chunks, make_chunk_points
+    from pyproj import Transformer
+
+    utm_crs = "EPSG:32754"  # same zone as Mitchell
+    to_wgs  = Transformer.from_crs(utm_crs, "EPSG:4326", always_xy=True)
+    to_utm  = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
+
+    r        = 10.0
+    chunk_px = 16
+    block_m  = chunk_px * r  # 160 m
+
+    # COG origin with a 4-pixel (40 m) easting overhang into the first block
+    cog_x_left = 554_000.0
+    cog_y_top  = 8_300_000.0
+    bbox_x0    = cog_x_left + 40.0   # x0_snap = 554_040
+    bbox_x1    = cog_x_left + 400.0  # spans ~3 full blocks east of overhang
+    bbox_y0    = cog_y_top  - 320.0
+    bbox_y1    = cog_y_top  - 160.0  # two chunk rows
+
+    lon0, lat0 = to_wgs.transform(bbox_x0, bbox_y0)
+    lon1, lat1 = to_wgs.transform(bbox_x1, bbox_y1)
+    bbox = [lon0, lat0, lon1, lat1]
+
+    chunks, meta = compute_chunks(
+        bbox, chunk_px, chunk_px, None,
+        cog_utm_crs=utm_crs, cog_y_top=cog_y_top, cog_x_left=cog_x_left,
+    )
+    assert len(chunks) >= 2, "need multiple chunks to test inter-chunk offsets"
+
+    x0_snap = meta["x0_snap"]
+    y0_snap = meta["y0_snap"]
+
+    # Write one parquet per chunk (mimicking the fetch pipeline output)
+    chunk_paths: list[Path] = []
+    for chunk in chunks:
+        pts = make_chunk_points(chunk, meta)
+        if not pts:
+            continue
+        crow = chunk["chunk_row"]
+        ccol = chunk["chunk_col"]
+        path = tmp_path / f"chunk_r{crow:02d}_c{ccol:02d}.parquet"
+        tbl = pa.Table.from_pydict({
+            "point_id": pa.array([p for p, _, _ in pts]),
+            "lon":      pa.array([ln for _, ln, _ in pts], type=pa.float64()),
+            "lat":      pa.array([lt for _, _, lt in pts], type=pa.float64()),
+        })
+        pq.write_table(tbl, path)
+        chunk_paths.append(path)
+
+    # Read all parquets back and collect all point_ids + coordinates
+    all_pids: list[str] = []
+    all_lons: list[float] = []
+    all_lats: list[float] = []
+    for path in chunk_paths:
+        tbl = pq.read_table(path)
+        all_pids.extend(tbl.column("point_id").to_pylist())
+        all_lons.extend(tbl.column("lon").to_pylist())
+        all_lats.extend(tbl.column("lat").to_pylist())
+
+    # xi and yi must form contiguous ranges across all chunks
+    xis = sorted({int(p.split("_")[1]) for p in all_pids})
+    yis = sorted({int(p.split("_")[2]) for p in all_pids})
+    xi_gaps = [xis[i+1] - xis[i] for i in range(len(xis)-1) if xis[i+1] - xis[i] > 1]
+    yi_gaps = [yis[i+1] - yis[i] for i in range(len(yis)-1) if yis[i+1] - yis[i] > 1]
+    assert not xi_gaps, f"xi gaps between chunks: {xi_gaps}  (range: {xis[0]}..{xis[-1]})"
+    assert not yi_gaps, f"yi gaps between chunks: {yi_gaps}  (range: {yis[0]}..{yis[-1]})"
+
+    # Every stored lon/lat must decode to the UTM coordinate implied by xi/yi
+    for pid, lon, lat in zip(all_pids, all_lons, all_lats):
+        xi = int(pid.split("_")[1])
+        yi = int(pid.split("_")[2])
+        expected_x = x0_snap + xi * r
+        expected_y = y0_snap + yi * r
+        actual_x, actual_y = to_utm.transform(lon, lat)
+        assert abs(actual_x - expected_x) < 1.0, (
+            f"{pid}: easting {actual_x:.1f} ≠ x0_snap+xi*r={expected_x:.1f}"
+        )
+        assert abs(actual_y - expected_y) < 1.0, (
+            f"{pid}: northing {actual_y:.1f} ≠ y0_snap+yi*r={expected_y:.1f}"
         )
