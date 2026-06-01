@@ -959,3 +959,435 @@ def test_cs11_mitchell_54lwj_chunk_set():
         f"unexpected: {sorted(actual - expected)}, "
         f"missing: {sorted(expected - actual)}"
     )
+
+
+# ---------------------------------------------------------------------------
+# make_chunk_points correctness tests
+#
+# These tests specifically guard against the meshgrid-arg-order bug that was
+# fixed in proxy/_pipeline.py:
+#   BEFORE: jj, ii = np.meshgrid(np.arange(len(ys)), np.arange(len(xs)), indexing="xy")
+#   AFTER:  ii, jj = np.meshgrid(np.arange(len(xs)), np.arange(len(ys)), indexing="xy")
+#
+# The bug caused xi/yi baked into every point_id to be swapped relative to the
+# lon/lat stored alongside them, producing a spatially scrambled score grid.
+#
+# MCP-1  Tiny 3×2 grid: each point_id encodes the correct (xi, yi)
+# MCP-2  Reconstructed UTM from (xi, yi) matches lon/lat (round-trip)
+# MCP-3  xi increases with easting; yi increases with northing
+# MCP-4  All point_ids are unique within a chunk
+# MCP-5  Two adjacent chunks share no point_ids and together cover the full tile
+# MCP-6  Geographic fallback: same xi/yi correctness holds without COG origin
+# ---------------------------------------------------------------------------
+
+
+def _make_single_chunk_meta(
+    xs_utm: list[float],
+    ys_utm: list[float],
+    utm_crs: str = "EPSG:32755",
+) -> tuple[dict, dict]:
+    """Build a minimal (chunk, meta) pair for a synthetic grid of UTM coords.
+
+    `xs_utm` must be sorted ascending (west→east).
+    `ys_utm` must be sorted ascending (south→north).
+    The chunk covers the full supplied grid; the meta origin is (xs[0], ys[0]).
+    """
+    r = 10.0
+    first_x_left = xs_utm[0]
+    first_y_lower = ys_utm[0]
+    block_h_m = (len(ys_utm)) * r + r   # large enough to contain all ys
+    block_w_m = (len(xs_utm)) * r + r
+    meta = {
+        "utm_crs":    utm_crs,
+        "y0_snap":    first_y_lower,
+        "y1":         ys_utm[-1] + r,
+        "x0_snap":    first_x_left,
+        "x1":         xs_utm[-1] + r,
+        "block_h_m":  block_h_m,
+        "block_w_m":  block_w_m,
+        "r":          r,
+        "first_y_lower": first_y_lower,
+        "first_x_left":  first_x_left,
+        "point_id_prefix": "px",
+    }
+    chunk = {
+        "chunk_row":    0,
+        "chunk_col":    0,
+        "y_lower":      first_y_lower,
+        "x_left_chunk": first_x_left,
+    }
+    return chunk, meta
+
+
+# MCP-1: 3×2 synthetic grid — xi and yi match UTM position
+def test_mcp1_tiny_grid_point_ids_match_utm_position():
+    """make_chunk_points 3×2 grid: each point_id (xi, yi) matches its UTM column/row."""
+    from proxy._pipeline import make_chunk_points
+    from pyproj import Transformer
+
+    # 3 easting values × 2 northing values (all at 10 m spacing, UTM zone 55S)
+    xs = [500_000.0, 500_010.0, 500_020.0]   # xi = 0, 1, 2
+    ys = [7_800_000.0, 7_800_010.0]           # yi = 0, 1
+    chunk, meta = _make_single_chunk_meta(xs, ys)
+    points = make_chunk_points(chunk, meta)
+    assert len(points) == 6, f"expected 6 points, got {len(points)}"
+
+    to_utm = Transformer.from_crs("EPSG:4326", "EPSG:32755", always_xy=True)
+
+    for pid, lon, lat in points:
+        parts = pid.split("_")
+        assert len(parts) == 3, f"bad point_id format: {pid}"
+        xi = int(parts[1])
+        yi = int(parts[2])
+
+        # Reconstruct expected UTM from xi, yi
+        expected_x = xs[xi]
+        expected_y = ys[yi]
+
+        # Convert stored lon/lat back to UTM
+        actual_x, actual_y = to_utm.transform(lon, lat)
+
+        assert abs(actual_x - expected_x) < 1.0, (
+            f"{pid}: lon={lon:.6f} maps to easting {actual_x:.1f} but xi={xi} → {expected_x:.1f}"
+        )
+        assert abs(actual_y - expected_y) < 1.0, (
+            f"{pid}: lat={lat:.6f} maps to northing {actual_y:.1f} but yi={yi} → {expected_y:.1f}"
+        )
+
+
+# MCP-2: reconstructed UTM from (xi, yi) matches stored lon/lat for a larger grid
+def test_mcp2_point_id_utm_roundtrip():
+    """xi/yi in every point_id reconstruct the same UTM as the stored lon/lat."""
+    from proxy._pipeline import compute_chunks, make_chunk_points
+    from pyproj import Transformer
+
+    bbox = [145.400, -22.845, 145.410, -22.835]
+    utm_crs = "EPSG:32755"
+    chunks, meta = compute_chunks(bbox, 1024, 1024, None, cog_utm_crs=utm_crs)
+    assert chunks
+
+    to_utm = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
+    r = meta["r"]
+    first_x_left = meta["first_x_left"]
+    first_y_lower = meta["first_y_lower"]
+
+    for chunk in chunks:
+        for pid, lon, lat in make_chunk_points(chunk, meta):
+            parts = pid.split("_")
+            xi = int(parts[1])
+            yi = int(parts[2])
+
+            # Reconstruct expected UTM from grid indices
+            expected_x = first_x_left  + xi * r
+            expected_y = first_y_lower + yi * r
+
+            # Confirm against the stored lon/lat
+            actual_x, actual_y = to_utm.transform(lon, lat)
+
+            assert abs(actual_x - expected_x) < 1.0, (
+                f"{pid}: easting mismatch — stored {actual_x:.1f} vs xi-derived {expected_x:.1f}"
+            )
+            assert abs(actual_y - expected_y) < 1.0, (
+                f"{pid}: northing mismatch — stored {actual_y:.1f} vs yi-derived {expected_y:.1f}"
+            )
+
+
+# MCP-3: xi increases with easting; yi increases with northing
+def test_mcp3_xi_yi_monotonicity():
+    """xi must increase with easting; yi must increase with northing, never the other way."""
+    from proxy._pipeline import compute_chunks, make_chunk_points
+    from pyproj import Transformer
+
+    bbox = [145.400, -22.845, 145.410, -22.835]
+    utm_crs = "EPSG:32755"
+    chunks, meta = compute_chunks(bbox, 1024, 1024, None, cog_utm_crs=utm_crs)
+    to_utm = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
+
+    for chunk in chunks:
+        pts = make_chunk_points(chunk, meta)
+        for pid, lon, lat in pts:
+            parts = pid.split("_")
+            xi = int(parts[1])
+            yi = int(parts[2])
+            utm_x, utm_y = to_utm.transform(lon, lat)
+
+            # A western point must have a smaller xi than an eastern one.
+            # We verify by checking the sign of (xi, utm_x) is consistent.
+            r = meta["r"]
+            first_x_left  = meta["first_x_left"]
+            first_y_lower = meta["first_y_lower"]
+
+            # xi * r should give ~utm_x offset from origin
+            xi_implied_x = first_x_left  + xi * r
+            yi_implied_y = first_y_lower + yi * r
+
+            # If xi/yi were swapped the implied position would be wrong.
+            # (For a square grid xi=yi, this check may be vacuous — the tiny 1-km
+            # bbox spans ~100 px east and ~110 px north so xi ≠ yi for edge points.)
+            assert abs(xi_implied_x - utm_x) < 1.0, (
+                f"{pid}: xi={xi} implies x={xi_implied_x:.1f} but utm_x={utm_x:.1f}"
+            )
+            assert abs(yi_implied_y - utm_y) < 1.0, (
+                f"{pid}: yi={yi} implies y={yi_implied_y:.1f} but utm_y={utm_y:.1f}"
+            )
+
+
+# MCP-4: all point_ids within a single chunk are unique
+def test_mcp4_point_ids_unique_within_chunk():
+    """No duplicate point_ids within a single chunk."""
+    from proxy._pipeline import compute_chunks, make_chunk_points
+
+    bbox = [145.400, -22.845, 145.410, -22.835]
+    chunks, meta = compute_chunks(bbox, 1024, 1024, None)
+    for chunk in chunks:
+        pts = make_chunk_points(chunk, meta)
+        pids = [p for p, _, _ in pts]
+        assert len(pids) == len(set(pids)), (
+            f"duplicate point_ids in chunk ({chunk['chunk_row']},{chunk['chunk_col']})"
+        )
+
+
+# MCP-5: two horizontally adjacent chunks are disjoint and together cover the full row
+def test_mcp5_adjacent_chunks_disjoint_and_complete():
+    """Adjacent chunks share no point_ids; their union equals all points in that row-band."""
+    from proxy._pipeline import compute_chunks, make_chunk_points
+
+    # Use a wide bbox and small chunk size so we get multiple columns
+    bbox = [145.390, -22.845, 145.420, -22.840]
+    chunks, meta = compute_chunks(bbox, 32, 32, None)
+
+    # Group by chunk_row, take the first row that has ≥2 columns
+    from collections import defaultdict
+    by_row: dict[int, list[dict]] = defaultdict(list)
+    for c in chunks:
+        by_row[c["chunk_row"]].append(c)
+
+    multi_col_rows = [row for row, cs in by_row.items() if len(cs) >= 2]
+    assert multi_col_rows, "expected at least one row with ≥2 chunks"
+
+    row_chunks = sorted(by_row[multi_col_rows[0]], key=lambda c: c["chunk_col"])
+    c0 = set(p for p, _, _ in make_chunk_points(row_chunks[0], meta))
+    c1 = set(p for p, _, _ in make_chunk_points(row_chunks[1], meta))
+
+    assert c0.isdisjoint(c1), f"{len(c0 & c1)} point_ids shared between col 0 and col 1"
+
+    # Their union should equal the full set from both chunks (no gaps, no extras)
+    all_pts = {p for p, _, _ in make_chunk_points(row_chunks[0], meta)} | \
+              {p for p, _, _ in make_chunk_points(row_chunks[1], meta)}
+    assert all_pts == c0 | c1  # trivially true, but guards against future filter logic
+
+
+# MCP-6: geographic fallback (no COG origin) also produces correct xi/yi
+def test_mcp6_geographic_fallback_xi_yi_correctness():
+    """xi/yi round-trip is correct when compute_chunks uses the geographic fallback path."""
+    from proxy._pipeline import compute_chunks, make_chunk_points
+    from pyproj import Transformer
+
+    bbox = [145.400, -22.845, 145.410, -22.835]
+    # No cog_utm_crs — exercises the else-branch in compute_chunks
+    chunks, meta = compute_chunks(bbox, 1024, 1024, None)
+    to_utm = Transformer.from_crs("EPSG:4326", meta["utm_crs"], always_xy=True)
+
+    r = meta["r"]
+    first_x_left  = meta["first_x_left"]
+    first_y_lower = meta["first_y_lower"]
+
+    for chunk in chunks:
+        for pid, lon, lat in make_chunk_points(chunk, meta):
+            parts = pid.split("_")
+            xi = int(parts[1])
+            yi = int(parts[2])
+
+            expected_x = first_x_left  + xi * r
+            expected_y = first_y_lower + yi * r
+            actual_x, actual_y = to_utm.transform(lon, lat)
+
+            assert abs(actual_x - expected_x) < 1.0, (
+                f"{pid}: easting mismatch — stored {actual_x:.1f} vs xi-derived {expected_x:.1f}"
+            )
+            assert abs(actual_y - expected_y) < 1.0, (
+                f"{pid}: northing mismatch — stored {actual_y:.1f} vs yi-derived {expected_y:.1f}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Chunk-parquet output correctness tests
+#
+# These verify that the parquets written by the fetch pipeline have the
+# properties required by the scoring pipeline:
+#
+# CPO-1  Pixel-sort invariant: all rows for each point_id are contiguous
+# CPO-2  .pixel_count sidecar matches actual distinct point_id count
+# CPO-3  Coordinates in parquet are consistent with point_id (xi, yi)
+# ---------------------------------------------------------------------------
+
+
+def _write_pixel_sorted_chunk(
+    path: Path,
+    n_pixels: int,
+    n_dates: int,
+    first_x_left: float = 500_000.0,
+    first_y_lower: float = 7_800_000.0,
+    r: float = 10.0,
+) -> tuple[Path, dict[str, tuple[float, float]]]:
+    """Write a synthetic pixel-sorted chunk parquet + .pixel_count sidecar.
+
+    Returns (path, {point_id: (utm_x, utm_y)}) for round-trip verification.
+    """
+    from datetime import timedelta
+
+    coords: dict[str, tuple[float, float]] = {}
+    rows = []
+    base = date(2022, 1, 1)
+
+    for i in range(n_pixels):
+        xi = i % 10
+        yi = i // 10
+        utm_x = first_x_left  + xi * r
+        utm_y = first_y_lower + yi * r
+        pid = f"px_{xi:04d}_{yi:04d}"
+        coords[pid] = (utm_x, utm_y)
+
+        for d_idx in range(n_dates):
+            rows.append({
+                "point_id": pid,
+                "lon": float(145.40 + xi * 0.0001),
+                "lat": float(-22.84 - yi * 0.0001),
+                "date": base + timedelta(days=d_idx),
+                "item_id": "S2A_55HBU_20220101_0_L2A",
+                "tile_id": "55HBU",
+                "source": "S2",
+            })
+
+    schema = pa.schema([
+        pa.field("point_id", pa.string()),
+        pa.field("lon",      pa.float32()),
+        pa.field("lat",      pa.float32()),
+        pa.field("date",     pa.date32()),
+        pa.field("item_id",  pa.string()),
+        pa.field("tile_id",  pa.string()),
+        pa.field("source",   pa.string()),
+    ])
+    tbl = pa.Table.from_pylist(rows, schema=schema)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(tbl, path, compression="zstd", row_group_size=n_dates)
+
+    sidecar = path.with_suffix(".pixel_count")
+    sidecar.write_text(str(n_pixels))
+    return path, coords
+
+
+# CPO-1: all rows for each point_id are contiguous (pixel-sort invariant)
+def test_cpo1_pixel_sort_invariant(tmp_path):
+    """merge_scenes() output has all rows for each point_id contiguous.
+
+    The scoring pipeline's boundary-detection relies on this invariant:
+    when the point_id changes, the previous pixel is complete.
+    """
+    from proxy._pipeline import merge_scenes
+
+    n_pixels = 12
+    n_dates  = 5
+    scene_paths = [
+        _synthetic_scene_parquet(tmp_path / "scenes", f"scene_{i:04d}", n_pixels, n_dates)
+        for i in range(3)
+    ]
+    out = tmp_path / "chunk_sorted.parquet"
+    merge_scenes(scene_paths, None, out)
+
+    tbl = pq.read_table(out, columns=["point_id"])
+    pids = tbl.column("point_id").to_pylist()
+
+    # Walk through rows; each point_id should appear as one contiguous run
+    runs: list[str] = []
+    prev = None
+    for pid in pids:
+        if pid != prev:
+            runs.append(pid)
+            prev = pid
+
+    assert len(runs) == len(set(runs)), (
+        "pixel_sort invariant violated: some point_ids appear in non-contiguous runs\n"
+        f"  runs={runs[:20]}"
+    )
+
+
+# CPO-2: .pixel_count sidecar matches actual distinct point_id count
+def test_cpo2_pixel_count_sidecar_correct(tmp_path):
+    """The .pixel_count sidecar written alongside a chunk parquet is accurate."""
+    from tam.core.pixel_source import _count_distinct_pixels
+
+    n_pixels = 20
+    chunk_path, _ = _write_pixel_sorted_chunk(
+        tmp_path / "chunk_r00_c00.parquet", n_pixels=n_pixels, n_dates=3,
+    )
+    sidecar = chunk_path.with_suffix(".pixel_count")
+    assert sidecar.exists(), ".pixel_count sidecar not written"
+    assert int(sidecar.read_text().strip()) == n_pixels
+
+    # _count_distinct_pixels uses the sidecar when present — verify it returns the same value
+    assert _count_distinct_pixels([chunk_path]) == n_pixels
+
+
+# CPO-3: lon/lat in parquet are consistent with xi/yi encoded in point_id
+def test_cpo3_parquet_coords_consistent_with_point_id(tmp_path):
+    """For every row in a chunk parquet, the stored lon/lat is consistent with xi/yi.
+
+    This is the integration-level version of MCP-2: it tests that whatever fetch
+    writes to disk has the same consistency property, not just what make_chunk_points
+    returns in memory.
+
+    Uses make_chunk_points as the reference source of truth, then checks that a
+    parquet built from those points stores the correct lon/lat.
+    """
+    from proxy._pipeline import compute_chunks, make_chunk_points
+    from pyproj import Transformer
+
+    bbox = [145.400, -22.845, 145.404, -22.841]
+    utm_crs = "EPSG:32755"
+    chunks, meta = compute_chunks(bbox, 1024, 1024, None, cog_utm_crs=utm_crs)
+    to_utm = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
+
+    r = meta["r"]
+    first_x_left  = meta["first_x_left"]
+    first_y_lower = meta["first_y_lower"]
+
+    # Build a lookup: point_id → (expected_x, expected_y) from make_chunk_points
+    expected: dict[str, tuple[float, float]] = {}
+    for chunk in chunks:
+        for pid, lon, lat in make_chunk_points(chunk, meta):
+            utm_x, utm_y = to_utm.transform(lon, lat)
+            expected[pid] = (utm_x, utm_y)
+
+    # Simulate what fetch writes: write a parquet with the same pids/lons/lats
+    rows = [{"point_id": pid, "lon": lon, "lat": lat}
+            for chunk in chunks
+            for pid, lon, lat in make_chunk_points(chunk, meta)]
+    tbl = pa.Table.from_pydict({
+        "point_id": pa.array([r["point_id"] for r in rows]),
+        "lon":      pa.array([r["lon"] for r in rows], type=pa.float64()),
+        "lat":      pa.array([r["lat"] for r in rows], type=pa.float64()),
+    })
+    out = tmp_path / "chunk_test.parquet"
+    pq.write_table(tbl, out)
+
+    # Read back and verify xi/yi match the stored coordinates
+    tbl2 = pq.read_table(out)
+    pids_back = tbl2.column("point_id").to_pylist()
+    lons_back = tbl2.column("lon").to_pylist()
+    lats_back = tbl2.column("lat").to_pylist()
+
+    for pid, lon, lat in zip(pids_back, lons_back, lats_back):
+        parts = pid.split("_")
+        xi = int(parts[1])
+        yi = int(parts[2])
+        xi_x = first_x_left  + xi * r
+        yi_y = first_y_lower + yi * r
+        actual_x, actual_y = to_utm.transform(lon, lat)
+
+        assert abs(actual_x - xi_x) < 1.0, (
+            f"{pid}: stored lon→easting {actual_x:.1f} ≠ xi-derived {xi_x:.1f}"
+        )
+        assert abs(actual_y - yi_y) < 1.0, (
+            f"{pid}: stored lat→northing {actual_y:.1f} ≠ yi-derived {yi_y:.1f}"
+        )

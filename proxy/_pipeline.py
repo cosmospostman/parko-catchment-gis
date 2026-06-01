@@ -400,8 +400,9 @@ def make_chunk_points(chunk: dict, meta: dict) -> list[tuple[str, float, float]]
     lons_arr = np.asarray(lons_arr)
     lats_arr = np.asarray(lats_arr)
 
-    # jj = local northing index within chunk's ys; ii = local easting index
-    jj, ii = np.meshgrid(np.arange(len(ys)), np.arange(len(xs)), indexing="xy")
+    # ii = local easting index (xs axis), jj = local northing index (ys axis).
+    # Must use same arg order as the xx/yy meshgrid above so the ravel order matches.
+    ii, jj = np.meshgrid(np.arange(len(xs)), np.arange(len(ys)), indexing="xy")
     ii_flat = ii.ravel()
     jj_flat = jj.ravel()
 
