@@ -1035,3 +1035,364 @@ class TestMixedModeScoring:
 
         assert len(r_mixed) == 1, "mixed path must score px1"
         assert len(r_s2only) == 0, "s2-only path must score nothing (no S1 obs)"
+
+
+# ---------------------------------------------------------------------------
+# TS-CPS  ChunkPixelSource cross-file boundary correctness
+#
+# The parser thread peels off the trailing pixel of each row group as a
+# "leftover" to handle pixels that straddle row-group boundaries.  It finds
+# the split point by scanning backward from the end of the combined
+# (leftover + current rg) array.
+#
+# Bug repro: the original code used np.searchsorted, which requires a sorted
+# array.  ChunkPixelSource presents files in spatial (row-major) order, so
+# point_id strings are NOT globally lexicographically sorted across files —
+# the last pixel of file N can have a higher string value than the first pixel
+# of file N+1.  searchsorted then returns a wrong split point, causing the
+# accumulated leftover to grow to millions of rows and swallow entire chunks
+# without scoring them.
+#
+# These tests construct a two-file ChunkPixelSource where the boundary pixel
+# of file 0 sorts AFTER the first pixel of file 1 (i.e. the real-world
+# failure condition), then assert that every pixel is scored.
+# ---------------------------------------------------------------------------
+
+_CPS_S2_COLS = ["B02", "B03", "B04"]
+_CPS_S1_COLS = ["s1_vh", "s1_vv"]
+
+
+def _make_chunk_parquet(
+    tmp_path: Path,
+    pixels: list[str],
+    year: int = 2023,
+    filename: str = "chunk.parquet",
+    obs_per_rg: int | None = None,
+) -> Path:
+    """Write a mixed S2+S1 chunk parquet in the supplied pixel order (not sorted).
+
+    Rows are written in the order given by `pixels` to reproduce spatial
+    (non-lex) ordering, matching real chunk parquets that are sorted by
+    pixel position rather than point_id string.  The mixed format is required
+    because the searchsorted bug lives in the mixed-mode parser path.
+    """
+    from tam.core.dataset import BAND_COLS as _BC
+    rng = np.random.default_rng(77)
+    rows = []
+    start_s2 = datetime.date(year, 1, 15)
+    start_s1 = datetime.date(year, 1, 1)
+    for pid in pixels:
+        for i in range(N_OBS_PER_YEAR):
+            d = start_s2 + datetime.timedelta(days=23 * i)
+            row = {
+                "point_id": pid,
+                "date": datetime.datetime(d.year, d.month, d.day),
+                "source": "S2",
+                "scl_purity": 1.0,
+                "vh": None,
+                "vv": None,
+            }
+            row.update({b: float(rng.uniform(0.01, 0.5)) for b in _CPS_S2_COLS})
+            rows.append(row)
+        for i in range(N_S1_OBS):
+            d = start_s1 + datetime.timedelta(days=12 * i)
+            rows.append({
+                "point_id": pid,
+                "date": datetime.datetime(d.year, d.month, d.day),
+                "source": "S1",
+                "scl_purity": None,
+                "vh": float(rng.uniform(1e-4, 1e-2)),
+                "vv": float(rng.uniform(1e-4, 1e-2)),
+                **{b: None for b in _CPS_S2_COLS},
+            })
+    df = pl.DataFrame(rows).with_columns(pl.col("date").cast(pl.Datetime("us")))
+    path = tmp_path / filename
+    rg_size = obs_per_rg if obs_per_rg is not None else (N_OBS_PER_YEAR + N_S1_OBS)
+    pq.write_table(df.to_arrow(), path, row_group_size=rg_size)
+    return path
+
+
+class TestChunkPixelSourceBoundary:
+    """Parser thread leftover logic must not lose pixels at chunk file boundaries
+    when point_id strings are not lexicographically sorted across files.
+
+    The bug lives in the mixed-mode parser path (``mixed=True``) which uses
+    PyArrow tables and the searchsorted-based tail-finding logic.  All tests
+    here use mixed=True to exercise that path.
+    """
+
+    def _score_chunk_source(self, tmp_path, paths, **kwargs):
+        from tam.core.score import score_pixels_chunked
+        from tam.core.pixel_source import ChunkPixelSource
+        from tam.core.config import TAMConfig
+
+        n_bands = len(_CPS_S2_COLS) + len(_CPS_S1_COLS)
+        cfg = TAMConfig(d_model=16, n_heads=2, n_layers=1, d_ff=32,
+                        n_bands=n_bands, use_s1="mixed", n_global_features=0)
+        torch.manual_seed(0)
+        model = TAMClassifier.from_config(cfg)
+        model._use_s1 = "mixed"
+        model._pixel_zscore = False
+        model.eval()
+        band_mean = np.zeros(n_bands, dtype=np.float32)
+        band_std  = np.ones(n_bands,  dtype=np.float32)
+
+        src = ChunkPixelSource(paths)
+        return score_pixels_chunked(
+            source=src, model=model, band_mean=band_mean, band_std=band_std,
+            device="cpu", mixed=True,
+            s2_feature_cols=_CPS_S2_COLS,
+            s1_feature_cols=_CPS_S1_COLS,
+            decay=0.0, **kwargs,
+        )
+
+    def test_all_pixels_scored_when_boundary_is_lex_descending(self, tmp_path):
+        """File 0 ends with a lex-high point_id; file 1 ends with a lex-low one.
+
+        This is the exact real-world topology that caused the searchsorted bug:
+        spatial row-major order means the last pixel of file N has a higher
+        lex value than the last pixel of file N+1 (column index resets between
+        rows).  The leftover from file N is prepended to file N+1's first row
+        group, making the combined array unsorted.  searchsorted then returns
+        the wrong split point (often 0), swallowing entire chunks as leftover.
+        """
+        # File 0: pixels with high string values (simulate end of spatial row N)
+        # File 1: pixels with low string values (simulate spatial row N+1, col 0)
+        # Crucially: last pid of file1 ALSO < leftover pid from file0, so
+        # searchsorted(combined, pid_last='px_0003_0001') returns 0 on the
+        # unsorted [px_9003_0000 * N, px_0000_0001 * N, ..., px_0003_0001 * N] array.
+        pids_file0 = [f"px_9{i:03d}_0000" for i in range(4)]
+        pids_file1 = [f"px_0{i:03d}_0001" for i in range(4)]
+
+        assert pids_file0[-1] > pids_file1[-1], (
+            "Test setup: last pid of file0 must lex-sort AFTER last pid of file1"
+        )
+
+        p0 = _make_chunk_parquet(tmp_path, pids_file0, filename="chunk_00.parquet")
+        p1 = _make_chunk_parquet(tmp_path, pids_file1, filename="chunk_01.parquet")
+
+        result = self._score_chunk_source(tmp_path, [p0, p1])
+        scored = set(result["point_id"].to_list())
+        missing = (set(pids_file0) | set(pids_file1)) - scored
+        assert not missing, f"Pixels not scored across lex-descending boundary: {missing}"
+
+    def test_pixel_count_matches_across_lex_descending_boundary(self, tmp_path):
+        """Score count must equal total pixel count regardless of lex order."""
+        pids_file0 = [f"px_8{i:03d}_0010" for i in range(6)]
+        pids_file1 = [f"px_1{i:03d}_0020" for i in range(6)]
+        assert pids_file0[-1] > pids_file1[-1]
+
+        p0 = _make_chunk_parquet(tmp_path, pids_file0, filename="c0.parquet")
+        p1 = _make_chunk_parquet(tmp_path, pids_file1, filename="c1.parquet")
+
+        result = self._score_chunk_source(tmp_path, [p0, p1])
+        assert len(result) == len(pids_file0) + len(pids_file1)
+        assert result["point_id"].n_unique() == len(pids_file0) + len(pids_file1)
+
+    def test_scores_match_single_merged_parquet(self, tmp_path):
+        """Scores via ChunkPixelSource must match a single merged parquet.
+
+        This is the definitive regression test: if the leftover logic is
+        correct, chunked and merged scoring produce identical results.
+        """
+        # These pids ensure: last pid of file1 ('px_0102_0001') < last pid of
+        # file0 ('px_7002_0000'), so searchsorted on the combined unsorted array
+        # returns 0 instead of the correct tail position.
+        pids_file0 = ["px_7000_0000", "px_7001_0000", "px_7002_0000"]
+        pids_file1 = ["px_0100_0001", "px_0101_0001", "px_0102_0001"]
+        assert pids_file0[-1] > pids_file1[-1]
+
+        p0 = _make_chunk_parquet(tmp_path, pids_file0, filename="c0.parquet")
+        p1 = _make_chunk_parquet(tmp_path, pids_file1, filename="c1.parquet")
+
+        # Build a merged single parquet (all pixels, sorted by point_id then date)
+        merged = pl.concat([pl.read_parquet(p0), pl.read_parquet(p1)]).sort(["point_id", "date"])
+        merged_path = tmp_path / "merged.parquet"
+        pq.write_table(merged.to_arrow(), merged_path, row_group_size=N_OBS_PER_YEAR)
+
+        result_chunked = self._score_chunk_source(tmp_path, [p0, p1]).sort("point_id")
+        result_merged  = self._score_chunk_source(tmp_path, [merged_path]).sort("point_id")
+
+        assert result_chunked["point_id"].to_list() == result_merged["point_id"].to_list()
+        for a, b in zip(result_chunked["prob_tam"].to_list(), result_merged["prob_tam"].to_list()):
+            assert a == pytest.approx(b, abs=1e-5), (
+                f"Score mismatch for pixel — chunked={a:.6f} merged={b:.6f}"
+            )
+
+    def test_three_file_chain_with_multiple_lex_drops(self, tmp_path):
+        """Multiple lex-descending boundaries across three files must all be handled."""
+        # Simulate a 3×3 spatial grid: each row resets the column index.
+        # row0→row1 and row1→row2 are both lex-descending drops.
+        pids_row0 = ["px_9000_0000", "px_9001_0000"]
+        pids_row1 = ["px_0500_0001", "px_0501_0001"]
+        pids_row2 = ["px_0100_0002", "px_0101_0002"]
+        assert pids_row0[-1] > pids_row1[-1], "row0→row1 boundary must be lex-descending"
+        assert pids_row1[-1] > pids_row2[-1], "row1→row2 boundary must be lex-descending"
+
+        p0 = _make_chunk_parquet(tmp_path, pids_row0, filename="r0.parquet")
+        p1 = _make_chunk_parquet(tmp_path, pids_row1, filename="r1.parquet")
+        p2 = _make_chunk_parquet(tmp_path, pids_row2, filename="r2.parquet")
+
+        result = self._score_chunk_source(tmp_path, [p0, p1, p2])
+        all_pids = set(pids_row0) | set(pids_row1) | set(pids_row2)
+        assert set(result["point_id"].to_list()) == all_pids
+
+    def test_lex_ascending_boundary_still_correct(self, tmp_path):
+        """When file boundaries happen to be lex-ascending, scoring must still be correct."""
+        pids_file0 = ["px_0100_0000", "px_0101_0000"]
+        pids_file1 = ["px_0200_0001", "px_0201_0001"]
+        assert pids_file0[-1] < pids_file1[-1], "must be lex-ascending for this test"
+
+        p0 = _make_chunk_parquet(tmp_path, pids_file0, filename="asc0.parquet")
+        p1 = _make_chunk_parquet(tmp_path, pids_file1, filename="asc1.parquet")
+
+        result = self._score_chunk_source(tmp_path, [p0, p1])
+        assert set(result["point_id"].to_list()) == set(pids_file0) | set(pids_file1)
+
+    def test_spatially_ordered_within_file_boundary(self, tmp_path):
+        """Reproduces the exact failure mode: pids are spatially ordered (lex-
+        descending) within each file, mirroring real chunk parquets where
+        pixels are processed west→east causing XXXX to decrease within a row.
+
+        File 0 ends with a high-lex pid (px_7290_*).  File 1 contains pixels
+        with decreasing pids so pid_last of file 1's rg is lex-lower than the
+        leftover from file 0.  With the old np.searchsorted code this returns
+        tail_start=0, swallowing the entire combined table into leftover and
+        splitting each pixel's observations across emitted chunks.  Fragmented
+        obs fall below min_obs_per_year, so affected pixels are silently dropped
+        from the output.
+        """
+        # File 0: px_7289_0000 → px_7270_0000, decreasing (spatial west-to-east)
+        pids_file0 = [f"px_{7289 - i:04d}_0000" for i in range(20)]
+        # File 1: px_7199_0001 → px_7180_0001, also decreasing
+        # pid_last of file1 rg = px_7180_0001 < leftover px_7270_0000
+        pids_file1 = [f"px_{7199 - i:04d}_0001" for i in range(20)]
+
+        assert pids_file0[-1] > pids_file1[-1], (
+            "last pid of file0 must lex-sort after last pid of file1"
+        )
+
+        p0 = _make_chunk_parquet(tmp_path, pids_file0, filename="sp0.parquet")
+        p1 = _make_chunk_parquet(tmp_path, pids_file1, filename="sp1.parquet")
+
+        result = self._score_chunk_source(tmp_path, [p0, p1])
+        all_pids = set(pids_file0) | set(pids_file1)
+        scored   = set(result["point_id"].to_list())
+        missing  = all_pids - scored
+        assert not missing, (
+            f"{len(missing)} pixels not scored (searchsorted boundary bug): "
+            f"{sorted(missing)[:5]}{'...' if len(missing) > 5 else ''}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TS-CPS-UNIT  Direct unit test of the tail-finding logic
+#
+# The end-to-end tests above verify correct scoring results but cannot
+# reliably trigger the searchsorted misfire at small array sizes (the binary
+# search happens to work when the combined array is short).  This unit test
+# directly verifies that the backward scan correctly locates the tail start
+# on an unsorted combined array, exercising the exact array topology that
+# caused the production bug.
+# ---------------------------------------------------------------------------
+
+class TestTailFindingLogic:
+    """The tail-finding backward scan must return the correct split point on
+    unsorted point_id arrays produced by spatial (non-lex) ordering."""
+
+    @staticmethod
+    def _tail_start_new(pid_arr: np.ndarray) -> int:
+        """Replicate the fixed backward-scan logic from score.py."""
+        pid_last = pid_arr[-1]
+        tail_start = len(pid_arr) - 1
+        while tail_start > 0 and pid_arr[tail_start - 1] == pid_last:
+            tail_start -= 1
+        return tail_start
+
+    @staticmethod
+    def _tail_start_old(pid_arr: np.ndarray) -> int:
+        """Replicate the buggy searchsorted logic (for comparison)."""
+        return int(np.searchsorted(pid_arr, pid_arr[-1], side="left"))
+
+    def _make_combined(self, leftover_pid: str, leftover_n: int,
+                       body_pids: list[str], obs_per_pid: int) -> np.ndarray:
+        """Build a combined [leftover + body] array as the parser sees it."""
+        arr = [leftover_pid] * leftover_n
+        for pid in body_pids:
+            arr.extend([pid] * obs_per_pid)
+        return np.array(arr)
+
+    def test_lex_descending_boundary_correct_tail(self):
+        """Leftover pid > pid_last: backward scan returns correct tail, searchsorted fails."""
+        # leftover from file0: high-lex px_7290_6124
+        # file1 body: descending px_7289, px_7288, ..., ending at px_7200
+        body_pids = [f"px_{7289 - i:04d}_6124" for i in range(90)]
+        combined = self._make_combined("px_7290_6124", 39, body_pids, obs_per_pid=15)
+
+        pid_last = combined[-1]  # px_7200_6124
+        correct_tail = len(combined) - 15  # last 15 rows belong to pid_last
+
+        new_tail = self._tail_start_new(combined)
+        old_tail = self._tail_start_old(combined)
+
+        assert new_tail == correct_tail, (
+            f"backward scan: expected {correct_tail}, got {new_tail}"
+        )
+        # The old searchsorted code must give a wrong answer on this input to
+        # justify the fix.  If this assertion fails the test topology is wrong.
+        assert old_tail != correct_tail, (
+            "searchsorted gave the right answer — test topology does not "
+            "reproduce the failure condition; adjust leftover/body_pids"
+        )
+
+    def test_lex_ascending_boundary_both_correct(self):
+        """When combined is lex-sorted, both methods agree."""
+        body_pids = [f"px_0{i:03d}_0001" for i in range(10)]
+        combined = self._make_combined("px_0000_0000", 5, body_pids, obs_per_pid=10)
+
+        new_tail = self._tail_start_new(combined)
+        old_tail = self._tail_start_old(combined)
+        correct  = len(combined) - 10
+
+        assert new_tail == correct
+        assert old_tail == correct  # both should agree on sorted data
+
+    def test_single_pixel_entire_rg(self):
+        """All rows belong to one pixel → tail_start=0 (carry forward)."""
+        combined = np.array(["px_1234_5678"] * 100)
+        assert self._tail_start_new(combined) == 0
+
+    def test_two_pixels_equal_split(self):
+        """Exactly half leftover, half body — tail starts at midpoint."""
+        combined = np.array(["px_A"] * 50 + ["px_B"] * 50)
+        assert self._tail_start_new(combined) == 50
+
+    def test_large_unsorted_array_correct_tail(self):
+        """At production-scale array sizes the backward scan must still be correct.
+
+        The real failure topology: the body of the combined array is also lex-
+        descending (spatial ordering within a file decreases the XXXX index as
+        pixels are processed east-to-west), so the full combined array is
+        completely unsorted.  searchsorted returns 0 instead of the correct tail.
+        """
+        # Simulate the real within-file sort: rg0 of r03_c10 has pids like
+        # px_7239_6124, px_7238_6124, ..., px_6924_6160 (XXXX decreasing).
+        # The leftover (px_7239_6124, 16 rows) is prepended to rg1 which
+        # continues the descent.  pid_last ends at px_6924_6160.
+        obs_per_pid = 15
+        leftover_pid = "px_7239_6124"
+        # Build a lex-descending body: 7238 down to 6925 (313 pids × 15 obs = 4695 rows)
+        body_pids = [f"px_{7238 - i:04d}_6124" for i in range(313)]
+        body_last_pid = f"px_{7238 - 312:04d}_6124"  # px_6926_6124
+        combined = self._make_combined(leftover_pid, 16, body_pids, obs_per_pid)
+
+        correct_tail = len(combined) - obs_per_pid
+        new_tail = self._tail_start_new(combined)
+        old_tail = self._tail_start_old(combined)
+
+        assert new_tail == correct_tail, (
+            f"backward scan wrong at production scale: {new_tail} != {correct_tail}"
+        )
+        assert old_tail != correct_tail, (
+            "searchsorted correct on descending body — test topology is wrong"
+        )

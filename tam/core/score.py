@@ -1446,16 +1446,13 @@ def score_pixels_chunked(
                         pa_leftover = None
                     # Peel off the trailing pixel — it may continue in the next rg.
                     pid_last = tbl.column("point_id")[-1].as_py()
-                    # Find where the last pixel starts (scan from end — usually <80 rows)
-                    pid_arr = np.asarray(tbl.column("point_id").chunks[-1])
-                    tail_start_in_chunk = int(np.searchsorted(pid_arr, pid_last, side="left"))
-                    n_chunks = tbl.column("point_id").num_chunks
-                    if n_chunks > 1:
-                        # leftover straddles the concat boundary; recompute on combined
-                        pid_arr_full = np.asarray(tbl.column("point_id").combine_chunks())
-                        tail_start = int(np.searchsorted(pid_arr_full, pid_last, side="left"))
-                    else:
-                        tail_start = tail_start_in_chunk
+                    # Scan backward from the end to find where the last pixel starts.
+                    # The parquet is sorted by pixel position (northing/easting), NOT by
+                    # point_id string, so searchsorted is incorrect here — use linear scan.
+                    pid_arr_full = np.asarray(tbl.column("point_id").combine_chunks())
+                    tail_start = len(pid_arr_full) - 1
+                    while tail_start > 0 and pid_arr_full[tail_start - 1] == pid_last:
+                        tail_start -= 1
                     if tail_start > 0:
                         pa_leftover = tbl.slice(tail_start)
                         tbl = tbl.slice(0, tail_start)
