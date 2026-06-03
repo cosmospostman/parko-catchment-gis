@@ -31,6 +31,7 @@ export default defineConfig({
       '/pmtiles': 'http://localhost:3000',
       '/sentinel2_tiles.geojson': 'http://localhost:3000',
       '/sentinel2_tile_labels.geojson': 'http://localhost:3000',
+      '/sentinel2_chunks.geojson': 'http://localhost:3000',
     },
   },
 });

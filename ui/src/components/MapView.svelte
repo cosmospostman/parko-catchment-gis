@@ -358,14 +358,34 @@
         },
         paint: { 'text-color': s2LabelColor, 'text-opacity': 0.8, 'text-halo-color': '#111', 'text-halo-width': 1 } });
       locationsStore.s2tilesReady = true;
-      try {
-        const chunks = await fetchJson('/api/chunk-boundaries');
-        map!.addSource('s2chunks', { type: 'geojson', data: chunks });
-        map!.addLayer({ id: 's2chunks-line', type: 'line', source: 's2chunks',
-          minzoom: 8,
-          layout: { visibility: vis },
-          paint: { 'line-color': s2Color, 'line-width': 1, 'line-opacity': 0.6, 'line-dasharray': [4, 3] } });
-      } catch (err) { console.error('Failed to load chunk boundaries:', err); }
+      const chunks = await fetchJson('/sentinel2_chunks.geojson');
+      map!.addSource('s2chunks', { type: 'geojson', data: chunks });
+      map!.addLayer({ id: 's2chunks-line', type: 'line', source: 's2chunks',
+        minzoom: 8,
+        layout: { visibility: vis },
+        paint: { 'line-color': s2Color, 'line-width': 1, 'line-opacity': 0.6, 'line-dasharray': [4, 3] } });
+
+      // Index centroid positions for fast nearest-tile lookup.
+      const centroids: { name: string; lng: number; lat: number }[] = labels.features.map((f: any) => ({
+        name: f.properties.name as string,
+        lng: f.geometry.coordinates[0] as number,
+        lat: f.geometry.coordinates[1] as number,
+      }));
+
+      function updateChunkFilter() {
+        if (!map!.getLayer('s2chunks-line')) return;
+        const centre = map!.getCenter();
+        let best = centroids[0];
+        let bestDist = Infinity;
+        for (const c of centroids) {
+          const d = (c.lng - centre.lng) ** 2 + (c.lat - centre.lat) ** 2;
+          if (d < bestDist) { bestDist = d; best = c; }
+        }
+        map!.setFilter('s2chunks-line', ['==', ['get', 'tile'], best.name]);
+      }
+
+      updateChunkFilter();
+      map!.on('moveend', updateChunkFilter);
     } catch (err) { console.error('Failed to load S2 tiles:', err); }
   }
 

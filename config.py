@@ -26,6 +26,7 @@ WORKING_DIR = Path(os.environ.get("WORKING_DIR", str(BASE_DIR / "working")))
 OUTPUTS_DIR = Path(os.environ.get("OUTPUTS_DIR", str(BASE_DIR / "outputs")))
 LOG_DIR = Path(os.environ.get("LOG_DIR", str(BASE_DIR / "logs")))
 CATCHMENT_GEOJSON = Path(os.environ.get("CATCHMENT_GEOJSON", str(BASE_DIR / "mitchell_catchment.geojson")))
+CHUNKSTORE_DIR = Path(os.environ.get("CHUNKSTORE_DIR", "/mnt/external/chunkstore"))
 CODE_DIR = Path(_require_env("CODE_DIR"))
 
 # ---------------------------------------------------------------------------

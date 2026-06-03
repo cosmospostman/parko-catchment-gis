@@ -1,4 +1,4 @@
-import type { FeatureCollection } from 'geojson';
+import type { FeatureCollection, Feature, Polygon } from 'geojson';
 import type { BBox } from './geo.ts';
 
 // ---------------------------------------------------------------------------
@@ -185,4 +185,93 @@ export function buildS2Grid(bbox: BBox, properties: Record<string, unknown> = {}
 export function emptyS2Grid(): S2GridData {
   const empty: FeatureCollection = { type: 'FeatureCollection', features: [] };
   return { gridLines: empty, pixelExtent: empty };
+}
+
+// ---------------------------------------------------------------------------
+// Build chunk grid GeoJSON from sentinel2_tiles.geojson.
+//
+// Each S2 COG tile is 10980 × 10980 px at 10 m.  Chunks are 1024 × 1024 px
+// (10240 m × 10240 m), starting from the tile's SW corner easting (x_left)
+// and N edge northing (y_top) — both derivable by projecting the tile polygon
+// corners to UTM and snapping to the nearest 10 m.
+//
+// The full grid is ceil(10980 / 1024) = 11 columns × 11 rows = up to 121
+// chunks per tile, each rendered as a Polygon ring in WGS84.
+// ---------------------------------------------------------------------------
+
+const CHUNK_PX   = 1024;
+const PIXEL_M    = 10;
+const CHUNK_M    = CHUNK_PX * PIXEL_M;   // 10240 m
+const TILE_PX    = 10980;
+const CHUNK_COLS = Math.ceil(TILE_PX / CHUNK_PX);  // 11
+const CHUNK_ROWS = Math.ceil(TILE_PX / CHUNK_PX);  // 11
+
+export function buildChunkGrid(tilesGeoJSON: FeatureCollection): FeatureCollection {
+  const features: Feature<Polygon>[] = [];
+
+  for (const feat of tilesGeoJSON.features) {
+    const geom = feat.geometry as any;
+    const name = (feat.properties as any)?.name as string | undefined;
+    if (!geom || !name) continue;
+
+    // Collect all ring coordinates (handle Polygon and MultiPolygon).
+    const rings: number[][][] =
+      geom.type === 'MultiPolygon'
+        ? (geom.coordinates as number[][][][]).flatMap((p: number[][][]) => p)
+        : (geom.coordinates as number[][][]);
+    const allCoords = rings.flat();
+    if (allCoords.length === 0) continue;
+
+    // Derive UTM zone from tile ID (first 1-2 digits).
+    const zoneMatch = name.match(/^(\d{1,2})/);
+    if (!zoneMatch) continue;
+    const zone = parseInt(zoneMatch[1], 10);
+
+    // Determine hemisphere from the MGRS band letter (3rd character of tile ID).
+    // Bands C–M are south of equator; N–X are north.
+    const band = name[2];
+    const isSouth = band >= 'C' && band <= 'M';
+
+    // Project all polygon vertices to UTM and find SW/NE extremes.
+    let minE = Infinity, maxE = -Infinity, minN = Infinity, maxN = -Infinity;
+    for (const [lng, lat] of allCoords) {
+      const { e, n } = toUtm(lng, lat, zone, isSouth);
+      if (e < minE) minE = e;
+      if (e > maxE) maxE = e;
+      if (n < minN) minN = n;
+      if (n > maxN) maxN = n;
+    }
+
+    // Snap to nearest 10 m — matches the COG transform exactly.
+    const xLeft = Math.round(minE / PIXEL_M) * PIXEL_M;
+    const yTop  = Math.round(maxN / PIXEL_M) * PIXEL_M;
+
+    // Emit one Polygon per chunk cell.
+    for (let row = 0; row < CHUNK_ROWS; row++) {
+      for (let col = 0; col < CHUNK_COLS; col++) {
+        const e0 = xLeft + col * CHUNK_M;
+        const e1 = e0 + CHUNK_M;
+        const n1 = yTop  - row * CHUNK_M;
+        const n0 = n1 - CHUNK_M;
+        const sw = fromUtm(e0, n0, zone, isSouth);
+        const se = fromUtm(e1, n0, zone, isSouth);
+        const ne = fromUtm(e1, n1, zone, isSouth);
+        const nw = fromUtm(e0, n1, zone, isSouth);
+        features.push({
+          type: 'Feature',
+          geometry: {
+            type: 'Polygon',
+            coordinates: [[
+              [sw.lng, sw.lat], [se.lng, se.lat],
+              [ne.lng, ne.lat], [nw.lng, nw.lat],
+              [sw.lng, sw.lat],
+            ]],
+          },
+          properties: { tile: name, chunk_row: row, chunk_col: col },
+        });
+      }
+    }
+  }
+
+  return { type: 'FeatureCollection', features };
 }

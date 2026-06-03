@@ -24,9 +24,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
+
+_CHUNKSTORE_DEFAULT = os.environ.get("CHUNKSTORE_DIR", "/mnt/external/chunkstore")
 
 import pyarrow.parquet as pq
 
@@ -117,7 +120,7 @@ def build_manifest(root: Path) -> list[dict]:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root", default="/mnt/external/chunkstore")
+    parser.add_argument("--root", default=_CHUNKSTORE_DEFAULT)
     args = parser.parse_args()
     manifest = build_manifest(Path(args.root))
     print(json.dumps(manifest))

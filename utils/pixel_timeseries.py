@@ -36,11 +36,15 @@ import json
 import sys
 from pathlib import Path
 
+import os
+
 import numpy as np
 import pyarrow.compute as pc
 
 # Allow running from repo root without installing the package.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+_CHUNKSTORE_DEFAULT = os.environ.get("CHUNKSTORE_DIR", "/mnt/external/chunkstore")
 
 from utils.pixel_reader import ChunkIndex
 
@@ -121,7 +125,7 @@ def compute_timeseries(
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--root",  default="/mnt/external/chunkstore")
+    ap.add_argument("--root",  default=_CHUNKSTORE_DEFAULT)
     ap.add_argument("--year",  type=int, required=True)
     ap.add_argument("--tile",  required=True)
     ap.add_argument("--bbox",  required=True,

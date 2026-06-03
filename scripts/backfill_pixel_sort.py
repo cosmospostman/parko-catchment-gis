@@ -18,10 +18,13 @@ Usage:
 """
 
 import argparse
+import os
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+_CHUNKSTORE_DEFAULT = os.environ.get("CHUNKSTORE_DIR", "/mnt/external/chunkstore")
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -261,7 +264,7 @@ def backfill(strips_dir: Path, *, dry_run: bool = False) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--dir", default="/mnt/external/chunkstore/mitchell/2025/54LWH",
+    parser.add_argument("--dir", default=str(Path(_CHUNKSTORE_DEFAULT) / "mitchell/2025/54LWH"),
                         help="Directory containing strip parquets (default: %(default)s)")
     parser.add_argument("--dry-run", action="store_true")
     # Internal: called by _sort_shards to sort a single shard in isolation

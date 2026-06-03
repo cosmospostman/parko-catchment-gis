@@ -6,12 +6,13 @@ All tests are skipped automatically if the mount is absent.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pyarrow.compute as pc
 import pytest
 
-CHUNKS_ROOT = Path("/mnt/external/chunkstore")
+CHUNKS_ROOT = Path(os.environ.get("CHUNKSTORE_DIR", "/mnt/external/chunkstore"))
 YEAR = 2025
 TILE_ID = "54LWH"
 
