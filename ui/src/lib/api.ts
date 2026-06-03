@@ -74,12 +74,47 @@ export async function fetchHeuristicRegions(): Promise<HeuristicRegion[]> {
   return r.json();
 }
 
-export async function fetchChunkCoverage(coords: [number, number, number, number]): Promise<number[]> {
+export interface ChunkCoverage {
+  years: number[];
+  tiles: Record<number, string[]>;
+}
+
+export async function fetchChunkCoverage(coords: [number, number, number, number]): Promise<ChunkCoverage> {
   const bbox = coords.join(',');
   const r = await fetch(`/api/chunk-coverage?bbox=${bbox}`);
-  if (!r.ok) return [];
-  const data = await r.json() as { years: number[] };
-  return data.years ?? [];
+  if (!r.ok) return { years: [], tiles: {} };
+  const data = await r.json() as ChunkCoverage;
+  return { years: data.years ?? [], tiles: data.tiles ?? {} };
+}
+
+export interface TimeseriesPoint {
+  date: string;
+  ndvi: number | null;
+  ndvi_p25: number | null;
+  ndvi_p75: number | null;
+  mavi: number | null;
+  mavi_p25: number | null;
+  mavi_p75: number | null;
+  vh_vv: number | null;
+  vh_vv_p25: number | null;
+  vh_vv_p75: number | null;
+}
+
+export interface PixelTimeseries {
+  year: number;
+  tile: string;
+  series: TimeseriesPoint[];
+}
+
+export async function fetchPixelTimeseries(
+  coords: [number, number, number, number],
+  year: number,
+  tile: string,
+): Promise<PixelTimeseries | null> {
+  const bbox = coords.join(',');
+  const r = await fetch(`/api/pixel-timeseries?bbox=${bbox}&year=${year}&tile=${encodeURIComponent(tile)}`);
+  if (!r.ok) return null;
+  return r.json() as Promise<PixelTimeseries>;
 }
 
 export async function fetchImageryInfo(x: number, y: number, layer: string, zoom: number): Promise<ImageryInfo> {

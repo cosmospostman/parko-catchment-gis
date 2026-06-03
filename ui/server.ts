@@ -20,10 +20,13 @@ const VENV_PYTHON = join(__dirname, "..", ".venv", "bin", "python3");
 interface ChunkExtent {
   year: number;
   tile: string;
+  chunk_row: number;
+  chunk_col: number;
   lon_min: number;
   lon_max: number;
   lat_min: number;
   lat_max: number;
+  ring?: [number, number][];  // 5-point UTM-snapped WGS84 polygon ring
 }
 
 let chunkIndex: ChunkExtent[] = [];
@@ -603,14 +606,67 @@ async function handler(req: Request): Promise<Response> {
     }
     const [lon_min, lat_min, lon_max, lat_max] = parts;
     const yearSet = new Set<number>();
+    const tilesMap: Record<number, string[]> = {};
     for (const c of chunkIndex) {
       if (c.lon_min <= lon_max && c.lon_max >= lon_min && c.lat_min <= lat_max && c.lat_max >= lat_min) {
         yearSet.add(c.year);
+        if (!tilesMap[c.year]) tilesMap[c.year] = [];
+        if (!tilesMap[c.year].includes(c.tile)) tilesMap[c.year].push(c.tile);
       }
     }
-    return new Response(JSON.stringify({ years: [...yearSet].sort() }), {
+    return new Response(JSON.stringify({ years: [...yearSet].sort(), tiles: tilesMap }), {
       headers: { "content-type": "application/json", "cache-control": "no-store" },
     });
+  }
+
+  if (url.pathname === "/api/chunk-boundaries") {
+    const features: GeoJSON.Feature[] = chunkIndex.map(c => ({
+      type: "Feature",
+      geometry: c.ring
+        ? { type: "Polygon", coordinates: [c.ring] }
+        : bboxToPolygon([c.lon_min, c.lat_min, c.lon_max, c.lat_max]),
+      properties: { year: c.year, tile: c.tile, chunk_row: c.chunk_row, chunk_col: c.chunk_col },
+    }));
+    const fc: GeoJSON.FeatureCollection = { type: "FeatureCollection", features };
+    return new Response(JSON.stringify(fc), {
+      headers: { "content-type": "application/json", "cache-control": "no-store" },
+    });
+  }
+
+  if (url.pathname === "/api/pixel-timeseries") {
+    const b = url.searchParams.get("bbox");
+    const yearStr = url.searchParams.get("year");
+    const tile = url.searchParams.get("tile");
+    if (!b || !yearStr || !tile) {
+      return new Response(JSON.stringify({ error: "bbox, year and tile required" }), { status: 400, headers: { "content-type": "application/json" } });
+    }
+    const parts = b.split(",").map(Number);
+    if (parts.length !== 4 || parts.some(isNaN)) {
+      return new Response(JSON.stringify({ error: "bbox must be lon_min,lat_min,lon_max,lat_max" }), { status: 400, headers: { "content-type": "application/json" } });
+    }
+    const year = parseInt(yearStr, 10);
+    if (isNaN(year)) {
+      return new Response(JSON.stringify({ error: "year must be an integer" }), { status: 400, headers: { "content-type": "application/json" } });
+    }
+    try {
+      const script = join(__dirname, "..", "utils", "pixel_timeseries.py");
+      const cmd = new Deno.Command(VENV_PYTHON, {
+        args: [script, "--root", CHUNKS_ROOT, "--year", String(year), "--tile", tile, "--bbox", b],
+        cwd: join(__dirname, ".."),
+        stdout: "piped",
+        stderr: "inherit",
+      });
+      const { success, stdout } = await cmd.output();
+      if (!success) {
+        return new Response(JSON.stringify({ error: "pixel_timeseries.py failed" }), { status: 500, headers: { "content-type": "application/json" } });
+      }
+      return new Response(stdout, {
+        headers: { "content-type": "application/json", "cache-control": "no-store" },
+      });
+    } catch (err) {
+      console.error("pixel-timeseries error:", err);
+      return new Response(JSON.stringify({ error: "internal error" }), { status: 500, headers: { "content-type": "application/json" } });
+    }
   }
 
   if (url.pathname === "/api/rankings") {

@@ -13,7 +13,9 @@
     "vite": "npm:vite@^5",
     "@sveltejs/vite-plugin-svelte": "npm:@sveltejs/vite-plugin-svelte@^4",
     "maplibre-gl": "npm:maplibre-gl@^5",
-    "pmtiles": "npm:pmtiles@^3"
+    "pmtiles": "npm:pmtiles@^3",
+    "d3-scale": "npm:d3-scale@4",
+    "d3-shape": "npm:d3-shape@3"
   },
   "tasks": {
     "dev": "deno run -A npm:vite --config vite.config.ts --host",

@@ -1,8 +1,10 @@
 <script lang="ts">
   import MapCard from '../shared/MapCard.svelte';
+  import SparkLine from '../shared/SparkLine.svelte';
   import { mapMode } from '../../stores/mapMode.svelte.ts';
   import { bbox as bboxStore } from '../../stores/bbox.svelte.ts';
-  import { fetchChunkCoverage } from '../../lib/api.ts';
+  import { fetchChunkCoverage, fetchPixelTimeseries } from '../../lib/api.ts';
+  import type { PixelTimeseries } from '../../lib/api.ts';
 
   interface Props {
     onclose: () => void;
@@ -11,7 +13,10 @@
 
   let copied = $state(false);
   let coverageYears = $state<number[] | null>(null);
+  let coverageTiles = $state<Record<number, string[]>>({});
   let inspecting = $state(false);
+  let timeseriesData = $state<PixelTimeseries[] | null>(null);
+  let timeseriesLoading = $state(false);
 
   $effect(() => {
     mapMode.current = 'bbox';
@@ -20,8 +25,38 @@
 
   $effect(() => {
     const coords = bboxStore.coords;
-    if (!coords) { coverageYears = null; inspecting = false; return; }
-    fetchChunkCoverage(coords).then(years => { coverageYears = years; });
+    if (!coords) {
+      coverageYears = null;
+      coverageTiles = {};
+      inspecting = false;
+      timeseriesData = null;
+      return;
+    }
+    fetchChunkCoverage(coords).then(cov => {
+      coverageYears = cov.years;
+      coverageTiles = cov.tiles;
+    });
+  });
+
+  $effect(() => {
+    const coords = bboxStore.coords;
+    if (!inspecting || !coords || !coverageYears || coverageYears.length === 0) {
+      if (!inspecting) timeseriesData = null;
+      return;
+    }
+    timeseriesLoading = true;
+    timeseriesData = null;
+    Promise.all(
+      coverageYears.map(year => {
+        const tiles = coverageTiles[year] ?? [];
+        const tile = tiles[0];
+        if (!tile) return Promise.resolve(null);
+        return fetchPixelTimeseries(coords, year, tile);
+      })
+    ).then(results => {
+      timeseriesData = results.filter((r): r is PixelTimeseries => r !== null);
+      timeseriesLoading = false;
+    });
   });
 
   async function copyToClipboard() {
@@ -46,6 +81,9 @@
     bboxStore.visible = false;
     bboxStore.coords = null;
     inspecting = false;
+    timeseriesData = null;
+    coverageYears = null;
+    coverageTiles = {};
   }
 </script>
 
@@ -82,6 +120,33 @@
             {/each}
           {/if}
         </div>
+
+        {#if timeseriesLoading}
+          <div class="ts-loading">loading timeseries…</div>
+        {:else if timeseriesData !== null}
+          {#each timeseriesData as ts}
+            <div class="ts-year-block">
+              <SparkLine
+                label="NDVI"
+                color="#86efac"
+                refBand={[0.25, 0.65]}
+                data={ts.series.map(s => ({ date: s.date, value: s.ndvi, p25: s.ndvi_p25, p75: s.ndvi_p75 }))}
+              />
+              <SparkLine
+                label="MAVI"
+                color="#67e8f9"
+                refBand={[0.10, 0.45]}
+                data={ts.series.map(s => ({ date: s.date, value: s.mavi, p25: s.mavi_p25, p75: s.mavi_p75 }))}
+              />
+              <SparkLine
+                label="VH/VV (dB)"
+                color="#fcd34d"
+                refBand={[-7.0, -3.0]}
+                data={ts.series.map(s => ({ date: s.date, value: s.vh_vv, p25: s.vh_vv_p25, p75: s.vh_vv_p75 }))}
+              />
+            </div>
+          {/each}
+        {/if}
       </div>
     {/if}
   </div>
@@ -197,4 +262,20 @@
 
   .coverage-none { font-size: 11px; color: #555; font-style: italic; }
   .coverage-checking { font-size: 11px; color: #444; font-style: italic; }
+
+  .ts-loading {
+    font-size: 11px;
+    color: #444;
+    font-style: italic;
+    margin-top: 6px;
+  }
+
+  .ts-year-block {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid #2a2a2a;
+  }
 </style>

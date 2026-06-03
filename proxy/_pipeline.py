@@ -97,6 +97,7 @@ def merge_scenes(
     scene_paths: list[Path],
     s1_path: Path | None,
     out_path: Path,
+    chunk_metadata: dict[str, str] | None = None,
 ) -> None:
     """K-way merge of pre-northing-sorted per-scene parquets (+ optional S1).
 
@@ -142,6 +143,8 @@ def merge_scenes(
     tmp_path.unlink(missing_ok=True)
 
     schema = COMBINED_PIXEL_SCHEMA
+    if chunk_metadata:
+        schema = schema.with_metadata({k.encode(): v.encode() for k, v in chunk_metadata.items()})
     writer = pq.ParquetWriter(
         str(tmp_path), schema,
         compression="zstd",
@@ -738,7 +741,17 @@ def run_tile_pipeline_v2(
         ccol = work.chunk["chunk_col"]
         scene_dir = tmp / f"chunk_{crow:02d}_{ccol:02d}_scenes"
         chunk_out = tmp / f"chunk_{crow:02d}_{ccol:02d}_sorted.parquet"
-        merge_scenes(work.scene_paths, work.s1_path, chunk_out)
+        _meta: dict[str, str] = {
+            "chunk_row": str(crow),
+            "chunk_col": str(ccol),
+        }
+        if cog_utm_crs is not None:
+            _meta["cog_utm_crs"] = cog_utm_crs
+        if cog_y_top is not None:
+            _meta["cog_y_top"] = str(cog_y_top)
+        if cog_x_left is not None:
+            _meta["cog_x_left"] = str(cog_x_left)
+        merge_scenes(work.scene_paths, work.s1_path, chunk_out, chunk_metadata=_meta)
         shutil.rmtree(scene_dir, ignore_errors=True)
         logger.info("[v2 tile %s %d] [chunk %02d_%02d] ready → %s",
                     tile_id, year, crow, ccol, chunk_out.name)

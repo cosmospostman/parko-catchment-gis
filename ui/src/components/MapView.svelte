@@ -206,7 +206,7 @@
   $effect(() => {
     if (!map || !locationsStore.s2tilesReady) return;
     const vis = layerVisibility.s2tiles ? 'visible' : 'none';
-    for (const id of ['s2tiles-fill', 's2tiles-line', 's2tiles-label']) {
+    for (const id of ['s2tiles-fill', 's2tiles-line', 's2tiles-label', 's2chunks-line']) {
       if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', vis);
     }
   });
@@ -358,6 +358,14 @@
         },
         paint: { 'text-color': s2LabelColor, 'text-opacity': 0.8, 'text-halo-color': '#111', 'text-halo-width': 1 } });
       locationsStore.s2tilesReady = true;
+      try {
+        const chunks = await fetchJson('/api/chunk-boundaries');
+        map!.addSource('s2chunks', { type: 'geojson', data: chunks });
+        map!.addLayer({ id: 's2chunks-line', type: 'line', source: 's2chunks',
+          minzoom: 8,
+          layout: { visibility: vis },
+          paint: { 'line-color': s2Color, 'line-width': 1, 'line-opacity': 0.6, 'line-dasharray': [4, 3] } });
+      } catch (err) { console.error('Failed to load chunk boundaries:', err); }
     } catch (err) { console.error('Failed to load S2 tiles:', err); }
   }
 
