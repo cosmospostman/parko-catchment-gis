@@ -74,6 +74,14 @@ export async function fetchHeuristicRegions(): Promise<HeuristicRegion[]> {
   return r.json();
 }
 
+export async function fetchChunkCoverage(coords: [number, number, number, number]): Promise<number[]> {
+  const bbox = coords.join(',');
+  const r = await fetch(`/api/chunk-coverage?bbox=${bbox}`);
+  if (!r.ok) return [];
+  const data = await r.json() as { years: number[] };
+  return data.years ?? [];
+}
+
 export async function fetchImageryInfo(x: number, y: number, layer: string, zoom: number): Promise<ImageryInfo> {
   const r = await fetch(`/api/imagery-date?x=${x}&y=${y}&layer=${layer}&zoom=${zoom}`);
   if (!r.ok) throw new Error(`HTTP ${r.status}`);

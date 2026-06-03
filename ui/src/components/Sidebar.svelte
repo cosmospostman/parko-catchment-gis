@@ -31,6 +31,21 @@
     <LocationsList />
   </div>
   <div class="bottom-panels">
+    <div class="tools-section">
+      <div class="section-label">Tools</div>
+      <div class="tools-row">
+        <button
+          class="icon-btn"
+          class:active={bboxOpen}
+          title="BBox tool"
+          type="button"
+          onclick={() => { bboxOpen = !bboxOpen; }}
+          aria-label="Toggle BBox tool"
+        >
+          <i class="ph ph-selection-plus"></i>
+        </button>
+      </div>
+    </div>
     <ImageryInfo {onLayerChange} bind:bboxOpen />
   </div>
 </aside>
@@ -87,4 +102,45 @@
 
   .sidebar-row:hover { background: #2e2e2e; }
   .sidebar-row.active { color: var(--primary-accent); }
+
+  .tools-section {
+    border-top: 1px solid #333;
+    padding: 10px 16px;
+  }
+
+  .section-label {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: #555;
+    margin-bottom: 8px;
+  }
+
+  .tools-row {
+    display: flex;
+    gap: 6px;
+  }
+
+  .icon-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    flex-shrink: 0;
+    background: none;
+    border: 1px solid #444;
+    border-radius: 4px;
+    color: #666;
+    font-size: 15px;
+    cursor: pointer;
+    transition: background 0.1s, color 0.1s, border-color 0.1s;
+  }
+  .icon-btn:hover { border-color: #666; color: #aaa; }
+  .icon-btn.active {
+    background: var(--primary-dark);
+    border-color: var(--primary-border);
+    color: var(--primary-accent);
+  }
 </style>

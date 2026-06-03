@@ -383,7 +383,15 @@
     const src = map?.getSource('drawn-bbox') as any;
     src?.setData({ type: 'FeatureCollection', features: [] });
     bboxStore.visible = false;
+    bboxStore.coords = null;
   }
+
+  $effect(() => {
+    if (!bboxStore.visible && map) {
+      const src = map.getSource('drawn-bbox') as any;
+      src?.setData({ type: 'FeatureCollection', features: [] });
+    }
+  });
 
   $effect(() => {
     if (!map) return;
@@ -395,6 +403,7 @@
       drawStart = { lng: e.lngLat.lng, lat: e.lngLat.lat };
       isDrawing = true;
       bboxStore.visible = false;
+      bboxStore.coords = null;
       (m.getSource('drawn-bbox') as any)?.setData({ type: 'FeatureCollection', features: [] });
       m.dragPan.disable();
     };
@@ -404,6 +413,7 @@
       (m.getSource('drawn-bbox') as any)?.setData({ type: 'FeatureCollection', features: [bboxToFeature(b)] });
       bboxStore.yaml = bboxToYaml(b);
       bboxStore.pixelCount = bboxPixelCount(b);
+      bboxStore.coords = b;
       bboxStore.visible = true;
     };
     const onMouseup = (e: MapMouseEvent) => {
@@ -414,6 +424,7 @@
       (m.getSource('drawn-bbox') as any)?.setData({ type: 'FeatureCollection', features: [bboxToFeature(b)] });
       bboxStore.yaml = bboxToYaml(b);
       bboxStore.pixelCount = bboxPixelCount(b);
+      bboxStore.coords = b;
       bboxStore.visible = true;
       drawStart = null;
     };

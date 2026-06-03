@@ -437,6 +437,7 @@ def run_tile_pipeline_v2(
     max_concurrent: int = 64,
     n_workers: int | None = None,
     resume_from_chunk: tuple[int, int] = (0, 0),
+    skip_chunks: set[tuple[int, int]] | None = None,
     items=None,
     calibration_out: Path | None = None,
     point_id_prefix: str = "px",
@@ -535,11 +536,20 @@ def run_tile_pipeline_v2(
     if not chunks:
         return
 
-    active_chunks = [c for c in chunks if (c["chunk_row"], c["chunk_col"]) >= resume_from_chunk]
+    _skip = skip_chunks or set()
+    active_chunks = [
+        c for c in chunks
+        if (c["chunk_row"], c["chunk_col"]) >= resume_from_chunk
+        and (c["chunk_row"], c["chunk_col"]) not in _skip
+    ]
     for c in chunks:
-        if (c["chunk_row"], c["chunk_col"]) < resume_from_chunk:
+        key = (c["chunk_row"], c["chunk_col"])
+        if key < resume_from_chunk:
             logger.info("[v2 tile %s %d] [chunk %02d_%02d] skipping (resume_from_chunk=%s)",
                         tile_id, year, c["chunk_row"], c["chunk_col"], resume_from_chunk)
+        elif key in _skip:
+            logger.info("[v2 tile %s %d] [chunk %02d_%02d] skipping (already exists)",
+                        tile_id, year, c["chunk_row"], c["chunk_col"])
 
     if not active_chunks:
         return

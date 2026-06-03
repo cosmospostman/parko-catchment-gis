@@ -1,6 +1,6 @@
 Score:
 
-python3 -m tam.pipeline sco`re \
+python3 -m tam.pipeline score \
   --checkpoint outputs/models/tam-v10-0530 \
   --location mitchell \
   --pixel-dir /mnt/external/mitchell \

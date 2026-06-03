@@ -563,13 +563,14 @@ def _preprocess(
     global_feat_mean: np.ndarray | None = None,
     global_feat_std: np.ndarray | None = None,
     n_global_features: int = 0,
-) -> list[_PreparedBatch]:
+) -> tuple[list[_PreparedBatch], int]:
     """CPU-side preprocessing using numba kernels for maximum throughput.
 
     Receives pre-extracted numpy arrays (_RawChunk built in the parser thread) so
     all Polars GIL-holding work is already done; only numba/numpy runs here.
 
-    Returns a list of _PreparedBatch objects, each at most batch_size windows.
+    Returns (batches, n_input_px) where n_input_px is the total pixel-windows seen
+    before min_obs filtering (used for progress tracking).
     """
     from tam.core._preprocess_numba import (
         fill_windows,
@@ -601,8 +602,10 @@ def _preprocess(
     else:
         valid = lengths >= min_obs_per_year
 
+    n_windows = len(boundaries)
+
     if not valid.any():
-        return []
+        return [], n_windows
 
     valid_starts  = boundaries[valid]          # already int64
     valid_lengths = lengths[valid]
@@ -731,7 +734,7 @@ def _preprocess(
             b_mask  = b_mask.pin_memory()
             b_nobs  = b_nobs.pin_memory()
         batches.append(_PreparedBatch(b_bands, b_doy, b_mask, b_nobs, pids[s:e], years[s:e], b_is_s1, b_gf))
-    return batches
+    return batches, n_windows
 
 
 def _compute_s2_pixel_zscore_stats(
@@ -1318,6 +1321,9 @@ def score_pixels_chunked(
     io_q:   Queue = Queue(maxsize=n_io_prefetch)
     raw_q:  Queue = Queue(maxsize=n_prep_workers * 4)
     prep_q: Queue = Queue(maxsize=n_prep_workers * 8)
+    # seen_q: preprocessors → main thread; each item is an int (pixel-windows seen before
+    # min_obs filtering).  Unbounded — items are tiny and the main thread drains it often.
+    seen_q: Queue = Queue()
     # Stage 3→4: scored chunks (only used when out_writer is set)
     out_q: Queue = Queue(maxsize=8)
 
@@ -1500,16 +1506,17 @@ def score_pixels_chunked(
                     raw = item
                 if raw is None:
                     continue
-                batches = _preprocess(raw, band_mean, band_std, min_obs_per_year, pin=pin,
-                                      mixed=mixed,
-                                      pixel_zscore=pixel_zscore,
-                                      pixel_zscore_stats=pixel_zscore_stats,
-                                      s1_zscore_stats=s1_zscore_stats,
-                                      max_seq_len=getattr(model, "_max_seq_len", MAX_SEQ_LEN),
-                                      batch_size=batch_size,
-                                      global_feat_mean=global_feat_mean,
-                                      global_feat_std=global_feat_std,
-                                      n_global_features=model.n_global_features)
+                batches, n_in = _preprocess(raw, band_mean, band_std, min_obs_per_year, pin=pin,
+                                            mixed=mixed,
+                                            pixel_zscore=pixel_zscore,
+                                            pixel_zscore_stats=pixel_zscore_stats,
+                                            s1_zscore_stats=s1_zscore_stats,
+                                            max_seq_len=getattr(model, "_max_seq_len", MAX_SEQ_LEN),
+                                            batch_size=batch_size,
+                                            global_feat_mean=global_feat_mean,
+                                            global_feat_std=global_feat_std,
+                                            n_global_features=model.n_global_features)
+                seen_q.put(n_in)
                 for b in batches:
                     prep_q.put(b)
         except Exception:
@@ -1572,6 +1579,7 @@ def score_pixels_chunked(
     all_probs: list[np.ndarray] = _all_probs if _all_probs is not None else []
     sentinels_seen = 0
     n_scored = 0
+    n_seen   = 0   # all pixels that entered _preprocess (scored + filtered by min_obs)
     n_last_logged = 0
     n_total_gate_cut = 0
     import time as _time
@@ -1780,8 +1788,14 @@ def score_pixels_chunked(
         _t_xfer_wait_total += _time.monotonic() - _tx
 
     def _collect_results() -> None:
-        """Drain result_q non-blocking; update n_scored and log progress."""
-        nonlocal n_scored, n_total_gate_cut, n_last_logged, _t_last_logged
+        """Drain result_q and seen_q non-blocking; update n_scored/n_seen and log progress."""
+        nonlocal n_scored, n_seen, n_total_gate_cut, n_last_logged, _t_last_logged
+        # Drain seen_q first — preprocessors emit input counts independently of GPU results.
+        while True:
+            try:
+                n_seen += seen_q.get_nowait()
+            except _queue.Empty:
+                break
         while True:
             try:
                 res = result_q.get_nowait()
@@ -1796,27 +1810,29 @@ def score_pixels_chunked(
             else:
                 all_pids.append(chunk[0]); all_years.append(chunk[1]); all_probs.append(chunk[2])
             n_scored += px_count
-            if n_scored - n_last_logged >= progress_log_interval:
-                _t_now = _time.monotonic()
-                dt_interval = _t_now - _t_last_logged
-                rate = (n_scored - n_last_logged) / dt_interval if dt_interval > 0 else 0.0
-                if n_total_pixels:
-                    global_scored = n_pixels_before + n_scored
-                    global_total  = n_pixels_before + n_total_pixels
-                    logger.info(
-                        "[%s] %.1f%% of %s px (%s px/s)",
-                        tile_id or "?",
-                        100.0 * global_scored / global_total,
-                        f"{global_total:,}", f"{rate:,.0f}",
-                    )
-                else:
-                    logger.info(
-                        "[%s] %s px scored (%s px/s)",
-                        tile_id or "?",
-                        f"{n_scored:,}", f"{rate:,.0f}",
-                    )
-                n_last_logged = n_scored
-                _t_last_logged = _t_now
+        # Progress uses n_seen (all pixels that passed geometry/date filters) so the bar
+        # reaches 100% even when many pixels are dropped by min_obs_per_year.
+        if n_seen - n_last_logged >= progress_log_interval:
+            _t_now = _time.monotonic()
+            dt_interval = _t_now - _t_last_logged
+            rate = (n_seen - n_last_logged) / dt_interval if dt_interval > 0 else 0.0
+            if n_total_pixels:
+                global_seen  = n_pixels_before + n_seen
+                global_total = n_pixels_before + n_total_pixels
+                logger.info(
+                    "[%s] %.1f%% of %s px (%s px/s)",
+                    tile_id or "?",
+                    100.0 * global_seen / global_total,
+                    f"{global_total:,}", f"{rate:,.0f}",
+                )
+            else:
+                logger.info(
+                    "[%s] %s px seen (%s px/s)",
+                    tile_id or "?",
+                    f"{n_seen:,}", f"{rate:,.0f}",
+                )
+            n_last_logged = n_seen
+            _t_last_logged = _t_now
 
     def _drain_and_join_threads() -> None:
         """Poison all queues so blocked worker threads unblock, then join them."""
@@ -1880,26 +1896,32 @@ def score_pixels_chunked(
             else:
                 all_pids.append(chunk[0]); all_years.append(chunk[1]); all_probs.append(chunk[2])
             n_scored += px_count
-            if n_scored - n_last_logged >= progress_log_interval:
+            # Drain any remaining seen_q items (preprocessors may have finished ahead of GPU).
+            while True:
+                try:
+                    n_seen += seen_q.get_nowait()
+                except _queue.Empty:
+                    break
+            if n_seen - n_last_logged >= progress_log_interval:
                 _t_now = _time.monotonic()
                 dt_interval = _t_now - _t_last_logged
-                rate = (n_scored - n_last_logged) / dt_interval if dt_interval > 0 else 0.0
+                rate = (n_seen - n_last_logged) / dt_interval if dt_interval > 0 else 0.0
                 if n_total_pixels:
-                    global_scored = n_pixels_before + n_scored
-                    global_total  = n_pixels_before + n_total_pixels
+                    global_seen  = n_pixels_before + n_seen
+                    global_total = n_pixels_before + n_total_pixels
                     logger.info(
                         "[%s] %.1f%% (%s/%s px) @ %s px/s",
                         tile_id or "?",
-                        100.0 * global_scored / global_total,
-                        f"{global_scored:,}", f"{global_total:,}", f"{rate:,.0f}",
+                        100.0 * global_seen / global_total,
+                        f"{global_seen:,}", f"{global_total:,}", f"{rate:,.0f}",
                     )
                 else:
                     logger.info(
-                        "[%s] %s px scored @ %s px/s",
+                        "[%s] %s px seen @ %s px/s",
                         tile_id or "?",
-                        f"{n_scored:,}", f"{rate:,.0f}",
+                        f"{n_seen:,}", f"{rate:,.0f}",
                     )
-                n_last_logged = n_scored
+                n_last_logged = n_seen
                 _t_last_logged = _t_now
 
         xfer_thread.join()

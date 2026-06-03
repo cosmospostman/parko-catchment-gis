@@ -10,6 +10,44 @@ const LOCATIONS_DIR = join(__dirname, "..", "data", "locations");
 const WMS_CACHE_DIR = join(__dirname, "..", "data", "cache", "wms");
 const SCORES_DIR    = join(__dirname, "..", "outputs", "scores");
 const PORT = Number(Deno.env.get("PORT") ?? 3000);
+const CHUNKS_ROOT = Deno.env.get("CHUNKS_ROOT") ?? "/mnt/external/mitchell";
+const VENV_PYTHON = join(__dirname, "..", ".venv", "bin", "python3");
+
+// ---------------------------------------------------------------------------
+// Chunk coverage index (loaded once at startup from parquet footers via Python)
+// ---------------------------------------------------------------------------
+
+interface ChunkExtent {
+  year: number;
+  tile: string;
+  lon_min: number;
+  lon_max: number;
+  lat_min: number;
+  lat_max: number;
+}
+
+let chunkIndex: ChunkExtent[] = [];
+
+async function loadChunkIndex(): Promise<void> {
+  try {
+    const script = join(__dirname, "..", "utils", "chunk_coverage.py");
+    const cmd = new Deno.Command(VENV_PYTHON, {
+      args: [script, "--root", CHUNKS_ROOT],
+      cwd: join(__dirname, ".."),
+      stdout: "piped",
+      stderr: "inherit",
+    });
+    const { success, stdout } = await cmd.output();
+    if (!success) { console.warn("chunk_coverage.py failed — coverage API will return empty"); return; }
+    chunkIndex = JSON.parse(new TextDecoder().decode(stdout));
+    console.log(`Chunk index loaded: ${chunkIndex.length} chunks across ${new Set(chunkIndex.map(c => c.year)).size} year(s)`);
+  } catch (err) {
+    console.warn("Failed to load chunk index:", err);
+  }
+}
+
+// Fire and forget — server starts immediately, index populates in background.
+loadChunkIndex();
 
 ensureDirSync(WMS_CACHE_DIR);
 
@@ -556,6 +594,25 @@ async function handler(req: Request): Promise<Response> {
     return handleImageryDate(req);
   }
 
+  if (url.pathname === "/api/chunk-coverage") {
+    const b = url.searchParams.get("bbox");
+    if (!b) return new Response(JSON.stringify({ error: "bbox required" }), { status: 400, headers: { "content-type": "application/json" } });
+    const parts = b.split(",").map(Number);
+    if (parts.length !== 4 || parts.some(isNaN)) {
+      return new Response(JSON.stringify({ error: "bbox must be lon_min,lat_min,lon_max,lat_max" }), { status: 400, headers: { "content-type": "application/json" } });
+    }
+    const [lon_min, lat_min, lon_max, lat_max] = parts;
+    const yearSet = new Set<number>();
+    for (const c of chunkIndex) {
+      if (c.lon_min <= lon_max && c.lon_max >= lon_min && c.lat_min <= lat_max && c.lat_max >= lat_min) {
+        yearSet.add(c.year);
+      }
+    }
+    return new Response(JSON.stringify({ years: [...yearSet].sort() }), {
+      headers: { "content-type": "application/json", "cache-control": "no-store" },
+    });
+  }
+
   if (url.pathname === "/api/rankings") {
     return new Response(JSON.stringify(listRankings()), {
       headers: { "content-type": "application/json", "cache-control": "no-store" },
@@ -586,6 +643,13 @@ async function handler(req: Request): Promise<Response> {
     try {
       const file = await Deno.open(filePath, { read: true });
       const stat = await file.stat();
+      const etag = `"${stat.mtime?.getTime() ?? 0}-${stat.size}"`;
+      const ifNoneMatch = req.headers.get("if-none-match");
+      if (ifNoneMatch === etag) {
+        file.close();
+        return new Response(null, { status: 304, headers: { "etag": etag, "access-control-allow-origin": "*" } });
+      }
+      const cacheHeaders = { "cache-control": "public, max-age=0, must-revalidate", "etag": etag };
       const rangeHeader = req.headers.get("range");
       if (rangeHeader) {
         const match = rangeHeader.match(/bytes=(\d+)-(\d+)/);
@@ -611,8 +675,8 @@ async function handler(req: Request): Promise<Response> {
             "content-type": "application/octet-stream",
             "content-range": `bytes ${start}-${end}/${stat.size}`,
             "accept-ranges": "bytes",
-            "cache-control": "public, max-age=3600",
             "access-control-allow-origin": "*",
+            ...cacheHeaders,
           },
         });
       } else {
@@ -629,8 +693,8 @@ async function handler(req: Request): Promise<Response> {
           headers: {
             "content-type": "application/octet-stream",
             "accept-ranges": "bytes",
-            "cache-control": "public, max-age=3600",
             "access-control-allow-origin": "*",
+            ...cacheHeaders,
           },
         });
       }

@@ -9,7 +9,9 @@ Output layout:
   out_dir/<year>/<tile_id>/.done                                     — sentinel when all chunks complete
 
 Chunk-level resume: existing <tile_id>_r??_c??.parquet files in the tile dir are
-included automatically; processing resumes from the chunk after the last complete one.
+skipped individually; the pipeline fetches only chunks whose output file does not
+yet exist.  This handles non-contiguous gaps (e.g. a middle row that failed while
+later rows completed).
 
 Tile-level resume: if the .done sentinel exists the function returns immediately.
 """
@@ -96,16 +98,15 @@ def fetch_tile_local(
     for p in _work_root.glob(f"{tile_id}_r??_c??.tmp"):
         p.unlink(missing_ok=True)
 
-    # Determine resume point from existing chunk files.
-    # Resume from the chunk after the last completed one (row-major order).
+    # Collect existing complete chunks; the pipeline will skip any whose dest
+    # already exists, allowing non-contiguous gaps to be filled without re-fetching
+    # chunks that completed in a prior run.
     complete_chunks = sorted(tile_dir.glob(f"{tile_id}_r??_c??.parquet"),
                              key=lambda p: _chunk_key(p.stem))
-    resume_from_chunk: tuple[int, int] = (0, 0)
+    existing_keys: set[tuple[int, int]] = {_chunk_key(p.stem) for p in complete_chunks}
     if complete_chunks:
-        last_row, last_col = _chunk_key(complete_chunks[-1].stem)
-        resume_from_chunk = (last_row, last_col + 1)
-        logger.info("[%s %d] resuming from chunk (%d, %d) (%d already complete)",
-                    tile_id, year, resume_from_chunk[0], resume_from_chunk[1], len(complete_chunks))
+        logger.info("[%s %d] %d chunks already present — will skip existing, fetch missing",
+                    tile_id, year, len(complete_chunks))
 
     received_chunks: list[Path] = list(complete_chunks)
 
@@ -123,7 +124,8 @@ def fetch_tile_local(
         chunk_width_px=chunk_width_px,
         max_concurrent=max_concurrent,
         n_workers=n_workers,
-        resume_from_chunk=resume_from_chunk,
+        resume_from_chunk=(0, 0),
+        skip_chunks=existing_keys,
         items=items,
         calibration_out=calibration_out,
         point_id_prefix=point_id_prefix,

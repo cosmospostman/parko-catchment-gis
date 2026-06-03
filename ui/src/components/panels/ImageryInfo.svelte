@@ -36,16 +36,6 @@
     <span class="ival mono">{imageryInfo.name || ''}{#if !imageryInfo.name}<span class="dim">—</span>{/if}</span>
   </div>
   <div class="toggle-row">
-    <button
-      class="icon-btn"
-      class:active={bboxOpen}
-      title="BBox tool"
-      type="button"
-      onclick={() => { bboxOpen = !bboxOpen; }}
-      aria-label="Toggle BBox tool"
-    >
-      <i class="ph ph-selection-plus"></i>
-    </button>
     <ToggleButton
       label="S2 tiles"
       palette="secondary"
@@ -121,24 +111,4 @@
   }
   .toggle-row :global(.toggle-btn) { flex: 1; }
 
-  .icon-btn {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    flex-shrink: 0;
-    background: none;
-    border: 1px solid #444;
-    border-radius: 4px;
-    color: #666;
-    font-size: 15px;
-    cursor: pointer;
-    transition: background 0.1s, color 0.1s, border-color 0.1s;
-  }
-  .icon-btn:hover { border-color: #666; color: #aaa; }
-  .icon-btn.active {
-    background: var(--primary-dark);
-    border-color: var(--primary-border);
-    color: var(--primary-accent);
-  }
 </style>
