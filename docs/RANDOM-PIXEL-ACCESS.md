@@ -2,7 +2,7 @@
 
 ## Context
 
-Chunk parquets from the proxy pipeline are stored on `/mnt/external/mitchell` at
+Chunk parquets from the proxy pipeline are stored on `/mnt/external/chunkstore` at
 `{root}/{year}/{tile_id}/{tile_id}_rNN_cNN.parquet`. These contain the full S2+S1
 time-series for every pixel (~65M rows per chunk, 66 row groups × ~10 MB compressed).
 The goal is a `utils/pixel_reader.py` module exposing two methods for interactive
@@ -72,7 +72,7 @@ All available columns from `COMBINED_PIXEL_SCHEMA`: `point_id`, `lon`, `lat`, `d
 
 ## Test: `tests/unit/test_pixel_reader.py`
 
-Uses real data at `/mnt/external/mitchell` (marked with a fixture guard to skip if
+Uses real data at `/mnt/external/chunkstore` (marked with a fixture guard to skip if
 the mount is absent).
 
 - **`test_query_point`**: sample a known `(lon, lat)` from an existing chunk row;

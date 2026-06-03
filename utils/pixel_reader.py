@@ -9,7 +9,7 @@ adjacent RGs cover overlapping lat bands (~1–2 pixel rows of overlap).
 
 Usage::
 
-    idx = ChunkIndex(Path("/mnt/external/mitchell"), year=2025, tile_id="54LWH")
+    idx = ChunkIndex(Path("/mnt/external/chunkstore"), year=2025, tile_id="54LWH")
     tbl = idx.query_point(lon=141.735, lat=-15.743)   # pa.Table | None
     tbl = idx.query_bbox(141.70, -15.76, 141.80, -15.70)  # pa.Table
 """

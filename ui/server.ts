@@ -10,7 +10,7 @@ const LOCATIONS_DIR = join(__dirname, "..", "data", "locations");
 const WMS_CACHE_DIR = join(__dirname, "..", "data", "cache", "wms");
 const SCORES_DIR    = join(__dirname, "..", "outputs", "scores");
 const PORT = Number(Deno.env.get("PORT") ?? 3000);
-const CHUNKS_ROOT = Deno.env.get("CHUNKS_ROOT") ?? "/mnt/external/mitchell";
+const CHUNKS_ROOT = Deno.env.get("CHUNKS_ROOT") ?? "/mnt/external/chunkstore";
 const VENV_PYTHON = join(__dirname, "..", ".venv", "bin", "python3");
 
 // ---------------------------------------------------------------------------

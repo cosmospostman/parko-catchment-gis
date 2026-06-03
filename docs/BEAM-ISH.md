@@ -234,7 +234,7 @@ On a 12 GB machine this leaves ~6.6 GB for the OS, Python runtime, and strip_pts
 python -m pytest tests/unit/test_pipeline_types.py -v
 
 # Integration: run fetch for one small tile, verify strips appear
-python cli/location.py fetch mitchell --years 2025 --output-dir /mnt/external/mitchell
+python cli/location.py fetch mitchell --years 2025 --output-dir /mnt/external/chunkstore
 
 # Confirm memory budget is logged at startup:
 # "[pipeline] fetch_tile peak budget: 5.4 GB (budget: 12.0 GB)"

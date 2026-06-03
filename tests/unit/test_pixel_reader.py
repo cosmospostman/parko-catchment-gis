@@ -1,6 +1,6 @@
 """tests/unit/test_pixel_reader.py — Integration tests for ChunkIndex.
 
-Requires /mnt/external/mitchell to be mounted with 2025/54LWH chunk parquets.
+Requires /mnt/external/chunkstore to be mounted with 2025/54LWH chunk parquets.
 All tests are skipped automatically if the mount is absent.
 """
 
@@ -11,13 +11,13 @@ from pathlib import Path
 import pyarrow.compute as pc
 import pytest
 
-CHUNKS_ROOT = Path("/mnt/external/mitchell")
+CHUNKS_ROOT = Path("/mnt/external/chunkstore")
 YEAR = 2025
 TILE_ID = "54LWH"
 
 pytestmark = pytest.mark.skipif(
     not (CHUNKS_ROOT / str(YEAR) / TILE_ID).exists(),
-    reason="/mnt/external/mitchell not mounted",
+    reason="/mnt/external/chunkstore not mounted",
 )
 
 # Real coordinates sampled from 54LWH_r03_c07.parquet RG2 row 500.

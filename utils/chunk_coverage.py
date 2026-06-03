@@ -17,7 +17,7 @@ falls back to a simple lon_min/max, lat_min/max bbox rectangle.
 One entry per chunk file.
 
 Usage:
-    python utils/chunk_coverage.py [--root /mnt/external/mitchell]
+    python utils/chunk_coverage.py [--root /mnt/external/chunkstore]
 """
 
 from __future__ import annotations
@@ -117,7 +117,7 @@ def build_manifest(root: Path) -> list[dict]:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root", default="/mnt/external/mitchell")
+    parser.add_argument("--root", default="/mnt/external/chunkstore")
     args = parser.parse_args()
     manifest = build_manifest(Path(args.root))
     print(json.dumps(manifest))

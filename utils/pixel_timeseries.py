@@ -6,7 +6,7 @@ NDVI, MAVI, and VH/VV (cross-pol ratio in dB) across all pixels in the bbox.
 Usage::
 
     python utils/pixel_timeseries.py \\
-        --root /mnt/external/mitchell \\
+        --root /mnt/external/chunkstore \\
         --year 2025 \\
         --tile 54LWH \\
         --bbox 141.493,−15.860,141.494,−15.859
@@ -121,7 +121,7 @@ def compute_timeseries(
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--root",  default="/mnt/external/mitchell")
+    ap.add_argument("--root",  default="/mnt/external/chunkstore")
     ap.add_argument("--year",  type=int, required=True)
     ap.add_argument("--tile",  required=True)
     ap.add_argument("--bbox",  required=True,
