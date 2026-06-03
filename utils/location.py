@@ -269,7 +269,6 @@ class Location:
         cache_dir: Optional[Path] = None,
         apply_nbar: bool = True,
         n_workers: Optional[int] = None,
-        proxy_url: Optional[str] = None,
         tiles: Optional[list[str]] = None,
         output_dir: Optional[Path] = None,
         work_dir: Optional[Path] = None,
@@ -280,23 +279,8 @@ class Location:
         Each parquet contains S2 rows (source="S2") interleaved with S1 rows (source="S1",
         vh, vv columns populated, S2 band columns null).
 
-        If *proxy_url* is set (e.g. "http://localhost:8765"), the fetch runs on
-        the remote proxy VM via proxy/client.fetch_tiles() — the WAN link sees
-        only compressed sorted parquet instead of raw COG traffic.
-
         Returns the list of written parquet paths.
         """
-        if proxy_url is not None:
-            return self._fetch_via_proxy(
-                proxy_url=proxy_url,
-                years=years,
-                cloud_max=cloud_max,
-                apply_nbar=apply_nbar,
-                n_workers=n_workers,
-                tiles=tiles,
-                output_dir=output_dir,
-            )
-
         from concurrent.futures import ThreadPoolExecutor, as_completed  # noqa: PLC0415
         from shapely.geometry import box  # noqa: PLC0415
         from utils.fetch_spec import _budget_params, _system_memory_gb  # noqa: PLC0415
@@ -352,45 +336,6 @@ class Location:
                         written.extend(result)
 
         return written
-
-    def _fetch_via_proxy(
-        self,
-        proxy_url: str,
-        years: list[int],
-        cloud_max: int,
-        apply_nbar: bool,
-        n_workers: Optional[int],
-        tiles: Optional[list[str]] = None,
-        output_dir: Optional[Path] = None,
-    ) -> list[Path]:
-        import base64
-        from shapely import wkb as shapely_wkb
-        from proxy.client import fetch_tiles  # noqa: PLC0415
-
-        geom = self.geometry
-        if geom is not None:
-            polygon_wkb_b64 = base64.b64encode(shapely_wkb.dumps(geom)).decode()
-        else:
-            from shapely.geometry import box
-            polygon_wkb_b64 = base64.b64encode(
-                shapely_wkb.dumps(box(*self.bbox))
-            ).decode()
-
-        out_dir = (output_dir / self.id) if output_dir is not None else (_PROJECT_ROOT / "data" / "pixels" / self.id)
-        tmp_dir = _PROJECT_ROOT / "data" / "pixels" / self.id / "_proxy_tmp"
-
-        tile_ids = [t for t in self.tile_ids() if not tiles or t in tiles]
-        return fetch_tiles(
-            proxy_url=proxy_url,
-            tile_ids=tile_ids,
-            years=years,
-            polygon_wkb_b64=polygon_wkb_b64,
-            out_dir=out_dir,
-            tmp_dir=tmp_dir,
-            cloud_max=cloud_max,
-            apply_nbar=apply_nbar,
-            n_workers=n_workers,
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -540,7 +485,6 @@ if __name__ == "__main__":
     _p_fetch.add_argument("--output-dir", default=None, help="Root output directory (default: data/pixels/<id>)")
     _p_fetch.add_argument("--work-dir", default=None, help="Root work directory for temp files (default: output-dir)")
     _p_fetch.add_argument("--cloud-max", type=int, default=30, help="Max cloud cover %% (default: 30)")
-    _p_fetch.add_argument("--proxy", default=None, help="Proxy URL (e.g. http://192.168.1.10:8765)")
 
     _args = _parser.parse_args()
 
@@ -554,7 +498,6 @@ if __name__ == "__main__":
             cloud_max=_args.cloud_max,
             output_dir=_out,
             work_dir=_work,
-            proxy_url=_args.proxy,
         )
         for p in _written:
             print(p)

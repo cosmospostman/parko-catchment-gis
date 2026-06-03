@@ -8,3 +8,6 @@ python3 -m tam.pipeline score \
   --out-parquet \
   --pmtiles outputs/scores/mitchell \
   --tile-id 54LWH
+
+Fetch:
+python cli/location.py fetch staaten --years 2025 --tiles 54KWG

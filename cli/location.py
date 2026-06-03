@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import re
 import sys
 import time
@@ -697,7 +698,6 @@ def cmd_fetch(args: argparse.Namespace) -> None:
             cloud_max=args.cloud_max,
             apply_nbar=not args.no_nbar,
             n_workers=args.workers,
-            proxy_url=getattr(args, "proxy", None),
             tiles=getattr(args, "tiles", None),
             output_dir=output_dir,
             work_dir=work_dir,
@@ -980,12 +980,11 @@ def main() -> None:
                     help="Concurrent item extraction workers (default: auto-scaled by pixel count)")
     pf.add_argument("--tiles", nargs="+", metavar="TILE_ID", default=None,
                     help="Only fetch these MGRS tile IDs (default: all tiles for the location)")
-    pf.add_argument("--proxy", type=str, default=None, metavar="URL",
-                    help="Proxy VM URL (e.g. http://localhost:8765). "
-                         "Routes extraction to the VM; only compressed parquet is transferred.")
-    pf.add_argument("--output-dir", type=str, default=None, metavar="DIR",
+    pf.add_argument("--output-dir", type=str,
+                    default=os.environ.get("CHUNKSTORE_DIR", "/mnt/external/chunkstore"),
+                    metavar="DIR",
                     help="Root directory for final chunk parquets "
-                         "(default: data/pixels/<id>/<year>/<tile_id>/). "
+                         "(default: $CHUNKSTORE_DIR or /mnt/external/chunkstore). "
                          "Chunks are written to <DIR>/<location_id>/<year>/<tile_id>/.")
     pf.add_argument("--work-dir", type=str, default=None, metavar="DIR",
                     help="Root directory for temporary working data "

@@ -376,10 +376,10 @@ def test_fetch_tile_local_resume(tmp_path):
     _write_chunk_parquet(tile_dir / "55HBU_r00_c00.parquet")
     _write_chunk_parquet(tile_dir / "55HBU_r00_c01.parquet")
 
-    resume_args: list = []
+    skip_args: list = []
 
-    def fake_pipeline(tile_id, year, polygon_geometry, tmp, resume_from_chunk=(0, 0), **kw):
-        resume_args.append(resume_from_chunk)
+    def fake_pipeline(tile_id, year, polygon_geometry, tmp, skip_chunks=None, **kw):
+        skip_args.append(set(skip_chunks) if skip_chunks else set())
         chunk_path = tmp / "chunk_000_002_sorted.parquet"
         _write_chunk_parquet(chunk_path)
         yield 0, 2, chunk_path
@@ -391,7 +391,7 @@ def test_fetch_tile_local_resume(tmp_path):
             out_dir=tmp_path / "out",
         )
 
-    assert resume_args == [(0, 2)], f"expected resume_from_chunk=(0,2), got {resume_args}"
+    assert skip_args == [{(0, 0), (0, 1)}], f"expected skip_chunks={{(0,0),(0,1)}}, got {skip_args}"
     assert result is not None
     assert len(result) == 3  # chunks (0,0), (0,1), (0,2)
     assert all("_r" in p.name and "_c" in p.name for p in result)
@@ -428,48 +428,7 @@ def test_fetch_tile_local_atomic_write_no_merge(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# TP-9  progress_frame now uses chunk_row/chunk_col
-# ---------------------------------------------------------------------------
-
-def test_server_frame_contract(tmp_path):
-    """Verify that progress_frame encodes chunk_row and chunk_col correctly."""
-    import json
-    from proxy._pipeline import progress_frame, write_frame, read_frame, StreamBuffer
-
-    chunk_bytes = b"PAR1" + b"\x00" * 64 + b"PAR1"
-    t_start = 0.0
-
-    raw_frames: list[bytes] = []
-    crow, ccol = 2, 3
-    raw_frames.append(progress_frame(crow, ccol, "stream", t_start))
-    raw_frames.append(write_frame(0x02, chunk_bytes))
-
-    raw = b"".join(raw_frames)
-    buf = StreamBuffer(iter([raw]))
-
-    frame_types = []
-    progress_msg = None
-    data_payloads = []
-    while True:
-        f = read_frame(buf)
-        if f is None:
-            break
-        frame_types.append(f[0])
-        if f[0] == 0x01:
-            progress_msg = json.loads(f[1].decode())
-        elif f[0] == 0x02:
-            data_payloads.append(f[1])
-
-    assert 0x01 in frame_types
-    assert 0x02 in frame_types
-    assert progress_msg is not None
-    assert progress_msg["chunk_row"] == crow
-    assert progress_msg["chunk_col"] == ccol
-    assert data_payloads == [chunk_bytes]
-
-
-# ---------------------------------------------------------------------------
-# TP-10 Integration: run_tile_pipeline_v2 with real merge_scenes
+# TP-9 Integration: run_tile_pipeline_v2 with real merge_scenes
 # ---------------------------------------------------------------------------
 
 def _synthetic_scene_parquet(out_dir: Path, scene_id: str, n_points: int) -> Path:

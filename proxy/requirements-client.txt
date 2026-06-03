@@ -1,5 +1,0 @@
-# proxy/requirements-client.txt — workstation-side proxy client dependencies
-# The workstation already has the full project environment installed.
-# Only the additional client dependency is listed here.
-
-httpx>=0.27,<1

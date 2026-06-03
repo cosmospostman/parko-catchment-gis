@@ -12,9 +12,6 @@ test_duckdb_merge_sorted_output         — merge_scenes() output sorted by (poi
 test_duckdb_merge_dictionary_encoded    — merge_scenes() has dict encoding on point_id
 test_duckdb_merge_row_count             — merge_scenes() row count = sum of inputs
 test_strip_purge_after_merge            — scene parquets deleted after merge_scenes()
-test_frame_roundtrip                    — write_frame/read_frame roundtrip both types
-test_atomic_strip_write                 — client: reads 0x02, writes .tmp, verifies, renames
-test_resume_skips_complete_strips       — client resume_from_strip logic
 test_workstation_merge_row_count        — merge_strips() on synthetic shards = correct count
 test_compression_ratio                  — sorted+dict strip ≥5× smaller than unsorted
 test_cpo1_pixel_sort_invariant          — all rows per point_id are contiguous after merge_scenes
@@ -25,9 +22,7 @@ test_cpo4_multi_chunk_parquet_xi_yi_consistent_with_cog_overhang — multi-chunk
 
 from __future__ import annotations
 
-import io
 import math
-import struct
 import tempfile
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -325,129 +320,6 @@ def test_strip_purge_after_merge(tmp_path):
     # does not delete them — that's the server loop's job).
     for sp in scene_paths:
         assert sp.exists()  # merge_scenes does not delete; server does
-
-
-# ---------------------------------------------------------------------------
-# Frame protocol tests
-# ---------------------------------------------------------------------------
-
-def test_frame_roundtrip():
-    """write_frame/read_frame roundtrip for both frame types."""
-    from proxy._pipeline import write_frame, read_frame
-
-    # 0x01 — JSON progress
-    payload_01 = b'{"strip": 0, "stage": "fetch", "t": 1.23}'
-    frame_01 = write_frame(0x01, payload_01)
-    stream = io.BytesIO(frame_01)
-    ft, pl_ = read_frame(stream)
-    assert ft == 0x01
-    assert pl_ == payload_01
-
-    # 0x02 — parquet bytes
-    payload_02 = b"PAR1" + b"\x00" * 100 + b"PAR1"
-    frame_02 = write_frame(0x02, payload_02)
-    stream = io.BytesIO(frame_02)
-    ft, pl_ = read_frame(stream)
-    assert ft == 0x02
-    assert pl_ == payload_02
-
-    # Multiple frames concatenated
-    combined = frame_01 + frame_02
-    stream = io.BytesIO(combined)
-    ft1, p1 = read_frame(stream)
-    ft2, p2 = read_frame(stream)
-    assert (ft1, p1) == (0x01, payload_01)
-    assert (ft2, p2) == (0x02, payload_02)
-    assert read_frame(stream) is None  # EOF
-
-
-def test_frame_length_field():
-    """Frame LENGTH field matches actual payload size."""
-    from proxy._pipeline import write_frame
-
-    payload = b"hello world"
-    frame = write_frame(0x01, payload)
-    assert len(frame) == 5 + len(payload)
-    _, length = struct.unpack(">BI", frame[:5])
-    assert length == len(payload)
-
-
-# ---------------------------------------------------------------------------
-# Atomic strip write test
-# ---------------------------------------------------------------------------
-
-def test_atomic_strip_write(tmp_path):
-    """Client reads 0x02 frame, writes .tmp, verifies length, renames to .parquet."""
-    from proxy._pipeline import write_frame, read_frame, StreamBuffer as _StreamBuffer
-
-    # Simulate a minimal parquet payload
-    fake_parquet = b"PAR1" + b"\xab" * 200 + b"PAR1"
-    frame = write_frame(0x02, fake_parquet)
-
-    stream = _StreamBuffer(iter([frame]))
-    ft, payload = read_frame(stream)
-    assert ft == 0x02
-
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    tmp_file  = tmp_path / "55HBU_r00_c00.tmp"
-    out_file  = tmp_path / "55HBU_r00_c00.parquet"
-
-    tmp_file.write_bytes(payload)
-    assert tmp_file.stat().st_size == len(payload)
-    tmp_file.replace(out_file)
-
-    assert out_file.exists()
-    assert not tmp_file.exists()
-    assert out_file.read_bytes() == fake_parquet
-
-
-# ---------------------------------------------------------------------------
-# Resume logic test
-# ---------------------------------------------------------------------------
-
-def test_resume_skips_complete_chunks(tmp_path):
-    """Client identifies the correct resume_from_chunk based on existing chunk files."""
-    import re as _re
-    _CHUNK_RE = _re.compile(r"_r(\d{2})_c(\d{2})$")
-
-    def _chunk_key(stem):
-        m = _CHUNK_RE.search(stem)
-        return (int(m.group(1)), int(m.group(2))) if m else (9999, 9999)
-
-    tile_id = "55HBU"
-    tile_tmp = tmp_path / tile_id / "2022"
-    tile_tmp.mkdir(parents=True)
-    # Simulate chunks (0,0), (0,1), (0,2) present → resume from (0,3)
-    for col in range(3):
-        (tile_tmp / f"{tile_id}_r00_c{col:02d}.parquet").touch()
-
-    complete = sorted(tile_tmp.glob(f"{tile_id}_r??_c??.parquet"),
-                      key=lambda p: _chunk_key(p.stem))
-    last_row, last_col = _chunk_key(complete[-1].stem)
-    resume_from_chunk = (last_row, last_col + 1)
-    assert resume_from_chunk == (0, 3)
-
-
-def test_resume_after_last_chunk(tmp_path):
-    """Resume point is always last_complete + 1 in column (row-major)."""
-    import re as _re
-    _CHUNK_RE = _re.compile(r"_r(\d{2})_c(\d{2})$")
-
-    def _chunk_key(stem):
-        m = _CHUNK_RE.search(stem)
-        return (int(m.group(1)), int(m.group(2))) if m else (9999, 9999)
-
-    tile_id = "55HBU"
-    tile_tmp = tmp_path / tile_id / "2022"
-    tile_tmp.mkdir(parents=True)
-    (tile_tmp / f"{tile_id}_r00_c00.parquet").touch()
-    (tile_tmp / f"{tile_id}_r01_c00.parquet").touch()
-
-    complete = sorted(tile_tmp.glob(f"{tile_id}_r??_c??.parquet"),
-                      key=lambda p: _chunk_key(p.stem))
-    last_row, last_col = _chunk_key(complete[-1].stem)
-    resume_from_chunk = (last_row, last_col + 1)
-    assert resume_from_chunk == (1, 1)
 
 
 # ---------------------------------------------------------------------------

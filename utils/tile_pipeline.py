@@ -110,12 +110,6 @@ def fetch_tile_local(
 
     received_chunks: list[Path] = list(complete_chunks)
 
-    if complete_chunks:
-        last_row, last_col = _chunk_key(complete_chunks[-1].stem)
-        resume_from_chunk = (last_row, last_col + 1)
-    else:
-        resume_from_chunk = (0, 0)
-
     pipeline_tmp = _work_root / "_work"
     pipeline_tmp.mkdir(parents=True, exist_ok=True)
 
@@ -130,7 +124,7 @@ def fetch_tile_local(
         chunk_width_px=chunk_width_px,
         max_concurrent=max_concurrent,
         n_workers=n_workers,
-        resume_from_chunk=resume_from_chunk,
+        resume_from_chunk=(0, 0),
         skip_chunks=existing_keys,
         items=items,
         calibration_out=calibration_out,

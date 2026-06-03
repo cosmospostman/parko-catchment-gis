@@ -1,18 +1,10 @@
-"""proxy/_pipeline.py — Pure pipeline logic importable without FastAPI.
-
-Shared by proxy/server.py (VM), utils/tile_pipeline.py (local path), and
-tests (workstation).  No FastAPI, uvicorn, or httpx imports here.
-"""
+"""proxy/_pipeline.py — Pure pipeline logic shared by the local fetch path and tests."""
 
 from __future__ import annotations
 
-import io
-import json
 import logging
 import math
 import os
-import struct
-import time
 from pathlib import Path
 
 from typing import Iterator
@@ -20,74 +12,7 @@ from typing import Iterator
 logger = logging.getLogger("proxy.pipeline")
 
 
-def _system_memory_gb() -> float:
-    try:
-        import psutil
-        return psutil.virtual_memory().total / (1024 ** 3)
-    except Exception:
-        pass
-    try:
-        with open("/proc/meminfo") as fh:
-            for line in fh:
-                if line.startswith("MemTotal:"):
-                    return int(line.split()[1]) / (1024 ** 2)
-    except Exception:
-        pass
-    return 8.0
-
-
-# ---------------------------------------------------------------------------
-# Frame encode / decode
-# ---------------------------------------------------------------------------
-
-def write_frame(frame_type: int, payload: bytes) -> bytes:
-    """Encode one frame: [TYPE 1B][LENGTH 4B big-endian][PAYLOAD]."""
-    return struct.pack(">BI", frame_type, len(payload)) + payload
-
-
-def read_frame(stream: io.RawIOBase) -> tuple[int, bytes] | None:
-    """Read one frame from a binary stream.  Returns None on clean EOF."""
-    header = stream.read(5)
-    if not header:
-        return None
-    if len(header) < 5:
-        raise EOFError(f"truncated frame header ({len(header)} bytes)")
-    frame_type, length = struct.unpack(">BI", header)
-    payload = b""
-    while len(payload) < length:
-        chunk = stream.read(length - len(payload))
-        if not chunk:
-            raise EOFError(f"truncated frame payload: got {len(payload)}, expected {length}")
-        payload += chunk
-    return frame_type, payload
-
-
-class StreamBuffer(io.RawIOBase):
-    """Wrap a bytes iterator into a RawIOBase for read_frame (no httpx dependency)."""
-
-    def __init__(self, iter_bytes: Iterator[bytes]) -> None:
-        self._iter = iter_bytes
-        self._buf = b""
-
-    def read(self, n: int = -1) -> bytes:
-        if n == -1:
-            return b"".join(self._iter)
-        while len(self._buf) < n:
-            try:
-                self._buf += next(self._iter)
-            except StopIteration:
-                break
-        out, self._buf = self._buf[:n], self._buf[n:]
-        return out
-
-    def readable(self) -> bool:
-        return True
-
-
-def progress_frame(chunk_row: int, chunk_col: int, stage: str, t: float) -> bytes:
-    payload = json.dumps({"chunk_row": chunk_row, "chunk_col": chunk_col, "stage": stage, "t": round(t, 2)}).encode()
-    return write_frame(0x01, payload)
-
+from utils.fetch_spec import _system_memory_gb  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # merge_scenes — streaming k-way merge of pre-sorted per-scene parquets

@@ -20,7 +20,7 @@ import rasterio.windows
 from pyproj import Transformer
 from rasterio.windows import Window
 
-from analysis.constants import SCL_BAND, SCL_CLEAR_VALUES
+from analysis.constants import SCL_BAND
 from analysis.timeseries.extraction import _scl_has_clear_pixels
 
 logger = logging.getLogger(__name__)
