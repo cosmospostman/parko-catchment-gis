@@ -1588,3 +1588,213 @@ regions:
     bbox: [142.539366, -21.236329, 142.541705, -21.233197]
     years: [2016, 2017, 2018, 2019, 2020]
     tags: [semi-arid, riparian]
+
+  # ---------------------------------------------------------------------------
+  # Mitchell River — Gulf savanna / monsoonal riparian (v11 additions)
+  # Purpose: fix false positives on mangroves, bare floodplain, native riparian,
+  # and water in the Kowanyama/Mitchell corridor.
+  # Presence patches span three reaches: southern (54KWG, ~−16.32–16.35°S),
+  # middle (54LWH, ~−16.20°S), northern (54LWH, ~−15.96–15.99°S).
+  # ---------------------------------------------------------------------------
+
+  # --- Presence (train) ---
+  - id: mitchell_presence_1
+    name: "Mitchell River — presence 1 (southern)"
+    label: presence
+    bbox: [141.363789, -16.336770, 141.365969, -16.335197]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [monsoonal, riparian]
+    notes: "Southern reach (54KWG, −16.34°S). Textbook profile: wet peak 0.875, dry floor 0.29–0.31, VH/VV stable −4.1 to −5.5 dB year-round."
+
+  - id: mitchell_presence_2
+    name: "Mitchell River — presence 2 (southern)"
+    label: presence
+    bbox: [141.400465, -16.324751, 141.402291, -16.323115]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [monsoonal, riparian]
+    notes: "Southern reach (54KWG, −16.32°S). Best signal of batch: wet peak 0.899, dry floor 0.24–0.26, Δ ~0.65, VH/VV stable −4.6 to −5.4 dB."
+
+  - id: mitchell_presence_3
+    name: "Mitchell River — presence 3 (southern)"
+    label: presence
+    bbox: [141.379285, -16.345988, 141.380974, -16.341960]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [monsoonal, riparian]
+    notes: "Southern reach (54KWG, −16.35°S). Wet peak 0.881, dry floor 0.27–0.31, VH/VV stable −4.1 to −4.9 dB. ~2.1 km from presence_2."
+
+  - id: mitchell_presence_4
+    name: "Mitchell River — presence 4 (middle)"
+    label: presence
+    bbox: [141.389167, -16.199947, 141.390500, -16.197966]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [monsoonal, riparian]
+    notes: "Middle reach (54LWH, −16.20°S). Wet peak 0.831, dry floor 0.25–0.28, VH/VV stable −3.9 to −4.9 dB. ~13 km north of southern cluster."
+
+  - id: mitchell_presence_5
+    name: "Mitchell River — presence 5 (northern)"
+    label: presence
+    bbox: [141.463662, -15.990899, 141.465735, -15.987729]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [monsoonal, riparian]
+    notes: "Northern reach (54LWH, −15.99°S). Wet peak 0.868, dry floor 0.26–0.28, VH/VV stable −4.0 to −5.0 dB. ~22 km north of middle cluster."
+
+  # --- Presence (val) ---
+  - id: mitchell_val_presence_1
+    name: "Mitchell River — val presence 1 (southern)"
+    label: presence
+    split: val
+    bbox: [141.364065, -16.339440, 141.364817, -16.336892]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [monsoonal, riparian]
+    notes: "Southern reach, adjacent to presence_1. Wet peak 0.891, dry floor 0.30–0.33. IQR widening in May–Jun at senescence."
+
+  - id: mitchell_val_presence_2
+    name: "Mitchell River — val presence 2 (southern, sparse)"
+    label: presence
+    split: val
+    bbox: [141.394728, -16.320307, 141.398059, -16.319024]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [monsoonal, riparian, sparse]
+    notes: "Southern reach, sparse canopy. Wet peak 0.868, dry floor 0.25–0.30, VH/VV stable. Useful sparse-presence val case."
+
+  - id: mitchell_val_presence_3
+    name: "Mitchell River — val presence 3 (middle)"
+    label: presence
+    split: val
+    bbox: [141.417057, -16.209358, 141.420611, -16.206871]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [monsoonal, riparian]
+    notes: "Middle reach (54LWH), ~2.8 km east of presence_4. Wet peak 0.820, dry floor 0.27–0.30, VH/VV stable −4.2 to −5.1 dB."
+
+  - id: mitchell_val_presence_4
+    name: "Mitchell River — val presence 4 (northern)"
+    label: presence
+    split: val
+    bbox: [141.474997, -15.959035, 141.477229, -15.956661]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [monsoonal, riparian]
+    notes: "Northern reach (54LWH, −15.96°S). Wet peak 0.793, dry floor 0.26–0.30, VH/VV stable −4.3 to −5.4 dB. Furthest north in presence set."
+
+  # --- Mangrove absence (train) ---
+  - id: mitchell_absence_mangrove_1
+    name: "Mitchell River — absence (mangrove 1)"
+    label: absence
+    bbox: [141.432703, -15.823780, 141.434759, -15.819690]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [monsoonal, mangrove]
+    notes: "Textbook mangrove: wet NDVI 0.93–0.96, dry floor 0.78–0.85, Δ ~0.12, VH/VV stable −5.3 to −6.1 dB."
+
+  - id: mitchell_absence_mangrove_2
+    name: "Mitchell River — absence (mangrove 2)"
+    label: absence
+    bbox: [141.522892, -15.867121, 141.526076, -15.864479]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [monsoonal, mangrove]
+    notes: "Fringe mangrove stand. Wet NDVI 0.86–0.87, dry floor 0.75–0.79, VH/VV stable. Different reach from mangrove_1."
+
+  - id: mitchell_absence_mangrove_3
+    name: "Mitchell River — absence (mangrove 3)"
+    label: absence
+    bbox: [141.425301, -16.057730, 141.427833, -16.054378]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [monsoonal, mangrove]
+    notes: "Southern reach mangrove. Wet NDVI 0.88–0.94, dry floor 0.63–0.72, Δ ~0.22, VH/VV stable −5.6 to −6.4 dB."
+
+  # --- Mangrove absence (val) ---
+  - id: mitchell_val_absence_mangrove_1
+    name: "Mitchell River — val absence (mangrove 1)"
+    label: absence
+    split: val
+    bbox: [141.416778, -15.894227, 141.419044, -15.891997]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [monsoonal, mangrove]
+    notes: "Separate tidal inlet, geographically independent from train patches. Wet NDVI 0.84–0.93, dry floor 0.77–0.87, VH/VV stable −4.5 to −5.6 dB."
+
+  # --- Bare ground absence (train) ---
+  - id: mitchell_absence_bare_1
+    name: "Mitchell River — absence (bare ground 1)"
+    label: absence
+    bbox: [141.490979, -16.057881, 141.494836, -16.055694]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [monsoonal, bare_soil]
+    notes: "Southern floodplain bare ground. Wet NDVI 0.49–0.55, dry floor 0.15–0.19, VH/VV crashes to −7.2 to −8.4 dB dry (Jul–Nov)."
+
+  - id: mitchell_absence_bare_2
+    name: "Mitchell River — absence (bare ground 2)"
+    label: absence
+    bbox: [141.637069, -15.392288, 141.640681, -15.389818]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [monsoonal, bare_soil]
+    notes: "Northern floodplain, seasonally inundated. Wet NDVI 0.68, dry floor 0.09–0.14, VH/VV crashes to −7 to −9.8 dB dry (Sep–Nov). Different reach/inundation regime from bare_1."
+
+  # --- Bare ground absence (val) ---
+  - id: mitchell_val_absence_bare_1
+    name: "Mitchell River — val absence (bare ground 1)"
+    label: absence
+    split: val
+    bbox: [141.546159, -15.953764, 141.548024, -15.951436]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [monsoonal, bare_soil]
+    notes: "Wet NDVI 0.52–0.55, dry floor 0.17–0.19, VH/VV −5.7 to −6.2 dB dry (slightly warmer than ideal — sparse grass retention). Geographically independent from bare_1."
+
+  # --- Riparian/woodland absence (train) ---
+  - id: mitchell_absence_riparian_1
+    name: "Mitchell River — absence (riparian 1)"
+    label: absence
+    bbox: [141.757433, -15.904606, 141.761327, -15.902438]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [monsoonal, riparian, woodland]
+    notes: "Native riparian/savanna. Wet NDVI 0.73–0.82, dry floor 0.47–0.49, VH/VV stable −4.4 to −6.1 dB. Dry floor well above Parkinsonia range."
+
+  - id: mitchell_absence_riparian_2
+    name: "Mitchell River — absence (riparian 2)"
+    label: absence
+    bbox: [141.989778, -15.915257, 141.993131, -15.912756]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [monsoonal, riparian, woodland]
+    notes: "Drier open woodland. Wet NDVI 0.67–0.70, dry floor 0.36–0.37, VH/VV stable −4.0 to −5.5 dB. Spectrally proximal to Parkinsonia at dry minimum — hard negative."
+
+  # --- Riparian/woodland absence (val) ---
+  - id: mitchell_val_absence_riparian_1
+    name: "Mitchell River — val absence (riparian 1)"
+    label: absence
+    split: val
+    bbox: [141.626992, -15.864820, 141.628852, -15.863669]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [monsoonal, riparian, woodland]
+    notes: "Clean riparian woodland. Wet NDVI 0.79–0.89, dry floor 0.48–0.53, VH/VV stable −3.7 to −6.0 dB. Geographically independent from train patches (141.63°E)."
+
+  # --- Water absence (train) ---
+  - id: mitchell_absence_water_1
+    name: "Mitchell River — absence (water 1)"
+    label: absence
+    bbox: [141.563041, -15.858784, 141.563571, -15.857719]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [monsoonal, water]
+    notes: "Permanent creek. NDVI −0.46 to −0.94 year-round. SAR noisy (specular reflection from narrow water body — expected)."
+
+  - id: mitchell_absence_water_2
+    name: "Mitchell River — absence (water 2)"
+    label: absence
+    bbox: [141.561771, -15.858072, 141.562854, -15.857077]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [monsoonal, water]
+    notes: "Same creek, different meander segment. NDVI −0.34 to −0.85 year-round."
+
+  - id: mitchell_absence_water_3
+    name: "Mitchell River — absence (water 3)"
+    label: absence
+    bbox: [141.566770, -15.861490, 141.567707, -15.860561]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [monsoonal, water]
+    notes: "Adjacent creek reach. NDVI −0.43 to −0.92 year-round. Combined train water pixels with water_1 and water_2 ~260."
+
+  # --- Water absence (val) ---
+  - id: mitchell_val_absence_water_1
+    name: "Mitchell River — val absence (water 1)"
+    label: absence
+    split: val
+    bbox: [141.563797, -15.853290, 141.565461, -15.852743]
+    years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
+    tags: [monsoonal, water]
+    notes: "Upstream reach, geographically independent from train patches. NDVI −0.12 to −0.70. One Dec anomaly (+0.30) from minor vegetated bank edge contamination."
