@@ -74,14 +74,6 @@ EXPERIMENT = Experiment(
         "rupert_ck_presence_1", "rupert_ck_presence_2", "rupert_ck_presence_3",
         "rupert_ck_presence_sparse_1",
         "rupert_ck_absence_1", "rupert_ck_absence_2", "rupert_ck_absence_3",
-        # Frenchs — Cape York Peninsula (monsoonal savanna-riparian)
-        "frenchs_presence_1", "frenchs_presence_2", "frenchs_presence_3",
-        "frenchs_presence_4",
-        "frenchs_absence_bare_soil_2", "frenchs_absence_bare_soil_3",
-        "frenchs_absence_mangrove", "frenchs_absence_ocean",
-        "frenchs_absence_riparian_woodland", "frenchs_absence_riparian",
-        "frenchs_absence_5", "frenchs_absence_6", "frenchs_absence_7",
-        "frenchs_absence_water_1", "frenchs_absence_water_2", "frenchs_absence_water_3",
         # Quaids — Cape York Peninsula (monsoonal savanna)
         "quaids_absence_1", "quaids_absence_3", "quaids_absence_5",
         "quaids_absence_7", "quaids_absence_9",
@@ -106,9 +98,6 @@ EXPERIMENT = Experiment(
         "maria_downs_val_presence_1", "maria_downs_val_absence_1",
         # Rupert Creek
         "rupert_ck_val_presence_1", "rupert_ck_val_absence_1",
-        # Frenchs — held out for monsoonal generalisation check
-        "frenchs_presence_5", "frenchs_presence_6",
-        "frenchs_absence_savanna", "frenchs_absence_4", "frenchs_absence_8",
         # Quaids — held out for monsoonal generalisation check
         "quaids_val_absence_2", "quaids_val_absence_4", "quaids_val_absence_6",
         "quaids_val_absence_8a", "quaids_val_absence_8b", "quaids_val_absence_10",

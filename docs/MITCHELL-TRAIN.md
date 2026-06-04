@@ -93,16 +93,6 @@ missing real infestations at lower canopy cover.
 Each region typically yields 20–100 pixels × multiple years. Target ~300–500 presence
 training pixels total across all regions and years.
 
-**Priority candidates identified so far** (confirmed on imagery or strongly suspected):
-- Bbox 5: `[141.405968, -16.209836, 141.406614, -16.209371]` — very tight IQR, Δ 0.65,
-  strongest signal of all candidates
-- Bbox 8: `[141.379503, -16.345300, 141.380893, -16.344083]` — very tight IQR year-round,
-  Δ 0.61, wet peak 0.88; best spatial purity of all candidates
-- Bbox 7: `[141.365263, -16.337010, 141.365895, -16.336488]` — moderate IQR, Δ 0.54,
-  plausible presence; include if confirmed on imagery to add realistic variance
-- Bbox 4: `[141.465037, -15.984845, 141.466129, -15.984326]` — wide wet-season IQR,
-  suspected presence; tighten bbox before committing
-
 ### Absence — mangrove (highest priority)
 
 Mangroves are the dominant false-positive class. Spatially clustered along tidal channels
@@ -122,14 +112,6 @@ patch and one broader stand would cover the range.
 **Quantity**: 2–3 training regions, 1 validation. Target ~200–400 absence pixels from
 mangrove across regions and years.
 
-**Candidate identified**: Bbox 1 `[141.493829, -15.491023, 141.494610, -15.490164]` —
-confirmed mangrove, wet NDVI 0.92–0.97, dry floor 0.70, Δ 0.25. Use as
-`mitchell_absence_mangrove_1`. Seek 1–2 more at different coastal positions.
-
-Note: Bbox 6 `[141.371368, -16.256234, 141.372865, -16.255527]` — v10 false positive,
-bbox clips a mangrove fringe edge. Tighten to the eastern mangrove pixels only before
-using as a mangrove absence region.
-
 ### Absence — bare ground / floodplain (high priority)
 
 Bare floodplain and exposed seasonal ground score high in v10 — a hard false-positive
@@ -148,10 +130,6 @@ maintains -3 to -6 dB year-round due to persistent woody stems.
 inundated floodplain fringe if available.
 
 **Quantity**: 1–2 training regions. Target ~150–300 absence pixels.
-
-**Candidate identified**: Bbox 3 `[141.545524, -15.489095, 141.546327, -15.488391]` —
-confirmed bare ground, v10 high false positive, NDVI crashes to 0.10–0.13 dry, VH/VV
--7 to -9 dB dry. Use as `mitchell_absence_bare_1`.
 
 ### Absence — native riparian / savanna woodland
 
@@ -174,19 +152,27 @@ riparian; add more only if presence patches are on different river reaches.
 
 ## Summary target for v11
 
-| ID | Label | Cover type | Priority | Status |
-|----|-------|-----------|----------|--------|
-| `mitchell_presence_1` | presence | Parkinsonia (dense) | Required | bbox 5 — confirm imagery |
-| `mitchell_presence_2` | presence | Parkinsonia (dense) | Required | bbox 8 — confirm imagery |
-| `mitchell_presence_3` | presence | Parkinsonia (moderate) | Recommended | bbox 7 — confirm imagery |
-| `mitchell_absence_mangrove_1` | absence | mangrove | Required | bbox 1 — confirmed |
-| `mitchell_absence_mangrove_2` | absence | mangrove | Required | new — find on coast |
-| `mitchell_absence_bare_1` | absence | bare ground | Required | bbox 3 — confirmed |
-| `mitchell_absence_riparian_1` | absence | native riparian | Recommended | existing `mitchell_river_absence` |
-| `mitchell_absence_riparian_2` | absence | native riparian | Optional | new — near presence patches |
+Based on the v10 training set (~390K presence / ~720K absence train pixel-years), Mitchell
+additions should be ~0.5–1% of the existing corpus per class — enough to shift the
+monsoonal decision boundary without destabilising existing performance. At 6 years and
+10 m pixels this translates to roughly 30–70 spatial pixels per training bbox and 15–30
+per val bbox.
 
-Minimum viable set: 2 presence + mangrove + bare ground = 4 new regions. Mirror the
-Frenchs pattern (4 presence, 8 absence) if enough clean patches can be identified.
+| Category | Train bboxes | Train pixel-years | Val bboxes | Val pixel-years |
+|---|---|---|---|---|
+| Presence | 3–4 | 2,000–4,000 | 1–2 | 500–1,000 |
+| Mangrove absence | 2–3 | 1,500–3,000 | 1 | 400–800 |
+| Bare ground absence | 1–2 | 1,000–2,000 | 1 | 300–600 |
+| Riparian absence | 1–2 | 1,000–2,000 | 1 | 300–600 |
+
+---
+
+## Candidate regions
+
+Working table for evaluating candidate bboxes before committing to training.yaml. "Pixels" is spatial pixel count (single year, ~10 m); multiply by years in training range for pixel-years.
+
+| # | Category | Bbox | Pixels | Signal quality | Notes |
+|---|---|---|---|---|---|
 
 ---
 
