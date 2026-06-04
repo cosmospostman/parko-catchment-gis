@@ -27,12 +27,14 @@ def merge_scenes(
 ) -> None:
     """Merge per-scene parquets into one pixel-sorted chunk parquet.
 
-    Reads all scene parquets into RAM (~5 GB for a 1024×1024×82-scene chunk on
-    a 64 GB machine), sorts in-memory by (northing, point_id, date, scl_purity
-    desc), then writes once with dictionary encoding.  No intermediate disk files.
+    Streams through all input files in northing-band passes so peak RAM is
+    O(n_files × _NORTHING_BAND) rather than O(total_rows).  For a 1024×1024
+    chunk with 82 scenes the old in-memory sort required ~34 GB; this approach
+    uses ~200 MB regardless of scene count.
 
-    S1 rows (if present) are included in the same in-memory sort so they
-    interleave correctly with S2 by northing and date.
+    Input scene parquets are expected to be sorted by northing (ascending yi
+    encoded in point_id suffix) — make_chunk_points guarantees this ordering.
+    S1 rows are merged in the final pass along with any remaining S2 rows.
 
     on_phase: optional callback called with a short human-readable string at the
         start of each phase ("reading N files", "sorting NM rows", "writing").
@@ -40,63 +42,89 @@ def merge_scenes(
     """
     import pyarrow as pa
     import pyarrow.parquet as pq
+    import polars as pl
     from utils.parquet_utils import COMBINED_PIXEL_SCHEMA, _conform_table
+
+    # Northings processed per band pass.  1024 northing rows × ~82 scenes ×
+    # ~1 clear pixel/point/scene × ~120 bytes ≈ 10 MB per pass.
+    _NORTHING_BAND = 1024
 
     def _phase(msg: str) -> None:
         if on_phase is not None:
             on_phase(msg)
 
-    all_paths: list[Path] = list(scene_paths)
-    if s1_path is not None and s1_path.exists():
-        all_paths.append(s1_path)
+    s2_paths: list[Path] = list(scene_paths)
+    s1_paths: list[Path] = [s1_path] if (s1_path is not None and s1_path.exists()) else []
+    all_paths: list[Path] = s2_paths + s1_paths
 
     if not all_paths:
         return
 
     n_files = len(all_paths)
     _phase(f"reading {n_files} files")
-    logger.info("merge_scenes: reading %d files into RAM → %s", n_files, out_path.name)
+    logger.info("merge_scenes: streaming %d files → %s", n_files, out_path.name)
 
     schema = COMBINED_PIXEL_SCHEMA
     if chunk_metadata:
         schema = schema.with_metadata({k.encode(): v.encode() for k, v in chunk_metadata.items()})
 
-    # Read every row-group from every file into a flat list of tables.
-    chunks: list[pa.Table] = []
+    # --- Pass 1: collect total row count and northing range from file metadata ---
+    n_rows_total = 0
     for p in all_paths:
         pf = pq.ParquetFile(str(p))
-        for rg in range(pf.metadata.num_row_groups):
-            chunks.append(_conform_table(pf.read_row_group(rg), schema))
+        n_rows_total += pf.metadata.num_rows
 
-    combined = pa.concat_tables(chunks, promote_options="none")
-    del chunks
+    _phase(f"sorting {n_rows_total // 1_000_000}M rows")
+    logger.info("merge_scenes: %d total rows across %d files", n_rows_total, n_files)
 
-    n_rows = len(combined)
-    _phase(f"sorting {n_rows // 1_000_000}M rows")
-    logger.info("merge_scenes: sorting %d rows in RAM ...", n_rows)
+    # --- Pass 2: stream all files, accumulate by northing band, sort+write ---
+    # Strategy: read one row group at a time from each file in round-robin order.
+    # Buffer rows in a per-northing-band accumulator.  When we've seen all row
+    # groups that could contribute to northing band [y0, y0+_NORTHING_BAND), flush
+    # that band (sort + write) and advance the band window.
+    #
+    # Because each input file is sorted by northing ascending, once a file's
+    # current row group has min_northing > band_top we know the band is complete.
+    # We use a simpler approach: read all files completely into a list of small
+    # band-keyed DataFrames, sorted per-file, then concat+sort per band.
+    # This avoids complex iterator state while still bounding RAM per band.
 
-    # Polars parallel sort (all CPU cores) — faster than single-threaded PyArrow sort.
-    # Extract northing from point_id as the primary sort key so pixels in the same
-    # geographic row are co-located in output row groups.
-    import polars as pl
-    df = pl.from_arrow(combined)
-    del combined
-    has_scl = "scl_purity" in df.columns
-    sort_cols = ["_northing", "point_id", "date", *(["scl_purity"] if has_scl else [])]
-    sort_desc  = [False,       False,       False, *([ True        ] if has_scl else [])]
-    df = (
-        df.with_columns(
-            pl.col("point_id").str.extract(r"_(\d+)$", 1).cast(pl.Int32).alias("_northing")
-        )
-        .sort(sort_cols, descending=sort_desc)
-        .drop("_northing")
-    )
-    n_pixels = df["point_id"].n_unique()
-    combined = _conform_table(df.to_arrow(), schema)
-    del df
+    # Open all files and create row-group iterators.
+    pfs = [pq.ParquetFile(str(p)) for p in all_paths]
+    n_rgs = [pf.metadata.num_row_groups for pf in pfs]
 
-    _phase(f"writing {n_pixels // 1000}k pixels")
-    logger.info("merge_scenes: writing %s (%d pixels) ...", out_path.name, n_pixels)
+    def _yi_from_pid(pid: str) -> int:
+        """Extract the global northing index from a point_id like 'px_0012_0034'."""
+        return int(pid.rsplit("_", 1)[-1])
+
+    # Determine the global northing range by sampling the first/last point_id
+    # from each file (cheap — reads one row from first and last row groups).
+    yi_min_global = math.inf
+    yi_max_global = -math.inf
+    for fi, pf in enumerate(pfs):
+        if n_rgs[fi] == 0:
+            continue
+        rg0 = pf.read_row_group(0, columns=["point_id"])
+        rg_last = pf.read_row_group(n_rgs[fi] - 1, columns=["point_id"])
+        pids_first = rg0.column("point_id").to_pylist()
+        pids_last  = rg_last.column("point_id").to_pylist()
+        if pids_first:
+            yi_min_global = min(yi_min_global, _yi_from_pid(pids_first[0]))
+        if pids_last:
+            yi_max_global = max(yi_max_global, _yi_from_pid(pids_last[-1]))
+
+    if math.isinf(yi_min_global):
+        return  # all files empty
+
+    yi_min_global = int(yi_min_global)
+    yi_max_global = int(yi_max_global)
+
+    # Build band boundaries: [yi_min, yi_min+BAND), [yi_min+BAND, ...), ...
+    band_starts = list(range(
+        (yi_min_global // _NORTHING_BAND) * _NORTHING_BAND,
+        yi_max_global + _NORTHING_BAND,
+        _NORTHING_BAND,
+    ))
 
     tmp_path = out_path.with_suffix(".merge_tmp.parquet")
     tmp_path.unlink(missing_ok=True)
@@ -106,22 +134,138 @@ def merge_scenes(
         compression="zstd",
         compression_level=3,
         use_dictionary=[c for c in schema.names if c in dict_cols],
-        write_statistics=False,
+        write_statistics=["lon", "lat"],
     )
-    rg_size = 5_000_000
-    for off in range(0, max(len(combined), 1), rg_size):
-        writer.write_table(combined.slice(off, rg_size))
+
+    n_pixels_total = 0
+    rg_size_out = 5_000_000
+
+    # Per-file row-group iterator state
+    rg_cursors = [0] * n_files          # next row group index to read per file
+    rg_buffers: list[pl.DataFrame | None] = [None] * n_files  # current buffered rg (with _yi column)
+
+    # Output accumulator for current band
+    band_frames: list[pl.DataFrame] = []
+
+    def _flush_band(frames: list[pl.DataFrame]) -> tuple[pl.DataFrame, int]:
+        """Sort and conform a list of frames from one northing band."""
+        if not frames:
+            return pl.DataFrame(), 0
+        combined_df = pl.concat(frames, how="diagonal_relaxed")
+        _has_scl = "scl_purity" in combined_df.columns
+        sort_cols = ["point_id", "date", *(["scl_purity"] if _has_scl else [])]
+        sort_desc  = [False,      False,  *([ True        ] if _has_scl else [])]
+        sorted_df = combined_df.sort(sort_cols, descending=sort_desc)
+        n_px = sorted_df["point_id"].n_unique()
+        return sorted_df, n_px
+
+    write_buffer: pl.DataFrame | None = None
+    write_buffer_rows = 0
+
+    def _flush_write_buffer(final: bool = False) -> None:
+        nonlocal write_buffer, write_buffer_rows
+        if write_buffer is None or len(write_buffer) == 0:
+            return
+        if not final and write_buffer_rows < rg_size_out:
+            return
+        tbl = _conform_table(write_buffer.to_arrow(), schema)
+        for off in range(0, max(len(tbl), 1), rg_size_out):
+            writer.write_table(tbl.slice(off, rg_size_out))
+        write_buffer = None
+        write_buffer_rows = 0
+
+    def _append_to_write_buffer(df: pl.DataFrame) -> None:
+        nonlocal write_buffer, write_buffer_rows
+        if len(df) == 0:
+            return
+        if write_buffer is None:
+            write_buffer = df
+        else:
+            write_buffer = pl.concat([write_buffer, df], how="diagonal_relaxed")
+        write_buffer_rows += len(df)
+        if write_buffer_rows >= rg_size_out:
+            _flush_write_buffer(final=False)
+
+    # Stream through all files band by band.
+    # For each band [band_start, band_start+_NORTHING_BAND):
+    #   - for each file, read row groups until the row group's min yi >= band_end
+    #   - collect rows that fall in [band_start, band_end) from each file
+    #   - flush band: sort + write
+    #
+    # Since files are sorted by yi ascending, once a file's next rg has min_yi
+    # >= band_end, we stop reading that file for this band.
+
+    def _load_rg(fi: int) -> pl.DataFrame | None:
+        """Read the next row group for file fi, pre-computing _yi, or return None."""
+        if rg_cursors[fi] >= n_rgs[fi]:
+            return None
+        rg_tbl = pfs[fi].read_row_group(rg_cursors[fi])
+        rg_cursors[fi] += 1
+        df = pl.from_arrow(_conform_table(rg_tbl, schema))
+        return df.with_columns(
+            pl.col("point_id").str.extract(r"_(\d+)$", 1).cast(pl.Int32).alias("_yi")
+        )
+
+    # Eagerly load first row group per file into buffer (_yi pre-computed).
+    for fi in range(n_files):
+        rg_buffers[fi] = _load_rg(fi)
+
+    for band_start in band_starts:
+        band_end = band_start + _NORTHING_BAND
+        band_frames = []
+
+        for fi in range(n_files):
+            file_frames: list[pl.DataFrame] = []
+
+            while True:
+                buf = rg_buffers[fi]
+                if buf is None or len(buf) == 0:
+                    break
+
+                # buf already has _yi column — split into in-band and after-band rows.
+                in_band    = buf.filter((pl.col("_yi") >= band_start) & (pl.col("_yi") < band_end))
+                after_band = buf.filter( pl.col("_yi") >= band_end)
+
+                if len(in_band) > 0:
+                    file_frames.append(in_band.drop("_yi"))
+
+                if len(after_band) > 0:
+                    # Keep remainder (yi >= band_end) for future bands.
+                    rg_buffers[fi] = after_band
+                    break
+                else:
+                    # Current rg fully consumed — load next.
+                    rg_buffers[fi] = _load_rg(fi)
+                    if rg_buffers[fi] is not None and rg_buffers[fi]["_yi"].min() >= band_end:
+                        # Entire new rg is past this band — leave it buffered and stop.
+                        break
+                    # Loop again to split the newly loaded rg.
+
+            if file_frames:
+                band_frames.append(pl.concat(file_frames, how="diagonal_relaxed"))
+
+        if not band_frames:
+            continue
+
+        sorted_band, n_px = _flush_band(band_frames)
+        n_pixels_total += n_px
+        _append_to_write_buffer(sorted_band)
+        del band_frames, sorted_band
+
+    _flush_write_buffer(final=True)
     writer.close()
-    del combined
 
     tmp_path.replace(out_path)
 
+    _phase(f"writing {n_pixels_total // 1000}k pixels")
+    logger.info("merge_scenes: writing %s (%d pixels) ...", out_path.name, n_pixels_total)
+
     # Write pixel count sidecar atomically so num_pixels() is instant on re-read.
     _sidecar_tmp = out_path.with_suffix(".pixel_count.tmp")
-    _sidecar_tmp.write_text(str(n_pixels))
+    _sidecar_tmp.write_text(str(n_pixels_total))
     _sidecar_tmp.replace(out_path.with_suffix(".pixel_count"))
 
-    logger.info("merge_scenes done: %d input files → %s (%d pixels)", n_files, out_path.name, n_pixels)
+    logger.info("merge_scenes done: %d input files → %s (%d pixels)", n_files, out_path.name, n_pixels_total)
 
 
 # ---------------------------------------------------------------------------

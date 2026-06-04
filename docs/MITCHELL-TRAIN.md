@@ -1,0 +1,234 @@
+# Mitchell River Training Region Design
+
+## Context
+
+V10 was trained with zero Mitchell River presence data and a single small absence region
+(`mitchell_river_absence`, ~1 km² riparian patch at 142.15°E, 15.80°S). When run over the
+broader Mitchell River mouth and surrounds (Gulf of Carpentaria coast), the model produces
+false positives on mangroves, bare floodplain ground, and native riparian woodland — the
+dominant non-Parkinsonia land covers in this landscape.
+
+The root cause: monsoonal vegetation pushes `rec_p` (wet–dry NDVI amplitude) far beyond
+the training range, so the model cannot discriminate Parkinsonia from any other green
+vegetation. The fix is adding Mitchell-region training data covering confirmed presence
+and hard-negative absence for the specific false-positive cover types.
+
+---
+
+## Using Claude to inspect candidate bboxes
+
+Claude can query the pixel timeseries for any bbox you draw in the UI. To use this:
+
+1. Draw a candidate bbox in the UI
+2. In a new chat, say: **"Inspect bbox: [lon_min, lat_min, lon_max, lat_max]"**
+
+Claude will run:
+
+```bash
+source .venv/bin/activate && python utils/pixel_timeseries.py \
+  --root /mnt/external/chunkstore --year 2025 \
+  --tile 54LWH --bbox <lon_min,lat_min,lon_max,lat_max>
+```
+
+If the result is empty, Claude retries with `--tile 54KWG`. Tile coverage:
+- `54LWH`: roughly lat -15.5 to -16.3, lon 141.5–142.1 (Mitchell mouth and north)
+- `54KWG`: roughly lat -16.3 to -16.7, lon 141.3–141.9 (further south/inland)
+
+Only 2025 data is available in the chunkstore at present.
+
+### Signal profiles for each cover type
+
+Claude interprets the output against these expected profiles:
+
+| Cover type | Wet NDVI | Dry NDVI | Wet–dry Δ | MAVI | Dry VH/VV |
+|---|---|---|---|---|---|
+| **Parkinsonia presence** | 0.75–0.90 | 0.20–0.35 | 0.50–0.65 | moderate (0.45–0.60) | -3 to -6 dB (stable) |
+| **Mangrove absence** | 0.90–0.97 | 0.65–0.75 | < 0.30 | high stable | -3 to -5 dB |
+| **Bare ground / floodplain** | 0.50–0.75 | 0.10–0.15 | > 0.55 | low (< 0.25 dry) | -7 to -9 dB dry |
+| **Native riparian / savanna** | 0.70–0.85 | 0.25–0.45 | 0.40–0.55 | moderate | -4 to -6 dB |
+
+Key discriminators:
+- **Mangrove vs Parkinsonia**: mangrove wet NDVI > 0.90, dry floor > 0.60, stable VH/VV —
+  Parkinsonia wet NDVI < 0.90, dry floor < 0.35
+- **Bare ground vs Parkinsonia**: bare ground dry VH/VV crashes to -7 to -9 dB (no woody
+  structure), Parkinsonia VH/VV stays at -3 to -6 dB year-round
+- **Native woodland vs Parkinsonia**: these are spectrally similar and the hardest to
+  separate — rely on WMS imagery confirmation; do not commit presence without visual
+  verification
+
+### Bbox quality checks
+
+Before committing any bbox, Claude will report:
+
+- **p25–p75 width**: narrow band (< 0.05) = spatially clean patch; wide band (> 0.10)
+  suggests spatial mixing — shrink the bbox or move it
+- **Anomalous single-date dips**: occasional NDVI near zero mid-season = cloud/shadow
+  contamination on one scene, not a real signal — safe to ignore
+- **Wet-season NDVI anomalously high** (> 0.90 for a supposed presence region): likely
+  clipping a mangrove or dense riparian edge — inspect imagery and tighten the bbox
+
+---
+
+## What we're looking for
+
+### Presence regions
+
+Target: dense, visually unambiguous Parkinsonia crown clusters confirmed on WMS imagery.
+Each bbox should be spatially compact (a few hundred metres per side, ~0.001° per edge).
+
+Expected spectral profile:
+- Wet NDVI 0.75–0.90, peaking late wet season (Apr–May)
+- Dry NDVI 0.20–0.35 (substantial crash — deciduous leaf drop)
+- Wet–dry Δ ≥ 0.50
+- MAVI/NDVI ratio ~0.60–0.70 in wet season (woody canopy water content)
+- VH/VV -3 to -6 dB, **seasonally stable** — persistent woody structure even when
+  optically bare. This is the key radar discriminator vs bare ground.
+
+**Variation needed**: aim for presence regions at different positions along the river
+(different reaches, not clustered in one spot) and if possible covering both dense
+interior crown patches and slightly sparser edge patches. Dense-only training risks
+missing real infestations at lower canopy cover.
+
+**Quantity**: 3–5 presence regions for training, 1–2 held out for validation.
+Each region typically yields 20–100 pixels × multiple years. Target ~300–500 presence
+training pixels total across all regions and years.
+
+**Priority candidates identified so far** (confirmed on imagery or strongly suspected):
+- Bbox 5: `[141.405968, -16.209836, 141.406614, -16.209371]` — very tight IQR, Δ 0.65,
+  strongest signal of all candidates
+- Bbox 8: `[141.379503, -16.345300, 141.380893, -16.344083]` — very tight IQR year-round,
+  Δ 0.61, wet peak 0.88; best spatial purity of all candidates
+- Bbox 7: `[141.365263, -16.337010, 141.365895, -16.336488]` — moderate IQR, Δ 0.54,
+  plausible presence; include if confirmed on imagery to add realistic variance
+- Bbox 4: `[141.465037, -15.984845, 141.466129, -15.984326]` — wide wet-season IQR,
+  suspected presence; tighten bbox before committing
+
+### Absence — mangrove (highest priority)
+
+Mangroves are the dominant false-positive class. Spatially clustered along tidal channels
+and the Gulf shoreline — identifiable in WMS as dark-green dense fringe.
+
+Expected spectral profile:
+- Wet NDVI 0.90–0.97 (higher than any Parkinsonia bbox)
+- Dry NDVI > 0.65 (stays green — no wet–dry crash)
+- Wet–dry Δ < 0.30
+- MAVI high and stable
+- VH/VV -3 to -5 dB (closed woody canopy), no seasonal swing
+
+**Variation needed**: 2–3 mangrove absence regions at different positions along the
+coast/tidal channels to capture spatial variability in mangrove density. One tight-fringe
+patch and one broader stand would cover the range.
+
+**Quantity**: 2–3 training regions, 1 validation. Target ~200–400 absence pixels from
+mangrove across regions and years.
+
+**Candidate identified**: Bbox 1 `[141.493829, -15.491023, 141.494610, -15.490164]` —
+confirmed mangrove, wet NDVI 0.92–0.97, dry floor 0.70, Δ 0.25. Use as
+`mitchell_absence_mangrove_1`. Seek 1–2 more at different coastal positions.
+
+Note: Bbox 6 `[141.371368, -16.256234, 141.372865, -16.255527]` — v10 false positive,
+bbox clips a mangrove fringe edge. Tighten to the eastern mangrove pixels only before
+using as a mangrove absence region.
+
+### Absence — bare ground / floodplain (high priority)
+
+Bare floodplain and exposed seasonal ground score high in v10 — a hard false-positive
+class the model has never seen.
+
+Expected spectral profile:
+- Wet NDVI 0.50–0.75 (moderate greenup from annual grass flush)
+- Dry NDVI 0.10–0.15 (near-bare, effectively no canopy)
+- Wet–dry Δ > 0.55
+- VH/VV crashes in dry season to -7 to -9 dB (no woody structure)
+
+The VH/VV dry-season crash is the clearest discriminator from Parkinsonia, which
+maintains -3 to -6 dB year-round due to persistent woody stems.
+
+**Variation needed**: 1–2 regions; one on exposed interfluve and one on seasonally
+inundated floodplain fringe if available.
+
+**Quantity**: 1–2 training regions. Target ~150–300 absence pixels.
+
+**Candidate identified**: Bbox 3 `[141.545524, -15.489095, 141.546327, -15.488391]` —
+confirmed bare ground, v10 high false positive, NDVI crashes to 0.10–0.13 dry, VH/VV
+-7 to -9 dB dry. Use as `mitchell_absence_bare_1`.
+
+### Absence — native riparian / savanna woodland
+
+Spectrally the most similar to Parkinsonia — deciduous woodland with a real wet–dry NDVI
+swing. Important for teaching the model local contrast near presence patches.
+
+Expected spectral profile:
+- Wet NDVI 0.70–0.85
+- Dry NDVI 0.25–0.45 (higher floor than Parkinsonia — retains more dry-season greenness)
+- VH/VV -4 to -6 dB, slight seasonal variation but not the bare-ground crash
+- Wider p25–p75 band than Parkinsonia (more canopy structural heterogeneity)
+
+**Variation needed**: 1–2 regions adjacent to or near presence patches so the model
+learns local contrast. The existing `mitchell_river_absence` (142.15°E) covers native
+riparian; add more only if presence patches are on different river reaches.
+
+**Quantity**: 1–2 training regions (the existing region counts). Target ~150–250 pixels.
+
+---
+
+## Summary target for v11
+
+| ID | Label | Cover type | Priority | Status |
+|----|-------|-----------|----------|--------|
+| `mitchell_presence_1` | presence | Parkinsonia (dense) | Required | bbox 5 — confirm imagery |
+| `mitchell_presence_2` | presence | Parkinsonia (dense) | Required | bbox 8 — confirm imagery |
+| `mitchell_presence_3` | presence | Parkinsonia (moderate) | Recommended | bbox 7 — confirm imagery |
+| `mitchell_absence_mangrove_1` | absence | mangrove | Required | bbox 1 — confirmed |
+| `mitchell_absence_mangrove_2` | absence | mangrove | Required | new — find on coast |
+| `mitchell_absence_bare_1` | absence | bare ground | Required | bbox 3 — confirmed |
+| `mitchell_absence_riparian_1` | absence | native riparian | Recommended | existing `mitchell_river_absence` |
+| `mitchell_absence_riparian_2` | absence | native riparian | Optional | new — near presence patches |
+
+Minimum viable set: 2 presence + mangrove + bare ground = 4 new regions. Mirror the
+Frenchs pattern (4 presence, 8 absence) if enough clean patches can be identified.
+
+---
+
+## Adding to training.yaml
+
+Add new regions to [data/locations/training.yaml](data/locations/training.yaml) after
+line 343 (the existing `mitchell_river_absence` entry), following this schema:
+
+```yaml
+- id: mitchell_presence_1
+  name: "Mitchell River — presence 1"
+  label: presence
+  bbox: [lon_min, lat_min, lon_max, lat_max]
+  years: [2020, 2021, 2022, 2023, 2024, 2025]
+  tags: [monsoonal, riparian]
+
+- id: mitchell_absence_mangrove_1
+  name: "Mitchell River — absence (mangrove 1)"
+  label: absence
+  bbox: [lon_min, lat_min, lon_max, lat_max]
+  years: [2020, 2021, 2022, 2023, 2024, 2025]
+  tags: [monsoonal, mangrove]
+
+- id: mitchell_absence_bare_1
+  name: "Mitchell River — absence (bare ground 1)"
+  label: absence
+  bbox: [lon_min, lat_min, lon_max, lat_max]
+  years: [2020, 2021, 2022, 2023, 2024, 2025]
+  tags: [monsoonal, bare_soil]
+```
+
+Then add the new region IDs to the experiment's `train_region_ids` list in the v11
+experiment file. Run the pixel collector to fetch training data, retrain, and evaluate
+the Kowanyama/Mitchell probability map — mangrove fringes and bare interfluve should
+collapse toward 0, confirmed presence patches should read > 0.7.
+
+---
+
+## Verification
+
+Score the Mitchell River bbox after retraining and compare the probability map against
+WMS imagery:
+- Mangrove fringes and bare interfluve: < 0.2
+- Confirmed presence patches: > 0.7
+- Check that existing site val metrics (Etna, Landsend, Frenchs val) do not regress

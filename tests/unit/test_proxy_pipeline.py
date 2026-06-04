@@ -1346,6 +1346,40 @@ def test_cpo3_parquet_coords_consistent_with_point_id(tmp_path):
         )
 
 
+# CPO-3b: merge_scenes() writes lon/lat row-group statistics (required by chunk_coverage)
+def test_cpo3b_merge_scenes_writes_lon_lat_statistics(tmp_path):
+    """Every row group in a merge_scenes() output has lon and lat statistics.
+
+    chunk_coverage.py skips any chunk whose row groups have no lon/lat stats —
+    which breaks the serve-layer spatial index.  This test locks down that
+    write_statistics includes at least lon and lat.
+    """
+    from proxy._pipeline import merge_scenes
+
+    scene_paths = [
+        _synthetic_scene_parquet(tmp_path / "scenes", f"scene_{i:04d}", n_points=8, n_dates=3)
+        for i in range(2)
+    ]
+    out = tmp_path / "chunk_stats.parquet"
+    merge_scenes(scene_paths, None, out)
+
+    pf = pq.ParquetFile(out)
+    schema_names = pf.schema_arrow.names
+    lon_i = schema_names.index("lon")
+    lat_i = schema_names.index("lat")
+
+    md = pf.metadata
+    assert md.num_row_groups >= 1
+    for rg_idx in range(md.num_row_groups):
+        rg = md.row_group(rg_idx)
+        lon_st = rg.column(lon_i).statistics
+        lat_st = rg.column(lat_i).statistics
+        assert lon_st is not None, f"row group {rg_idx}: lon statistics missing"
+        assert lat_st is not None, f"row group {rg_idx}: lat statistics missing"
+        assert lon_st.has_min_max, f"row group {rg_idx}: lon statistics have no min/max"
+        assert lat_st.has_min_max, f"row group {rg_idx}: lat statistics have no min/max"
+
+
 # CPO-4: multi-chunk fetch with COG overhang → parquets are spatially consistent
 def test_cpo4_multi_chunk_parquet_xi_yi_consistent_with_cog_overhang(tmp_path):
     """Fetch pipeline writes one parquet per chunk; xi/yi must be globally consistent.
