@@ -82,10 +82,16 @@ def build_manifest(root: Path) -> list[dict]:
                     lon_mins, lon_maxs, lat_mins, lat_maxs = [], [], [], []
                     for i in range(md.num_row_groups):
                         rg = md.row_group(i)
-                        lon_mins.append(rg.column(lon_i).statistics.min)
-                        lon_maxs.append(rg.column(lon_i).statistics.max)
-                        lat_mins.append(rg.column(lat_i).statistics.min)
-                        lat_maxs.append(rg.column(lat_i).statistics.max)
+                        lon_st = rg.column(lon_i).statistics
+                        lat_st = rg.column(lat_i).statistics
+                        if lon_st is None or lat_st is None:
+                            continue
+                        lon_mins.append(lon_st.min)
+                        lon_maxs.append(lon_st.max)
+                        lat_mins.append(lat_st.min)
+                        lat_maxs.append(lat_st.max)
+                    if not lon_mins:
+                        raise ValueError("no row-group statistics in any row group")
 
                     entry: dict = {
                         "year": year,

@@ -23,36 +23,28 @@ def merge_scenes(
     s1_path: Path | None,
     out_path: Path,
     chunk_metadata: dict[str, str] | None = None,
+    on_phase: "Callable[[str], None] | None" = None,
 ) -> None:
-    """K-way merge of pre-northing-sorted per-scene parquets (+ optional S1).
+    """Merge per-scene parquets into one pixel-sorted chunk parquet.
 
-    Each scene parquet is written with row_group_size = strip_height_px (1024),
-    so each row-group covers exactly one northing row of the strip grid.  Because
-    every file is sorted by northing and the row-groups cover non-overlapping
-    northing bands within each file, a min-heap keyed on each file's current
-    row-group's minimum northing produces a correctly sorted output with no sort
-    step and no I/O amplification.
+    Reads all scene parquets into RAM (~5 GB for a 1024×1024×82-scene chunk on
+    a 64 GB machine), sorts in-memory by (northing, point_id, date, scl_purity
+    desc), then writes once with dictionary encoding.  No intermediate disk files.
 
-    Peak RAM = n_files × strip_height_px × bytes_per_row ≈ 4 MB for 82 scenes.
-    No sort, no DuckDB, no spill — pure sequential PyArrow reads and writes.
+    S1 rows (if present) are included in the same in-memory sort so they
+    interleave correctly with S2 by northing and date.
 
-    S1 rows have many dates per northing; its row-groups may span multiple
-    northing values.  S1 is appended after the S2 merge and the combined output
-    is then re-sorted by (northing, date) only for the S1 rows — but in practice
-    S1 is a small fraction of total rows (~1%) so this sort is cheap.  Actually,
-    S1 is handled by appending S1 row-groups in northing order after S2 (S1 is
-    also northing-sorted by _sort_s1_shards) and the combined output is already
-    ordered: all S2 rows come first sorted by northing, then S1 rows sorted by
-    northing, which is NOT the desired (northing, date) interleaving.
-
-    Correct approach: treat S1 as another set of sorted runs in the heap.
-    S1 row-groups cover many dates per northing band, so their min-northing keys
-    interleave correctly with the S2 scene row-groups.
+    on_phase: optional callback called with a short human-readable string at the
+        start of each phase ("reading N files", "sorting NM rows", "writing").
+        Used by the progress display to show sub-step detail on the merge line.
     """
-    import heapq
     import pyarrow as pa
     import pyarrow.parquet as pq
-    from utils.parquet_utils import COMBINED_PIXEL_SCHEMA, _conform_table, sort_parquet_by_pixel
+    from utils.parquet_utils import COMBINED_PIXEL_SCHEMA, _conform_table
+
+    def _phase(msg: str) -> None:
+        if on_phase is not None:
+            on_phase(msg)
 
     all_paths: list[Path] = list(scene_paths)
     if s1_path is not None and s1_path.exists():
@@ -62,71 +54,74 @@ def merge_scenes(
         return
 
     n_files = len(all_paths)
-    logger.info("merge_scenes: merging %d files → %s", n_files, out_path.name)
-
-    tmp_path = out_path.with_suffix(".merge_tmp.parquet")
-    tmp_path.unlink(missing_ok=True)
+    _phase(f"reading {n_files} files")
+    logger.info("merge_scenes: reading %d files into RAM → %s", n_files, out_path.name)
 
     schema = COMBINED_PIXEL_SCHEMA
     if chunk_metadata:
         schema = schema.with_metadata({k.encode(): v.encode() for k, v in chunk_metadata.items()})
+
+    # Read every row-group from every file into a flat list of tables.
+    chunks: list[pa.Table] = []
+    for p in all_paths:
+        pf = pq.ParquetFile(str(p))
+        for rg in range(pf.metadata.num_row_groups):
+            chunks.append(_conform_table(pf.read_row_group(rg), schema))
+
+    combined = pa.concat_tables(chunks, promote_options="none")
+    del chunks
+
+    n_rows = len(combined)
+    _phase(f"sorting {n_rows // 1_000_000}M rows")
+    logger.info("merge_scenes: sorting %d rows in RAM ...", n_rows)
+
+    # Polars parallel sort (all CPU cores) — faster than single-threaded PyArrow sort.
+    # Extract northing from point_id as the primary sort key so pixels in the same
+    # geographic row are co-located in output row groups.
+    import polars as pl
+    df = pl.from_arrow(combined)
+    del combined
+    has_scl = "scl_purity" in df.columns
+    sort_cols = ["_northing", "point_id", "date", *(["scl_purity"] if has_scl else [])]
+    sort_desc  = [False,       False,       False, *([ True        ] if has_scl else [])]
+    df = (
+        df.with_columns(
+            pl.col("point_id").str.extract(r"_(\d+)$", 1).cast(pl.Int32).alias("_northing")
+        )
+        .sort(sort_cols, descending=sort_desc)
+        .drop("_northing")
+    )
+    n_pixels = df["point_id"].n_unique()
+    combined = _conform_table(df.to_arrow(), schema)
+    del df
+
+    _phase(f"writing {n_pixels // 1000}k pixels")
+    logger.info("merge_scenes: writing %s (%d pixels) ...", out_path.name, n_pixels)
+
+    tmp_path = out_path.with_suffix(".merge_tmp.parquet")
+    tmp_path.unlink(missing_ok=True)
+    dict_cols = {"point_id", "item_id", "tile_id"}
     writer = pq.ParquetWriter(
         str(tmp_path), schema,
         compression="zstd",
+        compression_level=3,
+        use_dictionary=[c for c in schema.names if c in dict_cols],
         write_statistics=False,
     )
-
-    readers = [pq.ParquetFile(str(p)) for p in all_paths]
-    cursors = [0] * n_files
-
-    def _northing_of_first_row(tbl: pa.Table) -> int:
-        # Rows are northing-sorted; the first row has the minimum northing.
-        # Split only the first point_id — O(1), no full-column Arrow kernel call.
-        return int(tbl.column("point_id")[0].as_py().rsplit("_", 1)[-1])
-
-    def _read_next(file_idx: int) -> tuple[int, int, pa.Table] | None:
-        pf  = readers[file_idx]
-        rg  = cursors[file_idx]
-        if rg >= pf.metadata.num_row_groups:
-            return None
-        tbl = _conform_table(pf.read_row_group(rg), schema)
-        cursors[file_idx] = rg + 1
-        return (_northing_of_first_row(tbl), file_idx, tbl)
-
-    heap: list[tuple[int, int, pa.Table]] = []
-    for idx in range(n_files):
-        entry = _read_next(idx)
-        if entry is not None:
-            heapq.heappush(heap, entry)
-
-    all_pids: set[str] = set()
-    try:
-        while heap:
-            _key, file_idx, tbl = heapq.heappop(heap)
-            writer.write_table(tbl)
-            all_pids.update(tbl.column("point_id").to_pylist())
-            nxt = _read_next(file_idx)
-            if nxt is not None:
-                heapq.heappush(heap, nxt)
-    finally:
-        writer.close()
+    rg_size = 5_000_000
+    for off in range(0, max(len(combined), 1), rg_size):
+        writer.write_table(combined.slice(off, rg_size))
+    writer.close()
+    del combined
 
     tmp_path.replace(out_path)
 
-    # Pixel-sort while still on NVMe (out_path is in pipeline_tmp, before any
-    # copy to external HDD).  Polars uses all available CPU threads.
-    logger.info("merge_scenes: pixel-sorting %s ...", out_path.name)
-    sorting_tmp = out_path.with_suffix(".sorting.parquet")
-    sort_parquet_by_pixel(out_path, sorting_tmp, row_group_size=5_000_000)
-    out_path.unlink()
-    sorting_tmp.replace(out_path)
-
     # Write pixel count sidecar atomically so num_pixels() is instant on re-read.
     _sidecar_tmp = out_path.with_suffix(".pixel_count.tmp")
-    _sidecar_tmp.write_text(str(len(all_pids)))
+    _sidecar_tmp.write_text(str(n_pixels))
     _sidecar_tmp.replace(out_path.with_suffix(".pixel_count"))
 
-    logger.info("merge_scenes done: %d input files → %s (%d pixels)", n_files, out_path.name, len(all_pids))
+    logger.info("merge_scenes done: %d input files → %s (%d pixels)", n_files, out_path.name, n_pixels)
 
 
 # ---------------------------------------------------------------------------
@@ -355,7 +350,7 @@ def make_chunk_points(chunk: dict, meta: dict) -> list[tuple[str, float, float]]
 
 def run_tile_pipeline_v2(
     tile_id: str,
-    year: int,
+    years: list[int] | int,
     polygon_geometry,
     tmp: Path,
     cloud_max: int = 80,
@@ -365,11 +360,14 @@ def run_tile_pipeline_v2(
     max_concurrent: int = 64,
     n_workers: int | None = None,
     resume_from_chunk: tuple[int, int] = (0, 0),
-    skip_chunks: set[tuple[int, int]] | None = None,
+    skip_chunks: set[tuple[int, int, int]] | None = None,
     items=None,
     calibration_out: Path | None = None,
     point_id_prefix: str = "px",
-) -> Iterator[tuple[int, int, Path]]:
+    log_dir: Path | None = None,
+    progress=None,   # TileProgress | None
+    grid_cache: Path | None = None,  # path to write/read _grid.json
+) -> Iterator[tuple[int, int, int, Path]]:
     """Two-pool network→disk / disk→extract pipeline for memory-constrained machines.
 
     Pool A (network→disk): fetch_patches_to_tiff() writes one GeoTIFF per
@@ -387,17 +385,23 @@ def run_tile_pipeline_v2(
         collect_s1     ×1  0.50 GB  — async S1 fetch + extract
         merge_scenes   ×1  0.05 GB  — k-way heap merge → sorted chunk parquet
 
-    Yields (chunk_row, chunk_col, sorted_chunk_parquet_path) for each completed chunk.
-    Chunks are in row-major order: (0,0), (0,1), ..., (1,0), ...
+    The fundamental unit of work is (chunk, year).  All (chunk, year) pairs for the
+    tile are queued together so the fetch stage is kept busy while extract processes
+    a previous chunk.
+
+    Yields (chunk_row, chunk_col, year, sorted_chunk_parquet_path) for each completed chunk.
+    Chunks within each year are in row-major order: (0,0), (0,1), ..., (1,0), ...
     """
     import asyncio
     import shutil
     import os
+    import time as _time
     from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _as_completed
     from dataclasses import dataclass, field
 
+    from utils.chunk_log import ChunkLogger, get_chunk_logger
+
     from utils.stac import search_sentinel2
-    from utils.pipeline_types import Pipeline, StageSpec
     from utils.pixel_collector import (
         collect, STAC_ENDPOINT, S2_COLLECTION, FETCH_BANDS, BAND_ALIAS,
         _extract_item_from_tiffs, _TILE_ID_RE,
@@ -410,77 +414,128 @@ def run_tile_pipeline_v2(
     # Must be called before any ThreadPoolExecutor so worker threads inherit the env.
     setup_gdal_env()
 
+    # Accept a single year for backward compatibility.
+    _years: list[int] = [years] if isinstance(years, int) else list(years)
+
     extract_workers = int(os.environ.get("EXTRACT_WORKERS", "2"))
     _mem_gb = _system_memory_gb()
     _default_prefetch = 1 if _mem_gb <= 20 else 2
     prefetch_depth = int(os.environ.get("PREFETCH_DEPTH", str(_default_prefetch)))
 
     bbox_wgs84 = list(polygon_geometry.bounds)
-    start_date = f"{year}-01-01"
-    end_date   = f"{year}-12-31"
 
-    if items is None:
-        logger.info("[v2 tile %s %d] STAC search ...", tile_id, year)
-        items = search_sentinel2(
-            bbox=bbox_wgs84,
-            start=start_date,
-            end=end_date,
-            cloud_cover_max=cloud_max,
-            endpoint=STAC_ENDPOINT,
-            collection=S2_COLLECTION,
-            mgrs_tile=tile_id,
-        )
-    logger.info("[v2 tile %s %d] %d STAC items", tile_id, year, len(items))
+    # --- Eager STAC search for all years --------------------------------------
+    # items_by_year may be pre-supplied (training pipeline) only when years is a
+    # single int and the caller passes items=<list>.  In that case wrap it.
+    if items is not None and isinstance(years, int):
+        items_by_year: dict[int, list] = {years: items}
+    else:
+        items_by_year = {}
+        for yr in _years:
+            if progress is not None:
+                progress.year(yr).set_status(f"STAC search {yr}…")
+            logger.info("[v2 tile %s %d] STAC search ...", tile_id, yr)
+            yr_items = search_sentinel2(
+                bbox=bbox_wgs84,
+                start=f"{yr}-01-01",
+                end=f"{yr}-12-31",
+                cloud_cover_max=cloud_max,
+                endpoint=STAC_ENDPOINT,
+                collection=S2_COLLECTION,
+                mgrs_tile=tile_id,
+            )
+            logger.info("[v2 tile %s %d] %d STAC items", tile_id, yr, len(yr_items))
+            if yr_items:
+                items_by_year[yr] = yr_items
 
-    if not items:
+    if not items_by_year:
         return
+
+    # --- Resolve COG transform for chunk-grid snapping ------------------------
+    # Order of preference:
+    #   1. Cached _grid.json written by a previous run (grid_cache path)
+    #   2. Live read from first STAC item's COG header
+    #   3. Geographic fallback (no snapping)
+    import json as _json
 
     cog_utm_crs: str | None  = None
     cog_y_top:   float | None = None
     cog_x_left:  float | None = None
     cog_block_height: int = chunk_height_px
     cog_block_width:  int = chunk_width_px
-    for item in items:
-        href_obj = item.assets.get("red") or item.assets.get("B04")
-        if href_obj is not None:
-            try:
-                cog_utm_crs, cog_y_top, cog_x_left, cog_block_height, cog_block_width = read_cog_transform(href_obj.href)
-                logger.info("[v2 tile %s %d] COG origin: crs=%s y_top=%.1f x_left=%.1f block=%dx%d px",
-                            tile_id, year, cog_utm_crs, cog_y_top, cog_x_left,
-                            cog_block_height, cog_block_width)
-            except Exception as exc:
-                logger.warning("[v2 tile %s %d] Could not read COG transform (%s) — using geographic fallback",
-                               tile_id, year, exc)
+
+    if grid_cache is not None and grid_cache.exists():
+        try:
+            _g = _json.loads(grid_cache.read_text())
+            cog_utm_crs    = _g["crs"]
+            cog_y_top      = _g["y_top"]
+            cog_x_left     = _g["x_left"]
+            cog_block_height = _g["block_height"]
+            cog_block_width  = _g["block_width"]
+            logger.info("[v2 tile %s] COG origin loaded from cache: crs=%s y_top=%.1f x_left=%.1f block=%dx%d px",
+                        tile_id, cog_utm_crs, cog_y_top, cog_x_left, cog_block_height, cog_block_width)
+        except Exception as exc:
+            logger.warning("[v2 tile %s] Could not read grid cache (%s) — will fetch from COG", tile_id, exc)
+            cog_utm_crs = cog_y_top = cog_x_left = None
+            cog_block_height = chunk_height_px
+            cog_block_width  = chunk_width_px
+
+    if cog_utm_crs is None:
+        if progress is not None:
+            for yr in _years:
+                if yr in items_by_year:
+                    progress.year(yr).set_status("reading COG grid…")
+        for _yr_items in items_by_year.values():
+            for item in _yr_items:
+                href_obj = item.assets.get("red") or item.assets.get("B04")
+                if href_obj is not None:
+                    try:
+                        cog_utm_crs, cog_y_top, cog_x_left, cog_block_height, cog_block_width = read_cog_transform(href_obj.href)
+                        logger.info("[v2 tile %s] COG origin: crs=%s y_top=%.1f x_left=%.1f block=%dx%d px",
+                                    tile_id, cog_utm_crs, cog_y_top, cog_x_left,
+                                    cog_block_height, cog_block_width)
+                    except Exception as exc:
+                        logger.warning("[v2 tile %s] Could not read COG transform (%s) — using geographic fallback",
+                                       tile_id, exc)
+                    break
+            else:
+                continue
             break
+
+    if cog_utm_crs is not None and grid_cache is not None and not grid_cache.exists():
+        try:
+            grid_cache.parent.mkdir(parents=True, exist_ok=True)
+            grid_cache.write_text(_json.dumps({
+                "crs": cog_utm_crs, "y_top": cog_y_top, "x_left": cog_x_left,
+                "block_height": cog_block_height, "block_width": cog_block_width,
+            }))
+            logger.info("[v2 tile %s] COG origin cached to %s", tile_id, grid_cache)
+        except Exception as exc:
+            logger.warning("[v2 tile %s] Could not write grid cache (%s)", tile_id, exc)
 
     chunks, chunks_meta = compute_chunks(
         bbox_wgs84, cog_block_height, cog_block_width, polygon_geometry,
         cog_utm_crs=cog_utm_crs, cog_y_top=cog_y_top, cog_x_left=cog_x_left,
     )
     chunks_meta["point_id_prefix"] = point_id_prefix
-    logger.info("[v2 tile %s %d] %d chunks (%dx%d px each)",
-                tile_id, year, len(chunks), cog_block_height, cog_block_width)
+    logger.info("[v2 tile %s] %d chunks (%dx%d px each) × %d years",
+                tile_id, len(chunks), cog_block_height, cog_block_width, len(items_by_year))
 
     if not chunks:
         return
 
-    _skip = skip_chunks or set()
-    active_chunks = [
-        c for c in chunks
-        if (c["chunk_row"], c["chunk_col"]) >= resume_from_chunk
-        and (c["chunk_row"], c["chunk_col"]) not in _skip
-    ]
-    for c in chunks:
-        key = (c["chunk_row"], c["chunk_col"])
-        if key < resume_from_chunk:
-            logger.info("[v2 tile %s %d] [chunk %02d_%02d] skipping (resume_from_chunk=%s)",
-                        tile_id, year, c["chunk_row"], c["chunk_col"], resume_from_chunk)
-        elif key in _skip:
-            logger.info("[v2 tile %s %d] [chunk %02d_%02d] skipping (already exists)",
-                        tile_id, year, c["chunk_row"], c["chunk_col"])
+    _skip: set[tuple[int, int, int]] = skip_chunks or set()
 
-    if not active_chunks:
-        return
+    # Inform the progress display of the chunk total now that the grid is known.
+    for yr in _years:
+        if yr not in items_by_year:
+            continue
+        n_skip_yr = sum(1 for (r, c, y) in _skip if y == yr)
+        n_fetch_yr = len(chunks) - n_skip_yr
+        logger.info("[v2 tile %s %d] %d chunks total: %d to fetch, %d already done",
+                    tile_id, yr, len(chunks), n_fetch_yr, n_skip_yr)
+        if progress is not None:
+            progress.year(yr).set_total(len(chunks))
 
     from utils.parquet_utils import _optimise_schema, _WRITE_OPTS
     import pyarrow.parquet as pq
@@ -497,46 +552,109 @@ def run_tile_pipeline_v2(
     @dataclass
     class _ChunkWork:
         chunk:       dict
+        year:        int
+        items:       list
         pts:         list          = field(default_factory=list)
         tiff_dir:    Path | None   = None
         scene_paths: list[Path]    = field(default_factory=list)
         s1_path:     Path | None   = None
+        clog:        object        = None   # ChunkLogger | None (avoid import cycle in type)
 
-    # --- Stage functions (capture only run-scoped constants) ------------------
+    # --- Stage functions (use work.year / work.items — no captured year) ------
 
     def _stage_fetch_tiffs(work: _ChunkWork) -> _ChunkWork:
-        """Pool A: fetch all item×band GeoTIFFs to disk for one chunk."""
+        """Pool A: fetch all item×band GeoTIFFs to disk for one chunk.
+
+        If work.tiff_dir is already set (surviving tiff dir from a prior interrupted
+        run), the network fetch is skipped entirely and the work item passes straight
+        through to extract.
+        """
+        if work.clog:
+            work.clog.activate()
         crow = work.chunk["chunk_row"]
         ccol = work.chunk["chunk_col"]
-        tiff_dir = tmp / f"chunk_{crow:02d}_{ccol:02d}_tiffs"
+
+        if work.scene_paths:
+            # Scenes already extracted in a prior run — skip fetch entirely.
+            logger.info("[v2 tile %s %d] [chunk %02d_%02d] fetch_tiffs — skipped (scenes cached)",
+                        tile_id, work.year, crow, ccol)
+            if work.clog:
+                work.clog.info("fetch_tiffs: skipped — %d scene parquets already present",
+                               len(work.scene_paths))
+            return work
+
+        if work.tiff_dir is not None:
+            # Tiffs already on disk from a prior run — skip fetch.
+            logger.info("[v2 tile %s %d] [chunk %02d_%02d] fetch_tiffs — skipped (tiffs cached)",
+                        tile_id, work.year, crow, ccol)
+            if work.clog:
+                work.clog.info("fetch_tiffs: skipped — tiff dir already present (%s)", work.tiff_dir)
+            return work
+
+        tiff_dir = tmp / str(work.year) / f"chunk_{crow:02d}_{ccol:02d}_tiffs"
         tiff_dir.mkdir(parents=True, exist_ok=True)
         logger.info("[v2 tile %s %d] [chunk %02d_%02d] fetch_tiffs → %s",
-                    tile_id, year, crow, ccol, tiff_dir.name)
+                    tile_id, work.year, crow, ccol, tiff_dir.name)
+
+        _yr_items = work.items
+        n_items   = len(_yr_items)
+
+        if work.clog:
+            work.clog.info("fetch_tiffs: %d S2 items, bbox=%s", n_items, work.chunk["bbox"])
+
+        _slot = f"fetch_{crow:02d}_{ccol:02d}_{work.year}"
+        _yr_prog = progress.year(work.year) if progress is not None else None
+        if _yr_prog is not None:
+            _yr_prog.stage_start(_slot, f"r{crow:02d}_c{ccol:02d}", "S2 fetch", total=n_items)
+
+        _t0 = _time.perf_counter()
+
+        def _fetch_progress_cb(done: int, total: int) -> None:
+            if _yr_prog is not None:
+                _yr_prog.stage_update(_slot, done)
 
         async def _fetch_async() -> None:
             from utils.fetch import fetch_patches_to_tiff
             await fetch_patches_to_tiff(
-                items=items,
+                items=_yr_items,
                 bands=FETCH_BANDS,
                 bbox_wgs84=work.chunk["bbox"],
                 out_dir=tiff_dir,
                 max_concurrent=max_concurrent,
                 band_alias=BAND_ALIAS,
+                progress_cb=_fetch_progress_cb,
             )
 
         asyncio.run(_fetch_async())
+        elapsed = _time.perf_counter() - _t0
+        if _yr_prog is not None:
+            _yr_prog.stage_end(_slot)
+        if work.clog:
+            work.clog.info("fetch_tiffs: done (%.1fs, %d items)", elapsed, n_items)
         work.tiff_dir = tiff_dir
         return work
 
     def _stage_extract_scenes(work: _ChunkWork) -> _ChunkWork | None:
         """Pool B: sample pixel values from tiffs → per-scene parquets."""
+        if work.clog:
+            work.clog.activate()
         crow      = work.chunk["chunk_row"]
         ccol      = work.chunk["chunk_col"]
         tiff_dir  = work.tiff_dir
         chunk_pts = work.pts
         rg_size   = max(1, len(chunk_pts) // chunk_height_px)
+        yr_items  = work.items
 
-        scene_dir = tmp / f"chunk_{crow:02d}_{ccol:02d}_scenes"
+        # Scenes were pre-loaded from a surviving scenes dir — skip extraction.
+        if work.scene_paths:
+            logger.info("[v2 tile %s %d] [chunk %02d_%02d] extract_scenes — skipped (%d cached)",
+                        tile_id, work.year, crow, ccol, len(work.scene_paths))
+            if work.clog:
+                work.clog.info("extract_scenes: skipped — %d scene parquets pre-loaded",
+                               len(work.scene_paths))
+            return work
+
+        scene_dir = tmp / str(work.year) / f"chunk_{crow:02d}_{ccol:02d}_scenes"
         scene_dir.mkdir(parents=True, exist_ok=True)
 
         point_ids = [pid      for pid, _, _   in chunk_pts]
@@ -549,15 +667,31 @@ def run_tile_pipeline_v2(
             "EPSG:4326", _utm, always_xy=True
         ).transform(lons, lats)
 
+        n_items = len(yr_items)
+        logger.info("[v2 tile %s %d] [chunk %02d_%02d] extract_scenes (%d pts, %d items)",
+                    tile_id, work.year, crow, ccol, len(chunk_pts), n_items)
+        if work.clog:
+            work.clog.info("extract_scenes: %d pts, %d S2 items", len(chunk_pts), n_items)
+
+        _extract_slot = "extract"
+        _yr_prog = progress.year(work.year) if progress is not None else None
+        if _yr_prog is not None:
+            _yr_prog.stage_start(_extract_slot, f"r{crow:02d}_c{ccol:02d}", "extract", total=n_items)
+
         if apply_nbar:
             from utils.granule_angles import prefetch_granule_xmls
-            prefetch_granule_xmls(items, max_workers=8)
+            prefetch_granule_xmls(yr_items, max_workers=8)
+        _scenes_done_count = [0]  # list so closure can mutate it
 
-        n_items = len(items)
-        logger.info("[v2 tile %s %d] [chunk %02d_%02d] extract_scenes (%d pts, %d items)",
-                    tile_id, year, crow, ccol, len(chunk_pts), n_items)
+        _extract_t0 = _time.perf_counter()
+        _clog_ref = work.clog  # capture for use in worker threads below
 
         def _extract_one(item_idx: int, item) -> Path | None:
+            # Re-activate in this worker thread (each _TPE thread is independent).
+            if _clog_ref:
+                _clog_ref.activate()
+            clog_w = get_chunk_logger()
+
             scene_id      = item.id
             out_path      = scene_dir / f"scene_{item_idx:04d}.parquet"
             item_tiff_dir = tiff_dir / scene_id
@@ -565,13 +699,23 @@ def run_tile_pipeline_v2(
             if out_path.exists() and out_path.stat().st_size > 0:
                 try:
                     pq.ParquetFile(out_path).metadata
+                    if clog_w:
+                        clog_w.info(
+                            "scene %d/%d %s — cached", item_idx + 1, n_items, scene_id
+                        )
                     return out_path
                 except Exception:
                     out_path.unlink(missing_ok=True)
 
             if not item_tiff_dir.exists():
+                if clog_w:
+                    clog_w.info(
+                        "scene %d/%d %s — no tiffs (skipped in fetch)",
+                        item_idx + 1, n_items, scene_id,
+                    )
                 return None
 
+            _t_scene = _time.perf_counter()
             _prof_path = Path(os.environ.get("PROFILE_SCENE", ""))
             if _prof_path.name and not _prof_path.exists():
                 import cProfile, pstats, io as _io
@@ -601,6 +745,11 @@ def run_tile_pipeline_v2(
             if df is None or len(df) == 0:
                 logger.info("[v2] [chunk %02d_%02d] scene %d/%d %s — no clear pixels",
                             crow, ccol, item_idx + 1, n_items, scene_id)
+                if clog_w:
+                    clog_w.info(
+                        "scene %d/%d %s — 0 clear pixels (%.2fs)",
+                        item_idx + 1, n_items, scene_id, _time.perf_counter() - _t_scene,
+                    )
                 return None
 
             tbl = _optimise_schema(df.select(col_order).to_arrow())
@@ -614,18 +763,28 @@ def run_tile_pipeline_v2(
             writer.close()
             tmp_path.replace(out_path)
 
+            n_rows = len(tbl)
             logger.info("[v2] [chunk %02d_%02d] scene %d/%d %s — %d rows",
-                        crow, ccol, item_idx + 1, n_items, scene_id, len(tbl))
+                        crow, ccol, item_idx + 1, n_items, scene_id, n_rows)
+            if clog_w:
+                clog_w.info(
+                    "scene %d/%d %s — %d rows (%.2fs)",
+                    item_idx + 1, n_items, scene_id, n_rows, _time.perf_counter() - _t_scene,
+                )
             return out_path
 
         scene_paths: list[Path] = []
         with _TPE(max_workers=extract_workers) as pool:
-            futs = {pool.submit(_extract_one, idx, item): idx for idx, item in enumerate(items)}
+            futs = {pool.submit(_extract_one, idx, item): idx for idx, item in enumerate(yr_items)}
             for fut in _as_completed(futs):
                 result = fut.result()
                 if result is not None:
                     scene_paths.append(result)
+                _scenes_done_count[0] += 1
+                if _yr_prog is not None:
+                    _yr_prog.stage_update(_extract_slot, _scenes_done_count[0])
 
+        extract_elapsed = _time.perf_counter() - _extract_t0
         del _chunk_utm_xy, lons, lats, point_ids
         import gc; gc.collect()
 
@@ -633,39 +792,75 @@ def run_tile_pipeline_v2(
         work.tiff_dir    = None
         work.scene_paths = scene_paths
 
+        if _yr_prog is not None:
+            _yr_prog.stage_end(_extract_slot)
+
         if not scene_paths:
             logger.info("[v2 tile %s %d] [chunk %02d_%02d] no scene data — skipping",
-                        tile_id, year, crow, ccol)
+                        tile_id, work.year, crow, ccol)
+            if work.clog:
+                work.clog.info(
+                    "extract_scenes: 0/%d scenes had clear pixels — chunk skipped (%.1fs)",
+                    n_items, extract_elapsed,
+                )
+                work.clog.close(success=False)
+            if _yr_prog is not None:
+                _yr_prog.chunk_skipped(f"r{crow:02d}_c{ccol:02d}")
             return None  # drops this chunk from the pipeline
 
+        if work.clog:
+            work.clog.info(
+                "extract_scenes: %d/%d scenes produced data (%.1fs)",
+                len(scene_paths), n_items, extract_elapsed,
+            )
         return work
 
     def _stage_collect_s1(work: _ChunkWork) -> _ChunkWork:
         """Async S1 fetch + extract for one chunk."""
+        if work.clog:
+            work.clog.activate()
         crow = work.chunk["chunk_row"]
         ccol = work.chunk["chunk_col"]
-        scene_dir = tmp / f"chunk_{crow:02d}_{ccol:02d}_scenes"
+        scene_dir = tmp / str(work.year) / f"chunk_{crow:02d}_{ccol:02d}_scenes"
+        _yr_prog = progress.year(work.year) if progress is not None else None
+        _s1_slot = f"s1_{crow:02d}_{ccol:02d}_{work.year}"
+        if _yr_prog is not None:
+            _yr_prog.stage_start(_s1_slot, f"r{crow:02d}_c{ccol:02d}", "S1 fetch")
+        _t0 = _time.perf_counter()
         work.s1_path = collect_s1_for_tile(
             s2_path=None,
             bbox_wgs84=work.chunk["bbox"],
-            start=start_date,
-            end=end_date,
+            start=f"{work.year}-01-01",
+            end=f"{work.year}-12-31",
             out_path=scene_dir / "s1_chunk.parquet",
             cache_dir=scene_dir / "s1_cache",
             max_concurrent=max_concurrent,
             points=work.pts,
         )
-        # pts held until S1 is done; free now before merge.
-        del work.pts
-        import gc; gc.collect()
+        if work.clog:
+            s1_rows = 0
+            if work.s1_path and work.s1_path.exists():
+                try:
+                    import pyarrow.parquet as _pq2
+                    s1_rows = _pq2.read_metadata(work.s1_path).num_rows
+                except Exception:
+                    pass
+            work.clog.info(
+                "collect_s1: %d S1 rows (%.1fs)",
+                s1_rows, _time.perf_counter() - _t0,
+            )
+        if _yr_prog is not None:
+            _yr_prog.stage_end(_s1_slot)
         return work
 
     def _stage_merge(work: _ChunkWork) -> _ChunkWork:
         """K-way heap merge of scene parquets + S1 → sorted chunk parquet."""
+        if work.clog:
+            work.clog.activate()
         crow = work.chunk["chunk_row"]
         ccol = work.chunk["chunk_col"]
-        scene_dir = tmp / f"chunk_{crow:02d}_{ccol:02d}_scenes"
-        chunk_out = tmp / f"chunk_{crow:02d}_{ccol:02d}_sorted.parquet"
+        scene_dir = tmp / str(work.year) / f"chunk_{crow:02d}_{ccol:02d}_scenes"
+        chunk_out = tmp / str(work.year) / f"chunk_{crow:02d}_{ccol:02d}_sorted.parquet"
         _meta: dict[str, str] = {
             "chunk_row": str(crow),
             "chunk_col": str(ccol),
@@ -676,43 +871,194 @@ def run_tile_pipeline_v2(
             _meta["cog_y_top"] = str(cog_y_top)
         if cog_x_left is not None:
             _meta["cog_x_left"] = str(cog_x_left)
-        merge_scenes(work.scene_paths, work.s1_path, chunk_out, chunk_metadata=_meta)
+        _yr_prog = progress.year(work.year) if progress is not None else None
+        if _yr_prog is not None:
+            _yr_prog.stage_start("merge", f"r{crow:02d}_c{ccol:02d}", "merge")
+
+        def _merge_phase(label: str) -> None:
+            if _yr_prog is not None:
+                _yr_prog.stage_set_label("merge", label)
+
+        _t0 = _time.perf_counter()
+        merge_scenes(work.scene_paths, work.s1_path, chunk_out, chunk_metadata=_meta, on_phase=_merge_phase)
+        if _yr_prog is not None:
+            _yr_prog.stage_end("merge")
+            _yr_prog.chunk_done(f"r{crow:02d}_c{ccol:02d}")
+        if work.clog:
+            final_rows = 0
+            try:
+                import pyarrow.parquet as _pq3
+                final_rows = _pq3.read_metadata(chunk_out).num_rows
+            except Exception:
+                pass
+            work.clog.info(
+                "merge_scenes: %d input files → %d total rows (%.1fs)",
+                len(work.scene_paths), final_rows, _time.perf_counter() - _t0,
+            )
+            size_mb = chunk_out.stat().st_size / 1e6 if chunk_out.exists() else 0.0
+            work.clog.info("output: %s (%.1f MB)", chunk_out.name, size_mb)
+            work.clog.close(success=True)
         shutil.rmtree(scene_dir, ignore_errors=True)
         logger.info("[v2 tile %s %d] [chunk %02d_%02d] ready → %s",
-                    tile_id, year, crow, ccol, chunk_out.name)
+                    tile_id, work.year, crow, ccol, chunk_out.name)
         work.scene_paths = []
         work.s1_path     = None
         return work
 
-    # --- Pipeline declaration -------------------------------------------------
+    # --- Pipeline: fetch thread + per-chunk S1 thread + process thread ---------
     #
-    # Memory budget per stage (concurrency × ram_gb):
-    #   fetch_tiffs    ×prefetch_depth  × 0.40 GB
-    #   extract_scenes ×1               × 4.00 GB
-    #   collect_s1     ×1               × 0.50 GB
-    #   merge_scenes   ×1               × 0.05 GB
+    # Three-thread pipeline:
+    #   fetch thread:   S2 fetch → hands off to a per-chunk S1 thread
+    #   S1 thread:      S1 fetch (one per chunk, overlaps with next S2 fetch)
+    #   process thread: extract → merge (drains _fetched_q)
     #
-    # At prefetch_depth=1: 0.40 + 4.00 + 0.50 + 0.05 = 4.95 GB declared.
-    # At prefetch_depth=2: 0.80 + 4.00 + 0.50 + 0.05 = 5.35 GB declared.
+    # The fetch thread starts S2 for chunk N+1 while S1 runs for chunk N.
+    import queue as _queue
 
-    fetch_pipeline = Pipeline(
-        [
-            StageSpec("fetch_tiffs",    fn=_stage_fetch_tiffs,    concurrency=prefetch_depth, ram_gb=0.40),
-            StageSpec("extract_scenes", fn=_stage_extract_scenes, concurrency=1,              ram_gb=4.00),
-            StageSpec("collect_s1",     fn=_stage_collect_s1,     concurrency=1,              ram_gb=0.50),
-            StageSpec("merge_scenes",   fn=_stage_merge,          concurrency=1,              ram_gb=0.05),
-        ],
-        ram_budget_gb=_mem_gb * 0.6,
-        name=f"fetch_tile_{tile_id}_{year}",
-    )
+    # Semaphore (not queue maxsize) bounds concurrent disk usage; queue is unbounded
+    # so S1 threads can always post without deadlocking against the semaphore.
+    _fetched_q: _queue.Queue = _queue.Queue()
+    _done_q:    _queue.Queue = _queue.Queue()
+    _STOP = object()
+    _fetch_error:   list[BaseException] = []
+    _process_error: list[BaseException] = []
 
-    def _chunk_inputs() -> Iterator[_ChunkWork]:
-        for chunk in active_chunks:
-            pts = make_chunk_points(chunk, chunks_meta)
-            yield _ChunkWork(chunk=chunk, pts=pts)
+    def _chunk_inputs():
+        for yr, yr_items in items_by_year.items():
+            for chunk in chunks:
+                crow = chunk["chunk_row"]
+                ccol = chunk["chunk_col"]
+                key  = (crow, ccol, yr)
+                if (crow, ccol) < resume_from_chunk:
+                    logger.info("[v2 tile %s %d] [chunk %02d_%02d] skipping (resume_from_chunk=%s)",
+                                tile_id, yr, crow, ccol, resume_from_chunk)
+                    continue
+                if key in _skip:
+                    logger.info("[v2 tile %s %d] [chunk %02d_%02d] skipping (already exists)",
+                                tile_id, yr, crow, ccol)
+                    continue
+                pts = make_chunk_points(chunk, chunks_meta)
+                clog: object = None
+                if log_dir is not None:
+                    _ldir = log_dir / str(yr) / tile_id / "fetchlogs"
+                    clog = ChunkLogger(tile_id, yr, crow, ccol, _ldir)
+                    clog.open()
+                cached_tiff_dir = tmp / str(yr) / f"chunk_{crow:02d}_{ccol:02d}_tiffs"
+                pre_fetched = (
+                    cached_tiff_dir.exists()
+                    and any(cached_tiff_dir.iterdir())
+                )
+                # If a scenes dir survived from a prior interrupted run (extract
+                # finished but merge didn't), skip both fetch and extract entirely.
+                cached_scene_dir = tmp / str(yr) / f"chunk_{crow:02d}_{ccol:02d}_scenes"
+                pre_extracted: list[Path] = []
+                if not pre_fetched and cached_scene_dir.exists():
+                    pre_extracted = sorted(
+                        p for p in cached_scene_dir.glob("scene_????.parquet")
+                        if p.stat().st_size > 0
+                    )
+                    if pre_extracted:
+                        logger.info(
+                            "[v2 tile %s %d] [chunk %02d_%02d] %d scene parquets cached — "
+                            "skipping fetch+extract",
+                            tile_id, yr, crow, ccol, len(pre_extracted),
+                        )
+                yield _ChunkWork(
+                    chunk=chunk,
+                    year=yr,
+                    items=yr_items,
+                    pts=pts,
+                    clog=clog,
+                    tiff_dir=cached_tiff_dir if pre_fetched else None,
+                    scene_paths=pre_extracted,
+                )
 
-    for work in fetch_pipeline.run(_chunk_inputs()):
-        crow = work.chunk["chunk_row"]
-        ccol = work.chunk["chunk_col"]
-        chunk_out = tmp / f"chunk_{crow:02d}_{ccol:02d}_sorted.parquet"
-        yield crow, ccol, chunk_out
+    import threading as _threading
+
+    # Semaphore caps how many chunks have tiffs+S1 on disk simultaneously.
+    _fetch_sem = _threading.Semaphore(prefetch_depth)
+
+    def _s1_thread(work: _ChunkWork) -> None:
+        try:
+            work = _stage_collect_s1(work)
+            _fetched_q.put(work)
+        except Exception as exc:
+            if work.clog:
+                work.clog.error("_s1_thread EXCEPTION: %s", exc)
+                work.clog.close(success=False)
+            _fetch_error.append(exc)
+            _fetched_q.put(_STOP)
+
+    def _fetch_thread():
+        _s1_threads: list[_threading.Thread] = []
+        try:
+            for work in _chunk_inputs():
+                _fetch_sem.acquire()          # wait until process thread has capacity
+                work = _stage_fetch_tiffs(work)
+                # S1 runs in its own thread so the next S2 fetch can start immediately.
+                t = _threading.Thread(
+                    target=_s1_thread, args=(work,),
+                    daemon=True, name=f"s1_{work.chunk['chunk_row']:02d}_{work.chunk['chunk_col']:02d}_{work.year}",
+                )
+                _s1_threads.append(t)
+                t.start()
+        except Exception as exc:
+            _fetch_error.append(exc)
+        finally:
+            # Wait for all S1 threads to post their work (or _STOP) before signalling done.
+            for t in _s1_threads:
+                t.join()
+            _fetched_q.put(_STOP)
+
+    def _process_thread():
+        try:
+            while True:
+                work = _fetched_q.get()
+                if work is _STOP:
+                    break
+                _fetch_sem.release()          # a slot freed; fetch thread can advance
+                work = _stage_extract_scenes(work)
+                if work is None:
+                    continue  # semaphore already released above
+                if hasattr(work, "pts"):
+                    del work.pts
+                import gc; gc.collect()
+                work = _stage_merge(work)
+                crow = work.chunk["chunk_row"]
+                ccol = work.chunk["chunk_col"]
+                chunk_out = tmp / str(work.year) / f"chunk_{crow:02d}_{ccol:02d}_sorted.parquet"
+                if work.clog and work.clog.logger is not None:
+                    work.clog.close(success=True)
+                _done_q.put((crow, ccol, work.year, chunk_out))
+        except Exception as exc:
+            if work is not None and work is not _STOP and hasattr(work, "clog") and work.clog:
+                work.clog.error("_process_thread EXCEPTION: %s", exc)
+                work.clog.close(success=False)
+            _process_error.append(exc)
+        finally:
+            _done_q.put(_STOP)
+
+    _ft = _threading.Thread(target=_fetch_thread,   daemon=True, name=f"fetch_tile_{tile_id}.fetch")
+    _pt = _threading.Thread(target=_process_thread, daemon=True, name=f"fetch_tile_{tile_id}.process")
+    _ft.start()
+    _pt.start()
+
+    while True:
+        result = _done_q.get()
+        if result is _STOP:
+            break
+        if _fetch_error:
+            raise _fetch_error[0]
+        if _process_error:
+            raise _process_error[0]
+        crow, ccol, yr, chunk_out = result
+        if progress is not None:
+            progress.refresh()
+        yield crow, ccol, yr, chunk_out
+
+    _ft.join()
+    _pt.join()
+    if _fetch_error:
+        raise _fetch_error[0]
+    if _process_error:
+        raise _process_error[0]

@@ -281,17 +281,15 @@ class Location:
 
         Returns the list of written parquet paths.
         """
-        from concurrent.futures import ThreadPoolExecutor, as_completed  # noqa: PLC0415
         from shapely.geometry import box  # noqa: PLC0415
         from utils.fetch_spec import _budget_params, _system_memory_gb  # noqa: PLC0415
         from utils.tile_pipeline import fetch_tile_local  # noqa: PLC0415
 
-        _params      = _budget_params(_system_memory_gb())
-        _max_extract = _params["max_extract_years"]
-        _chunk_px    = _params["strip_height_px"] or 1024
+        _params   = _budget_params(_system_memory_gb())
+        _chunk_px = _params["strip_height_px"] or 1024
 
-        out_dir  = (output_dir / self.id) if output_dir is not None else (_PROJECT_ROOT / "data" / "pixels" / self.id)
-        _work_dir = (work_dir / self.id) if work_dir is not None else None
+        out_dir   = output_dir if output_dir is not None else (_PROJECT_ROOT / "data" / "pixels" / self.id)
+        _work_dir = work_dir if work_dir is not None else None
 
         _cal_out: Path | None = None
         if len(self.tile_ids()) > 1:
@@ -314,26 +312,19 @@ class Location:
             else:
                 tile_fetch_geom = location_geom
 
-            with ThreadPoolExecutor(max_workers=_max_extract) as pool:
-                futs = {
-                    pool.submit(
-                        fetch_tile_local,
-                        tile_id, year, tile_fetch_geom,
-                        out_dir,
-                        cloud_max=cloud_max,
-                        apply_nbar=apply_nbar,
-                        chunk_height_px=_chunk_px,
-                        chunk_width_px=_chunk_px,
-                        n_workers=n_workers,
-                        calibration_out=_cal_out,
-                        work_dir=_work_dir,
-                    ): year
-                    for year in years
-                }
-                for fut in as_completed(futs):
-                    result = fut.result()
-                    if result is not None:
-                        written.extend(result)
+            result = fetch_tile_local(
+                tile_id, years, tile_fetch_geom,
+                out_dir,
+                cloud_max=cloud_max,
+                apply_nbar=apply_nbar,
+                chunk_height_px=_chunk_px,
+                chunk_width_px=_chunk_px,
+                n_workers=n_workers,
+                calibration_out=_cal_out,
+                work_dir=_work_dir,
+            )
+            if result is not None:
+                written.extend(result)
 
         return written
 

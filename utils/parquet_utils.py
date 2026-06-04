@@ -598,7 +598,7 @@ def sort_parquet_by_pixel(
                 compression="zstd",
                 compression_level=3,
                 row_group_size=row_group_size,
-                statistics=True,
+                statistics=False,
             )
         )
 
@@ -608,13 +608,24 @@ def sort_parquet_by_pixel(
             dict_cols = {"point_id", "item_id", "tile_id"}
             pf = pq.ParquetFile(tmp)
             schema = pf.schema_arrow
+            n_rg = pf.metadata.num_row_groups
+            stats_cols = [c for c in schema.names if c in {"lon", "lat"}]
             writer = pq.ParquetWriter(
                 dst, schema, compression="zstd",
                 use_dictionary=[c for c in schema.names if c in dict_cols],
-                write_statistics=True,
+                write_statistics=stats_cols if stats_cols else False,
             )
-            for i in range(pf.metadata.num_row_groups):
-                writer.write_table(pf.read_row_group(i))
+            from concurrent.futures import ThreadPoolExecutor as _TPE
+            with _TPE(max_workers=2) as _pool:
+                # Overlap read of row-group i+1 with write of row-group i.
+                _pending = None
+                for i in range(n_rg):
+                    _next = _pool.submit(pf.read_row_group, i)
+                    if _pending is not None:
+                        writer.write_table(_pending.result())
+                    _pending = _next
+                if _pending is not None:
+                    writer.write_table(_pending.result())
             writer.close()
             tmp.unlink(missing_ok=True)
 

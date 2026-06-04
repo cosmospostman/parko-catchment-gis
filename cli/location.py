@@ -986,9 +986,11 @@ def main() -> None:
                     help="Root directory for final chunk parquets "
                          "(default: $CHUNKSTORE_DIR or /mnt/external/chunkstore). "
                          "Chunks are written to <DIR>/<location_id>/<year>/<tile_id>/.")
-    pf.add_argument("--work-dir", type=str, default=None, metavar="DIR",
+    pf.add_argument("--work-dir", type=str,
+                    default=os.environ.get("WORK_DIR", "/data/chunkstore"),
+                    metavar="DIR",
                     help="Root directory for temporary working data "
-                         "(default: same as --output-dir). "
+                         "(default: $WORK_DIR or /data/chunkstore). "
                          "Should be on fast local NVMe — intermediate files are deleted after each chunk.")
 
     pv = sub.add_parser("validate", help="Validate parquet data quality for a location")

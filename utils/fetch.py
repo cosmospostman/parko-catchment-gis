@@ -397,6 +397,7 @@ async def fetch_patches_to_tiff(
     max_concurrent: int = 128,
     band_alias: dict[str, str] | None = None,
     item_signer: object | None = None,
+    progress_cb=None,  # callable(done: int, total: int) | None
 ) -> list[Path]:
     """Fetch one bbox-covering patch per (item, band) and write each to a GeoTIFF on disk.
 
@@ -406,6 +407,9 @@ async def fetch_patches_to_tiff(
 
     Applies the same SCL cloud filter as fetch_patches(): wholly-clouded items are skipped.
     Existing non-empty .tif files are skipped (resume support within a strip restart).
+
+    progress_cb(done, total) is called after each item (not patch) completes.
+    total is n_items; done increments once per item across both SCL and spectral phases.
 
     Returns a list of all written .tif paths.
     """
@@ -486,27 +490,29 @@ async def fetch_patches_to_tiff(
                 band_asset_keys.append((band, asset_key))
         item_specs.append((item, scl_asset_key if has_scl else None, band_asset_keys))
 
-    # Phase 1: SCL patches
-    n_scl = len(item_specs)
-    scl_done = 0
+    # Phase 1: SCL patches — one per item
+    n_items = len(item_specs)
+    items_done = 0
 
     async def fetch_scl_tracked(item, scl_asset_key):
-        nonlocal scl_done
+        nonlocal items_done
         if scl_asset_key is None:
             return None
         result = await _fetch_and_write(item, SCL_BAND, scl_asset_key)
-        scl_done += 1
-        print(f"    fetch S2: {scl_done}/{n_scl} SCL\r", end="", flush=True)
+        items_done += 1
+        logger.debug("fetch S2: %d/%d SCL", items_done, n_items)
+        if progress_cb is not None:
+            progress_cb(items_done, n_items)
         return result
 
     scl_paths = await asyncio.gather(*[
         fetch_scl_tracked(item, scl_asset_key)
         for (item, scl_asset_key, _) in item_specs
     ])
-    print(f"    fetch S2: {n_scl}/{n_scl} SCL")
 
-    # Phase 2: spectral patches for non-clouded items
-    spectral_tasks: list[tuple[asyncio.Task]] = []
+    # Phase 2: spectral patches for non-clouded items — track per item_id
+    spectral_tasks: list[tuple[str, asyncio.Task]] = []
+    spectral_items: set[str] = set()
     for (item, scl_asset_key, band_asset_keys), scl_path in zip(item_specs, scl_paths):
         if scl_asset_key is not None:
             if scl_path is None:
@@ -521,23 +527,26 @@ async def fetch_patches_to_tiff(
                 filtered += 1
                 logger.debug("Skipping wholly-clouded item %s", item.id)
                 continue
+        spectral_items.add(item.id)
         for band, asset_key in band_asset_keys:
-            spectral_tasks.append(asyncio.ensure_future(_fetch_and_write(item, band, asset_key)))
+            spectral_tasks.append((item.id, asyncio.ensure_future(_fetch_and_write(item, band, asset_key))))
 
-    n_spectral = len(spectral_tasks)
-    completed = 0
+    n_spectral_items = len(spectral_items)
+    spectral_done: set[str] = set()
 
-    async def tracked(task):
-        nonlocal completed
+    async def tracked(item_id: str, task: asyncio.Task):
         path = await task
-        completed += 1
-        print(f"    fetch S2: {completed}/{n_spectral} spectral\r", end="", flush=True)
+        if item_id not in spectral_done:
+            spectral_done.add(item_id)
+            count = len(spectral_done)
+            logger.debug("fetch S2: %d/%d spectral items", count, n_spectral_items)
+            if progress_cb is not None:
+                progress_cb(count, n_spectral_items)
         if path is not None:
             async with written_lock:
                 written.append(path)
 
-    await asyncio.gather(*[tracked(t) for t in spectral_tasks])
-    print(f"    fetch S2: {n_spectral}/{n_spectral} spectral")
+    await asyncio.gather(*[tracked(item_id, t) for item_id, t in spectral_tasks])
 
     fetch_executor.shutdown(wait=True)
     write_executor.shutdown(wait=True)

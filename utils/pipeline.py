@@ -68,6 +68,11 @@ def setup_gdal_env() -> None:
         # multipart upload IDs under high concurrency, producing spurious 409s.
         "CPL_VSIL_CURL_CHUNK_SIZE": "262144",  # 256 KB — sufficient for a 5×5 chip window
         "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
+        # Without these, a stalled MPC/Azure range request hangs indefinitely.
+        # _read_bbox_patch's retry logic only fires on exceptions — a silent
+        # hang never raises, so the semaphore slot stays consumed forever.
+        "GDAL_HTTP_TIMEOUT": "120",          # total transfer timeout (seconds)
+        "GDAL_HTTP_CONNECTTIMEOUT": "30",    # TCP connect timeout (seconds)
     }
     for k, v in gdal_env.items():
         os.environ.setdefault(k, v)

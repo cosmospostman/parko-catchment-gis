@@ -83,8 +83,10 @@ class ChunkIndex:
                 lat_st = rg.column(lat_idx).statistics
                 rg_metas.append(_RGMeta(
                     index=i,
-                    lon_min=lon_st.min, lon_max=lon_st.max,
-                    lat_min=lat_st.min, lat_max=lat_st.max,
+                    lon_min=lon_st.min if lon_st else float("-inf"),
+                    lon_max=lon_st.max if lon_st else float("inf"),
+                    lat_min=lat_st.min if lat_st else float("-inf"),
+                    lat_max=lat_st.max if lat_st else float("inf"),
                 ))
             self._chunks.append(_ChunkMeta(
                 path=path,

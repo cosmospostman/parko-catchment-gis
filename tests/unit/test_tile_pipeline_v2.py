@@ -15,6 +15,9 @@ TV-7  run_tile_pipeline_v2 yields (strip_idx, path) for each non-empty strip.
 TV-8  run_tile_pipeline_v2 skips strips before resume_from_strip.
 TV-9  run_tile_pipeline_v2 Pool A tiff_dir is cleaned up after Pool B completes.
 TV-10 run_tile_pipeline_v2 cleans up scene_dir after each strip is yielded.
+TV-11 run_tile_pipeline_v2 skips fetch when tiff dir already exists (interrupted mid-extract).
+TV-12 run_tile_pipeline_v2 does not skip fetch when tiff dir is empty.
+TV-13 run_tile_pipeline_v2 skips fetch+extract when scene parquets already exist (interrupted post-extract).
 """
 
 from __future__ import annotations
@@ -318,7 +321,7 @@ def test_run_tile_pipeline_v2_yields_strips(tmp_path):
          patch("utils.pixel_collector._extract_item_from_tiffs", return_value=None):
 
         results = list(run_tile_pipeline_v2(
-            tile_id="55HBU", year=2022,
+            tile_id="55HBU", years=2022,
             polygon_geometry=polygon,
             tmp=tmp_path / "work",
             items=[item],
@@ -353,7 +356,7 @@ def test_run_tile_pipeline_v2_resume(tmp_path):
          patch("proxy._pipeline.merge_scenes"):
 
         list(run_tile_pipeline_v2(
-            tile_id="55HBU", year=2022,
+            tile_id="55HBU", years=2022,
             polygon_geometry=polygon,
             tmp=tmp_path / "work",
             items=[_make_item("S2A_55HBU_20220601_0_L2A")],
@@ -361,7 +364,7 @@ def test_run_tile_pipeline_v2_resume(tmp_path):
         ))
 
     # Chunk (0,0) should have been skipped — tiff_dir for chunk_000_000 never created
-    assert not (tmp_path / "work" / "chunk_000_000_tiffs").exists()
+    assert not (tmp_path / "work" / "2022" / "chunk_000_000_tiffs").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -374,7 +377,7 @@ def test_run_tile_pipeline_v2_cleans_tiff_dir(tmp_path):
     polygon = _make_polygon()
     _chunk, _meta = _make_strip_and_meta()
 
-    tiff_dir_path = tmp_path / "work" / "chunk_00_00_tiffs"
+    tiff_dir_path = tmp_path / "work" / "2022" / "chunk_00_00_tiffs"
 
     def fake_asyncio_run(coro):
         # Simulate Pool A: create the tiff_dir so cleanup can be verified
@@ -392,7 +395,7 @@ def test_run_tile_pipeline_v2_cleans_tiff_dir(tmp_path):
          patch("proxy._pipeline.merge_scenes", side_effect=fake_merge):
 
         list(run_tile_pipeline_v2(
-            tile_id="55HBU", year=2022,
+            tile_id="55HBU", years=2022,
             polygon_geometry=polygon,
             tmp=tmp_path / "work",
             items=[_make_item("S2A_55HBU_20220601_0_L2A")],
@@ -400,3 +403,141 @@ def test_run_tile_pipeline_v2_cleans_tiff_dir(tmp_path):
 
     # tiff_dir should have been removed after Pool B completed
     assert not tiff_dir_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# TV-11  Surviving tiff dir skips re-fetch (interrupted mid-extract resume)
+# ---------------------------------------------------------------------------
+
+def test_run_tile_pipeline_v2_skips_fetch_when_tiff_dir_exists(tmp_path):
+    """If a tiff dir already exists and is non-empty, _stage_fetch_tiffs must
+    not call asyncio.run (i.e. no network fetch).  The chunk should proceed
+    directly to extract using the cached tiffs."""
+    from proxy._pipeline import run_tile_pipeline_v2
+
+    polygon = _make_polygon()
+    _chunk, _meta = _make_strip_and_meta()
+
+    # Pre-create a non-empty tiff dir as if a prior run fetched but was killed
+    # before extract completed.
+    work_tmp = tmp_path / "work"
+    tiff_dir = work_tmp / "2022" / "chunk_00_00_tiffs"
+    tiff_dir.mkdir(parents=True, exist_ok=True)
+    (tiff_dir / "sentinel.tif").write_bytes(b"\x00" * 16)
+
+    asyncio_run_calls = []
+
+    def fake_asyncio_run(coro):
+        asyncio_run_calls.append(True)
+        coro.close()
+
+    def fake_merge(scene_paths, s1_path, out_path):
+        _write_strip_parquet(out_path)
+
+    with patch("proxy._pipeline.read_cog_transform", return_value=("EPSG:32755", 7_600_000.0, 500_000.0, 1024, 1024)), \
+         patch("proxy._pipeline.compute_chunks", return_value=([_chunk], _meta)), \
+         patch("asyncio.run", side_effect=fake_asyncio_run), \
+         patch("utils.pixel_collector._extract_item_from_tiffs", return_value=None), \
+         patch("utils.s1_collector.collect_s1_for_tile", return_value=None), \
+         patch("proxy._pipeline.merge_scenes", side_effect=fake_merge):
+
+        list(run_tile_pipeline_v2(
+            tile_id="55HBU", years=2022,
+            polygon_geometry=polygon,
+            tmp=work_tmp,
+            items=[_make_item("S2A_55HBU_20220601_0_L2A")],
+        ))
+
+    assert asyncio_run_calls == [], "asyncio.run should not be called when tiff dir already exists"
+
+
+# ---------------------------------------------------------------------------
+# TV-12  Empty tiff dir does not skip fetch
+# ---------------------------------------------------------------------------
+
+def test_run_tile_pipeline_v2_does_not_skip_fetch_for_empty_tiff_dir(tmp_path):
+    """An empty tiff dir (e.g. mkdir was called but nothing was written before
+    the kill) must not be treated as a completed fetch — the fetch must run."""
+    from proxy._pipeline import run_tile_pipeline_v2
+
+    polygon = _make_polygon()
+    _chunk, _meta = _make_strip_and_meta()
+
+    # Pre-create an *empty* tiff dir — simulates a crash right after mkdir.
+    work_tmp = tmp_path / "work"
+    tiff_dir = work_tmp / "2022" / "chunk_00_00_tiffs"
+    tiff_dir.mkdir(parents=True, exist_ok=True)
+
+    asyncio_run_calls = []
+
+    def fake_asyncio_run(coro):
+        asyncio_run_calls.append(True)
+        coro.close()
+
+    with patch("proxy._pipeline.read_cog_transform", return_value=("EPSG:32755", 7_600_000.0, 500_000.0, 1024, 1024)), \
+         patch("proxy._pipeline.compute_chunks", return_value=([_chunk], _meta)), \
+         patch("asyncio.run", side_effect=fake_asyncio_run), \
+         patch("utils.pixel_collector._extract_item_from_tiffs", return_value=None), \
+         patch("utils.s1_collector.collect_s1_for_tile", return_value=None), \
+         patch("proxy._pipeline.merge_scenes"):
+
+        list(run_tile_pipeline_v2(
+            tile_id="55HBU", years=2022,
+            polygon_geometry=polygon,
+            tmp=work_tmp,
+            items=[_make_item("S2A_55HBU_20220601_0_L2A")],
+        ))
+
+
+# ---------------------------------------------------------------------------
+# TV-13  Surviving scene parquets skip fetch+extract (interrupted post-extract)
+# ---------------------------------------------------------------------------
+
+def test_run_tile_pipeline_v2_skips_fetch_when_scene_dir_exists(tmp_path):
+    """If a scenes dir already has scene parquets from a prior run (interrupted
+    between extract and merge), neither asyncio.run nor _extract_item_from_tiffs
+    should be called.  The chunk should proceed directly to S1 + merge."""
+    from proxy._pipeline import run_tile_pipeline_v2
+
+    polygon = _make_polygon()
+    _chunk, _meta = _make_strip_and_meta()
+
+    # Pre-create a non-empty scenes dir as if extract finished but merge was killed.
+    work_tmp = tmp_path / "work"
+    scene_dir = work_tmp / "2022" / "chunk_00_00_scenes"
+    scene_dir.mkdir(parents=True, exist_ok=True)
+
+    scene_parquet = scene_dir / "scene_0000.parquet"
+    tbl = pa.table({"x": pa.array([1], type=pa.int32())})
+    pq.write_table(tbl, scene_parquet)
+
+    asyncio_run_calls = []
+    extract_calls = []
+
+    def fake_asyncio_run(coro):
+        asyncio_run_calls.append(True)
+        coro.close()
+
+    def fake_extract(*args, **kwargs):
+        extract_calls.append(True)
+        return None
+
+    def fake_merge(scene_paths, s1_path, out_path, **kw):
+        _write_strip_parquet(out_path)
+
+    with patch("proxy._pipeline.read_cog_transform", return_value=("EPSG:32755", 7_600_000.0, 500_000.0, 1024, 1024)), \
+         patch("proxy._pipeline.compute_chunks", return_value=([_chunk], _meta)), \
+         patch("asyncio.run", side_effect=fake_asyncio_run), \
+         patch("utils.pixel_collector._extract_item_from_tiffs", side_effect=fake_extract), \
+         patch("utils.s1_collector.collect_s1_for_tile", return_value=None), \
+         patch("proxy._pipeline.merge_scenes", side_effect=fake_merge):
+
+        list(run_tile_pipeline_v2(
+            tile_id="55HBU", years=2022,
+            polygon_geometry=polygon,
+            tmp=work_tmp,
+            items=[_make_item("S2A_55HBU_20220601_0_L2A")],
+        ))
+
+    assert asyncio_run_calls == [], "asyncio.run should not be called when scene parquets already exist"
+    assert extract_calls == [], "_extract_item_from_tiffs should not be called when scene parquets already exist"

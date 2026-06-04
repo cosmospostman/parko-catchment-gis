@@ -22,6 +22,7 @@ export default defineConfig({
     },
   },
   server: {
+    allowedHosts: ['z640'],
     proxy: {
       '/api': 'http://localhost:3000',
       '/tile': 'http://localhost:3000',

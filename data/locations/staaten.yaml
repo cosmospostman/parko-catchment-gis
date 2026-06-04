@@ -1,0 +1,6 @@
+name: "Staaten River Catchment"
+polygon_file: data/catchments/staaten_river.geojson
+dry_months: [6, 7, 8, 9, 10]
+notes: >
+  Staaten River catchment, Far North Queensland. Bbox and pixel grid are
+  automatically derived from the catchment polygon boundary.
