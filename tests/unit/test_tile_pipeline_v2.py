@@ -541,3 +541,89 @@ def test_run_tile_pipeline_v2_skips_fetch_when_scene_dir_exists(tmp_path):
 
     assert asyncio_run_calls == [], "asyncio.run should not be called when scene parquets already exist"
     assert extract_calls == [], "_extract_item_from_tiffs should not be called when scene parquets already exist"
+
+
+# ---------------------------------------------------------------------------
+# TV-14  S1 cache is shared across all chunks in the same year
+# ---------------------------------------------------------------------------
+
+def test_run_tile_pipeline_v2_s1_cache_shared_across_chunks(tmp_path):
+    """All chunks must share one s1_cache dir AND use the tile-level bbox.
+
+    Two bugs fixed together:
+    1. cache_dir was per-chunk → each chunk got a fresh empty cache, re-downloading all patches.
+    2. bbox_wgs84 was per-chunk → _patch_covers_bbox rejected patches from other chunks,
+       forcing a re-download even when the shared cache dir was in place.
+
+    After both fixes: only chunk 1 downloads from the network; chunks 2+ read from disk.
+    """
+    from proxy._pipeline import run_tile_pipeline_v2
+
+    # Give each chunk a distinct bbox so we can detect which bbox was passed to S1.
+    # The tile polygon covers all three sub-bboxes.
+    _tile_bbox = [145.41, -22.81, 145.44, -22.74]
+    _chunk_bboxes = [
+        [145.41, -22.81, 145.42, -22.78],
+        [145.42, -22.81, 145.43, -22.78],
+        [145.43, -22.81, 145.44, -22.78],
+    ]
+    polygon = _make_polygon(bbox=_tile_bbox)
+    chunks = [
+        {"chunk_row": 0, "chunk_col": 0, "bbox": _chunk_bboxes[0], "y_lower": 7_480_000.0, "x_left_chunk": 500_000.0},
+        {"chunk_row": 0, "chunk_col": 1, "bbox": _chunk_bboxes[1], "y_lower": 7_480_000.0, "x_left_chunk": 500_512.0},
+        {"chunk_row": 0, "chunk_col": 2, "bbox": _chunk_bboxes[2], "y_lower": 7_480_000.0, "x_left_chunk": 501_024.0},
+    ]
+    _, meta = _make_strip_and_meta()
+
+    def fake_asyncio_run(coro):
+        coro.close()
+
+    def fake_merge(scene_paths, s1_path, out_path, **kw):
+        _write_strip_parquet(out_path)
+
+    collect_calls: list[tuple] = []  # (cache_dir, bbox_wgs84) per call
+
+    def fake_collect_s1(s2_path, bbox_wgs84, start, end, out_path, cache_dir, **kw):
+        collect_calls.append((cache_dir, list(bbox_wgs84)))
+        return None
+
+    work_tmp = tmp_path / "work"
+
+    with patch("proxy._pipeline.read_cog_transform", return_value=("EPSG:32755", 7_600_000.0, 500_000.0, 1024, 1024)), \
+         patch("proxy._pipeline.compute_chunks", return_value=(chunks, meta)), \
+         patch("asyncio.run", side_effect=fake_asyncio_run), \
+         patch("utils.pixel_collector._extract_item_from_tiffs", return_value=None), \
+         patch("utils.s1_collector.collect_s1_for_tile", side_effect=fake_collect_s1), \
+         patch("proxy._pipeline.merge_scenes", side_effect=fake_merge):
+
+        list(run_tile_pipeline_v2(
+            tile_id="55HBU", years=2022,
+            polygon_geometry=polygon,
+            tmp=work_tmp,
+            items=[_make_item("S2A_55HBU_20220601_0_L2A")],
+        ))
+
+    # collect_s1_for_tile is called at least once per chunk (fetch phase).
+    # Extract phase is skipped when no scene parquets are produced, so minimum is 3.
+    assert len(collect_calls) >= 3, f"expected at least 3 collect calls, got {len(collect_calls)}"
+
+    cache_dirs = [c for c, _ in collect_calls]
+    bboxes     = [b for _, b in collect_calls]
+
+    # All calls must use the same cache_dir — the shared per-year directory.
+    assert len(set(cache_dirs)) == 1, (
+        f"S1 cache_dir differs between chunks — patches will be re-downloaded: {set(cache_dirs)}"
+    )
+    expected_cache = work_tmp / "2022" / "s1_cache"
+    assert cache_dirs[0] == expected_cache, (
+        f"Expected shared cache at {expected_cache}, got {cache_dirs[0]}"
+    )
+
+    # All calls must use the tile-level bbox, not any per-chunk bbox.
+    # If a per-chunk bbox were used, _patch_covers_bbox would reject cached patches
+    # from other chunks and force re-downloads even with a shared cache dir.
+    for i, b in enumerate(bboxes):
+        assert b == pytest.approx(_tile_bbox, abs=1e-9), (
+            f"Call {i}: expected tile bbox {_tile_bbox}, got {b} — "
+            "per-chunk bbox breaks cross-chunk cache hits"
+        )

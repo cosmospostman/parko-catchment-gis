@@ -725,6 +725,21 @@ def run_tile_pipeline_v2(
 
     _skip: set[tuple[int, int, int]] = skip_chunks or set()
 
+    # Search remaining years in parallel now that the chunk grid is known.
+    # _chunk_inputs() will find them in items_by_year and skip the lazy search.
+    if _years_pending:
+        if progress is not None:
+            progress.set_status(f"STAC search ({len(_years_pending)} years)…")
+        from concurrent.futures import ThreadPoolExecutor as _SearchTPE, as_completed as _search_ac
+        _pending_copy = list(_years_pending)
+        _years_pending.clear()
+        with _SearchTPE(max_workers=len(_pending_copy)) as _pool:
+            _futs = {_pool.submit(_search_year, yr): yr for yr in _pending_copy}
+            for _f in _search_ac(_futs):
+                _f.result()  # re-raise any search exception
+        if progress is not None:
+            progress.set_status("")
+
     # Inform the progress display of the chunk total now that the grid is known.
     for yr in _years:
         if yr not in items_by_year:
@@ -734,7 +749,7 @@ def run_tile_pipeline_v2(
         logger.info("[v2 tile %s %d] %d chunks total: %d to fetch, %d already done",
                     tile_id, yr, len(chunks), n_fetch_yr, n_skip_yr)
         if progress is not None:
-            progress.set_total(yr, len(chunks))
+            progress.set_total(yr, len(chunks), already_done=n_skip_yr)
 
     from utils.parquet_utils import _optimise_schema, _WRITE_OPTS
     import pyarrow.parquet as pq
@@ -1016,7 +1031,8 @@ def run_tile_pipeline_v2(
         crow = work.chunk["chunk_row"]
         ccol = work.chunk["chunk_col"]
         scene_dir = tmp / str(work.year) / f"chunk_{crow:02d}_{ccol:02d}_scenes"
-        s1_cache  = scene_dir / "s1_cache"
+        # Shared per-(tile, year) cache so all chunks reuse patches downloaded by the first.
+        s1_cache  = tmp / str(work.year) / "s1_cache"
         _chunk_id = f"r{crow:02d}_c{ccol:02d}"
 
         def _on_items_resolved(n_items: int) -> None:
@@ -1027,10 +1043,15 @@ def run_tile_pipeline_v2(
             if progress is not None:
                 progress.fetch_update("S1 fetch", done=n_done)
 
+        if progress is not None:
+            progress.fetch_update("S1 search", tile_id, work.year, _chunk_id)
         _t0 = _time.perf_counter()
+        # Use the full tile bbox (not the chunk bbox) so all chunks download the same
+        # patches. Each S1 GRD covers the whole tile; per-chunk bbox differences would
+        # cause _patch_covers_bbox to reject cached patches and re-download from scratch.
         collect_s1_for_tile(
             s2_path=None,
-            bbox_wgs84=work.chunk["bbox"],
+            bbox_wgs84=bbox_wgs84,
             start=f"{work.year}-01-01",
             end=f"{work.year}-12-31",
             out_path=scene_dir / "s1_chunk.parquet",
@@ -1066,7 +1087,7 @@ def run_tile_pipeline_v2(
         _t0 = _time.perf_counter()
         work.s1_path = collect_s1_for_tile(
             s2_path=None,
-            bbox_wgs84=work.chunk["bbox"],
+            bbox_wgs84=bbox_wgs84,
             start=f"{work.year}-01-01",
             end=f"{work.year}-12-31",
             out_path=scene_dir / "s1_chunk.parquet",
@@ -1174,13 +1195,17 @@ def run_tile_pipeline_v2(
                 if yr not in _years_pending:
                     continue   # already searched, came back empty
                 _years_pending.remove(yr)
+                if progress is not None:
+                    progress.fetch_update("STAC search", tile_id, yr, "")
                 _search_year(yr)
+                if progress is not None:
+                    progress.fetch_update("waiting")
                 if yr not in items_by_year:
                     continue   # no scenes for this year
                 # Set progress total now that we know the chunk count.
                 if progress is not None:
                     n_skip_yr = sum(1 for (r, c, y) in _skip if y == yr)
-                    progress.set_total(yr, len(chunks))
+                    progress.set_total(yr, len(chunks), already_done=n_skip_yr)
                     logger.info("[v2 tile %s %d] %d chunks to fetch (lazy search)",
                                 tile_id, yr, len(chunks) - n_skip_yr)
             yr_items = items_by_year[yr]

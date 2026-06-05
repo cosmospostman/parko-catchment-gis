@@ -13,7 +13,7 @@ Each thread reports its state via a single update method.  The renderer reads
 a snapshot of all three states under one lock and formats the fixed layout.
 
 Exhaustive stage values per thread:
-  FETCH:   "waiting" | "S2 fetch" | "S1 fetch" | "done"
+  FETCH:   "waiting" | "STAC search" | "S2 fetch" | "S1 search" | "S1 fetch" | "done"
   PROCESS: "waiting" | "S2 extract" | "S1 extract" | "reading" | "sorting" | "writing" | "done"
   COPY:    "waiting" | "copy" | "done"
 """
@@ -217,9 +217,11 @@ class TileProgress:
     # Compat helpers (used by run_tile_pipeline_v2 set_total / set_status)
     # ------------------------------------------------------------------
 
-    def set_total(self, year: int, total: int) -> None:
+    def set_total(self, year: int, total: int, already_done: int = 0) -> None:
         with self._lock:
             self._total_chunks[year] = total
+            if already_done:
+                self._done_chunks[year] = self._done_chunks.get(year, 0) + already_done
             self._status = ""
 
     def set_status(self, status: str) -> None:
