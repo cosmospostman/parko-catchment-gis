@@ -1,12 +1,18 @@
 """utils/training_collector.py — Collect training pixels organised by S2 tile.
 
-Fetches Sentinel-2 observations for a set of TrainingRegions, writing one
-parquet per S2 tile to data/training/tiles/{tile_id}.parquet, and maintaining
-a sidecar index at data/training/index.parquet that maps region_id → tile_ids.
+Fetches Sentinel-2 + Sentinel-1 observations for a set of TrainingRegions by
+reusing the main tile fetch pipeline (fetch_tile_local / run_tile_pipeline_v2).
 
-Each region is fetched independently using its own small bbox, so only the
-pixels that fall within the actual training bbox are fetched from the COG.
-Per-region parquets are concatenated into the tile parquet.
+For each S2 tile that has training regions:
+  1. Build a MultiPolygon of the union of all region bboxes on the tile.
+  2. Call fetch_tile_local(), which uses compute_chunks() to select only the
+     COG-block-aligned chunks that intersect at least one region bbox — no empty
+     space between scattered regions is fetched.
+  3. Chunks are written to the chunkstore: {chunkstore}/{year}/{tile_id}/...
+  4. Extract each training region from the chunkstore via ChunkIndex.query_bbox(),
+     filtering rows to the region's own year list.
+  5. Write per-region parquets to data/training/tiles/regions/{region_id}.parquet.
+  6. Rebuild per-tile parquets by concatenating region parquets.
 
 Use via cli/location.py:
     python cli/location.py training fetch --all
@@ -16,7 +22,6 @@ Use via cli/location.py:
 from __future__ import annotations
 
 import logging
-import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -27,16 +32,13 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+import sys
 sys.path.insert(0, str(PROJECT_ROOT))
 
-import hashlib
-import pickle
-import re as _re
-
-from utils.location import tile_chips_path  # noqa: F401 — re-exported for monkeypatching
 from utils.regions import TrainingRegion, load_regions, select_regions
 from utils.s2_tiles import bbox_to_tile_ids
-from utils.stac import search_sentinel2
+from utils.location import tile_chips_path  # noqa: F401 — re-exported for monkeypatching in tests
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +53,6 @@ _INDEX_PATH   = _TRAINING_DIR / "index.parquet"
 # ---------------------------------------------------------------------------
 
 def _load_index() -> pl.DataFrame:
-    """Load the region→tile sidecar index, or return an empty frame."""
     if _INDEX_PATH.exists():
         return pl.read_parquet(_INDEX_PATH)
     return pl.DataFrame({"region_id": pl.Series([], dtype=pl.Utf8),
@@ -63,10 +64,12 @@ def _save_index(df: pl.DataFrame) -> None:
     df.write_parquet(_INDEX_PATH)
 
 
+_index_lock = threading.Lock()
+
+
 def _update_index(region_id: str, tile_ids: list[str]) -> None:
-    """Add or refresh the index entries for one region."""
     df = _load_index()
-    df = df.filter(pl.col("region_id") != region_id)  # remove stale entries
+    df = df.filter(pl.col("region_id") != region_id)
     if not tile_ids:
         raise ValueError(
             f"_update_index: region {region_id!r} maps to zero tiles — "
@@ -78,10 +81,7 @@ def _update_index(region_id: str, tile_ids: list[str]) -> None:
 
 
 def tile_ids_for_regions(region_ids: list[str]) -> list[str]:
-    """Return the deduplicated tile IDs that cover the given region IDs.
-
-    Consults the sidecar index — regions must have been collected first.
-    """
+    """Return deduplicated tile IDs covering the given region IDs (index must exist)."""
     df = _load_index()
     hits = df.filter(pl.col("region_id").is_in(region_ids))
     if hits.is_empty():
@@ -100,190 +100,205 @@ def _region_parquet_path(region_id: str) -> Path:
     return _TILES_DIR / "regions" / f"{region_id}.parquet"
 
 
-_STAC_ENDPOINT  = "https://earth-search.aws.element84.com/v1"
-_S2_COLLECTION  = "sentinel-2-l2a"
-_GRANULE_RE     = _re.compile(r"_\d+_L2A$")
+# ---------------------------------------------------------------------------
+# Chunkstore location
+# ---------------------------------------------------------------------------
+
+def _chunkstore_dir(override: Path | None = None) -> Path:
+    if override is not None:
+        return override
+    import os
+    return Path(os.environ.get("CHUNKSTORE_DIR", "/mnt/external/chunkstore"))
 
 
-def _best_tile_for_region(region: "TrainingRegion", tile_ids: list[str]) -> str:
-    """Return the tile whose footprint contains the region centroid, or the first tile."""
+# ---------------------------------------------------------------------------
+# Tile grouping helpers
+# ---------------------------------------------------------------------------
+
+def _best_tile_for_region(region: TrainingRegion, tile_ids: list[str]) -> str:
+    """Return the tile whose footprint contains the region centroid, or the first."""
     from shapely.geometry import Point
     from utils.s2_tiles import get_au_tile_grid
     cx = (region.bbox[0] + region.bbox[2]) / 2
     cy = (region.bbox[1] + region.bbox[3]) / 2
     centroid = Point(cx, cy)
-    grid = get_au_tile_grid()
-    tile_map = dict(grid)
+    grid = dict(get_au_tile_grid())
     for tile_id in tile_ids:
-        geom = tile_map.get(tile_id)
+        geom = grid.get(tile_id)
         if geom is not None and geom.contains(centroid):
             return tile_id
     return tile_ids[0]
 
 
-def _union_bbox(regions: list[TrainingRegion]) -> list[float]:
-    lon_min = min(r.bbox[0] for r in regions)
-    lat_min = min(r.bbox[1] for r in regions)
-    lon_max = max(r.bbox[2] for r in regions)
-    lat_max = max(r.bbox[3] for r in regions)
-    return [lon_min, lat_min, lon_max, lat_max]
+# ---------------------------------------------------------------------------
+# Small bbox/date utilities (used by tests and helpers)
+# ---------------------------------------------------------------------------
 
-
-def _fetch_tile_items(
-    tile_id: str,
-    tile_regions: list[TrainingRegion],
-    cloud_max: int,
-) -> list:
-    """Search STAC once for all regions on a tile; return deduplicated items.
-
-    Result is cached under data/training/stac/ so re-runs are instant.
-    """
-    start, end = _tile_date_window(tile_regions)
-    union = _union_bbox(tile_regions)
-    stac_key = hashlib.md5(
-        f"{union}|{start}|{end}|{cloud_max}".encode()
-    ).hexdigest()
-    stac_dir = _TRAINING_DIR / "stac"
-    stac_dir.mkdir(parents=True, exist_ok=True)
-    stac_cache = stac_dir / f"{tile_id}_{stac_key}.pkl"
-
-    if stac_cache.exists():
-        with stac_cache.open("rb") as fh:
-            items = pickle.load(fh)
-        logger.info(
-            "Tile %s: %d STAC items loaded from cache (%s)",
-            tile_id, len(items), stac_cache.name,
-        )
-        return items
-
-    logger.info(
-        "Tile %s: STAC search  %s → %s  cloud < %d%%  bbox=%s",
-        tile_id, start, end, cloud_max, union,
-    )
-    raw = search_sentinel2(
-        bbox=union,
-        start=start,
-        end=end,
-        cloud_cover_max=cloud_max,
-        endpoint=_STAC_ENDPOINT,
-        collection=_S2_COLLECTION,
-        mgrs_tile=tile_id,
-    )
-    if not raw:
-        raise RuntimeError(f"No STAC items found for tile {tile_id} — check bboxes and date range")
-
-    seen: set[str] = set()
-    items = []
-    for item in raw:
-        key = _GRANULE_RE.sub("", item.id)
-        if key not in seen:
-            seen.add(key)
-            items.append(item)
-
-    logger.info(
-        "Tile %s: %d items → %d deduplicated",
-        tile_id, len(raw), len(items),
-    )
-    with stac_cache.open("wb") as fh:
-        pickle.dump(items, fh)
-    return items
-
-
-def _tile_date_window(tile_regions: list[TrainingRegion]) -> tuple[str, str]:
-    """Derive fetch window from the explicit years lists across all regions on this tile."""
-    all_years = [yr for r in tile_regions for yr in r.years]
+def _tile_date_window(regions: list) -> tuple[str, str]:
+    """Return (start, end) ISO date strings spanning all years across regions."""
+    all_years = [yr for r in regions for yr in r.years]
     if not all_years:
-        raise ValueError(
-            f"Regions {[r.id for r in tile_regions]} have empty years lists"
-        )
+        raise ValueError("regions have no years")
     return f"{min(all_years)}-01-01", f"{max(all_years)}-12-31"
 
 
+def _union_bbox(regions: list) -> list[float]:
+    """Return [minx, miny, maxx, maxy] bbox covering all region bboxes."""
+    if not regions:
+        raise ValueError("regions is empty")
+    return [
+        min(r.bbox[0] for r in regions),
+        min(r.bbox[1] for r in regions),
+        max(r.bbox[2] for r in regions),
+        max(r.bbox[3] for r in regions),
+    ]
+
+
 # ---------------------------------------------------------------------------
-# Core
+# Startup summary table
 # ---------------------------------------------------------------------------
 
-_index_lock = threading.Lock()
+def _chunk_summary_table(
+    tile_to_regions: dict[str, list[TrainingRegion]],
+    chunkstore: Path,
+) -> None:
+    """Log a Year × Tile table showing collected vs. to-fetch chunk counts."""
+    import json
+    from shapely.geometry import box
+    from shapely.ops import unary_union
+
+    all_years: list[int] = sorted({yr for rs in tile_to_regions.values() for r in rs for yr in r.years})
+    tile_ids: list[str] = sorted(tile_to_regions)
+
+    # Expected chunks per tile (requires cached _grid.json + compute_chunks).
+    tile_expected: dict[str, int] = {}
+    for tile_id, tile_regions in tile_to_regions.items():
+        grid_path = chunkstore / tile_id / "_grid.json"
+        if not grid_path.exists():
+            tile_expected[tile_id] = -1
+            continue
+        try:
+            from proxy._pipeline import compute_chunks
+            g = json.loads(grid_path.read_text())
+            multi_geom = unary_union([box(*r.bbox) for r in tile_regions])
+            chunks, _ = compute_chunks(
+                list(multi_geom.bounds),
+                g["block_height"], g["block_width"],
+                multi_geom,
+                cog_utm_crs=g["crs"], cog_y_top=g["y_top"], cog_x_left=g["x_left"],
+            )
+            tile_expected[tile_id] = len(chunks)
+        except Exception:
+            tile_expected[tile_id] = -1
+
+    # Existing chunks per (year, tile).
+    present: dict[tuple[int, str], int] = {}
+    for tile_id in tile_ids:
+        for yr in all_years:
+            tile_dir = chunkstore / str(yr) / tile_id
+            present[(yr, tile_id)] = len(list(tile_dir.glob(f"{tile_id}_r??_c??.parquet"))) if tile_dir.exists() else 0
+
+    tile_w = max(len(t) for t in tile_ids)
+    num_w  = 3
+    gap    = "    "
+    header = f"  {'Year':<6}  {'Tile':<{tile_w}}  {'In store':>{num_w + 7}}  {gap}  {'To fetch':>{num_w + 7}}"
+    sep    = "  " + "-" * (len(header) - 2)
+    logger.info(header)
+    logger.info(sep)
+    for yr in all_years:
+        for i, tile_id in enumerate(tile_ids):
+            yr_label     = str(yr) if i == 0 else ""
+            n_present    = present[(yr, tile_id)]
+            expected     = tile_expected[tile_id]
+            n_fetch      = "?" if expected < 0 else str(max(0, expected - n_present))
+            in_store_str = f"{n_present} chunks"
+            to_fetch_str = f"{n_fetch} chunks"
+            logger.info(
+                f"  {yr_label:<6}  {tile_id:<{tile_w}}  {in_store_str:>{num_w + 7}}  {gap}  {to_fetch_str:>{num_w + 7}}"
+            )
 
 
-def _collect_one_region(
-    region: TrainingRegion,
+# ---------------------------------------------------------------------------
+# Fetch: write chunks to chunkstore
+# ---------------------------------------------------------------------------
+
+def _fetch_tile_chunks(
     tile_id: str,
-    tile_items: list,
+    tile_regions: list[TrainingRegion],
+    chunkstore: Path,
     cloud_max: int,
     apply_nbar: bool,
     max_concurrent: int,
-    n_sort_workers: int | None = None,
-    start: str | None = None,
-    end: str | None = None,
-) -> str | None:
-    """Fetch S2 and S1 for one region via FetchSpec, write region parquet.
+) -> None:
+    """Fetch only the chunkstore chunks that intersect the training regions on this tile."""
+    from shapely.geometry import box
+    from shapely.ops import unary_union
+    from utils.tile_pipeline import fetch_tile_local
 
-    Returns the actual S2 tile_id the data was sourced from, or None if no data
-    was written.
-    """
-    from utils.fetch_spec import FetchSpec, fetch_spec
+    multi_geom = unary_union([box(*r.bbox) for r in tile_regions])
+    all_years = sorted({yr for r in tile_regions for yr in r.years})
 
-    out_path  = _region_parquet_path(region.id)
-    cache_dir = tile_chips_path(tile_id) / region.id
-    bbox      = list(region.bbox)
-
-    this_tile_items = [it for it in tile_items if tile_id in it.id]
-
-    all_years = sorted(set(region.years))
-    spec = FetchSpec(
-        id=region.id,
-        bbox=bbox,
-        years=all_years,
-        point_id_prefix=region.id,
-        label=region.label,
-        out_dir=_TILES_DIR / "regions" / region.id,
-        cache_dir=cache_dir,
+    logger.info(
+        "Tile %s: fetching %d chunk(s) for %d region(s), years %d–%d",
+        tile_id, len(tile_regions), len(tile_regions), min(all_years), max(all_years),
     )
 
-    logger.info("Region %s: fetch start  bbox=%s  years=%s", region.id, bbox, all_years)
-
-    year_results = fetch_spec(
-        spec,
+    fetch_tile_local(
+        tile_id=tile_id,
+        years=all_years,
+        polygon_geometry=multi_geom,
+        out_dir=chunkstore,
         cloud_max=cloud_max,
         apply_nbar=apply_nbar,
         max_concurrent=max_concurrent,
-        items=this_tile_items,
-        n_s1_workers=n_sort_workers or 4,
     )
 
-    merged_paths: list[Path] = [p for paths in year_results.values() for p in paths]
 
-    if not merged_paths:
-        logger.warning("Region %s: no data — skipping", region.id)
+# ---------------------------------------------------------------------------
+# Extract: pull region rows from chunkstore chunks
+# ---------------------------------------------------------------------------
+
+def _extract_region(
+    region: TrainingRegion,
+    tile_id: str,
+    chunkstore: Path,
+) -> str | None:
+    """Query the chunkstore for one region and write its region parquet.
+
+    Returns the tile_id on success, None if no data found.
+    """
+    from utils.pixel_reader import ChunkIndex
+
+    out_path = _region_parquet_path(region.id)
+    lon_min, lat_min, lon_max, lat_max = region.bbox
+    region_years = set(region.years)
+
+    parts: list[pa.Table] = []
+    for year in sorted(region_years):
+        tile_dir = chunkstore / str(year) / tile_id
+        if not tile_dir.exists():
+            logger.debug("Region %s: no chunkstore dir for %d/%s", region.id, year, tile_id)
+            continue
+        idx = ChunkIndex(root=chunkstore, year=year, tile_id=tile_id)
+        tbl = idx.query_bbox(lon_min, lat_min, lon_max, lat_max)
+        if tbl.num_rows > 0:
+            parts.append(tbl)
+
+    if not parts:
+        logger.warning("Region %s: no rows found in chunkstore", region.id)
         return None
 
-    s2_paths = sorted(
-        p for yr in all_years
-        for p in (spec.out_dir / str(yr)).glob("*.s2.parquet")
-        if (spec.out_dir / str(yr)).is_dir()
-    )
-    actual_tile_id = s2_paths[0].stem.replace(".s2", "") if s2_paths else tile_id
+    combined = pa.concat_tables(parts)
 
-    if actual_tile_id != tile_id:
-        logger.warning(
-            "Region %s: S2 data from tile %s, not primary tile %s — indexing under %s",
-            region.id, actual_tile_id, tile_id, actual_tile_id,
-        )
-
-    schema = _superset_schema(merged_paths)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    writer = pq.ParquetWriter(out_path, schema)
-    for mp in merged_paths:
-        pf = pq.ParquetFile(mp)
-        for rg_idx in range(pf.metadata.num_row_groups):
-            tbl = _cast_to_schema(_normalise_source(pf.read_row_group(rg_idx)), schema)
-            writer.write_table(tbl)
-    writer.close()
+    pq.write_table(combined, out_path)
+    logger.info("Region %s: %d rows → %s", region.id, combined.num_rows, out_path.name)
+    return tile_id
 
-    logger.info("Region %s: done (%d years)", region.id, len(merged_paths))
-    return actual_tile_id
 
+# ---------------------------------------------------------------------------
+# Tile parquet rebuild (unchanged logic, same as before)
+# ---------------------------------------------------------------------------
 
 def _normalise_source(tbl: pa.Table) -> pa.Table:
     if "source" in tbl.schema.names:
@@ -294,11 +309,9 @@ def _normalise_source(tbl: pa.Table) -> pa.Table:
 
 
 def _superset_schema(paths: list[Path]) -> pa.Schema:
-    """Return the union schema across all parquet files (metadata-only reads)."""
     schema: pa.Schema | None = None
     for p in paths:
         s = pq.read_schema(p)
-        # Normalise source field type before merging.
         if "source" in s.names:
             idx = s.get_field_index("source")
             if s.field("source").type != pa.string():
@@ -308,7 +321,6 @@ def _superset_schema(paths: list[Path]) -> pa.Schema:
 
 
 def _cast_to_schema(tbl: pa.Table, schema: pa.Schema) -> pa.Table:
-    """Add any missing columns (as nulls) so tbl conforms to schema."""
     for i, field in enumerate(schema):
         if field.name not in tbl.schema.names:
             tbl = tbl.append_column(field, pa.nulls(len(tbl), type=field.type))
@@ -316,7 +328,6 @@ def _cast_to_schema(tbl: pa.Table, schema: pa.Schema) -> pa.Table:
 
 
 def _write_region_rows(writer_ref: list, tile_path: Path, rp: Path, schema: pa.Schema) -> int:
-    """Append all row-groups from a region parquet into writer_ref[0], returning row count."""
     pf = pq.ParquetFile(rp)
     rows = 0
     for rg_idx in range(pf.metadata.num_row_groups):
@@ -329,16 +340,7 @@ def _write_region_rows(writer_ref: list, tile_path: Path, rp: Path, schema: pa.S
 
 
 def _rebuild_tile_parquet(tile_id: str, new_region_ids: set[str] | None = None) -> None:
-    """Rebuild (or incrementally update) the merged tile parquet for tile_id.
-
-    If new_region_ids is given and the tile parquet already exists, performs an
-    incremental update: streams the existing tile, dropping rows whose point_id
-    prefix matches a changed region, then appends the fresh region parquets.
-    This avoids re-reading the unchanged majority of regions on large tiles.
-
-    Falls back to a full rebuild when the tile parquet is missing or
-    new_region_ids is not supplied.
-    """
+    """Rebuild (or incrementally update) the merged tile parquet for tile_id."""
     with _index_lock:
         all_indexed = _load_index()
         all_indexed_ids = set(
@@ -352,14 +354,12 @@ def _rebuild_tile_parquet(tile_id: str, new_region_ids: set[str] | None = None) 
         if _region_parquet_path(rid).exists()
     ] if new_region_ids else []
 
-    # --- Incremental path: tile exists and we know which regions changed ---
     if new_region_ids and tile_path.exists() and new_paths:
         tmp_path = tile_path.with_suffix(".tmp.parquet")
         logger.info(
             "Updating tile %s: replacing %d region(s) incrementally",
             tile_id, len(new_paths),
         )
-        # Derive superset schema from existing tile + new region parquets.
         schema = _superset_schema([tile_path] + new_paths)
         writer_ref: list = [None]
         total_rows = 0
@@ -385,7 +385,6 @@ def _rebuild_tile_parquet(tile_id: str, new_region_ids: set[str] | None = None) 
         logger.info("Tile %s: %d rows (incremental)", tile_id, total_rows)
         return
 
-    # --- Full rebuild ---
     region_paths = [
         _region_parquet_path(rid)
         for rid in sorted(all_indexed_ids)
@@ -405,36 +404,38 @@ def _rebuild_tile_parquet(tile_id: str, new_region_ids: set[str] | None = None) 
     logger.info("Tile %s: %d rows", tile_id, total_rows)
 
 
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
 def ensure_training_pixels(
     regions: list[TrainingRegion],
     cloud_max: int = 80,
     apply_nbar: bool = True,
     max_concurrent: int = 32,
     max_region_workers: int = 4,
+    chunkstore_dir: Path | None = None,
 ) -> None:
     """Ensure pixel parquets exist for all tiles covered by the given regions.
 
-    For each region:
-      1. Fetches S2 COGs and pre-warms the S1 STAC cache concurrently.
-      2. Writes data/training/tiles/regions/{region_id}.parquet (S2 + S1).
-      3. After all regions on a tile finish, rebuilds the tile parquet and
-         updates the sidecar index.
-
-    Regions on different tiles are fetched in parallel (up to max_region_workers
-    at a time).  Within each region, S2 and S1 STAC searches overlap.
+    For each S2 tile:
+      1. Fetch only the chunks that intersect the training region bboxes on the
+         tile, writing to the chunkstore (idempotent — existing chunks skipped).
+      2. Extract each pending region from the chunkstore via ChunkIndex.query_bbox().
+      3. Rebuild the tile parquet and update the sidecar index.
 
     Skips regions whose parquet already exists (idempotent).
     """
-    # Group regions by tile.  For each region, record which tile should own it
-    # (the one containing its centroid) so multi-tile regions aren't submitted
-    # under the wrong tile (e.g. a sliver tile whose patches are too small).
+    chunkstore = _chunkstore_dir(chunkstore_dir)
+
+    # Group regions by primary tile (centroid rule for multi-tile regions).
     region_primary_tile: dict[str, str] = {}
     tile_to_regions: dict[str, list[TrainingRegion]] = {}
     for region in regions:
         tile_ids = bbox_to_tile_ids(region.bbox_tuple)
-        region_primary_tile[region.id] = _best_tile_for_region(region, tile_ids)
-        for tile_id in tile_ids:
-            tile_to_regions.setdefault(tile_id, []).append(region)
+        primary = _best_tile_for_region(region, tile_ids)
+        region_primary_tile[region.id] = primary
+        tile_to_regions.setdefault(primary, []).append(region)
 
     if not tile_to_regions:
         logger.error("No S2 tiles found for the given regions — check bboxes")
@@ -444,92 +445,67 @@ def ensure_training_pixels(
         "%d regions → %d S2 tiles: %s",
         len(regions), len(tile_to_regions), sorted(tile_to_regions),
     )
+    _chunk_summary_table(tile_to_regions, chunkstore)
 
     _TILES_DIR.mkdir(parents=True, exist_ok=True)
     (_TILES_DIR / "regions").mkdir(parents=True, exist_ok=True)
 
-    # Track which tiles have new regions so we know what to rebuild afterwards.
-    tiles_with_new: set[str] = set()
-    tiles_with_new_lock = threading.Lock()
-    submitted_region_ids: set[str] = set()
+    tiles_new_regions: dict[str, set[str]] = {}
+    tiles_lock = threading.Lock()
 
-    # One lock per tile guards the shared STAC cache file so concurrent workers
-    # on the same tile don't race to write it.
-    tile_stac_locks: dict[str, threading.Lock] = {
-        tile_id: threading.Lock() for tile_id in tile_to_regions
-    }
+    for tile_id, tile_regions in sorted(tile_to_regions.items()):
+        pending = [r for r in tile_regions if not _region_parquet_path(r.id).exists()]
+        for r in tile_regions:
+            if r not in pending:
+                logger.info("Region %s already collected — skipping", r.id)
 
-    import math, os as _os
-    # Divide CPU cores evenly across concurrent region workers so parallel
-    # sort pools don't over-subscribe the machine.
-    _n_sort_workers = max(1, math.ceil((_os.cpu_count() or 4) / max_region_workers))
+        if not pending:
+            with _index_lock:
+                for r in tile_regions:
+                    _update_index(r.id, [tile_id])
+            continue
 
-    def _do_region(tile_id, region, tile_regions) -> None:
-        # STAC search is per-tile and cached; the lock ensures only one worker
-        # per tile does the live search — the rest load from the pickle.
-        with tile_stac_locks[tile_id]:
-            tile_items = _fetch_tile_items(tile_id, tile_regions, cloud_max)
-        actual_tile = _collect_one_region(
-            region=region,
+        # Step 1: fetch chunks (union geometry, all regions on tile).
+        _fetch_tile_chunks(
             tile_id=tile_id,
-            tile_items=tile_items,
+            tile_regions=tile_regions,
+            chunkstore=chunkstore,
             cloud_max=cloud_max,
             apply_nbar=apply_nbar,
             max_concurrent=max_concurrent,
-            n_sort_workers=_n_sort_workers,
         )
-        if actual_tile is not None:
-            with tiles_with_new_lock:
-                tiles_with_new.add(actual_tile)
-            # Update the index as soon as this region is done so a crash
-            # mid-run doesn't lose track of already-completed regions.
-            with _index_lock:
-                _update_index(region.id, [actual_tile])
 
-    with ThreadPoolExecutor(max_workers=max_region_workers) as pool:
-        futures: dict = {}
-        for tile_id, tile_regions in sorted(tile_to_regions.items()):
-            pending = [r for r in tile_regions if not _region_parquet_path(r.id).exists()]
+        # Step 2: extract pending regions in parallel.
+        def _do_extract(region: TrainingRegion, _tile_id: str = tile_id) -> str | None:
+            actual_tile = _extract_region(region, _tile_id, chunkstore)
+            if actual_tile is not None:
+                with _index_lock:
+                    _update_index(region.id, [actual_tile])
+                with tiles_lock:
+                    tiles_new_regions.setdefault(actual_tile, set()).add(region.id)
+            return actual_tile
+
+        with ThreadPoolExecutor(max_workers=max_region_workers) as pool:
+            futures = {pool.submit(_do_extract, r): r.id for r in pending}
+            for fut in as_completed(futures):
+                rid = futures[fut]
+                exc = fut.exception()
+                if exc:
+                    logger.error("Region %s failed: %s", rid, exc, exc_info=exc)
+
+        with _index_lock:
             for r in tile_regions:
                 if r not in pending:
-                    logger.info("Region %s already collected — skipping", r.id)
-            for region in pending:
-                if region.id in submitted_region_ids:
-                    # Region spans multiple tiles — already submitted under its
-                    # primary tile (centroid-containing). Skip other tiles.
-                    continue
-                if region_primary_tile[region.id] != tile_id:
-                    # This tile is not the primary for this region — it will be
-                    # submitted when we reach the primary tile in sorted order.
-                    continue
-                submitted_region_ids.add(region.id)
-                futures[pool.submit(_do_region, tile_id, region, tile_regions)] = region.id
+                    _update_index(r.id, [tile_id])
 
-        if not futures:
-            logger.info("All regions already collected.")
-        else:
-            logger.info(
-                "Fetching %d region(s) with up to %d parallel workers",
-                len(futures), max_region_workers,
-            )
-
-        for future in as_completed(futures):
-            region_id = futures[future]
-            exc = future.exception()
-            if exc:
-                logger.error("Region %s failed: %s", region_id, exc, exc_info=exc)
-
-    # Rebuild tile parquets for any tile that got new regions, and update the
-    # index for already-complete regions that weren't in the work list.
-    for tile_id, tile_regions in sorted(tile_to_regions.items()):
+    # Step 3: rebuild tile parquets for tiles that received new regions.
+    for tile_id in sorted(tile_to_regions):
         tile_missing = not tile_parquet_path(tile_id).exists()
-        if tile_id in tiles_with_new or tile_missing:
-            new_ids = {r.id for r in tile_regions if r.id in submitted_region_ids}
-            _rebuild_tile_parquet(tile_id, new_region_ids=new_ids if not tile_missing else None)
-        # Ensure already-complete regions are indexed (idempotent).
-        for region in tile_regions:
-            if region.id not in submitted_region_ids:
-                with _index_lock:
-                    _update_index(region.id, [tile_id])
+        new_ids = tiles_new_regions.get(tile_id)
+        if new_ids or tile_missing:
+            _rebuild_tile_parquet(
+                tile_id,
+                new_region_ids=new_ids if not tile_missing else None,
+            )
 
     logger.info("Done. Index: %s", _INDEX_PATH)

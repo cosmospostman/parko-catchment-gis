@@ -11,8 +11,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import threading
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import rasterio
@@ -24,6 +28,20 @@ from analysis.constants import SCL_BAND
 from analysis.timeseries.extraction import _scl_has_clear_pixels
 
 logger = logging.getLogger(__name__)
+
+# Module-level cache of per-path threading locks.
+# Keyed by resolved cache path so concurrent region-workers sharing the same
+# tile chunk serialise on the same lock and the second worker gets a cache hit.
+_chunk_locks: dict[Path, threading.Lock] = {}
+_chunk_locks_mutex = threading.Lock()
+
+
+def _get_chunk_lock(path: Path) -> threading.Lock:
+    with _chunk_locks_mutex:
+        if path not in _chunk_locks:
+            _chunk_locks[path] = threading.Lock()
+        return _chunk_locks[path]
+
 
 # Type alias: (item_id, band) → (2D float32 array, windowed Affine, rasterio CRS)
 PatchData = dict[tuple[str, str], tuple[np.ndarray, object, object]]
@@ -180,7 +198,9 @@ def _save_patch_cache(
     )
     if fetch_bbox is not None:
         kwargs["fetch_bbox"] = np.array(fetch_bbox, dtype=np.float64)
-    np.savez(path, **kwargs)
+    tmp = path.with_name(f"{path.stem}.{os.getpid()}.{threading.get_ident()}.tmp")
+    np.savez(tmp, **kwargs)
+    tmp.with_suffix(".tmp.npz").rename(path)
 
 
 async def fetch_patches(
@@ -194,6 +214,7 @@ async def fetch_patches(
     cache_dir: Path | None = None,
     item_signer: object | None = None,
     sensor_label: str = "S2",
+    on_item_done: "Callable[[str], None] | None" = None,
 ) -> PatchData:
     """Fetch one bbox-covering patch per (item, band) instead of per-point chips.
 
@@ -249,7 +270,6 @@ async def fetch_patches(
     result: PatchData = {}
     fetched = cached = filtered = errors = 0
     lon_min, lat_min, lon_max, lat_max = bbox_wgs84
-
     def _get_href(item, asset_key: str) -> str:
         """Sign item at call time (not upfront) so SAS tokens are fresh."""
         if item_signer is not None:
@@ -259,12 +279,24 @@ async def fetch_patches(
                 pass
         return item.assets[asset_key].href
 
+    def _fetch_or_load_cached(path: Path, href: str) -> tuple[np.ndarray, object, object] | None:
+        """Blocking: serialise on per-path threading lock, fetch if not cached."""
+        lock = _get_chunk_lock(path)
+        with lock:
+            if path.exists():
+                return _load_patch_cache(path)
+            data = _read_bbox_patch(href, bbox_wgs84)
+            if data is not None:
+                _save_patch_cache(path, data, bbox_wgs84)
+            return data
+
     async def fetch_one_patch(item, band: str, asset_key: str) -> tuple[np.ndarray, object, object] | None:
         nonlocal fetched, cached, errors
         item_id = item.id
         if cache_dir is not None:
             path = _cache_path(cache_dir, item_id, band)
             if path.exists():
+                # Fast path: already cached, no lock needed for a read.
                 data = await loop.run_in_executor(executor, _load_patch_cache, path)
                 if data is not None:
                     covers = await loop.run_in_executor(
@@ -277,19 +309,25 @@ async def fetch_patches(
                         "Cached patch for %s/%s does not cover bbox — re-fetching",
                         item_id, band,
                     )
-        # Sign outside the semaphore: signing may block on the MPC token API
-        # and should not hold a fetch concurrency slot while waiting.
+            # Sign before acquiring the lock so we don't hold it during token fetch.
+            href = await loop.run_in_executor(executor, _get_href, item, asset_key)
+            async with sem:
+                data = await loop.run_in_executor(executor, _fetch_or_load_cached, path, href)
+            if data is None:
+                errors += 1
+                return None
+            if path.exists():
+                cached += 1
+            else:
+                fetched += 1
+            return data
+        # No cache dir — fetch directly.
         href = await loop.run_in_executor(executor, _get_href, item, asset_key)
         async with sem:
             data = await loop.run_in_executor(executor, _read_bbox_patch, href, bbox_wgs84)
         if data is None:
             errors += 1
             return None
-        if cache_dir is not None:
-            await loop.run_in_executor(
-                executor, _save_patch_cache,
-                _cache_path(cache_dir, item_id, band), data, bbox_wgs84,
-            )
         fetched += 1
         return data
 
@@ -368,6 +406,12 @@ async def fetch_patches(
                 n_spectral, filtered)
 
     completed = 0
+    # Track per-item band counts to fire on_item_done when all bands finish.
+    _item_band_counts: dict[str, int] = defaultdict(int)
+    _item_band_totals: dict[str, int] = defaultdict(int)
+    if on_item_done is not None:
+        for item_id, band, _ in spectral_tasks:
+            _item_band_totals[item_id] += 1
 
     async def tracked(item_id: str, band: str, task: asyncio.Task):
         nonlocal completed
@@ -376,6 +420,10 @@ async def fetch_patches(
         if data is not None and _accumulate:
             result[(item_id, band)] = data
         logger.debug("  %s chips  fetch %d/%d patches done", sensor_label, completed, n_spectral)
+        if on_item_done is not None:
+            _item_band_counts[item_id] += 1
+            if _item_band_counts[item_id] >= _item_band_totals[item_id]:
+                on_item_done(item_id)
 
     await asyncio.gather(*[tracked(item_id, band, t) for item_id, band, t in spectral_tasks])
 

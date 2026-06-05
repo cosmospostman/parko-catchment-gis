@@ -1072,11 +1072,10 @@ def _run_ensure(
     region_id: str = "test_region",
     n_pixels: int = 3,
 ):
-    """Run ensure_training_pixels with a mocked fetch_spec()."""
+    """Run ensure_training_pixels with mocked fetch/extract calls."""
     import pyarrow as pa
     import pyarrow.parquet as pq
     import utils.training_collector as tc
-    import utils.fetch_spec as fs_mod
     from utils.regions import TrainingRegion
 
     region = TrainingRegion(
@@ -1092,29 +1091,27 @@ def _run_ensure(
     # Mock bbox_to_tile_ids → single tile
     monkeypatch.setattr(tc, "bbox_to_tile_ids", lambda bbox: ["55HBU"])
 
-    # Mock _fetch_tile_items → empty list (not needed)
-    monkeypatch.setattr(tc, "_fetch_tile_items", lambda *a, **kw: [])
+    # Mock _chunk_summary_table → no-op (avoids grid/compute_chunks lookup)
+    monkeypatch.setattr(tc, "_chunk_summary_table", lambda *a, **kw: None)
 
-    # Mock tile_chips_path
-    monkeypatch.setattr(tc, "tile_chips_path", lambda t: tmp_path / "chips")
+    # Mock _fetch_tile_chunks → no-op (no real COG fetch needed)
+    monkeypatch.setattr(tc, "_fetch_tile_chunks", lambda *a, **kw: None)
 
     s1_df = _make_s1_df(region_id=region_id, n_pixels=n_pixels)
 
-    def _fake_fetch_spec(spec, **kw):
-        year_dir = spec.out_dir / "2022"
-        year_dir.mkdir(parents=True, exist_ok=True)
-        # Write s2 intermediate so _collect_one_region can detect actual_tile_id
-        s2_path = year_dir / "55HBU.s2.parquet"
-        merged_path = year_dir / "55HBU.parquet"
-        _make_s2_parquet(s2_path, region_id=region_id, n_pixels=n_pixels)
-        # Merged = S2 rows + S1 rows
-        s2_tbl = pq.read_table(s2_path)
+    def _fake_extract_region(rgn, tile_id, chunkstore):
+        """Write combined S2+S1 parquet to the region path and return tile_id."""
+        out_path = tc._region_parquet_path(rgn.id)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        s2_tbl = pa.Table.from_pylist([])
+        _make_s2_parquet(out_path, region_id=rgn.id, n_pixels=n_pixels)
+        s2_tbl = pq.read_table(out_path)
         s1_tbl = s1_df.to_arrow()
         combined = pa.concat_tables([s2_tbl, s1_tbl], promote_options="default")
-        pq.write_table(combined, merged_path)
-        return {2022: [merged_path]}
+        pq.write_table(combined, out_path)
+        return tile_id
 
-    monkeypatch.setattr(fs_mod, "fetch_spec", _fake_fetch_spec)
+    monkeypatch.setattr(tc, "_extract_region", _fake_extract_region)
 
     tc.ensure_training_pixels([region])
 

@@ -214,6 +214,9 @@ class TileProgress:
 
         for yr, row in self._rows.items():
             done, skipped, total, activities, status, completed = row.snapshot()
+            # Skip years that haven't started yet (no data and no status message).
+            if not done and not skipped and not activities and not status and not completed:
+                continue
 
             # ---- completed chunks (most recent first, above header) ---------
             for cid, t_done in completed:

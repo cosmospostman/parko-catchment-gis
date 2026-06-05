@@ -750,14 +750,22 @@ def cmd_training_fetch(args: argparse.Namespace) -> None:
     yaml_path = Path(args.yaml) if args.yaml else None
     if args.all:
         regions = load_regions(yaml_path) if yaml_path else load_regions()
+    elif args.prefix:
+        all_regions = load_regions(yaml_path) if yaml_path else load_regions()
+        regions = [r for r in all_regions if r.id.startswith(args.prefix)]
+        if not regions:
+            print(f"  No regions match prefix {args.prefix!r}.")
+            return
     else:
         regions = select_regions(args.regions, yaml_path) if yaml_path else select_regions(args.regions)
+    chunkstore_dir = Path(args.chunkstore_dir) if getattr(args, "chunkstore_dir", None) else None
     ensure_training_pixels(
         regions=regions,
         cloud_max=args.cloud_max,
         apply_nbar=not args.no_nbar,
         max_concurrent=args.max_concurrent,
         max_region_workers=args.max_region_workers,
+        chunkstore_dir=chunkstore_dir,
     )
 
 
@@ -815,7 +823,7 @@ def cmd_training_verify(args: argparse.Namespace) -> None:
         if nan_counts > 0:
             region_issues.append(f"NAN      {r.id} — {nan_counts} NaN band values")
         bm_min, bm_max = min(band_means), max(band_means)
-        if bm_max > 1.5 or bm_min < -0.5:
+        if bm_max > 12000 or bm_min < 0:
             region_issues.append(f"RANGE    {r.id} — band means outside expected range [{bm_min:.2f}, {bm_max:.2f}]")
 
         # S1 backscatter sanity checks — VH lives in the tile parquet, not the region parquet
@@ -1019,14 +1027,20 @@ def main() -> None:
     grp = tf.add_mutually_exclusive_group(required=True)
     grp.add_argument("--regions", nargs="+", metavar="ID",
                      help="Region IDs to fetch")
+    grp.add_argument("--prefix", metavar="STR",
+                     help="Fetch all regions whose id starts with this prefix")
     grp.add_argument("--all", action="store_true",
                      help="Fetch all regions in the YAML")
     tf.add_argument("--cloud-max", type=int, default=80, metavar="N")
     tf.add_argument("--no-nbar", action="store_true")
-    tf.add_argument("--max-concurrent", type=int, default=32, metavar="N",
-                    help="Max concurrent HTTP patch fetches per tile (default: 32)")
-    tf.add_argument("--max-region-workers", type=int, default=4, metavar="N",
-                    help="Max regions fetched in parallel (default: 4)")
+    tf.add_argument("--max-concurrent", type=int, default=16, metavar="N",
+                    help="Max concurrent HTTP patch fetches per tile (default: 16)")
+    tf.add_argument("--max-region-workers", type=int, default=2, metavar="N",
+                    help="Max regions fetched in parallel (default: 2)")
+    tf.add_argument("--chunkstore-dir", type=str,
+                    default=os.environ.get("CHUNKSTORE_DIR", "/mnt/external/chunkstore"),
+                    metavar="DIR",
+                    help="Chunkstore root directory (default: $CHUNKSTORE_DIR or /mnt/external/chunkstore)")
 
     args = p.parse_args()
     {

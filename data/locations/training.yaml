@@ -1687,10 +1687,9 @@ regions:
   - id: mitchell_absence_mangrove_2
     name: "Mitchell River — absence (mangrove 2)"
     label: absence
-    bbox: [141.522892, -15.867121, 141.526076, -15.864479]
+    bbox: [141.501087, -15.849494, 141.502921, -15.844463]
     years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025]
     tags: [monsoonal, mangrove]
-    notes: "Fringe mangrove stand. Wet NDVI 0.86–0.87, dry floor 0.75–0.79, VH/VV stable. Different reach from mangrove_1."
 
   - id: mitchell_absence_mangrove_3
     name: "Mitchell River — absence (mangrove 3)"

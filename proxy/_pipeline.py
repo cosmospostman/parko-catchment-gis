@@ -568,31 +568,47 @@ def run_tile_pipeline_v2(
 
     bbox_wgs84 = list(polygon_geometry.bounds)
 
-    # --- Eager STAC search for all years --------------------------------------
+    # --- STAC search — lazy per year ------------------------------------------
+    # items_by_year is populated on demand: year[0] is searched upfront only
+    # when the COG grid is not yet cached (grid resolution needs at least one
+    # item to read the COG transform).  All other years are searched just before
+    # their first chunk is fed into the pipeline.
+    #
     # items_by_year may be pre-supplied (training pipeline) only when years is a
     # single int and the caller passes items=<list>.  In that case wrap it.
     if items is not None and isinstance(years, int):
         items_by_year: dict[int, list] = {years: items}
+        _years_pending: list[int] = []
     else:
         items_by_year = {}
-        for yr in _years:
-            if progress is not None:
-                progress.year(yr).set_status(f"STAC search {yr}…")
-            logger.info("[v2 tile %s %d] STAC search ...", tile_id, yr)
-            yr_items = search_sentinel2(
-                bbox=bbox_wgs84,
-                start=f"{yr}-01-01",
-                end=f"{yr}-12-31",
-                cloud_cover_max=cloud_max,
-                endpoint=STAC_ENDPOINT,
-                collection=S2_COLLECTION,
-                mgrs_tile=tile_id,
-            )
-            logger.info("[v2 tile %s %d] %d STAC items", tile_id, yr, len(yr_items))
-            if yr_items:
-                items_by_year[yr] = yr_items
+        _years_pending = list(_years)
 
-    if not items_by_year:
+    def _search_year(yr: int) -> None:
+        """Search STAC for *yr* and insert into items_by_year (or drop if empty)."""
+        if progress is not None:
+            progress.year(yr).set_status(f"STAC search {yr}…")
+        logger.info("[v2 tile %s %d] STAC search ...", tile_id, yr)
+        yr_items = search_sentinel2(
+            bbox=bbox_wgs84,
+            start=f"{yr}-01-01",
+            end=f"{yr}-12-31",
+            cloud_cover_max=cloud_max,
+            endpoint=STAC_ENDPOINT,
+            collection=S2_COLLECTION,
+            mgrs_tile=tile_id,
+        )
+        logger.info("[v2 tile %s %d] %d STAC items", tile_id, yr, len(yr_items))
+        if yr_items:
+            items_by_year[yr] = yr_items
+        if progress is not None and not yr_items:
+            progress.year(yr).set_status("")
+
+    # Search year[0] upfront only if needed for COG grid resolution.
+    grid_already_cached = grid_cache is not None and grid_cache.exists()
+    if _years_pending and not grid_already_cached:
+        _search_year(_years_pending.pop(0))
+
+    if not items_by_year and not _years_pending:
         return
 
     # --- Resolve COG transform for chunk-grid snapping ------------------------
@@ -625,10 +641,8 @@ def run_tile_pipeline_v2(
             cog_block_width  = chunk_width_px
 
     if cog_utm_crs is None:
-        if progress is not None:
-            for yr in _years:
-                if yr in items_by_year:
-                    progress.year(yr).set_status("reading COG grid…")
+        if progress is not None and items_by_year:
+            progress.year(next(iter(items_by_year))).set_status("reading COG grid…")
         for _yr_items in items_by_year.values():
             for item in _yr_items:
                 href_obj = item.assets.get("red") or item.assets.get("B04")
@@ -967,9 +981,25 @@ def run_tile_pipeline_v2(
         ccol = work.chunk["chunk_col"]
         scene_dir = tmp / str(work.year) / f"chunk_{crow:02d}_{ccol:02d}_scenes"
         _yr_prog = progress.year(work.year) if progress is not None else None
-        _s1_slot = f"s1_{crow:02d}_{ccol:02d}_{work.year}"
-        if _yr_prog is not None:
-            _yr_prog.stage_start(_s1_slot, f"r{crow:02d}_c{ccol:02d}", "S1 fetch")
+        _chunk_id = f"r{crow:02d}_c{ccol:02d}"
+        _s1_fetch_slot   = f"s1_fetch_{crow:02d}_{ccol:02d}_{work.year}"
+        _s1_extract_slot = f"s1_extr_{crow:02d}_{ccol:02d}_{work.year}"
+
+        def _on_items_resolved(n_items: int) -> None:
+            if _yr_prog is None:
+                return
+            # Now we know the real total — open slots with filled totals.
+            _yr_prog.stage_start(_s1_fetch_slot,   _chunk_id, "S1 fetch", total=n_items)
+            _yr_prog.stage_start(_s1_extract_slot, _chunk_id, "S1 extr",  total=n_items)
+
+        def _on_fetch_tick(n_done: int) -> None:
+            if _yr_prog is not None:
+                _yr_prog.stage_update(_s1_fetch_slot, n_done)
+
+        def _on_extract_tick(n_done: int) -> None:
+            if _yr_prog is not None:
+                _yr_prog.stage_update(_s1_extract_slot, n_done)
+
         _t0 = _time.perf_counter()
         work.s1_path = collect_s1_for_tile(
             s2_path=None,
@@ -980,6 +1010,9 @@ def run_tile_pipeline_v2(
             cache_dir=scene_dir / "s1_cache",
             max_concurrent=max_concurrent,
             points=work.pts,
+            on_items_resolved=_on_items_resolved if _yr_prog is not None else None,
+            on_fetch_tick=_on_fetch_tick if _yr_prog is not None else None,
+            on_extract_tick=_on_extract_tick if _yr_prog is not None else None,
         )
         if work.clog:
             s1_rows = 0
@@ -994,7 +1027,8 @@ def run_tile_pipeline_v2(
                 s1_rows, _time.perf_counter() - _t0,
             )
         if _yr_prog is not None:
-            _yr_prog.stage_end(_s1_slot)
+            _yr_prog.stage_end(_s1_fetch_slot)
+            _yr_prog.stage_end(_s1_extract_slot)
         return work
 
     def _stage_merge(work: _ChunkWork) -> _ChunkWork:
@@ -1068,7 +1102,22 @@ def run_tile_pipeline_v2(
     _process_error: list[BaseException] = []
 
     def _chunk_inputs():
-        for yr, yr_items in items_by_year.items():
+        for yr in _years:
+            # Search this year on demand if not yet in items_by_year.
+            if yr not in items_by_year:
+                if yr not in _years_pending:
+                    continue   # already searched, came back empty
+                _years_pending.remove(yr)
+                _search_year(yr)
+                if yr not in items_by_year:
+                    continue   # no scenes for this year
+                # Set progress total now that we know the chunk count.
+                if progress is not None:
+                    n_skip_yr = sum(1 for (r, c, y) in _skip if y == yr)
+                    progress.year(yr).set_total(len(chunks))
+                    logger.info("[v2 tile %s %d] %d chunks to fetch (lazy search)",
+                                tile_id, yr, len(chunks) - n_skip_yr)
+            yr_items = items_by_year[yr]
             for chunk in chunks:
                 crow = chunk["chunk_row"]
                 ccol = chunk["chunk_col"]

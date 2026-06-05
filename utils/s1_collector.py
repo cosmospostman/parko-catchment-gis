@@ -27,7 +27,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import polars as pl
@@ -388,6 +391,9 @@ def _extract_s1_from_store(
     )
 
 
+_S1_EXTRACT_WORKERS = 8
+
+
 def _collect_s1_shards(
     out_dir: Path,
     items: list,
@@ -397,12 +403,17 @@ def _collect_s1_shards(
     point_shard_size: int = 500_000,
     max_concurrent: int = 32,
     phases: "set[str] | None" = None,
+    on_fetch_tick: "Callable[[int], None] | None" = None,
+    on_extract_tick: "Callable[[int], None] | None" = None,
 ) -> list[Path]:
     """Fetch S1 patches via fetch_patches (async, semaphore-bounded) then extract.
 
     Uses the same fetch_patches + CachedNpzChipStore pattern as the S2 pipeline,
     giving true async concurrency for COG range requests instead of a fixed thread
     pool. max_concurrent controls the semaphore passed to fetch_patches.
+
+    on_fetch_tick(n_done) and on_extract_tick(n_done) are called as items complete
+    in each phase (used by the pipeline to drive the progress display).
 
     Returns list of written shard paths (empty if no data). Caller owns out_dir.
     """
@@ -451,13 +462,20 @@ def _collect_s1_shards(
         point_coords = {pid: (lon, lat) for pid, lon, lat in shard_points}
 
         if _do_fetch:
-            # Fetch all S1 patches for this shard (async, semaphore-bounded).
-            # scl_filter=False — S1 has no SCL band.
-            # item_signer=_sign — MPC assets need per-item SAS tokens at read time.
             logger.info(
                 "S1: shard %d/%d — fetching patches for %d items (%d concurrent)",
                 shard_idx + 1, n_shards, len(items), max_concurrent,
             )
+            _fetch_done = [0]
+            _fetch_lock = threading.Lock()
+
+            def _on_fetch_item(item_id: str) -> None:
+                with _fetch_lock:
+                    _fetch_done[0] += 1
+                    n = _fetch_done[0]
+                if on_fetch_tick is not None:
+                    on_fetch_tick(n)
+
             asyncio.run(fetch_patches(
                 points=shard_points,
                 items=items,
@@ -469,24 +487,36 @@ def _collect_s1_shards(
                 cache_dir=resolved_cache,
                 item_signer=_sign,
                 sensor_label="S1",
+                on_item_done=_on_fetch_item if on_fetch_tick is not None else None,
             ))
 
         if not _do_extract:
             continue
 
-        # Phase 2: extract pixel values from the on-disk patch cache.
-        store = CachedNpzChipStore(
-            cache_dir=resolved_cache,
-            point_coords=point_coords,
-            bands=_S1_BANDS,
-        )
+        # Phase 2: parallel extract — one CachedNpzChipStore per worker thread
+        # (store is not thread-safe; each thread gets its own instance).
+        _tls = threading.local()
 
+        def _get_store() -> "CachedNpzChipStore":
+            if not hasattr(_tls, "store"):
+                _tls.store = CachedNpzChipStore(
+                    cache_dir=resolved_cache,
+                    point_coords=point_coords,
+                    bands=_S1_BANDS,
+                )
+            return _tls.store
+
+        def _extract_one(item):
+            store = _get_store()
+            result = _extract_s1_from_store(item, store, point_ids, lons, lats)
+            store.release_item(item.id)
+            return result
+
+        # Collect results in submission order so parquet rows are date-ordered.
         writer = pq.ParquetWriter(shard_path, _ARROW_SCHEMA, compression="none", write_statistics=False)
         total_rows = 0
         log_interval = max(1, len(items) // 10)
 
-        # Accumulate per-item results as numpy arrays; flush to parquet in
-        # batches.  Avoids converting arrays → Python lists → pa.array().
         acc_pid:   list[list[str]]   = []
         acc_lon:   list[np.ndarray]  = []
         acc_lat:   list[np.ndarray]  = []
@@ -501,54 +531,64 @@ def _collect_s1_shards(
             nonlocal acc_rows
             if not acc_pid:
                 return
-            all_pids  = [p for chunk in acc_pid   for p in chunk]
-            all_lons  = np.concatenate(acc_lon)
-            all_lats  = np.concatenate(acc_lat)
-            all_dates = np.concatenate(acc_date)
-            all_vhs   = np.concatenate(acc_vh)
-            all_vvs   = np.concatenate(acc_vv)
+            all_pids   = [p for chunk in acc_pid for p in chunk]
+            all_lons   = np.concatenate(acc_lon)
+            all_lats   = np.concatenate(acc_lat)
+            all_dates  = np.concatenate(acc_date)
+            all_vhs    = np.concatenate(acc_vh)
+            all_vvs    = np.concatenate(acc_vv)
             all_orbits = np.concatenate(acc_orbit)
             tbl = pa.table({
-                "point_id": pa.array(all_pids,            pa.string()),
-                "lon":      pa.array(all_lons,            pa.float64()),
-                "lat":      pa.array(all_lats,            pa.float64()),
-                "date":     pa.array(all_dates,           pa.timestamp("ms")),
+                "point_id": pa.array(all_pids,   pa.string()),
+                "lon":      pa.array(all_lons,   pa.float64()),
+                "lat":      pa.array(all_lats,   pa.float64()),
+                "date":     pa.array(all_dates,  pa.timestamp("ms")),
                 "source":   pa.repeat("S1", len(all_pids)).cast(pa.string()),
-                "vh":       pa.array(all_vhs,             pa.float32()),
-                "vv":       pa.array(all_vvs,             pa.float32()),
-                "orbit":    pa.array(all_orbits,          pa.string()),
+                "vh":       pa.array(all_vhs,    pa.float32()),
+                "vv":       pa.array(all_vvs,    pa.float32()),
+                "orbit":    pa.array(all_orbits, pa.string()),
             })
             writer.write_table(tbl)
             acc_pid.clear(); acc_lon.clear(); acc_lat.clear(); acc_date.clear()
             acc_vh.clear();  acc_vv.clear();  acc_orbit.clear()
             acc_rows = 0
 
-        for i, item in enumerate(items):
-            result = _extract_s1_from_store(item, store, point_ids, lons, lats)
-            store.release_item(item.id)
-            if result is None:
-                continue
-            pids, i_lons, i_lats, date, vhs, vvs, orbit_state = result
-            n_item = len(pids)
-            acc_pid.append(pids)
-            acc_lon.append(i_lons)
-            acc_lat.append(i_lats)
-            acc_date.append(np.full(n_item, np.datetime64(date, "ms")))
-            acc_vh.append(vhs)
-            acc_vv.append(vvs)
-            acc_orbit.append(np.full(n_item, orbit_state if orbit_state is not None else "", dtype=object))
-            acc_rows += n_item
-            total_rows += n_item
-            if acc_rows >= _FLUSH_ROWS:
-                _flush()
-            if (i + 1) % log_interval == 0 or (i + 1) == len(items):
-                if use_sharding:
-                    logger.info(
-                        "S1 scenes  shard %d/%d  item %d/%d  %d rows",
-                        shard_idx + 1, n_shards, i + 1, len(items), total_rows,
-                    )
-                else:
-                    logger.info("S1: item %d/%d  %d rows so far", i + 1, len(items), total_rows)
+        _extract_done = [0]
+
+        with ThreadPoolExecutor(max_workers=_S1_EXTRACT_WORKERS) as pool:
+            futs = {pool.submit(_extract_one, item): item for item in items}
+
+            for fut in as_completed(futs):
+                result = fut.result()
+                _extract_done[0] += 1
+                if on_extract_tick is not None:
+                    on_extract_tick(_extract_done[0])
+
+                if result is None:
+                    continue
+                pids, i_lons, i_lats, date, vhs, vvs, orbit_state = result
+                n_item = len(pids)
+                acc_pid.append(pids)
+                acc_lon.append(i_lons)
+                acc_lat.append(i_lats)
+                acc_date.append(np.full(n_item, np.datetime64(date, "ms")))
+                acc_vh.append(vhs)
+                acc_vv.append(vvs)
+                acc_orbit.append(np.full(n_item, orbit_state if orbit_state is not None else "", dtype=object))
+                acc_rows += n_item
+                total_rows += n_item
+                if acc_rows >= _FLUSH_ROWS:
+                    _flush()
+
+                done_n = _extract_done[0]
+                if done_n % log_interval == 0 or done_n == len(items):
+                    if use_sharding:
+                        logger.info(
+                            "S1 scenes  shard %d/%d  item %d/%d  %d rows",
+                            shard_idx + 1, n_shards, done_n, len(items), total_rows,
+                        )
+                    else:
+                        logger.info("S1: item %d/%d  %d rows so far", done_n, len(items), total_rows)
 
         _flush()
         writer.close()
@@ -573,6 +613,9 @@ def collect_s1_for_tile(
     max_concurrent: int = 32,
     points: "list[tuple[str, float, float]] | None" = None,
     phases: "set[str] | None" = None,
+    on_fetch_tick: "Callable[[int], None] | None" = None,
+    on_extract_tick: "Callable[[int], None] | None" = None,
+    on_items_resolved: "Callable[[int], None] | None" = None,
 ) -> "Path | None":
     """Fetch S1 for a tile's pixel grid and write a sorted S1 parquet to out_path.
 
@@ -625,6 +668,9 @@ def collect_s1_for_tile(
         logger.info("no items for bbox %s %s/%s", bbox_wgs84, start, end)
         return None
 
+    if on_items_resolved is not None:
+        on_items_resolved(len(items))
+
     with tempfile.TemporaryDirectory(prefix="s1_tile_") as _tmp:
         shard_paths = _collect_s1_shards(
             out_dir=Path(_tmp),
@@ -634,6 +680,8 @@ def collect_s1_for_tile(
             resolved_cache=resolved_cache,
             max_concurrent=max_concurrent,
             phases=phases,
+            on_fetch_tick=on_fetch_tick,
+            on_extract_tick=on_extract_tick,
         )
 
         if _fetch_only:
