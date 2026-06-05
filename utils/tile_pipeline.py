@@ -178,17 +178,23 @@ def fetch_tile_local(
     _copy_errors: list[BaseException] = []
 
     def _copy_worker() -> None:
+        tile_progress.copy_update("waiting")
         while True:
             item = _copy_q.get()
             if item is None:
                 break
-            chunk_path, dest_tmp, dest = item
+            chunk_path, dest_tmp, dest, yr, chunk_row, chunk_col = item
+            chunk_id = f"r{chunk_row:02d}_c{chunk_col:02d}"
+            tile_progress.copy_update("copy", tile_id, yr, chunk_id)
             try:
                 shutil.copy2(chunk_path, dest_tmp)
                 dest_tmp.replace(dest)
                 chunk_path.unlink(missing_ok=True)
             except BaseException as exc:
                 _copy_errors.append(exc)
+            finally:
+                tile_progress.copy_update("waiting")
+        tile_progress.copy_update("done")
 
     _copy_thread = _threading.Thread(target=_copy_worker, daemon=True, name=f"copy_{tile_id}")
     _copy_thread.start()
@@ -223,7 +229,7 @@ def fetch_tile_local(
                 dest_tmp = dest.with_suffix(".tmp")
                 chunks_written_by_year[yr].append(dest)
                 all_received.append(dest)
-                _copy_q.put((chunk_path, dest_tmp, dest))
+                _copy_q.put((chunk_path, dest_tmp, dest, yr, chunk_row, chunk_col))
     finally:
         _copy_q.put(None)
         _copy_thread.join()

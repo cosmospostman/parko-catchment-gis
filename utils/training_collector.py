@@ -229,6 +229,7 @@ def _fetch_tile_chunks(
     cloud_max: int,
     apply_nbar: bool,
     max_concurrent: int,
+    work_dir: Path | None = None,
 ) -> None:
     """Fetch only the chunkstore chunks that intersect the training regions on this tile."""
     from shapely.geometry import box
@@ -251,6 +252,7 @@ def _fetch_tile_chunks(
         cloud_max=cloud_max,
         apply_nbar=apply_nbar,
         max_concurrent=max_concurrent,
+        work_dir=work_dir,
     )
 
 
@@ -415,6 +417,7 @@ def ensure_training_pixels(
     max_concurrent: int = 32,
     max_region_workers: int = 4,
     chunkstore_dir: Path | None = None,
+    work_dir: Path | None = None,
 ) -> None:
     """Ensure pixel parquets exist for all tiles covered by the given regions.
 
@@ -473,6 +476,7 @@ def ensure_training_pixels(
             cloud_max=cloud_max,
             apply_nbar=apply_nbar,
             max_concurrent=max_concurrent,
+            work_dir=work_dir,
         )
 
         # Step 2: extract pending regions in parallel.

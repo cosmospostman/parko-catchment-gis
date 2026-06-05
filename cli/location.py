@@ -759,6 +759,7 @@ def cmd_training_fetch(args: argparse.Namespace) -> None:
     else:
         regions = select_regions(args.regions, yaml_path) if yaml_path else select_regions(args.regions)
     chunkstore_dir = Path(args.chunkstore_dir) if getattr(args, "chunkstore_dir", None) else None
+    work_dir = Path(args.work_dir) if getattr(args, "work_dir", None) else None
     ensure_training_pixels(
         regions=regions,
         cloud_max=args.cloud_max,
@@ -766,6 +767,7 @@ def cmd_training_fetch(args: argparse.Namespace) -> None:
         max_concurrent=args.max_concurrent,
         max_region_workers=args.max_region_workers,
         chunkstore_dir=chunkstore_dir,
+        work_dir=work_dir,
     )
 
 
@@ -1041,6 +1043,11 @@ def main() -> None:
                     default=os.environ.get("CHUNKSTORE_DIR", "/mnt/external/chunkstore"),
                     metavar="DIR",
                     help="Chunkstore root directory (default: $CHUNKSTORE_DIR or /mnt/external/chunkstore)")
+    tf.add_argument("--work-dir", type=str,
+                    default=os.environ.get("WORK_DIR", "/data/tmp"),
+                    metavar="DIR",
+                    help="Fast working directory for intermediate files (default: $WORK_DIR or /data/tmp). "
+                         "Should be on NVMe — chunks are moved to --chunkstore-dir after completion.")
 
     args = p.parse_args()
     {

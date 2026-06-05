@@ -446,6 +446,37 @@ def _collect_s1_shards(
     if use_sharding:
         logger.info("S1: %d shards total (%d points each)", n_shards, point_shard_size)
 
+    # Fetch patches once for all shards — NPZ cache is keyed by (item_id, band),
+    # independent of which subset of points will be extracted.
+    if _do_fetch:
+        logger.info(
+            "S1: fetching patches for %d items (%d concurrent)",
+            len(items), max_concurrent,
+        )
+        _fetch_done = [0]
+        _fetch_lock = threading.Lock()
+
+        def _on_fetch_item(item_id: str) -> None:
+            with _fetch_lock:
+                _fetch_done[0] += 1
+                n = _fetch_done[0]
+            if on_fetch_tick is not None:
+                on_fetch_tick(n)
+
+        asyncio.run(fetch_patches(
+            points=points,
+            items=items,
+            bands=_S1_BANDS,
+            bbox_wgs84=bbox_wgs84,
+            scl_filter=False,
+            max_concurrent=max_concurrent,
+            band_alias=None,
+            cache_dir=resolved_cache,
+            item_signer=_sign,
+            sensor_label="S1",
+            on_item_done=_on_fetch_item if on_fetch_tick is not None else None,
+        ))
+
     for shard_idx in range(n_shards):
         shard_points = points[shard_idx * point_shard_size : (shard_idx + 1) * point_shard_size]
         shard_path = out_dir / f"shard_{shard_idx:04d}.parquet"
@@ -460,35 +491,6 @@ def _collect_s1_shards(
         lons = np.array([p[1] for p in shard_points], dtype=np.float64)
         lats = np.array([p[2] for p in shard_points], dtype=np.float64)
         point_coords = {pid: (lon, lat) for pid, lon, lat in shard_points}
-
-        if _do_fetch:
-            logger.info(
-                "S1: shard %d/%d — fetching patches for %d items (%d concurrent)",
-                shard_idx + 1, n_shards, len(items), max_concurrent,
-            )
-            _fetch_done = [0]
-            _fetch_lock = threading.Lock()
-
-            def _on_fetch_item(item_id: str) -> None:
-                with _fetch_lock:
-                    _fetch_done[0] += 1
-                    n = _fetch_done[0]
-                if on_fetch_tick is not None:
-                    on_fetch_tick(n)
-
-            asyncio.run(fetch_patches(
-                points=shard_points,
-                items=items,
-                bands=_S1_BANDS,
-                bbox_wgs84=bbox_wgs84,
-                scl_filter=False,
-                max_concurrent=max_concurrent,
-                band_alias=None,
-                cache_dir=resolved_cache,
-                item_signer=_sign,
-                sensor_label="S1",
-                on_item_done=_on_fetch_item if on_fetch_tick is not None else None,
-            ))
 
         if not _do_extract:
             continue

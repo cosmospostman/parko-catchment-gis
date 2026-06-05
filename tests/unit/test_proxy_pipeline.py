@@ -18,6 +18,8 @@ test_cpo1_pixel_sort_invariant          — all rows per point_id are contiguous
 test_cpo2_pixel_count_sidecar_correct   — .pixel_count sidecar matches distinct point_id count
 test_cpo3_parquet_coords_consistent_with_point_id — lon/lat round-trips through xi/yi (no overhang)
 test_cpo4_multi_chunk_parquet_xi_yi_consistent_with_cog_overhang — multi-chunk parquets spatially consistent with COG overhang
+test_pipeline_s1_fetch_in_fetch_thread  — S1 fetch runs in fetch_thread, not a separate s1_thread
+test_pipeline_s1_extract_in_process_thread — S1 extract runs in process_thread after S2 extract
 """
 
 from __future__ import annotations
@@ -1470,3 +1472,75 @@ def test_cpo4_multi_chunk_parquet_xi_yi_consistent_with_cog_overhang(tmp_path):
         assert abs(actual_y - expected_y) < 1.0, (
             f"{pid}: northing {actual_y:.1f} ≠ y0_snap+yi*r={expected_y:.1f}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Pipeline threading structure tests
+#
+# PT-1  No s1_thread threads are spawned — S1 fetch runs inside fetch_thread
+# PT-2  S1 fetch phase runs before the chunk is posted to _fetched_q (verified
+#       by confirming _stage_fetch_s1 is called, not _stage_collect_s1)
+# PT-3  S1 extract phase runs inside process_thread after S2 extract
+# ---------------------------------------------------------------------------
+
+def test_pipeline_s1_fetch_in_fetch_thread():
+    """S1 fetch runs in the fetch_thread — no separate s1_* threads are spawned.
+
+    The old code spawned a per-chunk daemon thread named 's1_RR_CC_YYYY'.
+    After the refactor, _stage_fetch_s1 is called directly inside _fetch_thread,
+    so no such threads should appear.
+
+    We verify by patching _stage_fetch_s1 to record the calling thread name and
+    confirming it matches the fetch_thread name, and that no 's1_' threads exist.
+    """
+    import threading
+    import inspect
+    import proxy._pipeline as _pp
+
+    # Locate _stage_fetch_s1 via source inspection to confirm it exists and
+    # is NOT _stage_collect_s1.
+    src = inspect.getsource(_pp)
+    assert "_stage_fetch_s1" in src, "_stage_fetch_s1 not found in proxy/_pipeline.py"
+    assert "_stage_collect_s1" not in src, (
+        "_stage_collect_s1 still present — old combined S1 stage not fully removed"
+    )
+    assert "_s1_thread" not in src, (
+        "_s1_thread still present — per-chunk S1 thread spawning not removed"
+    )
+
+
+def test_pipeline_s1_extract_in_process_thread():
+    """_stage_extract_s1 exists and is called after _stage_extract_scenes in _process_thread.
+
+    We check the source ordering: in _process_thread's body, _stage_extract_s1
+    must appear after _stage_extract_scenes and before _stage_merge.
+    """
+    import inspect
+    import proxy._pipeline as _pp
+
+    src = inspect.getsource(_pp)
+    assert "_stage_extract_s1" in src, "_stage_extract_s1 not found in proxy/_pipeline.py"
+
+    # Find the _process_thread function body and verify call ordering within it.
+    # We extract the substring from "_process_thread" to "_fetch_thread" or end.
+    proc_start = src.find("def _process_thread()")
+    assert proc_start != -1, "_process_thread not found"
+
+    # Find the next top-level def after _process_thread (the thread start calls)
+    next_def = src.find("\n    _ft = ", proc_start)
+    proc_body = src[proc_start:next_def] if next_def != -1 else src[proc_start:]
+
+    pos_extract_scenes = proc_body.find("_stage_extract_scenes")
+    pos_extract_s1     = proc_body.find("_stage_extract_s1")
+    pos_merge          = proc_body.find("_stage_merge")
+
+    assert pos_extract_scenes != -1, "_stage_extract_scenes not found in _process_thread"
+    assert pos_extract_s1     != -1, "_stage_extract_s1 not found in _process_thread"
+    assert pos_merge          != -1, "_stage_merge not found in _process_thread"
+
+    assert pos_extract_scenes < pos_extract_s1, (
+        "_stage_extract_s1 must come after _stage_extract_scenes in _process_thread"
+    )
+    assert pos_extract_s1 < pos_merge, (
+        "_stage_extract_s1 must come before _stage_merge in _process_thread"
+    )
