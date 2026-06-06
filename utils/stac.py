@@ -77,14 +77,23 @@ def search_sentinel1(
 
     Falls back to the pystac-client API if the GeoParquet approach fails.
     """
+    import time as _time
     with _geoparquet_lock:
-        try:
-            return _search_sentinel1_geoparquet(bbox, start, end, modifier=modifier)
-        except Exception as exc:
-            logger.warning(
-                "S1 GeoParquet search failed (%s), falling back to STAC API", exc,
-            )
-            return _search_sentinel1_api(bbox, start, end, endpoint, collection, modifier=modifier)
+        for _gp_attempt in range(1, 4):
+            try:
+                return _search_sentinel1_geoparquet(bbox, start, end, modifier=modifier)
+            except Exception as exc:
+                if _gp_attempt == 3:
+                    logger.warning(
+                        "S1 GeoParquet search failed after 3 attempts (%s), falling back to STAC API", exc,
+                    )
+                    break
+                wait = 30 * _gp_attempt
+                logger.warning(
+                    "S1 GeoParquet search failed (attempt %d/3): %s — retrying in %ds", _gp_attempt, exc, wait,
+                )
+                _time.sleep(wait)
+        return _search_sentinel1_api(bbox, start, end, endpoint, collection, modifier=modifier)
 
 
 def _search_sentinel1_geoparquet(
@@ -224,7 +233,7 @@ def _search_sentinel1_api(
     seen: set = set()
     items: List[Any] = []
 
-    max_retries = 3
+    max_retries = 5
 
     def _fetch_chunk(chunk_start: str, chunk_end: str) -> int:
         for attempt in range(1, max_retries + 1):
@@ -247,7 +256,7 @@ def _search_sentinel1_api(
             except Exception as exc:
                 if attempt == max_retries:
                     raise
-                wait = 30 * attempt
+                wait = 60 * attempt
                 logger.warning(
                     "S1 STAC API %s/%s failed (attempt %d/%d): %s — retrying in %ds",
                     chunk_start, chunk_end, attempt, max_retries, exc, wait,
