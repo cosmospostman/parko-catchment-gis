@@ -1025,33 +1025,33 @@ def run_tile_pipeline_v2(
         return work
 
     def _stage_fetch_s1(work: _ChunkWork) -> _ChunkWork:
-        """Fetch S1 patches to the on-disk cache (network I/O only, no extraction)."""
+        """Fetch S1 patches for this chunk's bbox to the on-disk cache (network I/O only)."""
         if work.clog:
             work.clog.activate()
         crow = work.chunk["chunk_row"]
         ccol = work.chunk["chunk_col"]
-        scene_dir = tmp / str(work.year) / f"chunk_{crow:02d}_{ccol:02d}_scenes"
-        # Shared per-(tile, year) cache so all chunks reuse patches downloaded by the first.
-        s1_cache  = tmp / str(work.year) / "s1_cache"
-        _chunk_id = f"r{crow:02d}_c{ccol:02d}"
+        scene_dir  = tmp / str(work.year) / f"chunk_{crow:02d}_{ccol:02d}_scenes"
+        s1_cache   = scene_dir / "s1_cache"
+        _chunk_id  = f"r{crow:02d}_c{ccol:02d}"
+        chunk_bbox = work.chunk["bbox"]
+
+        _s1_total: list[int] = [0]
 
         def _on_items_resolved(n_items: int) -> None:
             if progress is not None:
+                _s1_total[0] = n_items
                 progress.fetch_update("S1 fetch", tile_id, work.year, _chunk_id, done=0, total=n_items)
 
         def _on_fetch_tick(n_done: int) -> None:
             if progress is not None:
-                progress.fetch_update("S1 fetch", done=n_done)
+                progress.fetch_update("S1 fetch", done=n_done, total=_s1_total[0])
 
         if progress is not None:
             progress.fetch_update("S1 search", tile_id, work.year, _chunk_id)
         _t0 = _time.perf_counter()
-        # Use the full tile bbox (not the chunk bbox) so all chunks download the same
-        # patches. Each S1 GRD covers the whole tile; per-chunk bbox differences would
-        # cause _patch_covers_bbox to reject cached patches and re-download from scratch.
         collect_s1_for_tile(
             s2_path=None,
-            bbox_wgs84=bbox_wgs84,
+            bbox_wgs84=chunk_bbox,
             start=f"{work.year}-01-01",
             end=f"{work.year}-12-31",
             out_path=scene_dir / "s1_chunk.parquet",
@@ -1087,7 +1087,7 @@ def run_tile_pipeline_v2(
         _t0 = _time.perf_counter()
         work.s1_path = collect_s1_for_tile(
             s2_path=None,
-            bbox_wgs84=bbox_wgs84,
+            bbox_wgs84=work.chunk["bbox"],
             start=f"{work.year}-01-01",
             end=f"{work.year}-12-31",
             out_path=scene_dir / "s1_chunk.parquet",

@@ -446,8 +446,8 @@ def _collect_s1_shards(
     if use_sharding:
         logger.info("S1: %d shards total (%d points each)", n_shards, point_shard_size)
 
-    # Fetch patches once for all shards — NPZ cache is keyed by (item_id, band),
-    # independent of which subset of points will be extracted.
+    # Fetch patches for this chunk's bbox — cache is keyed by (item_id, band) so
+    # the extract phase can load them without re-downloading.
     if _do_fetch:
         logger.info(
             "S1: fetching patches for %d items (%d concurrent)",

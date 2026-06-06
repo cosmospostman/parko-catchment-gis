@@ -544,23 +544,19 @@ def test_run_tile_pipeline_v2_skips_fetch_when_scene_dir_exists(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# TV-14  S1 cache is shared across all chunks in the same year
+# TV-14  S1 fetch uses per-chunk bbox and per-chunk cache dir
 # ---------------------------------------------------------------------------
 
-def test_run_tile_pipeline_v2_s1_cache_shared_across_chunks(tmp_path):
-    """All chunks must share one s1_cache dir AND use the tile-level bbox.
+def test_run_tile_pipeline_v2_s1_uses_per_chunk_bbox(tmp_path):
+    """Each chunk fetches S1 for its own bbox and stores patches in its own cache dir.
 
-    Two bugs fixed together:
-    1. cache_dir was per-chunk → each chunk got a fresh empty cache, re-downloading all patches.
-    2. bbox_wgs84 was per-chunk → _patch_covers_bbox rejected patches from other chunks,
-       forcing a re-download even when the shared cache dir was in place.
-
-    After both fixes: only chunk 1 downloads from the network; chunks 2+ read from disk.
+    S1 GRD scenes cover a full swath (~300 km), so fetching the whole tile bbox
+    downloads ~100× more data than needed.  Per-chunk fetch downloads only the
+    ~1024×1024 px window each chunk actually needs.  The cache_dir is inside the
+    chunk's scene_dir so there is no cross-chunk sharing (and no need for it).
     """
     from proxy._pipeline import run_tile_pipeline_v2
 
-    # Give each chunk a distinct bbox so we can detect which bbox was passed to S1.
-    # The tile polygon covers all three sub-bboxes.
     _tile_bbox = [145.41, -22.81, 145.44, -22.74]
     _chunk_bboxes = [
         [145.41, -22.81, 145.42, -22.78],
@@ -603,27 +599,22 @@ def test_run_tile_pipeline_v2_s1_cache_shared_across_chunks(tmp_path):
             items=[_make_item("S2A_55HBU_20220601_0_L2A")],
         ))
 
-    # collect_s1_for_tile is called at least once per chunk (fetch phase).
-    # Extract phase is skipped when no scene parquets are produced, so minimum is 3.
+    # One fetch call per chunk (extract is skipped when no scene parquets produced).
     assert len(collect_calls) >= 3, f"expected at least 3 collect calls, got {len(collect_calls)}"
 
-    cache_dirs = [c for c, _ in collect_calls]
-    bboxes     = [b for _, b in collect_calls]
+    fetch_calls = collect_calls[:3]  # first call per chunk is the fetch phase
 
-    # All calls must use the same cache_dir — the shared per-year directory.
-    assert len(set(cache_dirs)) == 1, (
-        f"S1 cache_dir differs between chunks — patches will be re-downloaded: {set(cache_dirs)}"
-    )
-    expected_cache = work_tmp / "2022" / "s1_cache"
-    assert cache_dirs[0] == expected_cache, (
-        f"Expected shared cache at {expected_cache}, got {cache_dirs[0]}"
-    )
+    # Each chunk must use its own chunk bbox, not the tile bbox.
+    for i, (_, bbox) in enumerate(fetch_calls):
+        assert bbox == pytest.approx(_chunk_bboxes[i], abs=1e-9), (
+            f"Chunk {i}: expected chunk bbox {_chunk_bboxes[i]}, got {bbox} — "
+            "using tile bbox downloads ~100x more S1 data than needed"
+        )
 
-    # All calls must use the tile-level bbox, not any per-chunk bbox.
-    # If a per-chunk bbox were used, _patch_covers_bbox would reject cached patches
-    # from other chunks and force re-downloads even with a shared cache dir.
-    for i, b in enumerate(bboxes):
-        assert b == pytest.approx(_tile_bbox, abs=1e-9), (
-            f"Call {i}: expected tile bbox {_tile_bbox}, got {b} — "
-            "per-chunk bbox breaks cross-chunk cache hits"
+    # Each chunk must use its own cache dir nested inside its scene_dir.
+    for i, (cache_dir, _) in enumerate(fetch_calls):
+        crow, ccol = chunks[i]["chunk_row"], chunks[i]["chunk_col"]
+        expected_cache = work_tmp / "2022" / f"chunk_{crow:02d}_{ccol:02d}_scenes" / "s1_cache"
+        assert cache_dir == expected_cache, (
+            f"Chunk {i}: expected per-chunk cache at {expected_cache}, got {cache_dir}"
         )
