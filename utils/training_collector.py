@@ -290,7 +290,44 @@ def _extract_region(
         logger.warning("Region %s: no rows found in chunkstore", region.id)
         return None
 
-    combined = pa.concat_tables(parts)
+    combined = pa.concat_tables(parts, promote_options="permissive")
+
+    if "source" in combined.schema.names:
+        src_idx = combined.schema.get_field_index("source")
+        filled = pc.if_else(pc.is_null(combined.column("source")), "S2", combined.column("source"))
+        combined = combined.set_column(src_idx, "source", filled)
+
+    # Dedup multi-orbit S2 rows: same pixel+date from two passes → keep highest
+    # scl_purity; ties broken by item_id (orbit _0_ sorts before _1_).
+    n_before = len(combined)
+    df = pl.from_arrow(combined)
+    s2_mask = pl.col("source") == "S2"
+    s2 = (
+        df.filter(s2_mask)
+        .sort(["point_id", "date", "scl_purity", "item_id"], descending=[False, False, True, False])
+        .unique(subset=["point_id", "date"], keep="first")
+    )
+    s1 = df.filter(~s2_mask)
+    df = pl.concat([s2, s1], how="diagonal")
+    combined = df.to_arrow().cast(combined.schema)
+    n_dropped = n_before - len(combined)
+    if n_dropped:
+        logger.info("Region %s: dropped %d multi-orbit duplicate S2 rows", region.id, n_dropped)
+
+    # Drop S2 rows with any null band value (detector gaps, missing COG tiles).
+    _BAND_COLS = ["B02","B03","B04","B05","B06","B07","B08","B8A","B11","B12"]
+    present_bands = [b for b in _BAND_COLS if b in combined.schema.names]
+    if present_bands:
+        df2 = pl.from_arrow(combined)
+        s2_rows = df2.filter(pl.col("source") == "S2")
+        null_mask = pl.any_horizontal([pl.col(b).is_null() for b in present_bands])
+        n_null = s2_rows.filter(null_mask).height
+        if n_null:
+            s2_rows = s2_rows.filter(~null_mask)
+            s1_rows = df2.filter(pl.col("source") != "S2")
+            df2 = pl.concat([s2_rows, s1_rows], how="diagonal")
+            combined = df2.to_arrow().cast(combined.schema)
+            logger.info("Region %s: dropped %d S2 rows with null band values", region.id, n_null)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(combined, out_path)
@@ -302,23 +339,54 @@ def _extract_region(
 # Tile parquet rebuild (unchanged logic, same as before)
 # ---------------------------------------------------------------------------
 
+# Canonical types for fields that have drifted across schema generations.
+# string→large_string: old extractions used plain utf8; newer use large_utf8.
+# uint16 bands: earliest burdekin-era files stored bands as float after
+# index computation; the current pipeline writes raw uint16.
+_CANONICAL_TYPES: dict[str, pa.DataType] = {
+    "point_id":   pa.large_utf8(),
+    "item_id":    pa.large_utf8(),
+    "tile_id":    pa.large_utf8(),
+    "source":     pa.large_utf8(),
+    "orbit":      pa.large_utf8(),
+    **{b: pa.uint16() for b in ("B02","B03","B04","B05","B06","B07","B08","B8A","B11","B12")},
+    "scl_purity": pa.int8(),
+    "aot":        pa.uint8(),
+    "view_zenith": pa.uint8(),
+    "sun_zenith":  pa.uint8(),
+}
+
+
+def _normalise_schema(s: pa.Schema) -> pa.Schema:
+    """Apply canonical type overrides to a schema."""
+    for name, canonical in _CANONICAL_TYPES.items():
+        if name in s.names:
+            idx = s.get_field_index(name)
+            if s.field(name).type != canonical:
+                s = s.set(idx, pa.field(name, canonical))
+    return s
+
+
 def _normalise_source(tbl: pa.Table) -> pa.Table:
-    if "source" in tbl.schema.names:
-        src_idx = tbl.schema.get_field_index("source")
-        if tbl.schema.field("source").type != pa.string():
-            tbl = tbl.set_column(src_idx, "source", tbl.column("source").cast(pa.string()))
+    """Cast every column that has a canonical type to that type."""
+    for name, canonical in _CANONICAL_TYPES.items():
+        if name in tbl.schema.names:
+            idx = tbl.schema.get_field_index(name)
+            if tbl.schema.field(name).type != canonical:
+                tbl = tbl.set_column(idx, name, tbl.column(name).cast(canonical))
     return tbl
 
 
 def _superset_schema(paths: list[Path]) -> pa.Schema:
+    """Union schema across files, enforcing canonical types and promoting
+    string→large_string where unify_schemas would otherwise refuse."""
     schema: pa.Schema | None = None
     for p in paths:
-        s = pq.read_schema(p)
-        if "source" in s.names:
-            idx = s.get_field_index("source")
-            if s.field("source").type != pa.string():
-                s = s.set(idx, pa.field("source", pa.string()))
-        schema = s if schema is None else pa.unify_schemas([schema, s])
+        s = _normalise_schema(pq.read_schema(p))
+        if schema is None:
+            schema = s
+        else:
+            schema = pa.unify_schemas([schema, s], promote_options="permissive")
     return schema
 
 

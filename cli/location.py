@@ -803,6 +803,9 @@ def cmd_training_verify(args: argparse.Namespace) -> None:
 
         # Observations per pixel
         obs_per_pixel = s2.group_by("point_id").agg(pl.len().alias("n"))["n"]
+        if len(obs_per_pixel) == 0:
+            issues.append(f"EMPTY    {r.id} — no S2 rows after source filter")
+            continue
         obs_min = int(obs_per_pixel.min())
         obs_med = int(obs_per_pixel.median())
         obs_max = int(obs_per_pixel.max())
@@ -828,23 +831,17 @@ def cmd_training_verify(args: argparse.Namespace) -> None:
         if bm_max > 12000 or bm_min < 0:
             region_issues.append(f"RANGE    {r.id} — band means outside expected range [{bm_min:.2f}, {bm_max:.2f}]")
 
-        # S1 backscatter sanity checks — VH lives in the tile parquet, not the region parquet
-        index = _load_index()
-        tile_ids = index.filter(pl.col("region_id") == r.id)["tile_id"].to_list()
-        for tile_id in tile_ids:
-            tp = tile_parquet_path(tile_id)
-            if not tp.exists():
-                region_issues.append(f"S1_MISS  {r.id} — tile parquet {tile_id} not built yet")
-                continue
-            tile_df = pl.read_parquet(tp, columns=["point_id", "vh"])
-            region_prefix = r.id + "_"
-            vh = tile_df.filter(pl.col("point_id").str.starts_with(region_prefix))["vh"].drop_nulls()
+        # S1 backscatter sanity checks — read from the region parquet directly
+        if "vh" in df.columns:
+            vh = df.filter(pl.col("source") == "S1")["vh"].drop_nulls()
             if len(vh) == 0:
-                region_issues.append(f"S1_MISS  {r.id} — no S1 vh data in tile {tile_id}")
+                region_issues.append(f"S1_MISS  {r.id} — no S1 rows in region parquet")
             elif vh.median() > 1.0:
                 region_issues.append(
-                    f"S1_SCALE {r.id} — vh median={vh.median():.1f} in tile {tile_id} looks like raw GRD DN, not linear power"
+                    f"S1_SCALE {r.id} — vh median={vh.median():.1f} looks like raw GRD DN, not linear power"
                 )
+        else:
+            region_issues.append(f"S1_MISS  {r.id} — no vh column in region parquet")
 
         if not region_issues and args.prefix:
             issues.append(f"OK       {r.id}")
