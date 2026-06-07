@@ -98,7 +98,7 @@ def main() -> None:
         n_heads=4,
         d_ff=64,
         n_bands=len(V9_FEATURE_COLS),
-        n_global_features=0,
+        n_annual_features=0,
         n_epochs=60,
         patience=15,
         band_noise_std=0.03,

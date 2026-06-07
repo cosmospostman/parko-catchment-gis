@@ -92,7 +92,7 @@ class TAMClassifier(nn.Module):
         dropout:    float = 0.1,
         n_bands:           int   = N_BANDS,
         use_n_obs:         bool  = True,
-        n_global_features: int   = 0,
+        n_annual_features: int   = 0,
         doy_density_norm:  bool  = False,
     ) -> None:
         super().__init__()
@@ -103,7 +103,7 @@ class TAMClassifier(nn.Module):
         self.dropout            = dropout
         self.n_bands            = n_bands
         self.use_n_obs          = use_n_obs
-        self.n_global_features  = n_global_features
+        self.n_annual_features  = n_annual_features
         self.doy_density_norm   = doy_density_norm
 
         # DOY frequency tables: shape (366,) — index by DOY (1-365), 0 unused.
@@ -135,7 +135,7 @@ class TAMClassifier(nn.Module):
             batch_first=True,
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-        head_in = d_model + (1 if use_n_obs else 0) + n_global_features
+        head_in = d_model + (1 if use_n_obs else 0) + n_annual_features
         self.head = nn.Linear(head_in, 1)
         nn.init.constant_(self.head.bias, 0.1)  # positive bias → always starts predicting presence > 0.5
 
@@ -174,7 +174,7 @@ class TAMClassifier(nn.Module):
         doy:              torch.Tensor,          # (B, T)  int, 0=padding
         key_padding_mask: torch.Tensor,          # (B, T)  bool, True=padding
         n_obs:            torch.Tensor,          # (B,)    float32, n / MAX_SEQ_LEN
-        global_feats:     torch.Tensor | None = None,  # (B, n_global_features)
+        annual_feats:     torch.Tensor | None = None,  # (B, n_annual_features)
         is_s1:            torch.Tensor | None = None,  # (B, T)  bool, True=S1 obs
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return (prob, logit), each shape (B,)."""
@@ -208,11 +208,11 @@ class TAMClassifier(nn.Module):
         if self.use_n_obs:
             x_pool = torch.cat([x_pool, n_obs.unsqueeze(-1)], dim=-1)
 
-        if self.n_global_features > 0:
-            if global_feats is None:
-                global_feats = torch.zeros(x_pool.shape[0], self.n_global_features,
+        if self.n_annual_features > 0:
+            if annual_feats is None:
+                annual_feats = torch.zeros(x_pool.shape[0], self.n_annual_features,
                                            dtype=x_pool.dtype, device=x_pool.device)
-            x_pool = torch.cat([x_pool, global_feats], dim=-1)
+            x_pool = torch.cat([x_pool, annual_feats], dim=-1)
 
         logit = self.head(self.pre_head_dropout(x_pool)).squeeze(-1)   # (B,)
         prob  = torch.sigmoid(logit)
@@ -226,7 +226,7 @@ class TAMClassifier(nn.Module):
         cu_seqlens:   torch.Tensor,   # (B+1,)                    int32, cumulative token counts
         max_seqlen:   int,            # longest sequence in batch
         n_obs:        torch.Tensor,   # (B,)                      float32
-        global_feats: torch.Tensor | None = None,
+        annual_feats: torch.Tensor | None = None,
         is_s1_flat:   torch.Tensor | None = None,   # (total_tokens,) bool
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Varlen forward using flash-attn — no padding, O(sum T_i²) attention.
@@ -306,11 +306,11 @@ class TAMClassifier(nn.Module):
         if self.use_n_obs:
             x_pool = torch.cat([x_pool, n_obs.unsqueeze(-1)], dim=-1)
 
-        if self.n_global_features > 0:
-            if global_feats is None:
-                global_feats = torch.zeros(B, self.n_global_features,
+        if self.n_annual_features > 0:
+            if annual_feats is None:
+                annual_feats = torch.zeros(B, self.n_annual_features,
                                            dtype=x_pool.dtype, device=x_pool.device)
-            x_pool = torch.cat([x_pool, global_feats], dim=-1)
+            x_pool = torch.cat([x_pool, annual_feats], dim=-1)
 
         logit = self.head(self.pre_head_dropout(x_pool)).squeeze(-1)  # (B,)
         prob  = torch.sigmoid(logit)
@@ -364,7 +364,7 @@ class TAMClassifier(nn.Module):
             "dropout":            self.dropout,
             "n_bands":            self.n_bands,
             "use_n_obs":          self.use_n_obs,
-            "n_global_features":  self.n_global_features,
+            "n_annual_features":  self.n_annual_features,
             "doy_density_norm":   self.doy_density_norm,
             "max_seq_len":        getattr(self, "_max_seq_len", MAX_SEQ_LEN),
             # Data/inference config — needed by score pipeline
@@ -384,6 +384,6 @@ class TAMClassifier(nn.Module):
             dropout=cfg.dropout,
             n_bands=cfg.n_bands,
             use_n_obs=cfg.use_n_obs,
-            n_global_features=cfg.n_global_features,
+            n_annual_features=cfg.n_annual_features,
             doy_density_norm=cfg.doy_density_norm,
         )

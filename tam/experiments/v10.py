@@ -77,6 +77,15 @@ EXPERIMENT = Experiment(
         # Quaids — Cape York Peninsula (monsoonal savanna)
         "quaids_absence_1", "quaids_absence_3", "quaids_absence_5",
         "quaids_absence_7", "quaids_absence_9",
+        # Mitchell River — train regions
+        "mitchell_presence_1", "mitchell_presence_2", "mitchell_presence_3",
+        "mitchell_presence_4", "mitchell_presence_5",
+        "mitchell_absence_mangrove_1", "mitchell_absence_mangrove_2",
+        "mitchell_absence_mangrove_3",
+        "mitchell_absence_bare_1", "mitchell_absence_bare_2",
+        "mitchell_absence_riparian_1", "mitchell_absence_riparian_2",
+        "mitchell_absence_water_1", "mitchell_absence_water_2",
+        "mitchell_absence_water_3",
     ],
     val_region_ids=[
         # Etna Creek
@@ -101,6 +110,11 @@ EXPERIMENT = Experiment(
         # Quaids — held out for monsoonal generalisation check
         "quaids_val_absence_2", "quaids_val_absence_4", "quaids_val_absence_6",
         "quaids_val_absence_8a", "quaids_val_absence_8b", "quaids_val_absence_10",
+        # Mitchell River — held out for monsoonal generalisation check
+        "mitchell_val_presence_1", "mitchell_val_presence_2",
+        "mitchell_val_presence_3", "mitchell_val_presence_4",
+        "mitchell_val_absence_mangrove_1", "mitchell_val_absence_bare_1",
+        "mitchell_val_absence_riparian_1", "mitchell_val_absence_water_1",
     ],
     feature_cols=V10_FEATURE_COLS,
     model_kwargs={
@@ -109,7 +123,7 @@ EXPERIMENT = Experiment(
         "n_layers": 3,
         "dropout":  0.5,
         "n_bands":  len(V10_FEATURE_COLS) + len(V10_S1_FEATURE_COLS),  # 18
-        "n_global_features": 0,            # overridden at runtime by use_band_summaries
+        "n_annual_features": 0,            # overridden at runtime by use_band_summaries
     },
     train_kwargs={
         "lr":                    5e-5,

@@ -166,10 +166,10 @@ def main() -> None:
     saved_feature_cols   = cfg_dict.get("feature_cols") or (list(cfg.feature_cols_override) if cfg.feature_cols_override else None)
     saved_s1_feature_cols = cfg_dict.get("s1_feature_cols") or None
 
-    global_feat_df: pl.DataFrame | None = None
-    cache_path = ckpt_dir / "global_features_cache.parquet"
+    annual_feat_df: pl.DataFrame | None = None
+    cache_path = ckpt_dir / "annual_features_cache.parquet"
     if cache_path.exists():
-        global_feat_df = pl.read_parquet(cache_path)
+        annual_feat_df = pl.read_parquet(cache_path)
 
     n_heads = model.n_heads
     rng     = np.random.default_rng(42)
@@ -228,7 +228,7 @@ def main() -> None:
             scl_purity_min=cfg.scl_purity_min,
             min_obs_per_year=cfg.min_obs_per_year,
             doy_jitter=0,
-            global_features_df=global_feat_df,
+            annual_features_df=annual_feat_df,
             use_s1=cfg_dict.get("use_s1", False),
             feature_cols_override=saved_feature_cols,
             s1_feature_cols_override=saved_s1_feature_cols,

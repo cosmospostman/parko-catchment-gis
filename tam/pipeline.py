@@ -145,10 +145,10 @@ def _cmd_train(args: argparse.Namespace) -> None:
         for _c in ("source", "vh", "vv"):
             if _c in available and _c not in s1_cols:
                 s1_cols.append(_c)
-        # B08/B04 needed by compute_global_features even in S1-only experiments.
-        s2_global_cols = [c for c in ("B08", "B04") if c in available and c not in exp.feature_cols]
+        # B08/B04 needed by compute_annual_features even in S1-only experiments.
+        s2_annual_cols = [c for c in ("B08", "B04") if c in available and c not in exp.feature_cols]
         base_cols = ["point_id", "lon", "lat", "date", "scl_purity"]
-        read_cols = base_cols + [c for c in exp.feature_cols if c in available] + s1_cols + s2_global_cols
+        read_cols = base_cols + [c for c in exp.feature_cols if c in available] + s1_cols + s2_annual_cols
         tile_specs.append((path, read_cols, pf.metadata.num_row_groups))
 
     _want_pixel_zscore = exp.train_kwargs.get("pixel_zscore", False)
@@ -330,7 +330,7 @@ def _cmd_train(args: argparse.Namespace) -> None:
             band_summaries = pl.concat(band_summary_dfs)
             del band_summary_dfs
             gc.collect()
-            logger.info("Band summaries precomputed per tile: %d pixels", len(band_summaries))
+            logger.info("Band summaries precomputed per tile: %d pixel-years", len(band_summaries))
 
         pixel_df = pl.concat(tile_dfs)
         del tile_dfs
@@ -613,7 +613,7 @@ def _cmd_score(args: argparse.Namespace) -> None:
     signal.signal(signal.SIGINT, _handle_sigint)
 
     logger.info("Loading checkpoint from %s ...", checkpoint_dir)
-    model, band_mean, band_std, global_feat_mean, global_feat_std = load_tam(checkpoint_dir, device=args.device)
+    model, band_mean, band_std, annual_feat_mean, annual_feat_std = load_tam(checkpoint_dir, device=args.device)
 
     with open(checkpoint_dir / "tam_config.json") as _fh:
         _cfg_dict = json.load(_fh)
@@ -642,8 +642,8 @@ def _cmd_score(args: argparse.Namespace) -> None:
     s2_feature_cols_cfg = _cfg_dict.get("feature_cols", None)   # the 14 S2 cols for v10
     s1_feature_cols_cfg = s1_feature_cols_cfg or (["s1_vh", "s1_vv"] if mixed else None)
 
-    # summary_feature_cols: used for global band-summary head; must match global_feat_mean shape.
-    # For mixed models feature_cols in config = S2 cols only (14), matching n_global_features//3.
+    # summary_feature_cols: used for the annual band-summary head; must match annual_feat_mean shape.
+    # For mixed models feature_cols in config = S2 cols only (14), matching n_annual_features//3.
     summary_feature_cols = s2_feature_cols_cfg
 
     # In non-mixed S2-only mode: validate feature_cols length against model.n_bands
@@ -751,6 +751,8 @@ def _cmd_score(args: argparse.Namespace) -> None:
                 s1_feature_cols=s1_feature_cols_cfg if mixed else None,
                 pmtiles_out=pmtiles_out,
                 coords_by_tile=coords_by_tile if pmtiles_out else None,
+                annual_feat_mean=annual_feat_mean,
+                annual_feat_std=annual_feat_std,
             )
         except KeyboardInterrupt:
             signal.signal(signal.SIGINT, _prev_sigint)
@@ -781,8 +783,8 @@ def _cmd_score(args: argparse.Namespace) -> None:
             s2_feature_cols=s2_feature_cols_cfg if mixed else None,
             s1_feature_cols=s1_feature_cols_cfg if mixed else None,
             summary_feature_cols=summary_feature_cols,
-            global_feat_mean=global_feat_mean,
-            global_feat_std=global_feat_std,
+            annual_feat_mean=annual_feat_mean,
+            annual_feat_std=annual_feat_std,
             gate_threshold=args.gate_threshold,
             T_gate=args.t_gate,
         )

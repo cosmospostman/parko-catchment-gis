@@ -88,10 +88,10 @@ def main() -> None:
     with open(out_dir / "tam_config.json") as fh:
         cfg = TAMConfig.from_dict(json.load(fh))
 
-    global_feat_df: pl.DataFrame | None = None
-    cache_path = out_dir / "global_features_cache.parquet"
+    annual_feat_df: pl.DataFrame | None = None
+    cache_path = out_dir / "annual_features_cache.parquet"
     if cache_path.exists():
-        global_feat_df = pl.read_parquet(cache_path)
+        annual_feat_df = pl.read_parquet(cache_path)
 
     # --- Per-site eval --------------------------------------------------------
     print(f"{'site':<24}  {'val_auc':<10}  {'n_px'}")
@@ -118,7 +118,7 @@ def main() -> None:
             scl_purity_min=cfg.scl_purity_min,
             min_obs_per_year=cfg.min_obs_per_year,
             doy_jitter=0,
-            global_features_df=global_feat_df,
+            annual_features_df=annual_feat_df,
         )
 
         if len(ds) == 0:
@@ -134,7 +134,7 @@ def main() -> None:
                     batch["doy"].to(device),
                     batch["mask"].to(device),
                     batch["n_obs"].to(device),
-                    batch["global_feats"].to(device),
+                    batch["annual_feats"].to(device),
                 )
                 probs.extend(torch.sigmoid(p).cpu().numpy().tolist())
                 gt.extend(batch["label"].numpy().tolist())

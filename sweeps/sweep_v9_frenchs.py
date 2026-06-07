@@ -79,13 +79,13 @@ def _load_pixels(exp, base_out: Path):
         pf = pq.ParquetFile(path)
         available = set(pf.schema_arrow.names)
         extra_cols = [c for c in ("source", "scl", "scl_purity") if c in available]
-        s2_global_cols = [c for c in ("B08", "B04") if c in available and c not in exp.feature_cols]
+        s2_annual_cols = [c for c in ("B08", "B04") if c in available and c not in exp.feature_cols]
         base_cols = ["point_id", "lon", "lat", "date"]
         read_cols = (
             base_cols
             + [c for c in exp.feature_cols if c in available]
             + extra_cols
-            + s2_global_cols
+            + s2_annual_cols
         )
         seen: set[str] = set()
         read_cols = [c for c in read_cols if not (c in seen or seen.add(c))]  # type: ignore[func-returns-value]
@@ -130,7 +130,7 @@ def run_one(run_id: str, out_dir: Path, pixel_df, pixel_coords, labels,
         n_heads=4,
         d_ff=64,
         n_bands=len(V9_FEATURE_COLS),
-        n_global_features=0,
+        n_annual_features=0,
         n_epochs=60,
         patience=15,
         band_noise_std=0.03,

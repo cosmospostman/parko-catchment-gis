@@ -44,7 +44,7 @@ def smoke_cfg() -> TAMConfig:
         d_model=16, n_heads=2, n_layers=1, d_ff=32,
         n_bands=len(ALL_FEATURE_COLS),
         use_s1=False,
-        n_global_features=0,
+        n_annual_features=0,
         n_epochs=2, patience=2, batch_size=4,
         doy_jitter=3, val_frac=0.3,
     )
@@ -115,7 +115,7 @@ def trained_smoke(band_cols_session):
         d_model=16, n_heads=2, n_layers=1, d_ff=32,
         n_bands=len(ALL_FEATURE_COLS),
         use_s1=False,
-        n_global_features=0,
+        n_annual_features=0,
         n_epochs=1, patience=1, batch_size=4,
         doy_jitter=3, val_frac=0.3,
         dataset_subprocess=False,
@@ -300,11 +300,11 @@ class TestTT10S2ColsLoadedForNoiseFilter:
                     })
         return pl.DataFrame(rows)
 
-    def test_s2_global_features_not_nan_when_b08_b04_present(self):
-        from tam.core.global_features import compute_global_features
+    def test_s2_annual_features_not_nan_when_b08_b04_present(self):
+        from tam.core.annual_features import compute_annual_features
 
         df = self._make_multiyear_df()
-        gf = compute_global_features(df)
+        gf = compute_annual_features(df)
 
         assert "dry_ndvi" in gf.columns
         assert "rec_p" in gf.columns
@@ -313,15 +313,46 @@ class TestTT10S2ColsLoadedForNoiseFilter:
         assert gf["rec_p"].is_not_null().any(),    "rec_p is all NaN — B08/B04 missing from pixel_df"
         assert gf["nir_cv"].is_not_null().any(),   "nir_cv is all NaN — B08/B04 missing from pixel_df"
 
-    def test_s2_global_features_all_nan_when_b08_b04_absent(self):
-        from tam.core.global_features import compute_global_features
+    def test_s2_annual_features_all_nan_when_b08_b04_absent(self):
+        from tam.core.annual_features import compute_annual_features
 
         df = self._make_multiyear_df().drop(["B08", "B04"])
-        gf = compute_global_features(df)
+        gf = compute_annual_features(df)
 
         assert gf["dry_ndvi"].is_null().all(), "dry_ndvi should be NaN when B08/B04 absent"
         assert gf["rec_p"].is_null().all(),    "rec_p should be NaN when B08/B04 absent"
         assert gf["nir_cv"].is_null().all(),   "nir_cv should be NaN when B08/B04 absent"
+
+    def test_compute_band_summaries_groups_by_pixel_and_year(self):
+        """_compute_band_summaries must produce one row per (point_id, year) —
+        not one row per point_id — so that its scope matches what `score`
+        computes per pixel-year window at inference (Bug 2 / train↔inference
+        annual-feature aggregation parity)."""
+        from tam.core.train import _compute_band_summaries
+
+        # _compute_band_summaries' lazy plan unconditionally derives every
+        # spectral index (NDVI, NDWI, EVI, MAVI, NDRE, CI_RE) that isn't already
+        # present, so the fixture needs the full S2 band set even though we only
+        # request NDVI below.
+        df = self._make_multiyear_df()
+        rng = np.random.default_rng(1)
+        n = len(df)
+        df = df.with_columns([
+            pl.Series(c, rng.uniform(0.05, 0.3, size=n).astype(np.float32))
+            for c in ("B02", "B03", "B05", "B06", "B07", "B8A", "B11", "B12")
+        ])
+        n_pids  = df["point_id"].n_unique()
+        n_years = df["year"].n_unique()
+
+        summaries = _compute_band_summaries(df, ["B08", "B04", "NDVI"])
+
+        assert "point_id" in summaries.columns
+        assert "year" in summaries.columns
+        assert len(summaries) == n_pids * n_years, (
+            "expected one row per (point_id, year), got "
+            f"{len(summaries)} rows for {n_pids} pixels x {n_years} years"
+        )
+        assert summaries.select(["point_id", "year"]).is_duplicated().sum() == 0
 
 
 # ---------------------------------------------------------------------------
@@ -423,7 +454,7 @@ class TestTT12SummaryTableSharedSite:
             d_model=16, n_heads=2, n_layers=1, d_ff=32,
             n_bands=len(ALL_FEATURE_COLS),
             use_s1=False,
-            n_global_features=0,
+            n_annual_features=0,
             n_epochs=1, patience=1, batch_size=4,
             val_region_ids=("alpha_presence_2",),
             dataset_subprocess=False,

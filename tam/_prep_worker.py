@@ -12,7 +12,7 @@ Reads:
 Writes:
   <out_dir>/prep_train_pixel_df.parquet
   <out_dir>/prep_val_pixel_df.parquet
-  <out_dir>/prep_results.json  — train_py_labels, val_py_labels, global_feat_df path
+  <out_dir>/prep_results.json  — train_py_labels, val_py_labels, annual_feat_df path
 
 Design: the full pixel_df_cache.parquet (~5 GB compressed, ~20 GB in RAM) is
 never loaded as a single DataFrame. Instead all operations are done via
@@ -73,11 +73,11 @@ def main(work_dir: Path, out_dir: Path, experiment: str) -> None:
     from tam.core.config import TAMConfig
     from tam.core.constants import DRY_DOY_MIN as _DRY_DOY_MIN, DRY_DOY_MAX as _DRY_DOY_MAX
     from tam.core.dataset import BAND_COLS, S1_FEATURE_COLS, V9_FEATURE_COLS, lin_to_db
-    from tam.core.global_features import GLOBAL_FEATURE_NAMES
+    from tam.core.annual_features import ANNUAL_FEATURE_NAMES
     from tam.core.train import (
         _apply_presence_filter,
         _compute_band_summaries,
-        _load_or_compute_global_features,
+        _load_or_compute_annual_features,
         _site_class,
         region_holdout_split,
         site_holdout_split,
@@ -194,35 +194,35 @@ def main(work_dir: Path, out_dir: Path, experiment: str) -> None:
         )
         _log_rss("after presence slim extracts")
 
-    # --- Global features via slim scan ---------------------------------------
+    # --- Annual features via slim scan ---------------------------------------
     # Pass a slim DataFrame (only columns needed for cache key + computation).
-    global_feat_df: pl.DataFrame | None = None
-    _global_scan_cols = [c for c in ("point_id", "date", "B08", "B04", "vh", "vv", "source")
+    annual_feat_df: pl.DataFrame | None = None
+    _annual_scan_cols = [c for c in ("point_id", "date", "B08", "B04", "vh", "vv", "source")
                          if c in _cache_schema]
     if cfg.use_band_summaries:
         if band_summaries is not None:
-            global_feat_df = band_summaries
+            annual_feat_df = band_summaries
             logger.info("Using precomputed band summaries: %d pixels, %d features",
-                        len(global_feat_df), global_feat_df.width - 1)
+                        len(annual_feat_df), annual_feat_df.width - 1)
         else:
             _slim_df = ensure_float32_bands(pl.scan_parquet(str(_cache_path), n_rows=None).select(
                 [c for c in _scan_cols if c in _cache_schema]
             ).collect())
             logger.info("Computing band summaries (%d rows) ...", len(_slim_df))
-            global_feat_df = _compute_band_summaries(_slim_df, V9_FEATURE_COLS)
+            annual_feat_df = _compute_band_summaries(_slim_df, V9_FEATURE_COLS)
             del _slim_df
             gc.collect()
-    elif cfg.n_global_features > 0:
+    elif cfg.n_annual_features > 0:
         _slim_df = (
             pl.scan_parquet(str(_cache_path))
-            .select(_global_scan_cols)
+            .select(_annual_scan_cols)
             .collect()
         )
-        logger.info("Global features slim scan: %d rows  RSS=%.1f GB", len(_slim_df), _rss_gb())
-        global_feat_df = _load_or_compute_global_features(_slim_df, out_dir, GLOBAL_FEATURE_NAMES)
+        logger.info("Annual features slim scan: %d rows  RSS=%.1f GB", len(_slim_df), _rss_gb())
+        annual_feat_df = _load_or_compute_annual_features(_slim_df, out_dir, ANNUAL_FEATURE_NAMES)
         del _slim_df
         gc.collect()
-    _log_rss("after global features")
+    _log_rss("after annual features")
 
     # --- Broadcast pixel labels → pixel-year labels via scan -----------------
     # Collect just (point_id, year) unique pairs without loading all columns.
@@ -317,10 +317,10 @@ def main(work_dir: Path, out_dir: Path, experiment: str) -> None:
     train_pids_ds = set(k[0] for k in train_py_labels)
     val_pids_ds   = set(k[0] for k in val_py_labels)
 
-    # Slice global features
-    if global_feat_df is not None and not cfg.use_band_summaries:
-        global_feat_df = global_feat_df.select(
-            ["point_id"] + global_feat_df.columns[1:cfg.n_global_features + 1]
+    # Slice annual features
+    if annual_feat_df is not None and not cfg.use_band_summaries:
+        annual_feat_df = annual_feat_df.select(
+            ["point_id"] + annual_feat_df.columns[1:cfg.n_annual_features + 1]
         )
 
     # --- Build lazy scan with all column/row transforms applied --------------
@@ -354,12 +354,12 @@ def main(work_dir: Path, out_dir: Path, experiment: str) -> None:
     _write_scan(train_pids_ds, train_path, "train_pixel_df")
     _write_scan(val_pids_ds,   val_path,   "val_pixel_df")
 
-    # --- Write global features if present ------------------------------------
-    global_feat_path: str | None = None
-    if global_feat_df is not None:
-        global_feat_path = str(out_dir / "prep_global_feat_df.parquet")
-        global_feat_df.write_parquet(global_feat_path)
-        logger.info("Wrote global_feat_df: %d pixels  %d features", len(global_feat_df), global_feat_df.width - 1)
+    # --- Write annual features if present ------------------------------------
+    annual_feat_path: str | None = None
+    if annual_feat_df is not None:
+        annual_feat_path = str(out_dir / "prep_annual_feat_df.parquet")
+        annual_feat_df.write_parquet(annual_feat_path)
+        logger.info("Wrote annual_feat_df: %d pixels  %d features", len(annual_feat_df), annual_feat_df.width - 1)
 
     # Serialise label dicts — keys are (point_id, year) tuples, JSON needs strings
     def _labels_to_json(d: dict[tuple[str, int], float]) -> dict[str, float]:
@@ -368,7 +368,7 @@ def main(work_dir: Path, out_dir: Path, experiment: str) -> None:
     prep_results = {
         "train_py_labels": _labels_to_json(train_py_labels),
         "val_py_labels":   _labels_to_json(val_py_labels),
-        "global_feat_path": global_feat_path,
+        "annual_feat_path": annual_feat_path,
     }
     with open(out_dir / "prep_results.json", "w") as f:
         json.dump(prep_results, f)

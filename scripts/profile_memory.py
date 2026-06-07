@@ -347,7 +347,7 @@ def run_profile(
         d_model=256,
         n_layers=3,
         dropout=0.5,
-        n_global_features=0,
+        n_annual_features=0,
     )
 
     probe("before TAMDataset train", train_pixel_df)
@@ -355,7 +355,7 @@ def run_profile(
     try:
         train_ds = TAMDataset(
             train_pixel_df, py_labels_train,
-            global_features_df=band_summaries,
+            annual_features_df=band_summaries,
             use_s1="mixed" if use_s1 else False,
             pixel_zscore=False,
             feature_cols_override=list(V10_FEATURE_COLS),
@@ -383,9 +383,9 @@ def run_profile(
         val_ds = TAMDataset(
             val_pixel_df, py_labels_val,
             band_mean=band_mean, band_std=band_std,
-            global_features_df=band_summaries,
-            global_feat_mean=train_ds.global_feat_mean,
-            global_feat_std=train_ds.global_feat_std,
+            annual_features_df=band_summaries,
+            annual_feat_mean=train_ds.annual_feat_mean,
+            annual_feat_std=train_ds.annual_feat_std,
             use_s1="mixed" if use_s1 else False,
             pixel_zscore=False,
             feature_cols_override=list(V10_FEATURE_COLS),
@@ -409,13 +409,13 @@ def run_profile(
     import torch
     from tam.core.model import TAMClassifier
 
-    n_global = 0
-    if train_ds.global_feat_mean is not None:
-        n_global = len(train_ds.global_feat_mean)
-    cfg.n_global_features = n_global
+    n_annual = 0
+    if train_ds.annual_feat_mean is not None:
+        n_annual = len(train_ds.annual_feat_mean)
+    cfg.n_annual_features = n_annual
 
     print(f"\nStage: model init (d_model={cfg.d_model}, n_layers={cfg.n_layers}, "
-          f"n_bands={cfg.n_bands}, n_global={n_global}) ...")
+          f"n_bands={cfg.n_bands}, n_annual={n_annual}) ...")
     probe("before model init", None)
     model = TAMClassifier.from_config(cfg)
     model.to("cpu")

@@ -115,9 +115,9 @@ def _score_at_t(
             is_s1_batch = is_s1_th[start:end].to(device, non_blocking=True) if is_s1_th is not None else None
 
             gf_batch = None
-            if band_summaries is not None and model.n_global_features > 0:
+            if band_summaries is not None and model.n_annual_features > 0:
                 # band_summaries is a plain dict pid->array; we skip for simplicity here
-                # (pre-scored into global_feats array by caller if needed)
+                # (pre-scored into annual_feats array by caller if needed)
                 pass
 
             prob, _ = model(
@@ -125,7 +125,7 @@ def _score_at_t(
                 doy_th[start:end].to(device, non_blocking=True),
                 mask_th[start:end].to(device, non_blocking=True),
                 n_obs_th[start:end].to(device, non_blocking=True),
-                global_feats=gf_batch,
+                annual_feats=gf_batch,
                 is_s1=is_s1_batch,
             )
             probs_list.append(prob.cpu().float().numpy())
@@ -218,7 +218,7 @@ def main(args: argparse.Namespace) -> None:
     # 1. Load checkpoint
     # -----------------------------------------------------------------------
     print("\n[1/4] Loading checkpoint...")
-    model, band_mean, band_std, global_feat_mean, global_feat_std = load_tam(
+    model, band_mean, band_std, annual_feat_mean, annual_feat_std = load_tam(
         checkpoint_dir, device=device
     )
     with open(checkpoint_dir / "tam_config.json") as fh:

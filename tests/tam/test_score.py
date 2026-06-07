@@ -78,7 +78,7 @@ def _stub_model() -> tuple[TAMClassifier, np.ndarray, np.ndarray]:
     from tam.core.dataset import ALL_FEATURE_COLS
     n_features = len(ALL_FEATURE_COLS)  # 13: S2-only features
     cfg = TAMConfig(d_model=16, n_heads=2, n_layers=1, d_ff=32,
-                    n_bands=n_features, use_s1=False, n_global_features=0)
+                    n_bands=n_features, use_s1=False, n_annual_features=0)
     torch.manual_seed(42)
     model = TAMClassifier.from_config(cfg)
     model._use_s1 = False
@@ -758,7 +758,7 @@ def _make_s1_parquet(tmp_path: Path, pixels: list[str], years: list[int],
 def _stub_s1_model(n_features: int = 4) -> tuple[TAMClassifier, np.ndarray, np.ndarray]:
     """Tiny S1-only model stub."""
     cfg = TAMConfig(d_model=16, n_heads=2, n_layers=1, d_ff=32,
-                    n_bands=n_features, use_s1="s1_only", n_global_features=0)
+                    n_bands=n_features, use_s1="s1_only", n_annual_features=0)
     torch.manual_seed(7)
     model = TAMClassifier.from_config(cfg)
     model._use_s1 = "s1_only"
@@ -931,7 +931,7 @@ def _stub_mixed_model(
     """Tiny mixed S2+S1 model stub. n_bands = n_s2 + n_s1."""
     n_bands = n_s2 + n_s1
     cfg = TAMConfig(d_model=16, n_heads=2, n_layers=1, d_ff=32,
-                    n_bands=n_bands, use_s1="mixed", n_global_features=0)
+                    n_bands=n_bands, use_s1="mixed", n_annual_features=0)
     torch.manual_seed(13)
     model = TAMClassifier.from_config(cfg)
     model._use_s1 = "mixed"
@@ -1128,7 +1128,7 @@ class TestChunkPixelSourceBoundary:
 
         n_bands = len(_CPS_S2_COLS) + len(_CPS_S1_COLS)
         cfg = TAMConfig(d_model=16, n_heads=2, n_layers=1, d_ff=32,
-                        n_bands=n_bands, use_s1="mixed", n_global_features=0)
+                        n_bands=n_bands, use_s1="mixed", n_annual_features=0)
         torch.manual_seed(0)
         model = TAMClassifier.from_config(cfg)
         model._use_s1 = "mixed"

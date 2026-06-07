@@ -437,10 +437,10 @@ def run_profile(
         d_model=32,
         n_layers=1,
         dropout=0.3,
-        n_global_features=0,
+        n_annual_features=0,
     )
     _ds_kwargs = dict(
-        global_features_df=band_summaries,
+        annual_features_df=band_summaries,
         use_s1="mixed" if use_s1 else False,
         pixel_zscore=pixel_zscore,
         feature_cols_override=list(V10_FEATURE_COLS),
@@ -461,7 +461,7 @@ def run_profile(
         # --- Band stats subprocess -------------------------------------------
         _use_s1_mode = "mixed" if use_s1 else False
         _npz = _ds_tmp_path / "band_stats"
-        _gf_parquet = _ds_tmp_path / "global_feat.parquet"
+        _gf_parquet = _ds_tmp_path / "annual_feat.parquet"
         band_summaries.write_parquet(str(_gf_parquet))
         probe("before band stats subprocess")
         _stats = _compute_band_stats_subprocess(
@@ -472,7 +472,7 @@ def run_profile(
             s1_feature_cols=list(V10_S1_FEATURE_COLS) if use_s1 else [],
             scl_purity_min=0.5,
             s1_despeckle_window=0,
-            global_features_df_path=_gf_parquet,
+            annual_features_df_path=_gf_parquet,
         )
         band_mean = _stats["band_mean"]
         band_std  = _stats["band_std"]
@@ -490,8 +490,8 @@ def run_profile(
                 n_shards=n_shards,
                 band_mean=band_mean,
                 band_std=band_std,
-                global_feat_mean=_stats["global_feat_mean"],
-                global_feat_std=_stats["global_feat_std"],
+                annual_feat_mean=_stats["annual_feat_mean"],
+                annual_feat_std=_stats["annual_feat_std"],
             )
             probe(f"after TAMDataset(train) sharded n={n_shards}", rows=len(train_ds))
         else:
@@ -500,8 +500,8 @@ def run_profile(
                 _train_parquet, train_py_labels, _ds_tmp_path, "train",
                 kwargs=dict(**_ds_kwargs, doy_jitter=0,
                             band_mean=band_mean, band_std=band_std,
-                            global_feat_mean=_stats["global_feat_mean"],
-                            global_feat_std=_stats["global_feat_std"]),
+                            annual_feat_mean=_stats["annual_feat_mean"],
+                            annual_feat_std=_stats["annual_feat_std"]),
             )
             probe("after TAMDataset(train) subprocess", rows=len(train_ds))
 
@@ -515,8 +515,8 @@ def run_profile(
             _val_parquet, val_py_labels, _ds_tmp_path, "val",
             kwargs=dict(**_ds_kwargs,
                         band_mean=band_mean, band_std=band_std,
-                        global_feat_mean=train_ds.global_feat_mean,
-                        global_feat_std=train_ds.global_feat_std,
+                        annual_feat_mean=train_ds.annual_feat_mean,
+                        annual_feat_std=train_ds.annual_feat_std,
                         doy_jitter=0),
         )
         probe("after TAMDataset(val) subprocess", rows=len(val_ds))
@@ -550,8 +550,8 @@ def run_profile(
             val_ds = TAMDataset(
                 val_pixel_df, val_py_labels,
                 band_mean=band_mean, band_std=band_std,
-                global_feat_mean=train_ds.global_feat_mean,
-                global_feat_std=train_ds.global_feat_std,
+                annual_feat_mean=train_ds.annual_feat_mean,
+                annual_feat_std=train_ds.annual_feat_std,
                 doy_jitter=0,
                 _log_rss=_ds_probe,
                 **_ds_kwargs,
@@ -569,8 +569,8 @@ def run_profile(
 
     # --- Model init -------------------------------------------------------
     import torch
-    n_global = int(train_ds._n_global)
-    cfg.n_global_features = n_global
+    n_annual = int(train_ds._n_annual)
+    cfg.n_annual_features = n_annual
     model = TAMClassifier.from_config(cfg)
     model.to("cpu")
     probe("after model init", rows=sum(p.numel() for p in model.parameters()))

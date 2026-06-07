@@ -147,7 +147,7 @@ def run_one(run: dict, out_dir: Path, pixel_df, pixel_coords, labels, device) ->
         d_ff=run["d_ff"],
         dropout=run["dropout"],
         n_bands=len(V9_FEATURE_COLS),
-        n_global_features=0,
+        n_annual_features=0,
         lr=run["lr"],
         weight_decay=0.1,
         n_epochs=60,

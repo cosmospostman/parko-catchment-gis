@@ -126,7 +126,7 @@ def run_one(run: dict, out_dir: Path, pixel_df, pixel_coords, labels, device) ->
         n_heads=4,
         dropout=run["dropout"],
         n_bands=len(V10_FEATURE_COLS) + len(V10_S1_FEATURE_COLS),
-        n_global_features=0,
+        n_annual_features=0,
         lr=run["lr"],
         weight_decay=0.1,
         n_epochs=60,

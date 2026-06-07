@@ -8,7 +8,7 @@ Writes outputs/noise_pixels/{region_id}.json with per-pixel dry_ndvi, rec_p, nir
 and lon/lat. The browser uses this to render a keep/drop overlay with interactive
 threshold sliders.
 
-Cache strategy: if any outputs/*/global_features_cache.parquet already covers the
+Cache strategy: if any outputs/*/annual_features_cache.parquet already covers the
 region's pixels, reuse it (fast). Otherwise compute from the tile parquet (slow,
 ~1–2 min for large regions).
 """
@@ -37,7 +37,7 @@ def _find_cached_features(point_ids: set[str]) -> pl.DataFrame | None:
     """Return a DataFrame with NOISE_FEATURES if any existing cache covers all pixels."""
     sample = list(point_ids)[:20]
     for cache_path in sorted(
-        glob.glob(os.path.join(_OUTPUTS_DIR, "**", "global_features_cache.parquet"),
+        glob.glob(os.path.join(_OUTPUTS_DIR, "**", "annual_features_cache.parquet"),
                   recursive=True)
     ):
         try:
@@ -90,13 +90,13 @@ def export_region(region_id: str) -> str:
                             .iter_rows(named=True)
     }
 
-    # --- global features: reuse cache or compute ---
+    # --- annual features: reuse cache or compute ---
     point_ids = set(coords)
     gf_df = _find_cached_features(point_ids)
     if gf_df is None:
-        print("Computing global features (this may take a while) ...", file=sys.stderr)
-        from tam.core.global_features import compute_global_features
-        gf_full = compute_global_features(pixel_df)
+        print("Computing annual features (this may take a while) ...", file=sys.stderr)
+        from tam.core.annual_features import compute_annual_features
+        gf_full = compute_annual_features(pixel_df)
         gf_df = gf_full.select(["point_id"] + NOISE_FEATURES)
 
     gf_lookup: dict[str, dict] = {

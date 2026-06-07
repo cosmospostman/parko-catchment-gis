@@ -141,7 +141,7 @@ def _stub_score_model():
 
     n_features = len(ALL_FEATURE_COLS)
     cfg = TAMConfig(d_model=16, n_heads=2, n_layers=1, d_ff=32,
-                    n_bands=n_features, use_s1=False, n_global_features=0)
+                    n_bands=n_features, use_s1=False, n_annual_features=0)
     torch.manual_seed(0)
     model = TAMClassifier.from_config(cfg)
     model._use_s1 = False

@@ -1,4 +1,4 @@
-"""tam/core/global_features.py — Per-pixel annual statistics used as global features.
+"""tam/core/annual_features.py — Per-pixel annual statistics fed to the model as annual features.
 
 Features are computed from the full multi-year pixel time series and appended to the
 transformer's pooled representation before the classification head. This gives the model
@@ -34,7 +34,7 @@ import polars as pl
 
 from tam.core.constants import DRY_DOY_MIN as _DRY_DOY_MIN, DRY_DOY_MAX as _DRY_DOY_MAX
 
-GLOBAL_FEATURE_NAMES: list[str] = [
+ANNUAL_FEATURE_NAMES: list[str] = [
     "s1_mean_vh_dry", "s1_vh_contrast", "s1_vh_std", "s1_mean_rvi",
     "nir_cv", "rec_p", "peak_doy", "peak_doy_cv", "dry_ndvi",
 ]
@@ -46,8 +46,8 @@ _SMOOTH_DAYS = 30
 _WET_DOY_RANGES = [(305, 365), (1, 120)]   # Nov–Apr wraps around year boundary
 
 
-def compute_global_features(pixel_df: pl.DataFrame) -> pl.DataFrame:
-    """Compute per-pixel global features from the full observation time series.
+def compute_annual_features(pixel_df: pl.DataFrame) -> pl.DataFrame:
+    """Compute per-pixel annual features from the full observation time series.
 
     Parameters
     ----------
@@ -56,7 +56,7 @@ def compute_global_features(pixel_df: pl.DataFrame) -> pl.DataFrame:
 
     Returns
     -------
-    DataFrame with point_id column and global feature columns.
+    DataFrame with point_id column and annual feature columns.
     Pixels with insufficient data have null for the affected feature.
     """
     if "doy" not in pixel_df.columns:
@@ -83,7 +83,7 @@ def compute_global_features(pixel_df: pl.DataFrame) -> pl.DataFrame:
             result = result.with_columns(pl.lit(None).cast(pl.Float64).alias(col))
 
     if "vh" in pixel_df.columns and "vv" in pixel_df.columns:
-        s1_feats = _compute_s1_globals(pixel_df)
+        s1_feats = _compute_s1_annuals(pixel_df)
         for col in ["s1_mean_vh_dry", "s1_vh_contrast", "s1_vh_std", "s1_mean_rvi"]:
             if col in s1_feats.columns:
                 result = result.join(s1_feats.select(["point_id", col]), on="point_id", how="left")
@@ -93,7 +93,7 @@ def compute_global_features(pixel_df: pl.DataFrame) -> pl.DataFrame:
         for col in ["s1_mean_vh_dry", "s1_vh_contrast", "s1_vh_std", "s1_mean_rvi"]:
             result = result.with_columns(pl.lit(None).cast(pl.Float64).alias(col))
 
-    return result.select(["point_id"] + GLOBAL_FEATURE_NAMES)
+    return result.select(["point_id"] + ANNUAL_FEATURE_NAMES)
 
 
 def _compute_nir_cv_and_dry_ndvi(df: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
@@ -220,8 +220,8 @@ def _compute_peak_doy(df: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def _compute_s1_globals(pixel_df: pl.DataFrame) -> pl.DataFrame:
-    """Compute per-pixel S1 global features from S1 rows in pixel_df."""
+def _compute_s1_annuals(pixel_df: pl.DataFrame) -> pl.DataFrame:
+    """Compute per-pixel S1 annual features from S1 rows in pixel_df."""
     if "doy" not in pixel_df.columns:
         df = pixel_df.with_columns(
             pl.col("date").cast(pl.Date).dt.ordinal_day().alias("doy")

@@ -240,7 +240,7 @@ class _PreparedBatch(NamedTuple):
     pids:         np.ndarray          # (W,) object
     years:        np.ndarray          # (W,) int32
     is_s1:        torch.Tensor | None # (W, MAX_SEQ_LEN) bool; None for S2-only models
-    global_feats: np.ndarray | None   # (W, n_global_features) float32; None if no global head
+    annual_feats: np.ndarray | None   # (W, n_annual_features) float32; None if no annual head
 
 
 class _TransferredBatch(NamedTuple):
@@ -261,7 +261,7 @@ class _TransferredBatch(NamedTuple):
     mask_dev:        "torch.Tensor"        # (B, T_full) on device
     n_obs_dev:       "torch.Tensor"        # (B,) on device
     is_s1_dev:       "torch.Tensor | None" # (B, T_full) on device, or None
-    global_feats_dev: "torch.Tensor | None" # (B, G) on device, or None
+    annual_feats_dev: "torch.Tensor | None" # (B, G) on device, or None
     # CPU-side identity (never transferred)
     pids:            np.ndarray
     years:           np.ndarray
@@ -560,9 +560,9 @@ def _preprocess(
     s1_zscore_stats: _ZscoreArrays | tuple[dict, dict] | None = None,
     max_seq_len: int = MAX_SEQ_LEN,
     batch_size: int = 4096,
-    global_feat_mean: np.ndarray | None = None,
-    global_feat_std: np.ndarray | None = None,
-    n_global_features: int = 0,
+    annual_feat_mean: np.ndarray | None = None,
+    annual_feat_std: np.ndarray | None = None,
+    n_annual_features: int = 0,
 ) -> tuple[list[_PreparedBatch], int]:
     """CPU-side preprocessing using numba kernels for maximum throughput.
 
@@ -689,8 +689,10 @@ def _preprocess(
     # Compute per-window band summaries (p5/p95/std) from the assembled pixel data.
     # feat is still in raw (pre-z-score) units here, matching training convention.
     # Only S2 columns are used; in mixed mode we build a compact S2-only view first.
-    global_feats_np: np.ndarray | None = None
-    if n_global_features > 0 and global_feat_mean is not None and global_feat_std is not None:
+    # Each window is a (pixel, year) pair, so these are genuinely *annual* features —
+    # matching the per-(point_id, year) statistics computed at training time.
+    annual_feats_np: np.ndarray | None = None
+    if n_annual_features > 0 and annual_feat_mean is not None and annual_feat_std is not None:
         n_sum_cols = n_s2 if mixed else n_feat
         if mixed and is_s1_np is not None:
             # Build a compact array containing only S2 rows for the summary kernel.
@@ -710,8 +712,8 @@ def _preprocess(
         else:
             gf = np.empty((W, n_sum_cols * 3), dtype=np.float32)
             compute_band_summaries(feat[:, :n_sum_cols], valid_starts, ends[valid], gf)
-        safe_std = np.where(global_feat_std < 1e-6, 1.0, global_feat_std)
-        global_feats_np = ((gf - global_feat_mean) / safe_std).astype(np.float32)
+        safe_std = np.where(annual_feat_std < 1e-6, 1.0, annual_feat_std)
+        annual_feats_np = ((gf - annual_feat_mean) / safe_std).astype(np.float32)
 
     # Slice into batch_size-sized pieces before converting to tensors.
     # This bounds the size of each prep_q item regardless of how many windows
@@ -727,7 +729,7 @@ def _preprocess(
         b_mask  = torch.from_numpy(np.ascontiguousarray(mask_np[s:e]))
         b_nobs  = torch.from_numpy(np.ascontiguousarray(n_obs_np[s:e]))
         b_is_s1 = torch.from_numpy(np.ascontiguousarray(is_s1_out[s:e])) if is_s1_out is not None else None
-        b_gf    = np.ascontiguousarray(global_feats_np[s:e]) if global_feats_np is not None else None
+        b_gf    = np.ascontiguousarray(annual_feats_np[s:e]) if annual_feats_np is not None else None
         if pin:
             b_bands = b_bands.pin_memory()
             b_doy   = b_doy.pin_memory()
@@ -817,71 +819,6 @@ def _compute_s2_pixel_zscore_stats(
     return pid_mean, pid_std
 
 
-def _compute_band_summaries_from_parquets(
-    year_parquets: list[tuple[int, Path]],
-    feature_cols: list[str],
-    scl_purity_min: float,
-    global_feat_mean: np.ndarray,
-    global_feat_std: np.ndarray,
-) -> dict[str, np.ndarray]:
-    """Pre-pass: compute per-pixel normalised [p5, p95, std] for each feature col.
-
-    Reads all year parquets, concatenates S2 rows, computes summary stats per pixel,
-    normalises using global_feat_mean/std (saved from training), and returns a dict
-    {point_id: float32 array}.  Vector order matches _compute_band_summaries in train.py:
-    [col0_p5, col0_p95, col0_std, col1_p5, ...] (3 stats × n_feature_cols).
-    """
-    import pyarrow.parquet as pq
-
-    raw_band_cols = [c for c in feature_cols if c not in ("NDVI", "NDWI", "EVI")]
-    read_cols = ["point_id", "scl_purity"] + raw_band_cols
-
-    chunks: list[pl.DataFrame] = []
-    for _, path in sorted(year_parquets):
-        pf = pq.ParquetFile(path)
-        available = set(pf.schema_arrow.names)
-        if not any(c in available for c in raw_band_cols):
-            continue  # S1-only shard — no S2 bands
-        cols = [c for c in read_cols if c in available]
-        for rg in range(pf.metadata.num_row_groups):
-            chunks.append(pl.from_arrow(pf.read_row_group(rg, columns=cols)))
-
-    if not chunks:
-        return {}
-
-    df = prepare_s2_frame(pl.concat(chunks), scl_purity_min, feature_cols)
-
-    # Compute raw p5/p95/std per pixel for each feature col (no normalisation yet)
-    # NOTE: pixel z-score is intentionally NOT applied here — training computes band
-    # summaries from raw reflectances (before z-scoring), so inference must match.
-    agg_exprs = []
-    for col in feature_cols:
-        if col in df.columns:
-            agg_exprs += [
-                pl.col(col).quantile(0.05).alias(f"{col}_p5"),
-                pl.col(col).quantile(0.95).alias(f"{col}_p95"),
-                pl.col(col).std().fill_null(0.0).alias(f"{col}_std"),
-            ]
-    grp = df.group_by("point_id").agg(agg_exprs)
-    pids = grp["point_id"].to_numpy()
-    summary_cols: list[np.ndarray] = []
-    for col in feature_cols:
-        if col not in df.columns:
-            z = np.zeros(len(pids), dtype=np.float32)
-            summary_cols += [z, z, z]
-            continue
-        p5  = grp[f"{col}_p5"].fill_null(0.0).to_numpy().astype(np.float32)
-        p95 = grp[f"{col}_p95"].fill_null(0.0).to_numpy().astype(np.float32)
-        std = grp[f"{col}_std"].fill_null(0.0).to_numpy().astype(np.float32)
-        summary_cols += [p5, p95, std]
-
-    summary_matrix = np.column_stack(summary_cols)  # (n_pixels, n_cols*3)
-
-    # Normalise with training global_feat_mean/std, matching TAMDataset normalisation
-    summary_matrix = (summary_matrix - global_feat_mean) / np.where(global_feat_std < 1e-6, 1.0, global_feat_std)
-
-    return {pid: summary_matrix[i].astype(np.float32) for i, pid in enumerate(pids)}
-
 
 def _has_flash_attn() -> bool:
     """True if flash_attn varlen kernel is importable AND supports the current GPU."""
@@ -916,13 +853,13 @@ def _gpu_score(
     the full forward for pixels scoring below gate_threshold. Rejected pixels are
     returned with prob=0.0.
     """
-    bands_th, doy_th, mask_th, n_obs_th, pids, years, is_s1_th, global_feats_np = prepared
+    bands_th, doy_th, mask_th, n_obs_th, pids, years, is_s1_th, annual_feats_np = prepared
     B = len(pids)
     use_varlen = device.startswith("cuda") and _has_flash_attn()
 
     gf_batch: torch.Tensor | None = None
-    if global_feats_np is not None and model.n_global_features > 0:
-        gf_batch = torch.from_numpy(global_feats_np).to(device, non_blocking=True)
+    if annual_feats_np is not None and model.n_annual_features > 0:
+        gf_batch = torch.from_numpy(annual_feats_np).to(device, non_blocking=True)
 
     n_gate_cut = 0
 
@@ -958,7 +895,7 @@ def _gpu_score(
                 torch.from_numpy(gate_doy).to(device, non_blocking=True),
                 torch.from_numpy(gate_mask_np).to(device, non_blocking=True),
                 torch.from_numpy(gate_n_obs).to(device, non_blocking=True),
-                global_feats=gf_batch,
+                annual_feats=gf_batch,
                 is_s1=torch.from_numpy(gate_is_s1).to(device, non_blocking=True) if is_s1_th is not None else None,
             )
 
@@ -988,7 +925,7 @@ def _gpu_score(
                         doy_flat=doy_surv[valid_mask],
                         cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
                         n_obs=n_obs_surv,
-                        global_feats=gf_batch[survivor_idx_dev] if gf_batch is not None else None,
+                        annual_feats=gf_batch[survivor_idx_dev] if gf_batch is not None else None,
                         is_s1_flat=is_s1_surv[valid_mask] if is_s1_surv is not None else None,
                     )
                 else:
@@ -997,7 +934,7 @@ def _gpu_score(
                         doy_th[survivor_idx].to(device, non_blocking=True),
                         mask_th[survivor_idx].to(device, non_blocking=True),
                         n_obs_th[survivor_idx].to(device, non_blocking=True),
-                        global_feats=gf_batch[survivor_idx_dev] if gf_batch is not None else None,
+                        annual_feats=gf_batch[survivor_idx_dev] if gf_batch is not None else None,
                         is_s1=is_s1_th[survivor_idx].to(device, non_blocking=True) if is_s1_th is not None else None,
                     )
                 probs_out[survivor_idx] = prob.cpu().float().numpy()
@@ -1020,7 +957,7 @@ def _gpu_score(
                     doy_flat=doy_dev[valid_mask],
                     cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
                     n_obs=n_obs_dev,
-                    global_feats=gf_batch,
+                    annual_feats=gf_batch,
                     is_s1_flat=is_s1_dev[valid_mask] if is_s1_dev is not None else None,
                 )
             else:
@@ -1029,7 +966,7 @@ def _gpu_score(
                     doy_th.to(device, non_blocking=True),
                     mask_th.to(device, non_blocking=True),
                     n_obs_th.to(device, non_blocking=True),
-                    global_feats=gf_batch,
+                    annual_feats=gf_batch,
                     is_s1=is_s1_th.to(device, non_blocking=True) if is_s1_th is not None else None,
                 )
             return pids, years, prob.cpu().float().numpy(), 0
@@ -1064,7 +1001,7 @@ def _gpu_forward(
                 tb.gate_doy_dev,
                 tb.gate_mask_dev,
                 tb.gate_n_obs_dev,
-                global_feats=tb.global_feats_dev,
+                annual_feats=tb.annual_feats_dev,
                 is_s1=tb.gate_is_s1_dev,
             )
             survivor_idx_dev = torch.where(gate_prob.float() >= gate_threshold)[0]
@@ -1086,8 +1023,8 @@ def _gpu_forward(
                         doy_flat=tb.doy_dev[survivor_idx_dev][valid_mask],
                         cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
                         n_obs=tb.n_obs_dev[survivor_idx_dev],
-                        global_feats=(tb.global_feats_dev[survivor_idx_dev]
-                                      if tb.global_feats_dev is not None else None),
+                        annual_feats=(tb.annual_feats_dev[survivor_idx_dev]
+                                      if tb.annual_feats_dev is not None else None),
                         is_s1_flat=(tb.is_s1_dev[survivor_idx_dev][valid_mask]
                                     if tb.is_s1_dev is not None else None),
                     )
@@ -1097,8 +1034,8 @@ def _gpu_forward(
                         tb.doy_dev[survivor_idx_dev],
                         tb.mask_dev[survivor_idx_dev],
                         tb.n_obs_dev[survivor_idx_dev],
-                        global_feats=(tb.global_feats_dev[survivor_idx_dev]
-                                      if tb.global_feats_dev is not None else None),
+                        annual_feats=(tb.annual_feats_dev[survivor_idx_dev]
+                                      if tb.annual_feats_dev is not None else None),
                         is_s1=(tb.is_s1_dev[survivor_idx_dev]
                                if tb.is_s1_dev is not None else None),
                     )
@@ -1119,14 +1056,14 @@ def _gpu_forward(
                     doy_flat=tb.doy_dev[valid_mask],
                     cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
                     n_obs=tb.n_obs_dev,
-                    global_feats=tb.global_feats_dev,
+                    annual_feats=tb.annual_feats_dev,
                     is_s1_flat=(tb.is_s1_dev[valid_mask]
                                 if tb.is_s1_dev is not None else None),
                 )
             else:
                 prob, _ = model(
                     tb.bands_dev, tb.doy_dev, tb.mask_dev, tb.n_obs_dev,
-                    global_feats=tb.global_feats_dev,
+                    annual_feats=tb.annual_feats_dev,
                     is_s1=tb.is_s1_dev,
                 )
             return tb.pids, tb.years, prob.cpu().float().numpy(), 0
@@ -1203,8 +1140,8 @@ def score_pixels_chunked(
     feature_cols: list[str] | None = None,
     s2_feature_cols: list[str] | None = None,
     s1_feature_cols: list[str] | None = None,
-    global_feat_mean: np.ndarray | None = None,
-    global_feat_std: np.ndarray | None = None,
+    annual_feat_mean: np.ndarray | None = None,
+    annual_feat_std: np.ndarray | None = None,
     pixel_zscore_stats: _ZscoreArrays | tuple[dict, dict] | None = None,
     s1_zscore_stats: _ZscoreArrays | tuple[dict, dict] | None = None,
     # accumulators — pass across years to merge results before final aggregation
@@ -1513,9 +1450,9 @@ def score_pixels_chunked(
                                             s1_zscore_stats=s1_zscore_stats,
                                             max_seq_len=getattr(model, "_max_seq_len", MAX_SEQ_LEN),
                                             batch_size=batch_size,
-                                            global_feat_mean=global_feat_mean,
-                                            global_feat_std=global_feat_std,
-                                            n_global_features=model.n_global_features)
+                                            annual_feat_mean=annual_feat_mean,
+                                            annual_feat_std=annual_feat_std,
+                                            n_annual_features=model.n_annual_features)
                 seen_q.put(n_in)
                 for b in batches:
                     prep_q.put(b)
@@ -1681,8 +1618,8 @@ def score_pixels_chunked(
                 mask_dev   = _to_dev(merged.mask)
                 n_obs_dev  = _to_dev(merged.n_obs)
                 is_s1_dev  = (_to_dev(merged.is_s1) if merged.is_s1 is not None else None)
-                gf_dev     = (_to_dev(merged.global_feats)
-                              if merged.global_feats is not None else None)
+                gf_dev     = (_to_dev(merged.annual_feats)
+                              if merged.annual_feats is not None else None)
                 # Record event after all non_blocking transfers are enqueued.
                 xfer_event: "torch.cuda.Event | None" = None
                 if use_cuda:
@@ -1701,7 +1638,7 @@ def score_pixels_chunked(
                 mask_dev=mask_dev,
                 n_obs_dev=n_obs_dev,
                 is_s1_dev=is_s1_dev,
-                global_feats_dev=gf_dev,
+                annual_feats_dev=gf_dev,
                 pids=merged.pids,
                 years=merged.years,
                 B=B_,
@@ -1773,8 +1710,8 @@ def score_pixels_chunked(
                 years=np.concatenate([b.years for b in _acc]),
                 is_s1=(torch.cat([b.is_s1 for b in _acc], dim=0)
                        if _acc[0].is_s1 is not None else None),
-                global_feats=(np.concatenate([b.global_feats for b in _acc], axis=0)
-                              if _acc[0].global_feats is not None else None),
+                annual_feats=(np.concatenate([b.annual_feats for b in _acc], axis=0)
+                              if _acc[0].annual_feats is not None else None),
             )
         _t_merge_total += _time.monotonic() - _tm
         _tx = _time.monotonic()
@@ -2008,8 +1945,8 @@ def score_location_years(
     s2_feature_cols: list[str] | None = None,
     s1_feature_cols: list[str] | None = None,
     summary_feature_cols: list[str] | None = None,
-    global_feat_mean: np.ndarray | None = None,
-    global_feat_std: np.ndarray | None = None,
+    annual_feat_mean: np.ndarray | None = None,
+    annual_feat_std: np.ndarray | None = None,
     gate_threshold: float = 0.0,
     T_gate: int = 8,
 ) -> pl.DataFrame:
@@ -2027,7 +1964,7 @@ def score_location_years(
     # Resolve effective column lists:
     # - _s2_cols: S2 spectral features used in _preprocess
     # - _s1_cols: S1 dB features used in _preprocess (mixed mode only)
-    # - _summary_cols: band-summary global features (must match global_feat_mean shape)
+    # - _summary_cols: band-summary annual features (must match annual_feat_mean shape)
     _s2_cols = s2_feature_cols or feature_cols or list(ALL_FEATURE_COLS)
     _s1_cols = s1_feature_cols or ["s1_vh", "s1_vv"]
 
@@ -2063,8 +2000,8 @@ def score_location_years(
             feature_cols=None,
             s2_feature_cols=_s2_cols,
             s1_feature_cols=_s1_cols,
-            global_feat_mean=global_feat_mean,
-            global_feat_std=global_feat_std,
+            annual_feat_mean=annual_feat_mean,
+            annual_feat_std=annual_feat_std,
             pixel_zscore_stats=None,
             s1_zscore_stats=None,
             _all_pids=all_pids,
@@ -2118,8 +2055,8 @@ def score_tile_year(
     n_pixels_before: int = 0,
     s2_feature_cols: list[str] | None = None,
     s1_feature_cols: list[str] | None = None,
-    global_feat_mean: np.ndarray | None = None,
-    global_feat_std: np.ndarray | None = None,
+    annual_feat_mean: np.ndarray | None = None,
+    annual_feat_std: np.ndarray | None = None,
 ) -> Path:
     """Score a single (tile_id, year) parquet and write a staging parquet.
 
@@ -2170,8 +2107,8 @@ def score_tile_year(
             s1_only=s1_only,
             mixed=mixed,
             pixel_zscore=not s1_only,
-            global_feat_mean=global_feat_mean,
-            global_feat_std=global_feat_std,
+            annual_feat_mean=annual_feat_mean,
+            annual_feat_std=annual_feat_std,
             pixel_zscore_stats=None,
             s1_zscore_stats=None,
             s2_feature_cols=_s2_cols,
@@ -2197,6 +2134,7 @@ def _score_tile_worker(args: tuple) -> tuple[str, list[Path]]:
         staging_dir, scl_purity_min, min_obs_per_year,
         batch_size, n_prep_workers, device, n_tile_workers, s1_only, mixed,
         s1_despeckle_window, s2_feature_cols, s1_feature_cols,
+        annual_feat_mean, annual_feat_std,
         n_tile_pixels, n_pixels_before,
     ) = args
 
@@ -2222,6 +2160,8 @@ def _score_tile_worker(args: tuple) -> tuple[str, list[Path]]:
             s1_despeckle_window=s1_despeckle_window,
             s2_feature_cols=s2_feature_cols,
             s1_feature_cols=s1_feature_cols,
+            annual_feat_mean=annual_feat_mean,
+            annual_feat_std=annual_feat_std,
             n_total_pixels=n_tile_pixels,
             n_pixels_before=n_pixels_before,
         )
@@ -2252,6 +2192,8 @@ def score_tiles_chunked(
     T_gate: int = 8,
     pmtiles_out: Path | None = None,
     coords_by_tile: dict[str, Path] | None = None,
+    annual_feat_mean: np.ndarray | None = None,
+    annual_feat_std: np.ndarray | None = None,
 ) -> list[Path]:
     """Score each S2 tile independently, writing one parquet per tile.
 
@@ -2318,6 +2260,7 @@ def score_tiles_chunked(
             staging_dir, scl_purity_min, min_obs_per_year,
             batch_size, n_prep_workers, device, n_tile_workers, s1_only, mixed,
             s1_despeckle_window, s2_feature_cols, s1_feature_cols,
+            annual_feat_mean, annual_feat_std,
             pixels_by_tile.get(tile_id), 0,
         )
         for tile_id, year_parquets in tile_year_parquets.items()

@@ -605,7 +605,6 @@ def run_bench(args: argparse.Namespace, tmp_dir: Path) -> None:
     from tam.core.score import (
         score_pixels_chunked,
         _compute_s2_pixel_zscore_stats,
-        _compute_band_summaries_from_parquets,
         _compute_pixel_s1_stats_mixed,
     )
 
@@ -678,8 +677,8 @@ def run_bench(args: argparse.Namespace, tmp_dir: Path) -> None:
         pixel_zscore=args.pixel_zscore,
         pixel_zscore_stats=pixel_zscore_stats,
         s1_zscore_stats=s1_zscore_stats,
-        global_feat_mean=np.zeros(n_feat * 3, dtype=np.float32) if args.band_summaries else None,
-        global_feat_std=np.ones(n_feat * 3,  dtype=np.float32) if args.band_summaries else None,
+        annual_feat_mean=np.zeros(n_feat * 3, dtype=np.float32) if args.band_summaries else None,
+        annual_feat_std=np.ones(n_feat * 3,  dtype=np.float32) if args.band_summaries else None,
         mixed=args.mixed,
         s2_feature_cols=s2_cols,
         s1_feature_cols=s1_cols if args.mixed else None,

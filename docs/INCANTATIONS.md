@@ -1,7 +1,7 @@
-Score:
+# SCORE:
 
 python3 -m tam.pipeline score \
-  --checkpoint outputs/models/tam-v10-0530 \
+  --checkpoint outputs/models/tam-v10 \
   --location mitchell \
   --pixel-dir /mnt/external/chunkstore \
   --years 2025 \
@@ -9,5 +9,8 @@ python3 -m tam.pipeline score \
   --pmtiles outputs/scores/mitchell \
   --tile-id 54LWH
 
-Fetch:
+# FETCH:
 python cli/location.py fetch staaten --years 2025 --tiles 54KWG
+
+# TRAIN:
+python -m tam.pipeline train --experiment v10

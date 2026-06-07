@@ -106,12 +106,12 @@ def main(work_dir: Path, out_dir: Path, experiment: str) -> None:
             cfg_dict[_f] = tuple(cfg_dict[_f])
     cfg = TAMConfig(**{k: v for k, v in cfg_dict.items() if k in TAMConfig.__dataclass_fields__})
 
-    global_feat_df: pl.DataFrame | None = None
-    if prep_results.get("global_feat_path"):
+    annual_feat_df: pl.DataFrame | None = None
+    if prep_results.get("annual_feat_path"):
         import pyarrow.parquet as _pq2
-        global_feat_df = pl.from_arrow(_pq2.read_table(prep_results["global_feat_path"]))
-        logger.info("global_feat_df: %d pixels  %d features  RSS=%.1f GB",
-                    len(global_feat_df), global_feat_df.width - 1, _rss_gb())
+        annual_feat_df = pl.from_arrow(_pq2.read_table(prep_results["annual_feat_path"]))
+        logger.info("annual_feat_df: %d pixels  %d features  RSS=%.1f GB",
+                    len(annual_feat_df), annual_feat_df.width - 1, _rss_gb())
 
     logger.info("Calling train_tam (precomputed_split paths): RSS=%.1f GB", _rss_gb())
 
@@ -120,7 +120,7 @@ def main(work_dir: Path, out_dir: Path, experiment: str) -> None:
         "val_pixel_df":   out_dir / "prep_val_pixel_df.parquet",
         "train_py_labels": train_py_labels,
         "val_py_labels":   val_py_labels,
-        "global_feat_df":  global_feat_df,
+        "annual_feat_df":  annual_feat_df,
     }
     _split_holder = [precomputed_split]
     del precomputed_split
@@ -144,7 +144,7 @@ def main(work_dir: Path, out_dir: Path, experiment: str) -> None:
     for _p in (
         out_dir / "prep_train_pixel_df.parquet",
         out_dir / "prep_val_pixel_df.parquet",
-        out_dir / "prep_global_feat_df.parquet",
+        out_dir / "prep_annual_feat_df.parquet",
     ):
         try:
             _p.unlink()

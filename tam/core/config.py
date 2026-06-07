@@ -14,7 +14,7 @@ class TAMConfig:
     d_ff:       int   = 64
     dropout:    float = 0.3
     use_n_obs:         bool  = True   # append normalised obs-count to pooled repr before head
-    n_global_features: int   = 9     # 5 S2 globals + 4 S1 globals (0 to disable)
+    n_annual_features: int   = 9     # 5 S2 annuals + 4 S1 annuals (0 to disable)
     use_s1:  bool | str  = True   # True=mixed S1+S2 interleaved, "s1_only"=S1 sequence only, False=S2 only
     s1_feature_cols: tuple | None = None  # subset of S1_FEATURE_COLS to use; None=all four
     use_band_summaries: bool = False  # if True, append per-band [p5, p95, std] as global features

@@ -66,13 +66,13 @@ def _load_pixels(exp, base_out: Path):
         available = set(pf.schema_arrow.names)
         # Read source/scl for S2 filtering; B08/B04 for noise filter if not already in feature_cols.
         extra_cols = [c for c in ("source", "scl", "scl_purity") if c in available]
-        s2_global_cols = [c for c in ("B08", "B04") if c in available and c not in exp.feature_cols]
+        s2_annual_cols = [c for c in ("B08", "B04") if c in available and c not in exp.feature_cols]
         base_cols = ["point_id", "lon", "lat", "date"]
         read_cols = (
             base_cols
             + [c for c in exp.feature_cols if c in available]
             + extra_cols
-            + s2_global_cols
+            + s2_annual_cols
         )
         # Deduplicate while preserving order
         seen: set[str] = set()
@@ -128,7 +128,7 @@ def run_one(
         n_layers=2,
         dropout=0.5,
         n_bands=len(V9_FEATURE_COLS),  # 11; overridden by band summaries at runtime
-        n_global_features=0,
+        n_annual_features=0,
         # Training
         lr=lr,
         weight_decay=0.1,

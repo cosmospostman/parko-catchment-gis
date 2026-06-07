@@ -66,7 +66,7 @@ class TAMSample(NamedTuple):
     doy:          torch.Tensor   # (MAX_SEQ_LEN,)           int64, 1–365, 0=padding
     mask:         torch.Tensor   # (MAX_SEQ_LEN,)           bool, True=padding
     n_obs:        torch.Tensor   # ()                       float32, n / MAX_SEQ_LEN
-    global_feats: torch.Tensor   # (N_GLOBAL,)              float32, z-scored global features
+    annual_feats: torch.Tensor   # (N_ANNUAL,)              float32, z-scored annual features
     label:        torch.Tensor   # ()                       float32 {0, 1}
     weight:       torch.Tensor   # ()                       float32 confidence weight
     is_s1:        torch.Tensor   # (MAX_SEQ_LEN,)           bool, True=S1 observation
@@ -140,7 +140,7 @@ def collate_fn(samples: list[TAMSample]) -> dict:
         "doy":          torch.stack([s.doy          for s in samples]),
         "mask":         torch.stack([s.mask         for s in samples]),
         "n_obs":        torch.stack([s.n_obs        for s in samples]),
-        "global_feats": torch.stack([s.global_feats for s in samples]),
+        "annual_feats": torch.stack([s.annual_feats for s in samples]),
         "label":        torch.stack([s.label        for s in samples]),
         "weight":       torch.stack([s.weight       for s in samples]),
         "is_s1":        torch.stack([s.is_s1        for s in samples]),
@@ -211,9 +211,9 @@ class TAMDataset(Dataset):
         doy_phase_shift: bool = False,
         band_noise_std: float = 0.0,
         obs_dropout_min: int = 0,
-        global_features_df: pl.DataFrame | None = None,
-        global_feat_mean: np.ndarray | None = None,
-        global_feat_std: np.ndarray | None = None,
+        annual_features_df: pl.DataFrame | None = None,
+        annual_feat_mean: np.ndarray | None = None,
+        annual_feat_std: np.ndarray | None = None,
         use_s1: bool = False,
         pixel_zscore: bool = False,
         s1_despeckle_window: int = 0,
@@ -648,41 +648,55 @@ class TAMDataset(Dataset):
         self._p_gate = p_gate
         self._T_gate = T_gate
 
-        # Global features: per-pixel scalars z-scored and stored as float32 arrays
-        if global_features_df is not None and len(global_features_df) > 0:
-            feat_cols = [c for c in global_features_df.columns if c != "point_id"]
-            n_global = len(feat_cols)
+        # Annual features: per-(pixel, year) [or per-pixel, if no year column]
+        # scalars, z-scored and stored as float32 arrays.
+        if annual_features_df is not None and len(annual_features_df) > 0:
+            _has_year = "year" in annual_features_df.columns
+            _key_cols = ["point_id", "year"] if _has_year else ["point_id"]
+            feat_cols = [c for c in annual_features_df.columns if c not in _key_cols]
+            n_annual = len(feat_cols)
 
-            gf_numpy  = global_features_df.select(feat_cols).to_numpy().astype(np.float32)
-            gf_pids   = global_features_df["point_id"].to_numpy()
-            sorter    = np.argsort(gf_pids)
-            gf_pids_s = gf_pids[sorter]
+            gf_numpy = annual_features_df.select(feat_cols).to_numpy().astype(np.float32)
+            if _has_year:
+                # Composite (point_id, year) key — matches the per-(pixel, year)
+                # scope `_compute_band_summaries` now produces (Bug 2 fix): one
+                # row per window, not one row broadcast across a pixel's years.
+                gf_keys  = np.array([f"{p}\x00{y}" for p, y in
+                                     zip(annual_features_df["point_id"].to_list(),
+                                         annual_features_df["year"].to_list())])
+                win_keys = np.array([f"{p}\x00{y}" for p, y in
+                                     zip(self._pids, self._years)])
+            else:
+                gf_keys  = annual_features_df["point_id"].to_numpy()
+                win_keys = self._pids
+
+            sorter     = np.argsort(gf_keys)
+            gf_keys_s  = gf_keys[sorter]
             gf_numpy_s = gf_numpy[sorter]
 
             # Vectorised lookup: searchsorted + validity mask — no Python loop
-            n_windows = len(self._pids)
-            pos   = np.searchsorted(gf_pids_s, self._pids)
-            pos   = np.clip(pos, 0, len(gf_pids_s) - 1)
-            found = gf_pids_s[pos] == self._pids
+            pos   = np.searchsorted(gf_keys_s, win_keys)
+            pos   = np.clip(pos, 0, len(gf_keys_s) - 1)
+            found = gf_keys_s[pos] == win_keys
             feat_vals = np.where(found[:, None], gf_numpy_s[pos], np.nan).astype(np.float32)
 
-            if global_feat_mean is None or global_feat_std is None:
-                global_feat_mean = np.nanmean(feat_vals, axis=0)
-                global_feat_std  = np.nanstd(feat_vals, axis=0)
-                global_feat_mean = np.where(np.isnan(global_feat_mean), 0.0, global_feat_mean)
-                global_feat_std  = np.where(global_feat_std < 1e-6, 1.0, global_feat_std)
+            if annual_feat_mean is None or annual_feat_std is None:
+                annual_feat_mean = np.nanmean(feat_vals, axis=0)
+                annual_feat_std  = np.nanstd(feat_vals, axis=0)
+                annual_feat_mean = np.where(np.isnan(annual_feat_mean), 0.0, annual_feat_mean)
+                annual_feat_std  = np.where(annual_feat_std < 1e-6, 1.0, annual_feat_std)
 
-            self.global_feat_mean = global_feat_mean.astype(np.float32)
-            self.global_feat_std  = global_feat_std.astype(np.float32)
+            self.annual_feat_mean = annual_feat_mean.astype(np.float32)
+            self.annual_feat_std  = annual_feat_std.astype(np.float32)
 
-            normed = (feat_vals - self.global_feat_mean) / self.global_feat_std
-            self._global_feat_arr = np.where(np.isnan(normed), 0.0, normed).astype(np.float32)
-            self._n_global = n_global
+            normed = (feat_vals - self.annual_feat_mean) / self.annual_feat_std
+            self._annual_feat_arr = np.where(np.isnan(normed), 0.0, normed).astype(np.float32)
+            self._n_annual = n_annual
         else:
-            self.global_feat_mean = np.zeros(0, dtype=np.float32)
-            self.global_feat_std  = np.ones(0,  dtype=np.float32)
-            self._global_feat_arr = np.empty((0, 0), dtype=np.float32)
-            self._n_global = 0
+            self.annual_feat_mean = np.zeros(0, dtype=np.float32)
+            self.annual_feat_std  = np.ones(0,  dtype=np.float32)
+            self._annual_feat_arr = np.empty((0, 0), dtype=np.float32)
+            self._n_annual = 0
 
     # ------------------------------------------------------------------
     def __len__(self) -> int:
@@ -767,14 +781,14 @@ class TAMDataset(Dataset):
             label = float(self._labels[pid])  # type: ignore[index]
         weight = 1.0
 
-        gf = self._global_feat_arr[idx] if self._n_global > 0 else np.zeros(0, dtype=np.float32)
+        gf = self._annual_feat_arr[idx] if self._n_annual > 0 else np.zeros(0, dtype=np.float32)
 
         return TAMSample(
             bands        = torch.from_numpy(bands),
             doy          = torch.from_numpy(doy),
             mask         = torch.from_numpy(mask),
             n_obs        = torch.tensor(n / seq_cap, dtype=torch.float32),
-            global_feats = torch.from_numpy(gf),
+            annual_feats = torch.from_numpy(gf),
             label        = torch.tensor(label,  dtype=torch.float32),
             weight       = torch.tensor(weight, dtype=torch.float32),
             is_s1        = torch.from_numpy(is_s1),
@@ -811,7 +825,7 @@ class TAMDataset(Dataset):
             doy          = torch.from_numpy(doy_out),
             mask         = torch.from_numpy(mask_out),
             n_obs        = torch.tensor(n2 / seq_cap, dtype=torch.float32),
-            global_feats = sample.global_feats,
+            annual_feats = sample.annual_feats,
             label        = sample.label,
             weight       = sample.weight,
             is_s1        = torch.from_numpy(is_s1_out),
@@ -839,13 +853,13 @@ class TAMDataset(Dataset):
         np.save(path / "years.npy",   self._years)
         np.save(path / "band_mean.npy", self.band_mean)
         np.save(path / "band_std.npy",  self.band_std)
-        np.save(path / "global_feat_mean.npy", self.global_feat_mean)
-        np.save(path / "global_feat_std.npy",  self.global_feat_std)
-        if self._n_global > 0:
-            np.save(path / "global_feat_arr.npy", self._global_feat_arr)
+        np.save(path / "annual_feat_mean.npy", self.annual_feat_mean)
+        np.save(path / "annual_feat_std.npy",  self.annual_feat_std)
+        if self._n_annual > 0:
+            np.save(path / "annual_feat_arr.npy", self._annual_feat_arr)
         meta = {
             "n_features":      self._n_features,
-            "n_global":        self._n_global,
+            "n_annual":        self._n_annual,
             "doy_jitter":      self._doy_jitter,
             "doy_phase_shift": self._doy_phase_shift,
             "band_noise_std":  self._band_noise_std,
@@ -888,14 +902,14 @@ class TAMDataset(Dataset):
         obj._years   = np.load(path / "years.npy",   mmap_mode="r+")
         obj.band_mean = np.load(path / "band_mean.npy")
         obj.band_std  = np.load(path / "band_std.npy")
-        obj.global_feat_mean = np.load(path / "global_feat_mean.npy")
-        obj.global_feat_std  = np.load(path / "global_feat_std.npy")
+        obj.annual_feat_mean = np.load(path / "annual_feat_mean.npy")
+        obj.annual_feat_std  = np.load(path / "annual_feat_std.npy")
 
         with open(path / "meta.json") as f:
             meta = json.load(f)
 
         obj._n_features      = meta["n_features"]
-        obj._n_global        = meta["n_global"]
+        obj._n_annual        = meta["n_annual"]
         obj._doy_jitter      = doy_jitter
         obj._doy_phase_shift = doy_phase_shift
         obj._band_noise_std  = band_noise_std
@@ -906,10 +920,10 @@ class TAMDataset(Dataset):
         obj._labels_are_pixel_year = meta["labels_are_pixel_year"]
         obj._labels = labels
 
-        if obj._n_global > 0:
-            obj._global_feat_arr = np.load(path / "global_feat_arr.npy", mmap_mode="r+")
+        if obj._n_annual > 0:
+            obj._annual_feat_arr = np.load(path / "annual_feat_arr.npy", mmap_mode="r+")
         else:
-            obj._global_feat_arr = np.empty((0, 0), dtype=np.float32)
+            obj._annual_feat_arr = np.empty((0, 0), dtype=np.float32)
 
         return obj
 
@@ -921,8 +935,8 @@ class TAMDataset(Dataset):
         labels: "dict[tuple[str, int], float] | dict[str, float] | None",
         band_mean: np.ndarray,
         band_std: np.ndarray,
-        global_feat_mean: np.ndarray,
-        global_feat_std: np.ndarray,
+        annual_feat_mean: np.ndarray,
+        annual_feat_std: np.ndarray,
         doy_jitter: int = 0,
         doy_phase_shift: bool = False,
         band_noise_std: float = 0.0,
@@ -933,7 +947,7 @@ class TAMDataset(Dataset):
         """Merge a list of TAMDataset shards into a single dataset.
 
         Each shard was built with shared normalisation stats (band_mean/std,
-        global_feat_mean/std), so the per-band values are already in the same
+        annual_feat_mean/std), so the per-band values are already in the same
         space.  Merging is pure numpy: concatenate flat arrays and fix offsets.
         """
         if not shards:
@@ -960,19 +974,19 @@ class TAMDataset(Dataset):
         obj._pids    = np.concatenate(pids_list)
         obj._years   = np.concatenate(years_list)
 
-        # Global features: concatenate per-window rows (already normalised with shared stats)
-        if shards[0]._n_global > 0:
-            obj._global_feat_arr = np.concatenate([s._global_feat_arr for s in shards], axis=0)
-            obj._n_global = shards[0]._n_global
+        # Annual features: concatenate per-window rows (already normalised with shared stats)
+        if shards[0]._n_annual > 0:
+            obj._annual_feat_arr = np.concatenate([s._annual_feat_arr for s in shards], axis=0)
+            obj._n_annual = shards[0]._n_annual
         else:
-            obj._global_feat_arr = np.empty((0, 0), dtype=np.float32)
-            obj._n_global = 0
+            obj._annual_feat_arr = np.empty((0, 0), dtype=np.float32)
+            obj._n_annual = 0
 
         # Shared stats (passed in from the stats subprocess)
         obj.band_mean        = band_mean.astype(np.float32)
         obj.band_std         = band_std.astype(np.float32)
-        obj.global_feat_mean = global_feat_mean.astype(np.float32)
-        obj.global_feat_std  = global_feat_std.astype(np.float32)
+        obj.annual_feat_mean = annual_feat_mean.astype(np.float32)
+        obj.annual_feat_std  = annual_feat_std.astype(np.float32)
 
         # Training hyperparams
         obj._n_features      = shards[0]._n_features

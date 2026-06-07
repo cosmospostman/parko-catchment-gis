@@ -112,7 +112,7 @@ EXPERIMENT = Experiment(
         "n_layers": 3,
         "dropout":  0.5,
         "n_bands":  len(V9_FEATURE_COLS),  # 14
-        "n_global_features": 0,            # overridden at runtime by use_band_summaries
+        "n_annual_features": 0,            # overridden at runtime by use_band_summaries
     },
     train_kwargs={
         "lr":                    5e-5,

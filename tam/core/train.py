@@ -25,7 +25,7 @@ from torch.utils.data import DataLoader
 from tam.core.config import TAMConfig
 from tam.core.constants import DRY_DOY_MIN as _DRY_DOY_MIN, DRY_DOY_MAX as _DRY_DOY_MAX
 from tam.core.dataset import BAND_COLS, MAX_SEQ_LEN, S1_FEATURE_COLS, TAMDataset, V9_FEATURE_COLS, collate_fn, lin_to_db, ForcedGateDataset, GateAugDataset
-from tam.core.global_features import GLOBAL_FEATURE_NAMES, compute_global_features
+from tam.core.annual_features import ANNUAL_FEATURE_NAMES, compute_annual_features
 from tam.core.model import TAMClassifier
 
 logger = logging.getLogger(__name__)
@@ -120,11 +120,19 @@ def site_holdout_split(
 # ---------------------------------------------------------------------------
 
 def _compute_band_summaries(pixel_df: pl.DataFrame, feature_cols: list[str]) -> pl.DataFrame:
-    """Per-pixel [p5, p95, std] for each feature column, computed from S2 rows.
+    """Per-(pixel, year) [p5, p95, std] for each feature column, computed from S2 rows.
 
-    Returns a DataFrame with columns point_id, <col>_p5, <col>_p95, <col>_std
-    for each col in feature_cols.
-    Used as global features when cfg.use_band_summaries=True.
+    Returns a DataFrame with columns point_id, year, <col>_p5, <col>_p95, <col>_std
+    for each col in feature_cols — one row per (point_id, year) observed in pixel_df.
+    Used as annual features when cfg.use_band_summaries=True.
+
+    Grouping by (point_id, year) — rather than point_id alone — is essential: at
+    inference, `score` computes these same [p5, p95, std] statistics per pixel-year
+    window (a single year of observations), so training must produce statistics at
+    the same scope for the saved normalisation stats to be meaningful. Aggregating
+    across a pixel's entire multi-year history would calibrate the z-scoring on a
+    population with structurally different (wider-spread, higher-count) statistics
+    than what inference ever produces.
 
     Index columns (NDVI, NDWI, etc.) are computed inline as Polars expressions
     inside the lazy plan so they are never materialised as full-frame columns.
@@ -166,42 +174,42 @@ def _compute_band_summaries(pixel_df: pl.DataFrame, feature_cols: list[str]) -> 
         [pl.col(c).quantile(0.95).alias(f"{c}_p95") for c in cols] +
         [pl.col(c).std().alias(f"{c}_std")           for c in cols]
     )
-    grp = lf.group_by("point_id").agg(aggs).collect()
-    ordered = ["point_id"] + [f"{c}{s}" for c in cols for s in ("_p5", "_p95", "_std")]
+    grp = lf.group_by(["point_id", "year"]).agg(aggs).collect()
+    ordered = ["point_id", "year"] + [f"{c}{s}" for c in cols for s in ("_p5", "_p95", "_std")]
     return grp.select([c for c in ordered if c in grp.columns])
 
 
-def _global_features_cache_key(pixel_df: pl.DataFrame) -> str:
-    """Stable hash of the inputs to compute_global_features."""
-    cols = [c for c in ("point_id", "date", "B08", "B04", "vh", "vv", "source")
+def _annual_features_cache_key(pixel_df: pl.DataFrame) -> str:
+    """Stable hash of the inputs to compute_annual_features."""
+    cols = [c for c in ("point_id", "year", "date", "B08", "B04", "vh", "vv", "source")
             if c in pixel_df.columns]
     key_df = pixel_df.select(cols).sort(cols)
     return hashlib.md5(key_df.write_csv().encode()).hexdigest()
 
 
-def _load_or_compute_global_features(
+def _load_or_compute_annual_features(
     pixel_df: pl.DataFrame,
     out_dir: Path,
     feature_names: list[str],
 ) -> pl.DataFrame:
-    cache_path = out_dir / "global_features_cache.parquet"
-    key_path   = out_dir / "global_features_cache.key"
-    cache_key  = _global_features_cache_key(pixel_df)
+    cache_path = out_dir / "annual_features_cache.parquet"
+    key_path   = out_dir / "annual_features_cache.key"
+    cache_key  = _annual_features_cache_key(pixel_df)
 
     if cache_path.exists() and key_path.exists() and key_path.read_text().strip() == cache_key:
-        logger.info("Loading cached global features from %s", cache_path)
+        logger.info("Loading cached annual features from %s", cache_path)
         return pl.read_parquet(cache_path)
 
-    logger.info("Computing global features: %s", feature_names)
-    global_feat_df = compute_global_features(pixel_df)
+    logger.info("Computing annual features: %s", feature_names)
+    annual_feat_df = compute_annual_features(pixel_df)
     logger.info(
-        "Global feature means — %s",
-        "  ".join(f"{k}={global_feat_df[k].mean():.4f}" for k in feature_names),
+        "Annual feature means — %s",
+        "  ".join(f"{k}={annual_feat_df[k].mean():.4f}" for k in feature_names),
     )
-    global_feat_df.write_parquet(cache_path)
+    annual_feat_df.write_parquet(cache_path)
     key_path.write_text(cache_key)
-    logger.info("Cached global features to %s", cache_path)
-    return global_feat_df
+    logger.info("Cached annual features to %s", cache_path)
+    return annual_feat_df
 
 
 def _site_class(pid: str) -> tuple[str, str]:
@@ -291,7 +299,7 @@ def _compute_band_stats_worker(
     s1_feature_cols: list,
     scl_purity_min: float,
     s1_despeckle_window: int,
-    global_features_df_path: str | None,
+    annual_features_df_path: str | None,
 ) -> None:
     """Subprocess worker: compute band normalisation stats and write to *out_path*.npz.
 
@@ -365,20 +373,20 @@ def _compute_band_stats_worker(
     band_mean = _np.where(_np.isnan(band_mean), 0.0, band_mean)
     band_std  = _np.where(band_std < 1e-6, 1.0, band_std)
 
-    # Global feature stats
-    global_feat_mean = _np.zeros(0, dtype=_np.float32)
-    global_feat_std  = _np.ones(0,  dtype=_np.float32)
-    if global_features_df_path is not None:
-        gf = _pl.from_arrow(_pq.read_table(global_features_df_path))
+    # Annual feature stats
+    annual_feat_mean = _np.zeros(0, dtype=_np.float32)
+    annual_feat_std  = _np.ones(0,  dtype=_np.float32)
+    if annual_features_df_path is not None:
+        gf = _pl.from_arrow(_pq.read_table(annual_features_df_path))
         feat_cols_gf = [c for c in gf.columns if c != "point_id"]
         gf_arr = gf.select(feat_cols_gf).to_numpy().astype(_np.float32)
-        global_feat_mean = _np.nanmean(gf_arr, axis=0)
-        global_feat_std  = _np.nanstd(gf_arr,  axis=0)
-        global_feat_mean = _np.where(_np.isnan(global_feat_mean), 0.0, global_feat_mean)
-        global_feat_std  = _np.where(global_feat_std < 1e-6, 1.0, global_feat_std)
+        annual_feat_mean = _np.nanmean(gf_arr, axis=0)
+        annual_feat_std  = _np.nanstd(gf_arr,  axis=0)
+        annual_feat_mean = _np.where(_np.isnan(annual_feat_mean), 0.0, annual_feat_mean)
+        annual_feat_std  = _np.where(annual_feat_std < 1e-6, 1.0, annual_feat_std)
 
     _np.savez(out_path, band_mean=band_mean, band_std=band_std,
-              global_feat_mean=global_feat_mean, global_feat_std=global_feat_std)
+              annual_feat_mean=annual_feat_mean, annual_feat_std=annual_feat_std)
 
 
 def _compute_band_stats_subprocess(
@@ -389,7 +397,7 @@ def _compute_band_stats_subprocess(
     s1_feature_cols: list,
     scl_purity_min: float,
     s1_despeckle_window: int,
-    global_features_df_path: "Path | None",
+    annual_features_df_path: "Path | None",
 ) -> dict:
     """Run _compute_band_stats_worker in a subprocess; return stats as dict of arrays."""
     ctx = multiprocessing.get_context("spawn")
@@ -399,7 +407,7 @@ def _compute_band_stats_subprocess(
             str(parquet_path), str(out_npz),
             use_s1, feature_cols, s1_feature_cols,
             scl_purity_min, s1_despeckle_window,
-            str(global_features_df_path) if global_features_df_path else None,
+            str(annual_features_df_path) if annual_features_df_path else None,
         ),
     )
     p.start()
@@ -503,8 +511,8 @@ def _build_dataset_sharded(
     n_shards: int,
     band_mean: np.ndarray,
     band_std: np.ndarray,
-    global_feat_mean: np.ndarray,
-    global_feat_std: np.ndarray,
+    annual_feat_mean: np.ndarray,
+    annual_feat_std: np.ndarray,
 ) -> "TAMDataset":
     """Build a TAMDataset by splitting pixels across N sequential subprocesses.
 
@@ -589,8 +597,8 @@ def _build_dataset_sharded(
     # Launch one subprocess per shard sequentially; each reads its pre-written parquet.
     shard_kwargs = dict(kwargs,
                         band_mean=band_mean, band_std=band_std,
-                        global_feat_mean=global_feat_mean,
-                        global_feat_std=global_feat_std)
+                        annual_feat_mean=annual_feat_mean,
+                        annual_feat_std=annual_feat_std)
 
     shard_label_sets: list[dict] = []
     for pid_group_pa in pid_groups_pa:
@@ -620,7 +628,7 @@ def _build_dataset_sharded(
     return TAMDataset.merge_shards(
         shards, labels,
         band_mean=band_mean, band_std=band_std,
-        global_feat_mean=global_feat_mean, global_feat_std=global_feat_std,
+        annual_feat_mean=annual_feat_mean, annual_feat_std=annual_feat_std,
         **train_augment_kwargs,
     )
 
@@ -655,7 +663,7 @@ def train_tam(
     precomputed_split:
         When provided (by _train_worker.py after _prep_worker.py has run), skip all
         preprocessing and go straight to dataset construction. Must contain keys:
-        train_pixel_df, val_pixel_df, train_py_labels, val_py_labels, global_feat_df.
+        train_pixel_df, val_pixel_df, train_py_labels, val_py_labels, annual_feat_df.
 
     Returns
     -------
@@ -704,7 +712,7 @@ def train_tam(
             val_pixel_df    = _raw_val
         train_py_labels = precomputed_split["train_py_labels"]
         val_py_labels   = precomputed_split["val_py_labels"]
-        global_feat_df  = precomputed_split["global_feat_df"]
+        annual_feat_df  = precomputed_split["annual_feat_df"]
         _log_rss("entry (precomputed_split)")
     else:
         # --- Split labels -----------------------------------------------------
@@ -751,23 +759,23 @@ def train_tam(
             pixel_df = pixel_df.drop("scl")
         _log_rss("after SCL exclusion")
 
-        # --- Global features + presence-filter slim extracts -----------------
-        global_feat_df: pl.DataFrame | None = None
+        # --- Annual features + presence-filter slim extracts -----------------
+        annual_feat_df: pl.DataFrame | None = None
         _presence_filter_s1_slim: pl.DataFrame | None = None
         _presence_filter_s2_slim: pl.DataFrame | None = None
         _has_source = "source" in pixel_df.columns
 
         if cfg.use_band_summaries:
             if precomputed_band_summaries is not None:
-                global_feat_df = precomputed_band_summaries
-                logger.info("Using precomputed band summaries: %d pixels, %d features", len(global_feat_df), global_feat_df.width - 1)
+                annual_feat_df = precomputed_band_summaries
+                logger.info("Using precomputed band summaries: %d pixels, %d features", len(annual_feat_df), annual_feat_df.width - 1)
             else:
                 _s2_n = int((pixel_df["source"] == "S2").sum()) if _has_source else len(pixel_df)
                 logger.info("Computing band summaries (%d rows) ...", _s2_n)
-                global_feat_df = _compute_band_summaries(pixel_df, V9_FEATURE_COLS)
-                logger.info("Band summaries computed: %d pixels, %d features", len(global_feat_df), global_feat_df.width - 1)
-        elif cfg.n_global_features > 0:
-            global_feat_df = _load_or_compute_global_features(pixel_df, out_dir, GLOBAL_FEATURE_NAMES)
+                annual_feat_df = _compute_band_summaries(pixel_df, V9_FEATURE_COLS)
+                logger.info("Band summaries computed: %d pixels, %d features", len(annual_feat_df), annual_feat_df.width - 1)
+        elif cfg.n_annual_features > 0:
+            annual_feat_df = _load_or_compute_annual_features(pixel_df, out_dir, ANNUAL_FEATURE_NAMES)
         _log_rss("after band summaries")
 
         if (cfg.presence_min_vh_dry_db > -99 and _has_source and "vh" in pixel_df.columns):
@@ -1032,10 +1040,10 @@ def train_tam(
         lines.append(sep)
         logger.info("Pixel summary (stride=%d):\n%s", cfg.spatial_stride, "\n".join(lines))
 
-        # Slice global features to exactly the columns the model head expects.
-        if global_feat_df is not None and not cfg.use_band_summaries:
-            global_feat_df = global_feat_df.select(
-                ["point_id"] + global_feat_df.columns[1:cfg.n_global_features + 1]
+        # Slice annual features to exactly the columns the model head expects.
+        if annual_feat_df is not None and not cfg.use_band_summaries:
+            annual_feat_df = annual_feat_df.select(
+                ["point_id"] + annual_feat_df.columns[1:cfg.n_annual_features + 1]
             )
 
         # Slice pixel_df into train/val and free the original.
@@ -1069,7 +1077,7 @@ def train_tam(
     _ds_common_kwargs: dict = dict(
         scl_purity_min=cfg.scl_purity_min,
         min_obs_per_year=cfg.min_obs_per_year,
-        global_features_df=global_feat_df,
+        annual_features_df=annual_feat_df,
         use_s1=cfg.use_s1,
         pixel_zscore=cfg.pixel_zscore,
         s1_despeckle_window=cfg.s1_despeckle_window,
@@ -1114,7 +1122,7 @@ def train_tam(
     
             if cfg.n_dataset_shards > 1:
                 # Step 1: compute normalisation stats in a lightweight subprocess.
-                # Write global_feat_df to a temp parquet so the worker can read it.
+                # Write annual_feat_df to a temp parquet so the worker can read it.
                 # Resolve feature cols the same way TAMDataset.__init__ would.
                 from tam.core.dataset import ALL_FEATURE_COLS as _ALL_FC
                 _s2_base_cols    = list(_feature_cols_override) if _feature_cols_override else list(_ALL_FC)
@@ -1124,11 +1132,11 @@ def train_tam(
                 else:
                     _stats_feat_cols = _s2_base_cols
                 _gf_parquet_path: Path | None = None
-                if global_feat_df is not None:
-                    _gf_parquet_path = _ds_tmp_path / "global_feat_for_stats.parquet"
-                    global_feat_df.write_parquet(str(_gf_parquet_path))
-                elif _precomputed_paths is not None and "global_feat" in _precomputed_paths:
-                    _gf_parquet_path = _precomputed_paths["global_feat"]
+                if annual_feat_df is not None:
+                    _gf_parquet_path = _ds_tmp_path / "annual_feat_for_stats.parquet"
+                    annual_feat_df.write_parquet(str(_gf_parquet_path))
+                elif _precomputed_paths is not None and "annual_feat" in _precomputed_paths:
+                    _gf_parquet_path = _precomputed_paths["annual_feat"]
     
                 logger.info("Computing band stats from train parquet in subprocess")
                 _stats = _compute_band_stats_subprocess(
@@ -1139,12 +1147,12 @@ def train_tam(
                     s1_feature_cols=_stats_s1_cols,
                     scl_purity_min=cfg.scl_purity_min,
                     s1_despeckle_window=cfg.s1_despeckle_window,
-                    global_features_df_path=_gf_parquet_path,
+                    annual_features_df_path=_gf_parquet_path,
                 )
                 _band_mean_pre   = _stats["band_mean"]
                 _band_std_pre    = _stats["band_std"]
-                _gf_mean_pre     = _stats["global_feat_mean"]
-                _gf_std_pre      = _stats["global_feat_std"]
+                _gf_mean_pre     = _stats["annual_feat_mean"]
+                _gf_std_pre      = _stats["annual_feat_std"]
                 _log_rss("after band stats subprocess")
     
                 # Step 2: build train shards, each using the shared stats.
@@ -1158,8 +1166,8 @@ def train_tam(
                     n_shards=cfg.n_dataset_shards,
                     band_mean=_band_mean_pre,
                     band_std=_band_std_pre,
-                    global_feat_mean=_gf_mean_pre,
-                    global_feat_std=_gf_std_pre,
+                    annual_feat_mean=_gf_mean_pre,
+                    annual_feat_std=_gf_std_pre,
                 )
             else:
                 logger.info("Building TAMDataset(train) in subprocess → %s", _ds_tmp_path / "train")
@@ -1200,16 +1208,16 @@ def train_tam(
                 _val_parquet, val_py_labels, _ds_tmp_path, "val",
                 kwargs=dict(**_ds_common_kwargs,
                             band_mean=band_mean, band_std=band_std,
-                            global_feat_mean=train_ds.global_feat_mean,
-                            global_feat_std=train_ds.global_feat_std,
+                            annual_feat_mean=train_ds.annual_feat_mean,
+                            annual_feat_std=train_ds.annual_feat_std,
                             doy_jitter=0),
             )
         else:
             val_ds = TAMDataset(
                 val_pixel_df, val_py_labels,
                 band_mean=band_mean, band_std=band_std,
-                global_feat_mean=train_ds.global_feat_mean,
-                global_feat_std=train_ds.global_feat_std,
+                annual_feat_mean=train_ds.annual_feat_mean,
+                annual_feat_std=train_ds.annual_feat_std,
                 doy_jitter=0,
                 _log_rss=_log_rss,
                 **_ds_common_kwargs,
@@ -1311,9 +1319,9 @@ def train_tam(
         pos_weight = torch.tensor([n_neg / n_pos], dtype=torch.float32).to(device) if n_pos > 0 and n_neg > 0 else None
     
         # --- Model + optimiser --------------------------------------------------
-        if cfg.use_band_summaries and global_feat_df is not None:
-            cfg.n_global_features = global_feat_df.width - 1  # exclude point_id column
-        del global_feat_df
+        if cfg.use_band_summaries and annual_feat_df is not None:
+            cfg.n_annual_features = annual_feat_df.width - 1  # exclude point_id column
+        del annual_feat_df
         gc.collect()
         model = TAMClassifier.from_config(cfg)
         model._use_s1 = cfg.use_s1
@@ -1342,9 +1350,9 @@ def train_tam(
         _log_rss("after model init")
     
         np.savez(out_dir / "tam_band_stats.npz", mean=band_mean, std=band_std)
-        if train_ds.global_feat_mean is not None and len(train_ds.global_feat_mean) > 0:
-            np.savez(out_dir / "tam_global_feat_stats.npz",
-                     mean=train_ds.global_feat_mean, std=train_ds.global_feat_std)
+        if train_ds.annual_feat_mean is not None and len(train_ds.annual_feat_mean) > 0:
+            np.savez(out_dir / "tam_annual_feat_stats.npz",
+                     mean=train_ds.annual_feat_mean, std=train_ds.annual_feat_std)
         with open(out_dir / "tam_config.json", "w") as fh:
             json.dump(_raw_model.config(), fh, indent=2)
     
@@ -1357,7 +1365,7 @@ def train_tam(
                 for p in m.parameters():
                     p.requires_grad = not frozen
             if frozen:
-                logger.info("Temporal stream frozen — training head only (globals warmup)")
+                logger.info("Temporal stream frozen — training head only (annual-feature warmup)")
             else:
                 logger.info("Temporal stream unfrozen — full model training")
     
@@ -1391,24 +1399,24 @@ def train_tam(
                 doy           = batch["doy"].to(device)
                 mask          = batch["mask"].to(device)
                 n_obs         = batch["n_obs"].to(device)
-                global_feats  = batch["global_feats"].to(device)
+                annual_feats  = batch["annual_feats"].to(device)
                 label         = batch["label"].to(device)
                 weight        = batch["weight"].to(device)
     
                 is_s1 = batch["is_s1"].to(device)
                 with autocast(device_type="cuda" if torch.cuda.is_available() else "cpu", dtype=torch.bfloat16):
-                    prob, logit = model(bands, doy, mask, n_obs, global_feats, is_s1=is_s1)
+                    prob, logit = model(bands, doy, mask, n_obs, annual_feats, is_s1=is_s1)
     
                     if torch.isnan(prob).any():
                         nan_mask = torch.isnan(prob)
                         logger.warning(
                             "NaN in model output: %d/%d samples. "
-                            "bands NaN=%s, doy NaN=%s, mask all-pad=%s, global_feats NaN=%s",
+                            "bands NaN=%s, doy NaN=%s, mask all-pad=%s, annual_feats NaN=%s",
                             nan_mask.sum().item(), len(prob),
                             torch.isnan(bands).any().item(),
                             torch.isnan(doy.float()).any().item(),
                             mask.all(dim=1).any().item(),
-                            torch.isnan(global_feats).any().item(),
+                            torch.isnan(annual_feats).any().item(),
                         )
                         prob = torch.nan_to_num(prob, nan=0.5)
                         logit = torch.nan_to_num(logit, nan=0.0)
@@ -1442,7 +1450,7 @@ def train_tam(
                         batch["doy"].to(device),
                         batch["mask"].to(device),
                         batch["n_obs"].to(device),
-                        batch["global_feats"].to(device),
+                        batch["annual_feats"].to(device),
                         is_s1=batch["is_s1"].to(device),
                     )
                     val_probs.extend(prob.cpu().float().numpy())
@@ -1476,7 +1484,7 @@ def train_tam(
                             batch["doy"].to(device),
                             batch["mask"].to(device),
                             batch["n_obs"].to(device),
-                            batch["global_feats"].to(device),
+                            batch["annual_feats"].to(device),
                             is_s1=batch["is_s1"].to(device),
                         )
                         gate_probs.extend(prob.cpu().float().numpy())
@@ -1532,9 +1540,9 @@ def train_tam(
         )
     
         np.savez(out_dir / "tam_band_stats.npz", mean=band_mean, std=band_std)
-        if train_ds.global_feat_mean is not None and len(train_ds.global_feat_mean) > 0:
-            np.savez(out_dir / "tam_global_feat_stats.npz",
-                     mean=train_ds.global_feat_mean, std=train_ds.global_feat_std)
+        if train_ds.annual_feat_mean is not None and len(train_ds.annual_feat_mean) > 0:
+            np.savez(out_dir / "tam_annual_feat_stats.npz",
+                     mean=train_ds.annual_feat_mean, std=train_ds.annual_feat_std)
         cfg_dict = _raw_model.config()
         cfg_dict["best_val_auc"] = round(best_val_auc, 6)
         with open(out_dir / "tam_config.json", "w") as fh:
@@ -1580,8 +1588,8 @@ def load_tam(out_dir: Path, device: str | None = None) -> tuple[TAMClassifier, n
 
     Returns
     -------
-    (model, band_mean, band_std, global_feat_mean, global_feat_std)
-    global_feat_mean/std are None when the model has no global features.
+    (model, band_mean, band_std, annual_feat_mean, annual_feat_std)
+    annual_feat_mean/std are None when the model has no annual features.
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -1598,7 +1606,7 @@ def load_tam(out_dir: Path, device: str | None = None) -> tuple[TAMClassifier, n
     head_in = state["head.weight"].shape[1]
     extra = head_in - cfg.d_model
     cfg.use_n_obs = extra > 0
-    cfg.n_global_features = extra - (1 if cfg.use_n_obs else 0)
+    cfg.n_annual_features = extra - (1 if cfg.use_n_obs else 0)
 
     model = TAMClassifier.from_config(cfg)
     if "doy_inv_freq" in state:
@@ -1618,12 +1626,12 @@ def load_tam(out_dir: Path, device: str | None = None) -> tuple[TAMClassifier, n
     # Replace with identity (mean=0, std=1) so fill_windows passes them through as zero.
     band_mean_arr = np.where(np.isnan(stats["mean"]), 0.0, stats["mean"]).astype(np.float32)
     band_std_arr  = np.where(np.isnan(stats["std"]),  1.0, stats["std"]).astype(np.float32)
-    gf_stats_path = out_dir / "tam_global_feat_stats.npz"
+    gf_stats_path = out_dir / "tam_annual_feat_stats.npz"
     if gf_stats_path.exists():
         gf = np.load(gf_stats_path)
-        global_feat_mean: np.ndarray | None = gf["mean"]
-        global_feat_std:  np.ndarray | None = gf["std"]
+        annual_feat_mean: np.ndarray | None = gf["mean"]
+        annual_feat_std:  np.ndarray | None = gf["std"]
     else:
-        global_feat_mean = None
-        global_feat_std  = None
-    return model, band_mean_arr, band_std_arr, global_feat_mean, global_feat_std
+        annual_feat_mean = None
+        annual_feat_std  = None
+    return model, band_mean_arr, band_std_arr, annual_feat_mean, annual_feat_std
