@@ -25,10 +25,13 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+import polars as pl
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from utils.pixel_timeseries import compute_timeseries
+from utils.pixel_reader import ChunkIndex
+from utils.pixel_timeseries import _mean, _percentile, _safe_div
+from signals.base import Signal
 
 # ---------------------------------------------------------------------------
 # Cover-type thresholds (from docs/MITCHELL-TRAIN.md)
@@ -236,11 +239,88 @@ _TILE_PRIMARY   = "54LWH"
 _TILE_SECONDARY = "54KWG"
 
 
+def _compute_timeseries_quality_filtered(
+    root: Path,
+    year: int,
+    tile_id: str,
+    lon_min: float,
+    lat_min: float,
+    lon_max: float,
+    lat_max: float,
+) -> list[dict]:
+    """Like compute_timeseries, but applies Signal.quality_mask (the exact
+    gate the training pipeline uses: source == "S2" and scl_purity >= 0.5)
+    before computing optical indices — so the audit measures the same pixels
+    the model actually trains on. VH/VV (Sentinel-1) is unaffected by the
+    optical quality gate and is computed from all rows carrying radar bands.
+    """
+    chunk_idx = ChunkIndex(root, year, tile_id)
+    tbl = chunk_idx.query_bbox(lon_min, lat_min, lon_max, lat_max)
+    if tbl.num_rows == 0:
+        return []
+
+    df = pl.from_arrow(tbl)
+    # Raw chunkstore rows store S2 with source=null (only S1 is explicitly
+    # tagged); the training pipeline backfills null -> "S2" before gating
+    # (see utils/training_collector.py), so mirror that here.
+    if "source" in df.columns:
+        df = df.with_columns(pl.col("source").fill_null("S2"))
+    good = Signal.quality_mask(df)
+
+    def col(frame: pl.DataFrame, name: str) -> np.ndarray:
+        return frame[name].to_numpy().astype("float32")
+
+    # --- Optical indices: only from rows passing the training quality gate.
+    opt = df.filter(good)
+    if len(opt) > 0:
+        b04 = col(opt, "B04")
+        b08 = col(opt, "B08")
+        b11 = col(opt, "B11")
+        ndvi = _safe_div(b08 - b04, b08 + b04)
+        mavi = _safe_div(b08 - b04, b08 + b04 + b11)
+        opt_dates = opt["date"].to_numpy()
+    else:
+        ndvi = mavi = np.array([], dtype="float32")
+        opt_dates = np.array([])
+
+    # --- Radar (VH/VV): SCL purity does not apply to S1; use all rows with
+    # valid radar bands (mirrors how downstream signals treat S1 separately).
+    rad_mask = df["vh"].is_not_null() & df["vv"].is_not_null()
+    rad = df.filter(rad_mask)
+    if len(rad) > 0:
+        vh = col(rad, "vh")
+        vv = col(rad, "vv")
+        with np.errstate(divide="ignore", invalid="ignore"):
+            vh_db = np.where(vh > 0, 10.0 * np.log10(vh.astype("float64")), np.nan).astype("float32")
+            vv_db = np.where(vv > 0, 10.0 * np.log10(vv.astype("float64")), np.nan).astype("float32")
+        vh_vv = vh_db - vv_db
+        rad_dates = rad["date"].to_numpy()
+    else:
+        vh_vv = np.array([], dtype="float32")
+        rad_dates = np.array([])
+
+    unique_dates = sorted(set(opt_dates.tolist()) | set(rad_dates.tolist()))
+
+    series = []
+    for d in unique_dates:
+        row: dict[str, object] = {"date": str(d)}
+        opt_g = ndvi[opt_dates == d]
+        mavi_g = mavi[opt_dates == d]
+        rad_g = vh_vv[rad_dates == d]
+        for name, g in [("ndvi", opt_g), ("mavi", mavi_g), ("vh_vv", rad_g)]:
+            row[name]          = _mean(g)
+            row[f"{name}_p25"] = _percentile(g, 25)
+            row[f"{name}_p75"] = _percentile(g, 75)
+        series.append(row)
+
+    return series
+
+
 def fetch_year(root: Path, year: int, bbox: list[float]) -> tuple[list[dict], str]:
     lon_min, lat_min, lon_max, lat_max = bbox
     for tile in (_TILE_PRIMARY, _TILE_SECONDARY):
         try:
-            series = compute_timeseries(root, year, tile, lon_min, lat_min, lon_max, lat_max)
+            series = _compute_timeseries_quality_filtered(root, year, tile, lon_min, lat_min, lon_max, lat_max)
         except Exception:
             series = []
         if series:
