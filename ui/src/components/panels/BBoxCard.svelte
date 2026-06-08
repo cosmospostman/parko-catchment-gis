@@ -17,6 +17,7 @@
   let inspecting = $state(false);
   let timeseriesData = $state<PixelTimeseries[] | null>(null);
   let timeseriesLoading = $state(false);
+  let selectedYear = $state<number | null>(null);
 
   $effect(() => {
     mapMode.current = 'bbox';
@@ -35,26 +36,23 @@
     fetchChunkCoverage(coords).then(cov => {
       coverageYears = cov.years;
       coverageTiles = cov.tiles;
+      selectedYear = cov.years.length > 0 ? cov.years[cov.years.length - 1] : null;
     });
   });
 
   $effect(() => {
     const coords = bboxStore.coords;
-    if (!inspecting || !coords || !coverageYears || coverageYears.length === 0) {
+    if (!inspecting || !coords || selectedYear === null) {
       if (!inspecting) timeseriesData = null;
       return;
     }
     timeseriesLoading = true;
     timeseriesData = null;
-    Promise.all(
-      coverageYears.map(year => {
-        const tiles = coverageTiles[year] ?? [];
-        const tile = tiles[0];
-        if (!tile) return Promise.resolve(null);
-        return fetchPixelTimeseries(coords, year, tile);
-      })
-    ).then(results => {
-      timeseriesData = results.filter((r): r is PixelTimeseries => r !== null);
+    const tiles = coverageTiles[selectedYear] ?? [];
+    const tile = tiles[0];
+    if (!tile) { timeseriesLoading = false; return; }
+    fetchPixelTimeseries(coords, selectedYear, tile).then(result => {
+      timeseriesData = result !== null ? [result] : [];
       timeseriesLoading = false;
     });
   });
@@ -84,6 +82,7 @@
     timeseriesData = null;
     coverageYears = null;
     coverageTiles = {};
+    selectedYear = null;
   }
 </script>
 
@@ -116,7 +115,12 @@
             <span class="coverage-none">no pixel data cached</span>
           {:else}
             {#each coverageYears as year}
-              <span class="coverage-year">{year}</span>
+              <button
+                type="button"
+                class="coverage-year"
+                class:active={year === selectedYear}
+                onclick={() => { selectedYear = year; }}
+              >{year}</button>
             {/each}
           {/if}
         </div>
@@ -253,11 +257,19 @@
   .coverage-year {
     font-size: 11px;
     font-weight: 600;
+    color: #6aab88;
+    background: #0e2d1a;
+    border: 1px solid #1a4a28;
+    border-radius: 3px;
+    padding: 2px 6px;
+    cursor: pointer;
+    transition: background 0.1s, color 0.1s, border-color 0.1s;
+  }
+  .coverage-year:hover { background: #142d1e; border-color: #1a6b35; color: #86efac; }
+  .coverage-year.active {
     color: #86efac;
     background: #14532d;
-    border: 1px solid #1a6b35;
-    border-radius: 3px;
-    padding: 1px 5px;
+    border-color: #22c55e;
   }
 
   .coverage-none { font-size: 11px; color: #555; font-style: italic; }

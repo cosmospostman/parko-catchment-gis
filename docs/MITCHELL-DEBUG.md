@@ -1,248 +1,105 @@
-# Mitchell False-Positive Debug — investigation starting point
+# Mitchell False-Positive Debug — working document
 
-## Symptom
+## Current status (post-retrain, 2026-06-08)
 
-After training v10 on the new Mitchell regions, scoring confidently picks bare ground,
-mangrove, and non-Parkinsonia riparian vegetation as Parkinsonia — despite the model
-having been shown exactly these kinds of pixels as `absence` during training.
+v10 was retrained and rescored after fixing five compounding train/score pipeline bugs
+(see **Resolved: Bugs 1–5** below). Results are meaningfully improved — overall false
+positives are substantially reduced. Three residual problems remain:
 
-## What we've already ruled out
+1. **Residual mangrove/water false positives** — strands of mangroves and water patches
+   still score as Parkinsonia, though at lower rates than before.
+2. **Bare grass false positives** — some patches of bare/sparse grass are still
+   classified as present.
+3. **Missed presence bboxes** — some training presence bboxes are not being scored as
+   present at all (false negatives on known-good sites).
 
-A multi-year quality audit of every Mitchell training bbox (`docs/MITCHELL-BBOX-AUDIT.md`,
-produced by `utils/bbox_audit.py`, refactored to filter pixels using the exact same
-`Signal.quality_mask` gate the training pipeline applies — so the audit measures the same
-data the model trains on) found:
+---
 
-- **Presence bboxes look correct in every year (2017–2025)**: strong wet-season green-up
-  (NDVI peak 0.71–0.97), deep wet–dry seasonal swing (Δ 0.49–0.83), and consistent VH/VV
-  (−3.9 to −5.4 dB) — the textbook deciduous-shrub Parkinsonia signature, present every
-  single year of every bbox. The audit's "✗ fail" verdicts on these bboxes are a
-  thresholding artefact (IQR ceiling of 0.12 and dry-NDVI-floor lower bound of 0.20 were
-  calibrated from a single 2025 snapshot and are too tight for the real multi-year range),
-  not evidence of bad sites or bad labels.
-- **Borderline absence bboxes (riparian) were eyeballed by the user on imagery** for the
-  specific years where their seasonal metrics nudged into presence-like territory
-  (`mitchell_absence_riparian_1` 2022, `mitchell_val_absence_riparian_1` 2017/2019). The
-  user confirmed the vegetation is predominantly non-Parkinsonia, with at most minor
-  subpixel mixing — expected at a riparian/Parkinsonia ecological boundary, not a
-  labeling error.
-- **Cloud/shadow contamination is real in the raw timeseries but does not meaningfully
-  affect the features the model actually trains on.** `utils/contamination_check.py`
-  reproduces v10's real feature-extraction path (`_compute_band_summaries` in
-  `tam/core/train.py` — per-pixel `[p5, p95, std]` of NDVI/MAVI across the full multi-year
-  S2 timeseries) and compares it computed with vs. without the audit's flagged
-  "likely cloud/shadow" dates dropped. Result: **zero feature movement on all 3 sampled
-  presence bboxes**, and only a small, localized effect (mean Δ≈0.002, max|Δ|≈0.055,
-  affecting ~1–2% of pixels) on the one absence bbox where contamination was real and
-  substantial (`mitchell_absence_mangrove_3`).
-- **The `scl_purity` quality gate is a structural no-op on this chunkstore** — uniformly
-  1.0 across every sampled region/year/tile combination, so it neither helps nor hurts.
+## Next: diagnose the residual problems
 
-In short: **the training data and labels for Mitchell appear sound.** The false-positive
-problem is unlikely to be explained by bad bboxes, mislabeling, or unfiltered noise in the
-features the model was shown.
+Three candidate explanations, which can be distinguished by inspecting `prob_tam`
+distributions from the `.scores.parquet` output:
 
-## ROOT CAUSE FOUND & FIXED: four compounding train/inference "annual feature" bugs
+### A. Threshold / calibration issue (most benign)
+The model emits a continuous `prob_tam`; there is no scoring-side decision threshold.
+"Present vs absent" is purely a UI display slider (`ranking.cutoff`, default 0 = show
+everything). If residual FP pixels cluster at moderate probability (0.4–0.6) and known
+Parkinsonia clusters at 0.8+, the fix is threshold calibration in the UI, not the model.
 
-(Note: these were called "global features" during the investigation — renamed to
-"annual features" in the fix, since they are per-(pixel, year) statistical summaries,
-not global pixel-level constants. See the rename rationale in
-`tam/core/annual_features.py:1` and the implementation plan for the full identifier
-rename table.)
+**Check**: pull `prob_tam` distributions from `.scores.parquet` for the three problem
+categories and compare against true-positive Parkinsonia pixels. This single check
+distinguishes "threshold story" from "fit story".
 
-Confirmed by reading the code (not guessing from naming) — **four distinct, compounding
-bugs**, all now fixed:
+### B. Missed presence bboxes — quality mask or scoring gap
+If presence bboxes are outright missing from scored output (not just low-probability),
+they may be quality-masked out. Check whether they appear in `.scores.parquet` at all.
+If present but low-probability, check whether those bboxes/years fall in geography or
+seasonal windows under-represented in training (spatial generalization gap).
 
-### Bug 1 — zero-substitution wiring bug (primary cause, fixed)
+### C. Held-out fit on training regions
+If FPs are genuinely high-confidence and missed-presence is genuinely near-zero (i.e.,
+not a threshold story), check whether these problem pixels fall *inside or near* training
+regions. If the model can't discriminate presence from absence on its own training
+geography, the problem is upstream of generalization — a residual feature or fit issue,
+not an OOD story.
 
-The exact `tam.pipeline score ... --out-parquet` path
-(`score_tiles_chunked` → `_score_tile_worker` → `score_tile_year` →
-`score_pixels_chunked` → `_preprocess`) never threaded `annual_feat_mean`/
-`annual_feat_std` through `score_tiles_chunked`'s signature, the worker-args tuple, or
-`_score_tile_worker`'s call to `score_tile_year` — nor did `tam/pipeline.py`'s call site
-pass them, even though `load_tam` already returns them. So `None` flowed all the way
-down to `_preprocess`, whose gate
-`if n_annual_features > 0 and annual_feat_mean is not None and annual_feat_std is not None`
-evaluated **False**, leaving `annual_feats_np` as `None`. In `model.py`'s forward pass,
-when `annual_feats is None` but `self.n_annual_features > 0`, the model **explicitly
-substitutes an all-zeros tensor**. Effect: **every single pixel** at inference received
-a constant all-zero annual-feature vector — a massive, uniform distribution shift on
-~42 input dimensions where the model expected substantial per-pixel-varying z-scored
-values. This was assessed as the dominant cause of "confidently wrong everywhere",
-since it affects literally every pixel identically regardless of true cover type.
+**Class balance context**: training data is ~1.46:1 absence:presence at the pixel-year
+level, corrected via `pos_weight = n_neg/n_pos` in `BCEWithLogitsLoss`. Val macro AUC
+≈ 0.957, CVaR25 AUC ≈ 0.944 (from `outputs/models/tam-v10/train.log`). AUC is high
+but there is no logged precision/recall at any fixed threshold — computing that from the
+val parquets would be needed to quantify FP/FN rates operationally.
 
-**Fix**: wired `annual_feat_mean`/`annual_feat_std` through the entire chunked-scoring
-call chain (`score_tiles_chunked` signature, worker-args tuple, `_score_tile_worker`
-unpacking + call, `score_tile_year`, `score_pixels_chunked`) and added them to
-`pipeline.py`'s `score_tiles_chunked(...)` call site.
+---
 
-### Bug 2 — aggregation-level mismatch (secondary, compounding, fixed)
+## Resolved: Bugs 1–5 (fixed in `12711af`, `3e918f7`; retrained + rescored `6f4ba88`)
 
-Even with Bug 1 fixed, a second, more subtle bug remained:
+Five compounding train/score pipeline bugs caused every pixel at inference to receive
+wrong annual features, producing confident, uniform false positives across bare ground,
+mangrove, and riparian cover types.
 
-- **Training** (`_compute_band_summaries`, `tam/core/train.py`) used to group the
-  *entire* `pixel_df` — which contains the same physical pixel sampled across all its
-  years — by `point_id` **alone** (`group_by("point_id")`). So each pixel's
-  `[p5, p95, std]` annual features were computed across its **entire multi-year
-  history** (e.g. 2017–2025 combined), and every (pixel, year) training window for that
-  pixel was given the *same* annual-feature vector (broadcast via the `point_id`-only
-  lookup in `dataset.py`). The saved z-scoring stats (`tam_global_feat_stats.npz`) were
-  `nanmean`/`nanstd` over this population of **per-pixel, multi-year-aggregated**
-  summary vectors.
+**Bug 1 — zero-substitution wiring (`12711af`)**: `annual_feat_mean`/`annual_feat_std`
+were never threaded through the chunked-scoring call chain, so the model received an
+all-zeros annual-feature vector for every pixel at inference.
 
-- **Inference** (`_preprocess` in `score.py`) splits the scoring pixel stream into
-  windows on `pid_change | year_change` — i.e. **per pixel-year**, not per pixel —
-  then computes `[p5, p95, std]` **per window** (a single year of observations), and
-  normalizes using the training-time stats that were calibrated on multi-year
-  aggregates.
+**Bug 2 — aggregation-level mismatch (`12711af`)**: training aggregated annual features
+per-pixel across *all years* (`group_by("point_id")`); inference computed them per
+pixel-year. The saved z-scoring stats were calibrated on multi-year aggregates but
+applied to single-year summaries.
 
-**Why this produces confident, uniform false positives:** a single year of observations
-has a narrower date range and far fewer samples than a 9-year aggregate, so its
-`[p5, p95, std]` distribution is structurally different (typically tighter `std`,
-narrower `p5`–`p95` spread). Normalizing single-year summaries with multi-year-
-calibrated stats systematically shifts every pixel's annual features into a different
-region of normalized space than the model was trained on — independent of true cover
-type. That's exactly the "confidently wrong everywhere" symptom: bare ground, mangrove,
-and riparian pixels all land in whatever normalized region the shift happens to map them
-into, which apparently overlaps the Parkinsonia region.
+**Bug 3 — quantile/std numerical method mismatch (`12711af`)**: training used Polars'
+`interpolation="nearest"` quantiles and `ddof=1` std; inference's numba kernel uses
+linear-interpolation percentiles and `ddof=0`. Fixed by aligning training to match
+inference.
 
-**Fix**: changed `_compute_band_summaries` to group by `["point_id", "year"]` instead
-of `point_id` alone — matching what `score` actually produces at inference (one row per
-pixel-year, not one row per pixel broadcast across years) — and updated `dataset.py`'s
-lookup to a composite `(point_id, year)` key. This was simpler than making inference
-replicate multi-year aggregation (incompatible with `score`'s streaming/chunked
-architecture), and arguably more semantically correct: a pixel's spectral character
-*for a given year* is more meaningful than a blend across 9 years.
+**Bug 4 — NaN handling mismatch (`12711af`)**: training passed raw floats into Polars
+aggregations (where `NaN` behaves differently from `null`); inference's numba kernel
+skips non-finite values. Fixed by converting `NaN → null` before aggregation in
+`_compute_band_summaries`.
 
-### Bug 3 — quantile/std numerical-method mismatch (tertiary, compounding, fixed)
+**Bug 5 — MAVI/CI_RE transcription bug (`3e918f7`)**: `add_spectral_indices` in
+`analysis/constants.py` used wrong formulas for MAVI and CI_RE (using `B8A` instead of
+`B08`/`B07`), introduced during a performance refactor. Fixed to match `MAVISignal`/
+`CIRESignal` exactly; structural fix collapsed four independent "bands → indices"
+implementations into one via the Unified Pixel Pipeline (UPP).
 
-A new parity test (now `test_train_score_numerical_parity` in
-`tests/tam/test_train_score_parity.py`, case `band_summaries_p5_p95_std`) that
-directly compares `_compute_band_summaries`' (train, `tam/core/train.py`) output
-against `score`'s numba `compute_band_summaries` kernel
-(`tam/core/_preprocess_numba.py`) on **identical raw observations** caught a third
-bug — even with Bug 2's grouping scope aligned, the two sides computed numerically
-*different* `[p5, p95, std]` values for the same data:
+---
 
-- **Training** used Polars' defaults: `.quantile(0.05)` → `interpolation="nearest"`,
-  and `.std()` → `ddof=1` (sample standard deviation).
-- **Inference**'s numba kernel uses linear-interpolation percentiles
-  (`_lerp_percentile`, matching `np.quantile`'s default) and population variance
-  (`ddof=0`, dividing by `cnt` not `cnt - 1`).
+## What was ruled out earlier (training data is sound)
 
-These methods diverge by a small but non-trivial amount per pixel-year (observed
-~1.2% relative difference on `B08_p5` in the test fixture) — yet another systematic,
-uniform shift between the stats used to calibrate normalisation at training time and
-the stats actually produced at inference, compounding Bugs 1 and 2.
+A full audit (`utils/bbox_audit.py`, `utils/contamination_check.py`) confirmed:
+- Presence bboxes show textbook Parkinsonia spectral signature every year (2017–2025).
+- Borderline riparian absence bboxes were eyeballed and confirmed non-Parkinsonia.
+- Cloud/shadow contamination does not meaningfully move the features the model trains on.
+- `scl_purity` quality gate is a structural no-op on this chunkstore (uniformly 1.0).
 
-**Fix**: changed `_compute_band_summaries`'s aggregation expressions to
-`pl.col(c).quantile(0.05, interpolation="linear")` /
-`pl.col(c).quantile(0.95, interpolation="linear")` / `pl.col(c).std(ddof=0)` —
-verified numerically identical (`rtol=1e-5`) to the numba kernel's output via the
-new parity test.
+**Conclusion**: the training data and labels for Mitchell are sound. The original
+false-positive problem was the pipeline bugs above, not labeling or contamination.
 
-### Bug 4 — NaN handling mismatch in band-summary aggregation (quaternary, compounding, fixed)
+---
 
-While extending the parity test's synthetic fixture to include NaNs (`pixel_df`'s raw
-band columns can genuinely contain float `NaN` — see `dataset.py`'s "S2 cols are NaN
-in S1 rows and vice versa" / `lin_to_db`'s `np.nan` for invalid backscatter), the test
-immediately found a fourth divergence:
+## Useful tools
 
-- **Inference**'s numba `compute_band_summaries` kernel explicitly collects only
-  finite values into its scratch buffer before computing percentiles/variance — NaNs
-  are skipped entirely (`if v == v: ...`).
-- **Training**'s `_compute_band_summaries` passed raw columns straight into Polars'
-  `.quantile()`/`.std()`, which treat float `NaN` very differently from `null`:
-  `.quantile()` sorts `NaN` in as if it were a real (large) value, silently producing
-  a *wrong* — not even a missing — percentile, while `.std()` propagates `NaN` to the
-  whole-column result. (Polars `null` values, by contrast, are correctly excluded by
-  both and match `numpy`'s NaN-dropping behaviour exactly — confirmed empirically.)
-
-**Fix**: added `lf = lf.with_columns([pl.col(c).fill_nan(None) for c in cols])`
-immediately before the aggregation in `_compute_band_summaries`, converting `NaN` →
-`null` so Polars' aggregations exclude missing values exactly like the numba kernel
-does. Re-verified numerically identical (including with NaNs present in the input)
-via the parity test.
-
-### Bug 5 — MAVI / CI_RE transcription bug in `add_spectral_indices` (mode-dependent, fixed)
-
-A fifth, independent instance of the same bug *class* (independent reimplementations
-of "raw bands → spectral indices" silently drifting apart) was found while planning
-the structural fix below — see `docs/UNIFIED-PIXEL-PIPELINE.md` for the full
-root-cause writeup. Summary:
-
-`analysis/constants.py::add_spectral_indices` — used by `dataset.py::prepare_s2_frame`
-in scoring's *default* mixed-mode (`mixed=True`) path — had **wrong formulas for MAVI
-and CI_RE**:
-
-| | MAVI | CI_RE |
-|---|---|---|
-| Canonical (`signals/mavi.py`, `signals/ndre.py`, `extract_features`, training) | `(B08-B04)/(B08+B04+B11)` | `(B07/B05)-1` |
-| `add_spectral_indices` (broken, since commit `f023003`, 2026-05-26) | `(B8A-B11)/(B8A+B11)` | `(B8A/B05)-1` |
-
-Root cause: commit `f023003` inlined `add_spectral_indices` from `Signal`-class
-delegation into raw Polars expressions for performance, and during transcription
-substituted `B8A` for `B08`/`B07` in a way that mirrors the adjacent NDRE formula —
-a copy-paste/band-substitution slip. Any **mixed-mode scoring run since
-2026-05-26** fed the model corrupted MAVI/CI_RE values via this path — a fifth
-independent source of train/score distribution shift active over the same period as
-bugs 1-4.
-
-**Fix**: corrected the formulas directly in `add_spectral_indices`
-(`analysis/constants.py`) to match `MAVISignal`/`CIRESignal` exactly. The deeper
-structural fix — making training and the UI pixel inspector call the *same* numba
-primitives scoring uses (`extract_features`, `compute_band_summaries`, new
-`detect_pixel_year_windows`) rather than independently reimplementing this logic —
-is implemented per `docs/UNIFIED-PIXEL-PIPELINE.md`, collapsing what were four+
-independent "bands → indices" implementations down to one.
-
-### Status
-
-All five bugs are fixed in code (renamed `global_feature` → `annual_feature` throughout —
-see `tam/core/annual_features.py`, `tam/core/train.py::_compute_band_summaries`,
-`tam/core/dataset.py`, `tam/core/score.py`, `tam/core/model.py`, `tam/pipeline.py`).
-**v10 must be retrained** — the existing `outputs/models/tam-v10` checkpoint's saved
-`tam_global_feat_stats.npz` was computed at the wrong aggregation level (per-pixel
-multi-year, not per-pixel-year) and is now incompatible with the fixed pipeline.
-After retraining, re-run the scoring command from `docs/INCANTATIONS.md` and visually
-confirm bare ground / mangrove / riparian areas are no longer confidently classified
-as Parkinsonia.
-
-This is very likely the actual root cause of the false-positive symptom — not a
-labeling, contamination, or quality-gate issue (all ruled out above).
-
-## Other directions (lower priority — only revisit if the above doesn't fully resolve it)
-
-- **Class imbalance / decision threshold.** How many presence vs. absence examples did
-  v10 actually see, and what threshold does `tam.pipeline score` use to call a pixel
-  "Parkinsonia"? A skewed training set or a miscalibrated operating threshold could bias
-  the model toward over-predicting presence regardless of feature quality.
-
-- **Spatial generalization.** Are the false positives concentrated in areas geographically
-  distant from any training bbox (terrain/soil/lighting the model has never seen), or do
-  they also appear close to training sites? This distinguishes a generalization gap from a
-  more fundamental fit problem.
-
-- **Held-out fit on training regions.** Does the model discriminate presence from absence
-  well on held-out pixels *within* the training regions themselves? If not, the problem is
-  upstream of generalization — e.g. a fundamental fit or feature-pipeline issue — and
-  inspecting new geography is a red herring.
-
-## Useful tools produced during this investigation
-
-- `utils/bbox_audit.py` — multi-year quality audit of Mitchell training bboxes; measures
-  data using the exact same `Signal.quality_mask` filter the training pipeline applies.
-  Regenerate with:
-  ```
-  python utils/bbox_audit.py --root /mnt/external/chunkstore \
-      --training data/locations/training.yaml --prefix mitchell \
-      --out docs/MITCHELL-BBOX-AUDIT.md
-  ```
-- `utils/contamination_check.py` — compares v10's actual per-pixel annual features
-  (`[p5, p95, std]` of NDVI/MAVI, mirroring `_compute_band_summaries`) computed with vs.
-  without suspected cloud/shadow-contaminated dates dropped, to quantify whether
-  contamination meaningfully moves what the model trains on:
-  ```
-  python utils/contamination_check.py --root /mnt/external/chunkstore \
-      --training data/locations/training.yaml --bbox-id <id> [<id> ...]
-  ```
+- `utils/bbox_audit.py` — multi-year quality audit of training bboxes using the exact
+  same `Signal.quality_mask` filter as the training pipeline.
+- `utils/contamination_check.py` — quantifies whether cloud/shadow contamination
+  meaningfully moves per-pixel annual features.
