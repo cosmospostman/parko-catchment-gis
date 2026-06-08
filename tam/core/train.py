@@ -134,61 +134,57 @@ def _compute_band_summaries(pixel_df: pl.DataFrame, feature_cols: list[str]) -> 
     population with structurally different (wider-spread, higher-count) statistics
     than what inference ever produces.
 
-    Index columns (NDVI, NDWI, etc.) are computed inline as Polars expressions
-    inside the lazy plan so they are never materialised as full-frame columns.
+    Implementation: this calls the *exact same* numba primitives `score` uses
+    (`extract_features` for raw-bands -> spectral-index conversion,
+    `detect_pixel_year_windows` for grouping, `compute_band_summaries` for the
+    [p5, p95, std] aggregation itself) rather than an independent Polars
+    re-implementation. Three earlier bugs (see docs/MITCHELL-DEBUG.md and
+    [[project_annual_feature_parity_bugs]]) were all caused by these two paths
+    silently drifting apart; calling the same function makes that class of bug
+    impossible to (re)introduce here.
     """
-    # Polars expressions for index columns not already present in pixel_df.
-    # quality guard: scl_purity >= 0.5 (mirrors Signal.quality_mask for S2 rows).
-    _qm = pl.lit(True)
-    if "scl_purity" in pixel_df.columns:
-        _qm = pl.col("scl_purity") >= 0.5
-
-    def _safe_ratio(num: pl.Expr, denom: pl.Expr) -> pl.Expr:
-        return pl.when(_qm & (denom != 0)).then(num / denom).otherwise(pl.lit(None))
-
-    _index_exprs: dict[str, pl.Expr] = {
-        "NDVI":  _safe_ratio(pl.col("B08") - pl.col("B04"), pl.col("B08") + pl.col("B04")),
-        "NDWI":  _safe_ratio(pl.col("B03") - pl.col("B08"), pl.col("B03") + pl.col("B08")),
-        "EVI":   _safe_ratio(
-            2.5 * (pl.col("B08") - pl.col("B04")),
-            pl.col("B08") + 6 * pl.col("B04") - 7.5 * pl.col("B02") + 1,
-        ),
-        "MAVI":  _safe_ratio(pl.col("B08") - pl.col("B04"), pl.col("B08") + pl.col("B04") + pl.col("B11")),
-        "NDRE":  _safe_ratio(pl.col("B8A") - pl.col("B05"), pl.col("B8A") + pl.col("B05")),
-        "CI_RE": pl.when(_qm & (pl.col("B05") != 0)).then(pl.col("B07") / pl.col("B05") - 1).otherwise(pl.lit(None)),
-    }
+    from tam.core._preprocess_numba import compute_band_summaries, detect_pixel_year_windows, extract_features
+    from tam.core.dataset import ALL_FEATURE_COLS
 
     lf = pixel_df.lazy()
     if "source" in pixel_df.columns:
         lf = lf.filter(pl.col("source") == "S2")
+    if "scl_purity" in pixel_df.columns:
+        lf = lf.filter(pl.col("scl_purity") >= 0.5)
+    # `.filter()` is a boolean-mask op and preserves row order — required for the
+    # boundary-scan below to see correctly-sorted (point_id, year) runs. Do not
+    # replace with a join/semi-join (see docs/UNIFIED-PIXEL-PIPELINE.md "order-
+    # preservation invariant").
+    s2_df = lf.sort(["point_id", "year", "date"]).collect()
 
-    # Add index columns that are missing from the stored data.
-    extra = {name: expr for name, expr in _index_exprs.items()
-             if name not in pixel_df.columns}
-    if extra:
-        lf = lf.with_columns([expr.alias(name) for name, expr in extra.items()])
+    cols = [c for c in feature_cols if c in ALL_FEATURE_COLS]
+    if s2_df.is_empty() or not cols:
+        ordered = ["point_id", "year"] + [f"{c}{s}" for c in cols for s in ("_p5", "_p95", "_std")]
+        return pl.DataFrame({c: [] for c in ordered},
+                            schema={"point_id": pl.Utf8, "year": pl.Int64,
+                                    **{c: pl.Float32 for c in ordered[2:]}})
 
-    cols = [c for c in feature_cols if c in pixel_df.columns or c in extra]
-    # NaN -> null so Polars' aggregations exclude missing values exactly like `score`'s
-    # numba `compute_band_summaries` kernel does (it explicitly skips non-finite entries
-    # when collecting valid observations). Without this, a float NaN in a raw band column
-    # (e.g. from `lin_to_db`/masked observations — "S2 cols are NaN in S1 rows and vice
-    # versa", dataset.py) is treated by Polars as a sortable value in `.quantile()` and
-    # contaminates `.std()` to NaN — silently diverging from the score-side result.
-    lf = lf.with_columns([pl.col(c).fill_nan(None) for c in cols])
-    # interpolation="linear" and ddof=0 match `score`'s numba `compute_band_summaries`
-    # kernel exactly (linear-interpolated percentiles, population variance) — Polars'
-    # defaults (`nearest` interpolation, ddof=1 sample std) would silently diverge from
-    # what inference computes per pixel-year window, reproducing the train/inference
-    # "annual feature" distribution-shift bug this function exists to fix.
-    aggs = (
-        [pl.col(c).quantile(0.05, interpolation="linear").alias(f"{c}_p5")  for c in cols] +
-        [pl.col(c).quantile(0.95, interpolation="linear").alias(f"{c}_p95") for c in cols] +
-        [pl.col(c).std(ddof=0).alias(f"{c}_std")                             for c in cols]
-    )
-    grp = lf.group_by(["point_id", "year"]).agg(aggs).collect()
+    band_arrs = [s2_df[b].cast(pl.Float32).to_numpy() for b in BAND_COLS]
+    feat = np.empty((len(s2_df), len(ALL_FEATURE_COLS)), dtype=np.float32)
+    extract_features(*band_arrs, feat)
+
+    pid_arr  = s2_df["point_id"].to_numpy()
+    year_arr = s2_df["year"].to_numpy().astype(np.int32)
+    boundaries, ends = detect_pixel_year_windows(pid_arr, year_arr)
+
+    col_idx = np.array([ALL_FEATURE_COLS.index(c) for c in cols], dtype=np.int64)
+    out = np.empty((len(boundaries), len(cols) * 3), dtype=np.float32)
+    compute_band_summaries(np.ascontiguousarray(feat[:, col_idx]), boundaries, ends, out)
+
+    pids_at_starts  = pid_arr[boundaries]
+    years_at_starts = year_arr[boundaries]
+    data = {"point_id": pids_at_starts, "year": years_at_starts}
+    for i, c in enumerate(cols):
+        data[f"{c}_p5"]  = out[:, i * 3]
+        data[f"{c}_p95"] = out[:, i * 3 + 1]
+        data[f"{c}_std"] = out[:, i * 3 + 2]
     ordered = ["point_id", "year"] + [f"{c}{s}" for c in cols for s in ("_p5", "_p95", "_std")]
-    return grp.select([c for c in ordered if c in grp.columns])
+    return pl.DataFrame(data).select(ordered)
 
 
 def _annual_features_cache_key(pixel_df: pl.DataFrame) -> str:

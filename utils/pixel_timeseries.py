@@ -39,13 +39,16 @@ from pathlib import Path
 import os
 
 import numpy as np
-import pyarrow.compute as pc
+import polars as pl
 
 # Allow running from repo root without installing the package.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 _CHUNKSTORE_DEFAULT = os.environ.get("CHUNKSTORE_DIR", "/mnt/external/chunkstore")
 
+from analysis.constants import add_spectral_indices
+from signals.base import Signal
+from tam.core.dataset import lin_to_db
 from utils.pixel_reader import ChunkIndex
 
 
@@ -85,36 +88,57 @@ def compute_timeseries(
     if tbl.num_rows == 0:
         return []
 
-    # Cast bands to float32 numpy arrays.
-    def col(name: str) -> np.ndarray:
-        return tbl.column(name).to_numpy(zero_copy_only=False).astype("float32")
+    df = pl.from_arrow(tbl)
+    # Raw chunkstore rows store S2 with source=null (only S1 is explicitly
+    # tagged); training backfills null -> "S2" before gating (see
+    # utils/training_collector.py) — mirror that here so the inspector shows
+    # the same pixels the model trains/scores on, not a superset that includes
+    # cloud/shadow-contaminated observations the model never sees.
+    if "source" in df.columns:
+        df = df.with_columns(pl.col("source").fill_null("S2"))
+    good = Signal.quality_mask(df)
 
-    b04 = col("B04")
-    b08 = col("B08")
-    b11 = col("B11")
-    vh  = col("vh")
-    vv  = col("vv")
+    # --- Optical indices: computed via the canonical `add_spectral_indices`
+    # primitive (the same one `prepare_s2_frame`/training/scoring use) on rows
+    # passing the training quality gate — eliminates the hand-rolled NDVI/MAVI
+    # transcription this function used to carry (see
+    # docs/UNIFIED-PIXEL-PIPELINE.md "fourth (UI-side) reimplementation").
+    opt = df.filter(good)
+    if len(opt) > 0:
+        opt = add_spectral_indices(opt)
+        ndvi = opt["NDVI"].to_numpy().astype("float32")
+        mavi = opt["MAVI"].to_numpy().astype("float32")
+        opt_dates = opt["date"].to_numpy()
+    else:
+        ndvi = mavi = np.array([], dtype="float32")
+        opt_dates = np.array([])
 
-    # Derived indices — NaN where invalid.
-    ndvi = _safe_div(b08 - b04, b08 + b04)
-    mavi = _safe_div(b08 - b04, b08 + b04 + b11)
+    # --- Radar (VH/VV): SCL purity does not apply to S1; use all rows with
+    # valid radar bands, and convert via the canonical `lin_to_db` (the same
+    # helper `prepare_s1_frame` uses for training/scoring) rather than a
+    # hand-rolled 10*log10.
+    if "vh" in df.columns and "vv" in df.columns:
+        rad = df.filter(pl.col("vh").is_not_null() & pl.col("vv").is_not_null())
+    else:
+        rad = df.head(0)
+    if len(rad) > 0:
+        vh_lin = rad["vh"].cast(pl.Float32).to_numpy()
+        vv_lin = rad["vv"].cast(pl.Float32).to_numpy()
+        vh_vv = (lin_to_db(vh_lin) - lin_to_db(vv_lin)).astype("float32")
+        rad_dates = rad["date"].to_numpy()
+    else:
+        vh_vv = np.array([], dtype="float32")
+        rad_dates = np.array([])
 
-    # VH/VV in dB: 10*log10(vh) - 10*log10(vv). Both must be > 0.
-    with np.errstate(divide="ignore", invalid="ignore"):
-        vh_db = np.where(vh > 0, 10.0 * np.log10(vh.astype("float64")), np.nan).astype("float32")
-        vv_db = np.where(vv > 0, 10.0 * np.log10(vv.astype("float64")), np.nan).astype("float32")
-    vh_vv = vh_db - vv_db
-
-    # Group by date — use pyarrow to get unique sorted dates, then filter.
-    date_col = tbl.column("date")
-    unique_dates = sorted(set(date_col.to_pylist()))
+    unique_dates = sorted(set(opt_dates.tolist()) | set(rad_dates.tolist()))
 
     series = []
     for d in unique_dates:
-        mask = np.array(pc.equal(date_col, d).to_pylist())
         row: dict[str, object] = {"date": str(d)}
-        for name, signal in [("ndvi", ndvi), ("mavi", mavi), ("vh_vv", vh_vv)]:
-            g = signal[mask]
+        opt_g  = ndvi[opt_dates == d]
+        mavi_g = mavi[opt_dates == d]
+        rad_g  = vh_vv[rad_dates == d]
+        for name, g in [("ndvi", opt_g), ("mavi", mavi_g), ("vh_vv", rad_g)]:
             row[name]          = _mean(g)
             row[f"{name}_p25"] = _percentile(g, 25)
             row[f"{name}_p75"] = _percentile(g, 75)

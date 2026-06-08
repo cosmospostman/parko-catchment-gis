@@ -128,7 +128,7 @@ EXPERIMENT = Experiment(
     train_kwargs={
         "lr":                    5e-5,
         "weight_decay":          0.1,
-        "batch_size":            4096,
+        "batch_size":            2048,
         "n_epochs":              60,
         "patience":              15,
         "band_noise_std":        0.05,

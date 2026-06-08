@@ -132,3 +132,91 @@ def test_train_score_numerical_parity(case: ParityCase):
                 f"score-side implementations compute this statistic differently. "
                 f"Check for differing library defaults (quantile interpolation, std "
                 f"ddof, float precision, NaN handling).")
+
+
+# ---------------------------------------------------------------------------
+# Structural identity: train and score now call the *same* numba primitives for
+# raw-bands -> indices -> per-pixel-year [p5, p95, std] (see
+# docs/UNIFIED-PIXEL-PIPELINE.md). A numerical-closeness check would be a weaker
+# assertion than what's actually true post-unification — assert the stronger fact
+# directly: both call sites import and invoke the identical functions.
+# ---------------------------------------------------------------------------
+
+def test_train_band_summaries_uses_score_primitives():
+    """`_compute_band_summaries` must call score's own `extract_features`,
+    `detect_pixel_year_windows`, and `compute_band_summaries` kernels — not an
+    independent re-implementation. This is what makes the train/score annual-feature
+    bug class (MITCHELL-DEBUG.md bugs 1-5) structurally impossible to reintroduce
+    here: there is exactly one implementation, and both sides call it."""
+    import inspect
+    from tam.core import _preprocess_numba
+    from tam.core.train import _compute_band_summaries
+
+    src = inspect.getsource(_compute_band_summaries)
+    for fn_name in ("extract_features", "detect_pixel_year_windows", "compute_band_summaries"):
+        assert fn_name in src, (
+            f"_compute_band_summaries no longer references {fn_name} — "
+            f"has it regressed to an independent re-implementation?"
+        )
+        assert hasattr(_preprocess_numba, fn_name), (
+            f"tam.core._preprocess_numba.{fn_name} not found — "
+            f"_compute_band_summaries imports a function that no longer exists there"
+        )
+
+
+def test_band_summaries_bit_identical_train_vs_score_path(rng=np.random.default_rng(11)):
+    """Feed the same raw S2 rows through `_compute_band_summaries` (train path) and
+    directly through score's `extract_features` + `detect_pixel_year_windows` +
+    `compute_band_summaries` kernels (score path), and assert bit-identical output.
+
+    This is strictly stronger than `assert_allclose` numerical-closeness checks —
+    since both paths now route through the same kernels, any discrepancy would
+    indicate the train-side wrapper (sorting, filtering, column selection/permutation)
+    is feeding the kernels different data than score does, not a numerical-method
+    mismatch."""
+    from tam.core._preprocess_numba import compute_band_summaries, detect_pixel_year_windows, extract_features
+    from tam.core.dataset import ALL_FEATURE_COLS, BAND_COLS
+    from tam.core.train import _compute_band_summaries
+
+    n_per_year = 40
+    rows = []
+    for pid in ("px_a", "px_b"):
+        for year in (2021, 2022):
+            for i in range(n_per_year):
+                row = {"point_id": pid, "year": year, "date": f"{year}-01-{(i % 28) + 1:02d}",
+                       "doy": i * 9 + 1, "source": "S2", "scl_purity": float(rng.uniform(0.5, 1.0))}
+                for b in BAND_COLS:
+                    row[b] = float(rng.uniform(0.05, 0.4))
+                rows.append(row)
+    df = pl.DataFrame(rows)
+
+    cols = ["B08", "B04", "NDVI", "MAVI", "CI_RE"]
+    actual = _compute_band_summaries(df, cols).sort(["point_id", "year"])
+
+    # Score-side: filter + sort exactly as `_compute_band_summaries` now does, then
+    # call the shared kernels directly (mirrors what `_preprocess` does on a _RawChunk).
+    s2_df = (df.lazy().filter(pl.col("source") == "S2")
+             .filter(pl.col("scl_purity") >= 0.5)
+             .sort(["point_id", "year", "date"]).collect())
+    band_arrs = [s2_df[b].cast(pl.Float32).to_numpy() for b in BAND_COLS]
+    feat = np.empty((len(s2_df), len(ALL_FEATURE_COLS)), dtype=np.float32)
+    extract_features(*band_arrs, feat)
+    pid_arr  = s2_df["point_id"].to_numpy()
+    year_arr = s2_df["year"].to_numpy().astype(np.int32)
+    boundaries, ends = detect_pixel_year_windows(pid_arr, year_arr)
+    col_idx = np.array([ALL_FEATURE_COLS.index(c) for c in cols], dtype=np.int64)
+    out = np.empty((len(boundaries), len(cols) * 3), dtype=np.float32)
+    compute_band_summaries(np.ascontiguousarray(feat[:, col_idx]), boundaries, ends, out)
+
+    expected = pl.DataFrame({
+        "point_id": pid_arr[boundaries],
+        "year": year_arr[boundaries],
+        **{f"{c}{s}": out[:, i * 3 + j]
+           for i, c in enumerate(cols) for j, s in enumerate(("_p5", "_p95", "_std"))},
+    }).sort(["point_id", "year"])
+
+    for col in expected.columns:
+        np.testing.assert_array_equal(
+            actual[col].to_numpy(), expected[col].to_numpy(),
+            err_msg=f"bit-identical mismatch in column '{col}' between train and score paths"
+        )

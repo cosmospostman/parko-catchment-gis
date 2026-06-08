@@ -490,6 +490,36 @@ def fill_windows_zscore(
                 bands_out[k, t, f] = 0.0 if (v != v) else v  # nan→0
 
 
+def detect_pixel_year_windows(
+    pid_arr: np.ndarray,   # (N,) — point_id per row, sorted with year/date
+    year_arr: np.ndarray,  # (N,) — year per row, sorted within each pid run
+) -> tuple[np.ndarray, np.ndarray]:
+    """Find (point_id, year) run boundaries in arrays sorted by (point_id, year, date).
+
+    Returns (boundaries, ends): boundaries[k] is the start index and ends[k] is the
+    one-past-end index of the k'th run. A new run starts wherever point_id or year
+    changes from the previous row — this is the "pixel-year window" definition both
+    training (`_compute_band_summaries`, grouping by point_id+year) and scoring
+    (`_preprocess`, streaming windows) must agree on for their per-window statistics
+    to be comparable.
+
+    Plain numpy, not numba — two N-length comparisons and a `np.where`, called once
+    per chunk; not worth JIT overhead. Requires `pid_arr`/`year_arr` to be sorted by
+    (point_id, year, ...) with no order-disturbing operation (join/sort/groupby)
+    applied after slicing — see UNIFIED-PIXEL-PIPELINE.md's "order-preservation
+    invariant" note.
+    """
+    pid_change  = np.empty(len(pid_arr), dtype=bool)
+    year_change = np.empty(len(pid_arr), dtype=bool)
+    pid_change[0] = year_change[0] = True
+    pid_change[1:]  = pid_arr[1:]  != pid_arr[:-1]
+    year_change[1:] = year_arr[1:] != year_arr[:-1]
+
+    boundaries = np.where(pid_change | year_change)[0].astype(np.int64)
+    ends       = np.append(boundaries[1:], np.int64(len(pid_arr))).astype(np.int64)
+    return boundaries, ends
+
+
 @njit(parallel=True, cache=True)
 def extract_features(
     b02: np.ndarray,  # (N,) float32

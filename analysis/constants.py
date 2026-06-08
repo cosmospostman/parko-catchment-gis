@@ -111,16 +111,16 @@ def add_spectral_indices(df):
             return pl.when(good & (denom != 0)).then(expr).otherwise(pl.lit(None).cast(pl.Float32))
 
         b02, b03, b04 = pl.col("B02"), pl.col("B03"), pl.col("B04")
-        b05, b08      = pl.col("B05"), pl.col("B08")
+        b05, b07, b08 = pl.col("B05"), pl.col("B07"), pl.col("B08")
         b8a, b11      = pl.col("B8A"), pl.col("B11")
 
         ndvi  = _safe((b08 - b04) / (b08 + b04),          b08 + b04)
         ndwi  = _safe((b03 - b08) / (b03 + b08),          b03 + b08)
         evi_d = b08 + 6 * b04 - 7.5 * b02 + 1
         evi   = _safe(2.5 * (b08 - b04) / evi_d,          evi_d)
-        mavi  = _safe((b8a - b11) / (b8a + b11),          b8a + b11)
+        mavi  = _safe((b08 - b04) / (b08 + b04 + b11),    b08 + b04 + b11)
         ndre  = _safe((b8a - b05) / (b8a + b05),          b8a + b05)
-        cire  = _safe(b8a / b05 - 1,                      b05)
+        cire  = _safe(b07 / b05 - 1,                      b05)
 
         return df.with_columns([
             ndvi.alias("NDVI"),

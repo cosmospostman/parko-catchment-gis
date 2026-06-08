@@ -575,7 +575,7 @@ def _preprocess(
     from tam.core._preprocess_numba import (
         fill_windows,
         fill_windows_mixed, fill_windows_mixed_subsample, fill_windows_zscore,
-        count_s2_s1_per_window,
+        count_s2_s1_per_window, detect_pixel_year_windows,
         compute_window_stats, compute_window_stats_s2only, compute_band_summaries,
     )
     from tam.core.dataset import MIN_S1_OBS_PER_YEAR
@@ -583,15 +583,8 @@ def _preprocess(
     feat, is_s1_np, pid_arr, year_arr, doy_arr, n_feat, n_s2, n_s1 = raw
 
     # Step 2: find group boundaries (pixel-year windows)
-    pid_change  = np.empty(len(pid_arr), dtype=bool)
-    year_change = np.empty(len(pid_arr), dtype=bool)
-    pid_change[0] = year_change[0] = True
-    pid_change[1:]  = pid_arr[1:]  != pid_arr[:-1]
-    year_change[1:] = year_arr[1:] != year_arr[:-1]
-
-    boundaries = np.where(pid_change | year_change)[0].astype(np.int64)
-    ends       = np.append(boundaries[1:], np.int64(len(pid_arr))).astype(np.int64)
-    lengths    = (ends - boundaries).astype(np.int32)
+    boundaries, ends = detect_pixel_year_windows(pid_arr, year_arr)
+    lengths = (ends - boundaries).astype(np.int32)
 
     if mixed:
         # Count S2 and S1 obs per window in parallel via numba kernel.

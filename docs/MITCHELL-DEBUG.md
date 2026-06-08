@@ -164,9 +164,41 @@ immediately before the aggregation in `_compute_band_summaries`, converting `NaN
 does. Re-verified numerically identical (including with NaNs present in the input)
 via the parity test.
 
+### Bug 5 — MAVI / CI_RE transcription bug in `add_spectral_indices` (mode-dependent, fixed)
+
+A fifth, independent instance of the same bug *class* (independent reimplementations
+of "raw bands → spectral indices" silently drifting apart) was found while planning
+the structural fix below — see `docs/UNIFIED-PIXEL-PIPELINE.md` for the full
+root-cause writeup. Summary:
+
+`analysis/constants.py::add_spectral_indices` — used by `dataset.py::prepare_s2_frame`
+in scoring's *default* mixed-mode (`mixed=True`) path — had **wrong formulas for MAVI
+and CI_RE**:
+
+| | MAVI | CI_RE |
+|---|---|---|
+| Canonical (`signals/mavi.py`, `signals/ndre.py`, `extract_features`, training) | `(B08-B04)/(B08+B04+B11)` | `(B07/B05)-1` |
+| `add_spectral_indices` (broken, since commit `f023003`, 2026-05-26) | `(B8A-B11)/(B8A+B11)` | `(B8A/B05)-1` |
+
+Root cause: commit `f023003` inlined `add_spectral_indices` from `Signal`-class
+delegation into raw Polars expressions for performance, and during transcription
+substituted `B8A` for `B08`/`B07` in a way that mirrors the adjacent NDRE formula —
+a copy-paste/band-substitution slip. Any **mixed-mode scoring run since
+2026-05-26** fed the model corrupted MAVI/CI_RE values via this path — a fifth
+independent source of train/score distribution shift active over the same period as
+bugs 1-4.
+
+**Fix**: corrected the formulas directly in `add_spectral_indices`
+(`analysis/constants.py`) to match `MAVISignal`/`CIRESignal` exactly. The deeper
+structural fix — making training and the UI pixel inspector call the *same* numba
+primitives scoring uses (`extract_features`, `compute_band_summaries`, new
+`detect_pixel_year_windows`) rather than independently reimplementing this logic —
+is implemented per `docs/UNIFIED-PIXEL-PIPELINE.md`, collapsing what were four+
+independent "bands → indices" implementations down to one.
+
 ### Status
 
-All four bugs are fixed in code (renamed `global_feature` → `annual_feature` throughout —
+All five bugs are fixed in code (renamed `global_feature` → `annual_feature` throughout —
 see `tam/core/annual_features.py`, `tam/core/train.py::_compute_band_summaries`,
 `tam/core/dataset.py`, `tam/core/score.py`, `tam/core/model.py`, `tam/pipeline.py`).
 **v10 must be retrained** — the existing `outputs/models/tam-v10` checkpoint's saved

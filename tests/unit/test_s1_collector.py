@@ -1012,8 +1012,10 @@ def test_s1_df_to_arrow_row_count():
 # ---------------------------------------------------------------------------
 
 def _make_s2_parquet(path: Path, region_id: str, n_pixels: int = 3) -> None:
-    """Write a minimal S2-style parquet."""
-    from analysis.constants import BANDS, SPECTRAL_INDEX_COLS
+    """Write a minimal S2-style parquet, matching the real pipeline's on-disk
+    encoding: bands as raw uint16 DN (reflectance × 10000), scl_purity as
+    int8 (0/1), aot/view_zenith/sun_zenith as uint8 (0-100)."""
+    from analysis.constants import BANDS, SPECTRAL_INDEX_COLS, UINT16_BAND_SCALE
     rows = []
     for i in range(n_pixels):
         for dt in [date(2022, 6, 1), date(2022, 7, 1)]:
@@ -1025,12 +1027,12 @@ def _make_s2_parquet(path: Path, region_id: str, n_pixels: int = 3) -> None:
                 "source": "S2",
                 "item_id": f"S2A_tile_{dt}",
                 "tile_id": "55HBU",
-                **{b: 0.1 + i * 0.01 for b in BANDS},
-                "scl_purity": 1.0,
+                **{b: int((0.1 + i * 0.01) * UINT16_BAND_SCALE) for b in BANDS},
+                "scl_purity": 1,
                 "scl": 4,
-                "aot": 0.9,
-                "view_zenith": 0.95,
-                "sun_zenith": 0.85,
+                "aot": 90,
+                "view_zenith": 95,
+                "sun_zenith": 85,
                 **{c: 0.25 for c in SPECTRAL_INDEX_COLS},
                 "vh": None,
                 "vv": None,
