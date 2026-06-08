@@ -169,10 +169,22 @@ def _compute_band_summaries(pixel_df: pl.DataFrame, feature_cols: list[str]) -> 
         lf = lf.with_columns([expr.alias(name) for name, expr in extra.items()])
 
     cols = [c for c in feature_cols if c in pixel_df.columns or c in extra]
+    # NaN -> null so Polars' aggregations exclude missing values exactly like `score`'s
+    # numba `compute_band_summaries` kernel does (it explicitly skips non-finite entries
+    # when collecting valid observations). Without this, a float NaN in a raw band column
+    # (e.g. from `lin_to_db`/masked observations — "S2 cols are NaN in S1 rows and vice
+    # versa", dataset.py) is treated by Polars as a sortable value in `.quantile()` and
+    # contaminates `.std()` to NaN — silently diverging from the score-side result.
+    lf = lf.with_columns([pl.col(c).fill_nan(None) for c in cols])
+    # interpolation="linear" and ddof=0 match `score`'s numba `compute_band_summaries`
+    # kernel exactly (linear-interpolated percentiles, population variance) — Polars'
+    # defaults (`nearest` interpolation, ddof=1 sample std) would silently diverge from
+    # what inference computes per pixel-year window, reproducing the train/inference
+    # "annual feature" distribution-shift bug this function exists to fix.
     aggs = (
-        [pl.col(c).quantile(0.05).alias(f"{c}_p5")  for c in cols] +
-        [pl.col(c).quantile(0.95).alias(f"{c}_p95") for c in cols] +
-        [pl.col(c).std().alias(f"{c}_std")           for c in cols]
+        [pl.col(c).quantile(0.05, interpolation="linear").alias(f"{c}_p5")  for c in cols] +
+        [pl.col(c).quantile(0.95, interpolation="linear").alias(f"{c}_p95") for c in cols] +
+        [pl.col(c).std(ddof=0).alias(f"{c}_std")                             for c in cols]
     )
     grp = lf.group_by(["point_id", "year"]).agg(aggs).collect()
     ordered = ["point_id", "year"] + [f"{c}{s}" for c in cols for s in ("_p5", "_p95", "_std")]

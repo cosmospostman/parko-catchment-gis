@@ -42,7 +42,7 @@ In short: **the training data and labels for Mitchell appear sound.** The false-
 problem is unlikely to be explained by bad bboxes, mislabeling, or unfiltered noise in the
 features the model was shown.
 
-## ROOT CAUSE FOUND & FIXED: two compounding train/inference "annual feature" bugs
+## ROOT CAUSE FOUND & FIXED: four compounding train/inference "annual feature" bugs
 
 (Note: these were called "global features" during the investigation — renamed to
 "annual features" in the fix, since they are per-(pixel, year) statistical summaries,
@@ -50,8 +50,8 @@ not global pixel-level constants. See the rename rationale in
 `tam/core/annual_features.py:1` and the implementation plan for the full identifier
 rename table.)
 
-Confirmed by reading the code (not guessing from naming) — **two distinct, compounding
-bugs**, both now fixed:
+Confirmed by reading the code (not guessing from naming) — **four distinct, compounding
+bugs**, all now fixed:
 
 ### Bug 1 — zero-substitution wiring bug (primary cause, fixed)
 
@@ -114,9 +114,59 @@ replicate multi-year aggregation (incompatible with `score`'s streaming/chunked
 architecture), and arguably more semantically correct: a pixel's spectral character
 *for a given year* is more meaningful than a blend across 9 years.
 
+### Bug 3 — quantile/std numerical-method mismatch (tertiary, compounding, fixed)
+
+A new parity test (now `test_train_score_numerical_parity` in
+`tests/tam/test_train_score_parity.py`, case `band_summaries_p5_p95_std`) that
+directly compares `_compute_band_summaries`' (train, `tam/core/train.py`) output
+against `score`'s numba `compute_band_summaries` kernel
+(`tam/core/_preprocess_numba.py`) on **identical raw observations** caught a third
+bug — even with Bug 2's grouping scope aligned, the two sides computed numerically
+*different* `[p5, p95, std]` values for the same data:
+
+- **Training** used Polars' defaults: `.quantile(0.05)` → `interpolation="nearest"`,
+  and `.std()` → `ddof=1` (sample standard deviation).
+- **Inference**'s numba kernel uses linear-interpolation percentiles
+  (`_lerp_percentile`, matching `np.quantile`'s default) and population variance
+  (`ddof=0`, dividing by `cnt` not `cnt - 1`).
+
+These methods diverge by a small but non-trivial amount per pixel-year (observed
+~1.2% relative difference on `B08_p5` in the test fixture) — yet another systematic,
+uniform shift between the stats used to calibrate normalisation at training time and
+the stats actually produced at inference, compounding Bugs 1 and 2.
+
+**Fix**: changed `_compute_band_summaries`'s aggregation expressions to
+`pl.col(c).quantile(0.05, interpolation="linear")` /
+`pl.col(c).quantile(0.95, interpolation="linear")` / `pl.col(c).std(ddof=0)` —
+verified numerically identical (`rtol=1e-5`) to the numba kernel's output via the
+new parity test.
+
+### Bug 4 — NaN handling mismatch in band-summary aggregation (quaternary, compounding, fixed)
+
+While extending the parity test's synthetic fixture to include NaNs (`pixel_df`'s raw
+band columns can genuinely contain float `NaN` — see `dataset.py`'s "S2 cols are NaN
+in S1 rows and vice versa" / `lin_to_db`'s `np.nan` for invalid backscatter), the test
+immediately found a fourth divergence:
+
+- **Inference**'s numba `compute_band_summaries` kernel explicitly collects only
+  finite values into its scratch buffer before computing percentiles/variance — NaNs
+  are skipped entirely (`if v == v: ...`).
+- **Training**'s `_compute_band_summaries` passed raw columns straight into Polars'
+  `.quantile()`/`.std()`, which treat float `NaN` very differently from `null`:
+  `.quantile()` sorts `NaN` in as if it were a real (large) value, silently producing
+  a *wrong* — not even a missing — percentile, while `.std()` propagates `NaN` to the
+  whole-column result. (Polars `null` values, by contrast, are correctly excluded by
+  both and match `numpy`'s NaN-dropping behaviour exactly — confirmed empirically.)
+
+**Fix**: added `lf = lf.with_columns([pl.col(c).fill_nan(None) for c in cols])`
+immediately before the aggregation in `_compute_band_summaries`, converting `NaN` →
+`null` so Polars' aggregations exclude missing values exactly like the numba kernel
+does. Re-verified numerically identical (including with NaNs present in the input)
+via the parity test.
+
 ### Status
 
-Both bugs are fixed in code (renamed `global_feature` → `annual_feature` throughout —
+All four bugs are fixed in code (renamed `global_feature` → `annual_feature` throughout —
 see `tam/core/annual_features.py`, `tam/core/train.py::_compute_band_summaries`,
 `tam/core/dataset.py`, `tam/core/score.py`, `tam/core/model.py`, `tam/pipeline.py`).
 **v10 must be retrained** — the existing `outputs/models/tam-v10` checkpoint's saved

@@ -354,6 +354,12 @@ class TestTT10S2ColsLoadedForNoiseFilter:
         )
         assert summaries.select(["point_id", "year"]).is_duplicated().sum() == 0
 
+    # Numerical train/score parity for `_compute_band_summaries` vs. score's numba
+    # `compute_band_summaries` kernel is covered by the registry-driven
+    # `test_train_score_numerical_parity` in `tests/tam/test_train_score_parity.py`
+    # (case "band_summaries_p5_p95_std") — see that module's docstring for why a
+    # registry, not a one-off test, is the right shape for this kind of check.
+
 
 # ---------------------------------------------------------------------------
 # TT-11: region_holdout_split with a site that spans both train and val regions
