@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import logging
 import math
 from pathlib import Path
 from typing import Iterator
@@ -9,6 +10,8 @@ from typing import Iterator
 import numpy as np
 import polars as pl
 import pyarrow.parquet as pq
+
+logger = logging.getLogger(__name__)
 
 
 def scores_to_grid(
@@ -433,10 +436,18 @@ def rasterize_tile_to_pmtiles(
     }
     metadata: dict = {"name": tile_id}
 
+    tiles = list(iter_tiles(merc_grid, merc_transform, zoom_min=8, zoom_max=16))
+    if not tiles:
+        logger.warning(
+            "Tile %s has no above-zero scores — skipping PMTiles output (%s)",
+            tile_id, out_pmtiles,
+        )
+        return
+
     out_pmtiles.parent.mkdir(parents=True, exist_ok=True)
     with open(out_pmtiles, "wb") as f:
         writer = Writer(f)
-        for z, x, y, png_bytes in iter_tiles(merc_grid, merc_transform, zoom_min=8, zoom_max=16):
+        for z, x, y, png_bytes in tiles:
             tileid = zxy_to_tileid(z, x, y)
             writer.write_tile(tileid, png_bytes)
         writer.finalize(header, metadata)
@@ -477,10 +488,18 @@ def rasterize_scores_dir_to_pmtiles(
     header = {"tile_type": TileType.PNG, "tile_compression": Compression.NONE}
     metadata: dict = {"name": tile_id}
 
+    tiles = list(iter_tiles(merc_grid, merc_transform, zoom_min=zoom_min, zoom_max=zoom_max))
+    if not tiles:
+        logger.warning(
+            "Tile %s has no above-zero scores — skipping PMTiles output (%s)",
+            tile_id, out_pmtiles,
+        )
+        return
+
     out_pmtiles.parent.mkdir(parents=True, exist_ok=True)
     with open(out_pmtiles, "wb") as f:
         writer = Writer(f)
-        for z, x, y, png_bytes in iter_tiles(merc_grid, merc_transform, zoom_min=zoom_min, zoom_max=zoom_max):
+        for z, x, y, png_bytes in tiles:
             tileid = zxy_to_tileid(z, x, y)
             writer.write_tile(tileid, png_bytes)
         writer.finalize(header, metadata)

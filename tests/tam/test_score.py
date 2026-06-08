@@ -19,13 +19,15 @@ import pyarrow.parquet as pq
 import pytest
 import torch
 
-from tam.core.dataset import BAND_COLS, S1_FEATURE_COLS, MIN_S1_OBS_PER_YEAR
+from tam.core.dataset import ALL_FEATURE_COLS, BAND_COLS, S1_FEATURE_COLS, MIN_S1_OBS_PER_YEAR
 from tam.core.model import TAMClassifier
 from tam.core.score import (
     score_pixels_chunked, score_location_years, score_tiles_chunked,
-    _compute_s1_despeckle_lookup,
+    _compute_s1_despeckle_lookup, _extract_mixed_pa, _PASlice,
 )
 from tam.core.config import TAMConfig
+from tam.core._preprocess_numba import extract_features
+from analysis.constants import UINT16_BAND_SCALE
 
 
 # ---------------------------------------------------------------------------
@@ -37,6 +39,20 @@ N_OBS_PER_YEAR = 15  # enough to clear the min_obs_per_year=8 threshold
 
 def _band_row(rng: np.random.Generator) -> dict:
     return {b: float(rng.uniform(0.01, 0.5)) for b in BAND_COLS}
+
+
+def _band_row_uint16(rng: np.random.Generator) -> dict:
+    """Raw-cache-shaped band row: uint16 DN values (reflectance × UINT16_BAND_SCALE).
+
+    Matches the real chunkstore schema (e.g. /mnt/external/chunkstore/<year>/<tile>/
+    *.parquet stores B02..B12 as UInt16 ×10000) — as opposed to _band_row's
+    already-reflectance-scaled floats, which is what every other mixed-mode
+    fixture here writes and why the missing /UINT16_BAND_SCALE conversion in
+    _extract_mixed_pa went undetected (see [[project_annual_feature_parity_bugs]]
+    follow-on: an all-zero scoring run traced to raw DN values, ~10,000x the
+    expected reflectance scale, being fed straight to the model).
+    """
+    return {b: int(rng.integers(50, 4000)) for b in BAND_COLS}
 
 
 def _make_parquet(
@@ -876,13 +892,23 @@ def _make_mixed_parquet(
     include_s1: bool = True,
     n_s1_obs: int = N_S1_OBS,
     filename: str = "mixed.parquet",
+    band_dtype: "pl.DataType" = pl.Float32,
 ) -> Path:
     """Write a parquet with interleaved S2 and S1 rows (source column).
 
     S2 rows carry spectral bands + scl_purity.
     S1 rows carry raw linear vh/vv; all spectral band columns are absent/null.
+
+    band_dtype: pl.Float32 (default) writes already-reflectance-scaled band
+    values via _band_row — the shape every other mixed-mode fixture here uses.
+    pl.UInt16 instead writes raw chunkstore-shaped DN values via
+    _band_row_uint16 (×UINT16_BAND_SCALE), matching the real cache schema that
+    _extract_mixed_pa must convert back to reflectance before computing
+    spectral indices — see _band_row_uint16's docstring for why this distinction
+    matters.
     """
     rng = np.random.default_rng(55)
+    _row_fn = _band_row_uint16 if band_dtype == pl.UInt16 else _band_row
     rows = []
     for pid in pixels:
         for yr in years:
@@ -898,7 +924,7 @@ def _make_mixed_parquet(
                     "vh": None,
                     "vv": None,
                 }
-                row.update(_band_row(rng))
+                row.update(_row_fn(rng))
                 rows.append(row)
 
             if include_s1:
@@ -917,7 +943,8 @@ def _make_mixed_parquet(
                     })
 
     df = pl.DataFrame(rows).with_columns(
-        pl.col("date").cast(pl.Datetime("us"))
+        [pl.col("date").cast(pl.Datetime("us"))]
+        + [pl.col(b).cast(band_dtype) for b in BAND_COLS]
     ).sort(["point_id", "date"])
     path = tmp_path / filename
     pq.write_table(df.to_arrow(), path, row_group_size=N_OBS_PER_YEAR + n_s1_obs)
@@ -940,6 +967,43 @@ def _stub_mixed_model(
     band_mean = np.zeros(n_bands, dtype=np.float32)
     band_std  = np.ones(n_bands,  dtype=np.float32)
     return model, band_mean, band_std
+
+
+def _stub_mixed_model_with_annual_features(
+    n_s2: int = 3,
+    n_s1: int = 2,
+) -> tuple[TAMClassifier, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Mixed S2+S1 model stub with a non-trivial annual-feature head.
+
+    n_annual_features = n_s2 * 3 (p5/p95/std per S2 column), matching the real
+    "annual feature" convention (tam_config.json's feature_cols × 3 — see
+    score.py's compute_band_summaries call site). annual_feat_mean/std are set
+    to plausible reflectance-scale band-summary statistics (~0.01-0.5, std
+    ~0.01-0.1) — i.e. calibrated as if computed via ensure_float32_bands +
+    extract_features over reflectance-scale data, exactly like training does.
+
+    This is the piece _stub_mixed_model lacks (n_annual_features=0): without it,
+    a model can't exhibit the actual production failure mode, where ~10,000x
+    out-of-scale band summaries fed through a reflectance-calibrated
+    normalisation saturate the head and collapse every prediction toward the
+    same extreme value.
+    """
+    n_bands = n_s2 + n_s1
+    n_annual = n_s2 * 3
+    cfg = TAMConfig(d_model=16, n_heads=2, n_layers=1, d_ff=32,
+                    n_bands=n_bands, use_s1="mixed", n_annual_features=n_annual)
+    torch.manual_seed(13)
+    model = TAMClassifier.from_config(cfg)
+    model._use_s1 = "mixed"
+    model._pixel_zscore = False
+    model.eval()
+    band_mean = np.zeros(n_bands, dtype=np.float32)
+    band_std  = np.ones(n_bands,  dtype=np.float32)
+
+    rng = np.random.default_rng(91)
+    annual_feat_mean = rng.uniform(0.01, 0.5, size=n_annual).astype(np.float32)
+    annual_feat_std  = rng.uniform(0.01, 0.1, size=n_annual).astype(np.float32)
+    return model, band_mean, band_std, annual_feat_mean, annual_feat_std
 
 
 # ---------------------------------------------------------------------------
@@ -1035,6 +1099,189 @@ class TestMixedModeScoring:
 
         assert len(r_mixed) == 1, "mixed path must score px1"
         assert len(r_s2only) == 0, "s2-only path must score nothing (no S1 obs)"
+
+
+# ---------------------------------------------------------------------------
+# TS-RCV  Raw-chunk → model "pixel view" contract
+#
+# _extract_mixed_pa is the GIL-free PyArrow path that turns raw chunkstore rows
+# into the `feat` matrix fed to the model in mixed (use_s1=True) mode — the path
+# every production scoring run with an S1-aware checkpoint (e.g. tam-v10) takes.
+#
+# The real chunkstore stores S2 bands as uint16 DN values (×UINT16_BAND_SCALE,
+# see analysis.constants.ensure_float32_bands), and never stores spectral index
+# columns (NDVI, NDWI, ...) — those are derived. Training computes its
+# "annual feature" statistics by running ensure_float32_bands + the
+# `extract_features` numba kernel over that same raw cache shape
+# (tam/_prep_worker.py calls ensure_float32_bands before _compute_band_summaries,
+# which itself now delegates to extract_features — see _compute_band_summaries'
+# docstring and [[project_annual_feature_parity_bugs]]).
+#
+# _extract_mixed_pa must therefore present the model the *same reflectance-scale,
+# index-augmented view* of each pixel, or the model's annual-feature normalisation
+# (calibrated against reflectance-scale stats) silently saturates. That's exactly
+# what happened in production: raw DN values ~10,000x the expected scale were fed
+# straight through, collapsing every prediction to prob_tam_raw == 0.0 — see the
+# Mitchell tile 54LWH/2025 all-zero scoring investigation that prompted this test.
+#
+# These tests build a chunkstore-shaped (uint16-band) parquet and assert the S2
+# columns of `feat` match the oracle: ensure_float32_bands-equivalent scaling
+# (raw / UINT16_BAND_SCALE) run through the same `extract_features` kernel,
+# selected by ALL_FEATURE_COLS index — never a hand-rolled formula, to avoid
+# reintroducing the "two independent implementations silently drift" risk this
+# whole bug class stems from.
+# ---------------------------------------------------------------------------
+
+_RCV_S2_COLS = ["B02", "B03", "B04", "NDVI", "NDWI", "MAVI", "NDRE", "CI_RE"]
+_RCV_S1_COLS = ["s1_vh", "s1_vv"]
+
+
+def _pa_slices_from_parquet(path: Path, s2_cols: list[str], s1_cols: list[str],
+                            scl_purity_min: float = 0.5) -> list["_PASlice"]:
+    """Read a parquet into _PASlice objects exactly as the mixed-mode reader does.
+
+    Mirrors the year/doy derivation in score.py's _reader (pyarrow.compute.year /
+    day_of_year, both cast to int32, appended as columns) so the resulting table
+    has the shape _extract_mixed_pa expects — one slice per row group, which is
+    enough for these single-pixel, single-row-group fixtures.
+    """
+    import pyarrow.compute as pac
+    tbl = pq.read_table(path)
+    date_col = tbl.column("date")
+    year_col = pac.year(date_col).cast("int32")
+    doy_col  = pac.day_of_year(date_col).cast("int32")
+    tbl = tbl.append_column(pa.field("year", pa.int32()), year_col)
+    tbl = tbl.append_column(pa.field("doy",  pa.int32()), doy_col)
+    return [_PASlice(tbl, s2_cols, s1_cols, scl_purity_min)]
+
+
+def _expected_s2_features(raw_uint16: dict[str, np.ndarray], s2_cols: list[str]) -> np.ndarray:
+    """Oracle: scale raw uint16 DN bands to reflectance, run extract_features,
+    select the requested columns by ALL_FEATURE_COLS index — the same sequence
+    ensure_float32_bands + extract_features performs on the train-prep side."""
+    band_arrs = [raw_uint16[b].astype(np.float32) / UINT16_BAND_SCALE for b in BAND_COLS]
+    n = len(band_arrs[0])
+    full = np.empty((n, len(ALL_FEATURE_COLS)), dtype=np.float32)
+    extract_features(*band_arrs, full)
+    col_idx = [ALL_FEATURE_COLS.index(c) for c in s2_cols]
+    return full[:, col_idx]
+
+
+class TestRawChunkPixelView:
+    """_extract_mixed_pa must convert raw chunkstore rows to the model's expected view."""
+
+    def test_uint16_bands_scaled_and_indices_computed(self, tmp_path):
+        """S2 feature columns extracted from a uint16-band chunk must equal the
+        ensure_float32_bands + extract_features oracle — both the raw-band scale
+        (reflectance, not DN) and the derived spectral indices."""
+        path = _make_mixed_parquet(tmp_path, pixels=["px1"], years=[2023],
+                                   band_dtype=pl.UInt16, filename="rcv_uint16.parquet")
+        raw_df = pl.read_parquet(path).filter(pl.col("source") == "S2").sort("date")
+        raw_uint16 = {b: raw_df[b].to_numpy() for b in BAND_COLS}
+
+        slices = _pa_slices_from_parquet(path, _RCV_S2_COLS, _RCV_S1_COLS)
+        chunk = _extract_mixed_pa(slices[0])
+        assert chunk is not None
+        s2_feat = chunk.feat[~chunk.is_s1][:, :chunk.n_s2]
+
+        expected = _expected_s2_features(raw_uint16, _RCV_S2_COLS)
+        np.testing.assert_allclose(s2_feat, expected, rtol=1e-5, atol=1e-6)
+
+    def test_raw_dn_values_are_rescaled_not_passed_through(self, tmp_path):
+        """Regression guard for the actual failure mode: raw DN values (tens to
+        thousands) must not appear verbatim in `feat` — they must be divided down
+        to reflectance (~0-1). A test that only checks index *formulas* could
+        still pass with the scaling bug present, since ratio-based indices
+        (NDVI etc.) are scale-invariant — which is exactly why this bug was
+        subtle and the model's sequence features looked superficially fine while
+        its annual features (which depend on absolute band scale) saturated."""
+        path = _make_mixed_parquet(tmp_path, pixels=["px1"], years=[2023],
+                                   band_dtype=pl.UInt16, filename="rcv_scale.parquet")
+        raw_df = pl.read_parquet(path).filter(pl.col("source") == "S2").sort("date")
+        raw_b02 = raw_df["B02"].to_numpy().astype(np.float32)
+        assert raw_b02.max() > 10, "fixture sanity check: DN values should be in the hundreds-thousands"
+
+        slices = _pa_slices_from_parquet(path, _RCV_S2_COLS, _RCV_S1_COLS)
+        chunk = _extract_mixed_pa(slices[0])
+        assert chunk is not None
+        b02_idx = _RCV_S2_COLS.index("B02")
+        b02_feat = chunk.feat[~chunk.is_s1][:, b02_idx]
+
+        np.testing.assert_allclose(b02_feat, raw_b02 / UINT16_BAND_SCALE, rtol=1e-6, atol=1e-7)
+        assert b02_feat.max() < 1.0, (
+            f"B02 feature values must be reflectance-scale (<1.0), got max={b02_feat.max()} "
+            "— raw DN values are being passed through without /UINT16_BAND_SCALE conversion"
+        )
+
+    def test_float_band_fixture_unaffected(self, tmp_path):
+        """Sanity check: the default (Float32) fixture shape — used by every other
+        mixed-mode test — must pass through _extract_mixed_pa unscaled, confirming
+        the uint16 path is additive and doesn't regress the already-reflectance
+        case (e.g. older cache formats / pre-scaled test data)."""
+        path = _make_mixed_parquet(tmp_path, pixels=["px1"], years=[2023],
+                                   filename="rcv_float.parquet")  # band_dtype=Float32 default
+        raw_df = pl.read_parquet(path).filter(pl.col("source") == "S2").sort("date")
+        raw_b02 = raw_df["B02"].to_numpy().astype(np.float32)
+
+        slices = _pa_slices_from_parquet(path, _RCV_S2_COLS, _RCV_S1_COLS)
+        chunk = _extract_mixed_pa(slices[0])
+        assert chunk is not None
+        b02_idx = _RCV_S2_COLS.index("B02")
+        b02_feat = chunk.feat[~chunk.is_s1][:, b02_idx]
+
+        np.testing.assert_allclose(b02_feat, raw_b02, rtol=1e-6, atol=1e-7)
+
+
+class TestMixedModeSaturationGuard:
+    """End-to-end guard: a wrong-scale `feat` must not silently saturate the model."""
+
+    S2_COLS = _RCV_S2_COLS
+    S1_COLS = _RCV_S1_COLS
+
+    def test_uint16_chunkstore_input_produces_varied_scores(self, tmp_path):
+        """score_pixels_chunked on chunkstore-shaped (uint16-band) input must
+        produce prob_tam values with real spread across pixels, not the
+        all-identical/all-saturated output a ~10,000x band-scale error produces
+        (every pixel's annual features pinned to the same extreme normalised
+        value regardless of its actual spectral signature).
+
+        Uses _stub_mixed_model_with_annual_features — a plain n_annual_features=0
+        stub can't exhibit this failure mode, since the per-window band z-scoring
+        on the sequence path is scale-invariant; only the annual-feature head
+        (normalised against fixed, reflectance-scale annual_feat_mean/std) is
+        sensitive to absolute band scale, and that's where production saturated."""
+        path = _make_mixed_parquet(tmp_path, pixels=["px1", "px2", "px3", "px4"], years=[2023],
+                                   band_dtype=pl.UInt16, filename="rcv_e2e.parquet")
+        model, band_mean, band_std, afm, afs = _stub_mixed_model_with_annual_features(
+            n_s2=len(self.S2_COLS), n_s1=len(self.S1_COLS))
+        result = score_pixels_chunked(
+            path, model, band_mean, band_std,
+            device="cpu", mixed=True,
+            s2_feature_cols=self.S2_COLS,
+            s1_feature_cols=self.S1_COLS,
+            annual_feat_mean=afm,
+            annual_feat_std=afs,
+        )
+        assert len(result) == 4
+        assert result["prob_tam"].is_between(0, 1).all()
+        vals = result["prob_tam"].to_list()
+        assert result["prob_tam"].n_unique() > 1, (
+            "expected varied scores across pixels with distinct random band values; "
+            f"got: {vals} — looks like saturated/collapsed output"
+        )
+        # The untrained stub's absolute output magnitude is small and arbitrary
+        # (depends on random init), so check *relative* spread rather than an
+        # absolute threshold — the failure mode this guards against is every
+        # pixel being pinned to the *same* extreme value (e.g. all 1.0, as the
+        # ~10,000x-out-of-scale annual features saturate the head identically
+        # regardless of each pixel's actual spectral signature), not merely
+        # "small" outputs.
+        lo, hi = min(vals), max(vals)
+        rel_spread = (hi - lo) / hi if hi > 0 else 0.0
+        assert rel_spread > 0.01, (
+            f"expected meaningfully varied scores (relative spread={rel_spread:.4g}); "
+            f"got: {vals} — annual-feature head looks saturated"
+        )
 
 
 # ---------------------------------------------------------------------------

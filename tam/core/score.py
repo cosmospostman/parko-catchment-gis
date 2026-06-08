@@ -353,6 +353,7 @@ def _extract_mixed_pa(
     _extract_raw_arrays for that path.
     """
     import pyarrow.compute as _pac
+    from tam.core._preprocess_numba import extract_features
 
     tbl = pa_slice.tbl
     _s2_cols = pa_slice.s2_feature_cols
@@ -399,16 +400,34 @@ def _extract_mixed_pa(
     s2_idx_pa = _pa_local.array(s2_idx, type=_pa_local.int64())
     s1_idx_pa = _pa_local.array(s1_idx, type=_pa_local.int64())
 
-    # S2 bands: extract the float block via Polars from_arrow → to_numpy.
-    # pl.from_arrow zero-copies the Arrow buffers; to_numpy writes a single
-    # C-contiguous float32 matrix in one C-level pass — 5× faster than a
-    # per-column combine_chunks+asarray loop for the same data.
+    # S2 bands + indices: pull raw band columns (uint16 ×10000 → reflectance),
+    # then run them through the same `extract_features` numba kernel training's
+    # _compute_band_summaries uses, so band scale and index formulas match exactly
+    # — anything else silently drifts the annual-feature distribution (see
+    # docs/MITCHELL-DEBUG.md, [[project_annual_feature_parity_bugs]]).
     if s2_idx.size > 0:
-        raw_s2_cols = [c for c in _s2_cols if c not in ("NDVI", "NDWI", "EVI", "MAVI", "NDRE", "CI_RE")]
-        present_s2 = [c for c in raw_s2_cols if c in schema_names]
-        if present_s2:
-            s2_sub = tbl.select(present_s2).take(s2_idx_pa)
-            feat[s2_idx, :len(present_s2)] = pl.from_arrow(s2_sub).to_numpy(order="c")
+        present_bands = [c for c in BAND_COLS if c in schema_names]
+        if present_bands:
+            from analysis.constants import UINT16_BAND_SCALE
+
+            band_sub = tbl.select(present_bands).take(s2_idx_pa)
+            band_block = pl.from_arrow(band_sub)
+            band_arrs = []
+            for c in BAND_COLS:
+                if c in present_bands:
+                    col = band_block[c]
+                    if col.dtype == pl.UInt16:
+                        col = col.cast(pl.Float32) / UINT16_BAND_SCALE
+                    else:
+                        col = col.cast(pl.Float32)
+                    band_arrs.append(np.ascontiguousarray(col.to_numpy()))
+                else:
+                    band_arrs.append(np.zeros(s2_idx.size, dtype=np.float32))
+
+            full_feat = np.empty((s2_idx.size, _N_FEATURES), dtype=np.float32)
+            extract_features(*band_arrs, full_feat)
+            col_idx = np.array([_BAND_INDICES[c] for c in _s2_cols], dtype=np.int64)
+            feat[s2_idx, :len(_s2_cols)] = full_feat[:, col_idx]
 
     # S1 features: VH/VV → dB + ratio features
     if s1_idx.size > 0 and "vh" in schema_names and "vv" in schema_names:
