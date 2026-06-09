@@ -430,7 +430,6 @@ def run_profile(
         patience=1,
         use_s1="mixed" if use_s1 else False,
         pixel_zscore=pixel_zscore,
-        use_band_summaries=True,
         feature_cols_override=tuple(V10_FEATURE_COLS),
         s1_feature_cols=tuple(V10_S1_FEATURE_COLS) if use_s1 else (),
         n_bands=len(V10_FEATURE_COLS) + (len(V10_S1_FEATURE_COLS) if use_s1 else 0),

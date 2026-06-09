@@ -220,3 +220,59 @@ def test_band_summaries_bit_identical_train_vs_score_path(rng=np.random.default_
             actual[col].to_numpy(), expected[col].to_numpy(),
             err_msg=f"bit-identical mismatch in column '{col}' between train and score paths"
         )
+
+
+def test_s1_band_summaries_bit_identical_train_vs_score_path(rng=np.random.default_rng(42)):
+    """S1 p5/p95/std summaries from `_compute_band_summaries(s1_feature_cols=...)` (train)
+    must be bit-identical to what score builds by running the same kernel on S1 rows."""
+    from tam.core._preprocess_numba import compute_band_summaries, detect_pixel_year_windows
+    from tam.core.dataset import BAND_COLS, lin_to_db
+    from tam.core.train import _compute_band_summaries
+
+    s1_cols = ["s1_vh", "s1_vv", "s1_vh_vv", "s1_rvi"]
+    rows = []
+    for pid in ("px_a", "px_b"):
+        for year in (2021, 2022):
+            # S2 rows (required so the train function has an S2 side to join against)
+            for i in range(20):
+                row = {"point_id": pid, "year": year,
+                       "date": f"{year}-0{(i % 9) + 1}-01", "doy": i * 9 + 1,
+                       "source": "S2", "scl_purity": 1.0, "vh": None, "vv": None}
+                for b in BAND_COLS:
+                    row[b] = float(rng.uniform(0.05, 0.4))
+                rows.append(row)
+            # S1 rows
+            for i in range(15):
+                vh_lin = float(rng.uniform(0.001, 0.05))
+                vv_lin = float(rng.uniform(0.001, 0.05))
+                row = {"point_id": pid, "year": year,
+                       "date": f"{year}-0{(i % 9) + 1}-15", "doy": i * 12 + 3,
+                       "source": "S1", "scl_purity": None, "vh": vh_lin, "vv": vv_lin}
+                for b in BAND_COLS:
+                    row[b] = None
+                rows.append(row)
+
+    df = pl.DataFrame(rows)
+    result = _compute_band_summaries(df, ["B08", "NDVI"], s1_feature_cols=s1_cols).sort(["point_id", "year"])
+
+    # Score-side: filter S1 rows, run prepare_s1_frame, then the same kernel.
+    from tam.core.dataset import prepare_s1_frame
+    s1_df = (df.lazy().filter(pl.col("source") == "S1")
+             .sort(["point_id", "year", "date"]).collect())
+    s1_df = prepare_s1_frame(s1_df)
+    s1_pid_arr  = s1_df["point_id"].to_numpy()
+    s1_year_arr = s1_df["year"].to_numpy().astype(np.int32)
+    s1_bounds, s1_ends = detect_pixel_year_windows(s1_pid_arr, s1_year_arr)
+    s1_feat = np.ascontiguousarray(
+        np.stack([s1_df[c].cast(pl.Float32).to_numpy() for c in s1_cols], axis=1)
+    )
+    s1_out = np.empty((len(s1_bounds), len(s1_cols) * 3), dtype=np.float32)
+    compute_band_summaries(s1_feat, s1_bounds, s1_ends, s1_out)
+
+    for i, c in enumerate(s1_cols):
+        for j, sfx in enumerate(("_p5", "_p95", "_std")):
+            col = f"{c}{sfx}"
+            np.testing.assert_array_equal(
+                result[col].to_numpy(), s1_out[:, i * 3 + j],
+                err_msg=f"bit-identical mismatch in S1 column '{col}'"
+            )

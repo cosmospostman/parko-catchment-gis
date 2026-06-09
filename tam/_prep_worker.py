@@ -73,11 +73,9 @@ def main(work_dir: Path, out_dir: Path, experiment: str) -> None:
     from tam.core.config import TAMConfig
     from tam.core.constants import DRY_DOY_MIN as _DRY_DOY_MIN, DRY_DOY_MAX as _DRY_DOY_MAX
     from tam.core.dataset import BAND_COLS, S1_FEATURE_COLS, V9_FEATURE_COLS, lin_to_db
-    from tam.core.annual_features import ANNUAL_FEATURE_NAMES
     from tam.core.train import (
         _apply_presence_filter,
         _compute_band_summaries,
-        _load_or_compute_annual_features,
         _site_class,
         region_holdout_split,
         site_holdout_split,
@@ -199,7 +197,7 @@ def main(work_dir: Path, out_dir: Path, experiment: str) -> None:
     annual_feat_df: pl.DataFrame | None = None
     _annual_scan_cols = [c for c in ("point_id", "date", "B08", "B04", "vh", "vv", "source")
                          if c in _cache_schema]
-    if cfg.use_band_summaries:
+    if cfg.n_annual_features != 0:
         if band_summaries is not None:
             annual_feat_df = band_summaries
             logger.info("Using precomputed band summaries: %d pixels, %d features",
@@ -212,16 +210,6 @@ def main(work_dir: Path, out_dir: Path, experiment: str) -> None:
             annual_feat_df = _compute_band_summaries(_slim_df, V9_FEATURE_COLS)
             del _slim_df
             gc.collect()
-    elif cfg.n_annual_features > 0:
-        _slim_df = (
-            pl.scan_parquet(str(_cache_path))
-            .select(_annual_scan_cols)
-            .collect()
-        )
-        logger.info("Annual features slim scan: %d rows  RSS=%.1f GB", len(_slim_df), _rss_gb())
-        annual_feat_df = _load_or_compute_annual_features(_slim_df, out_dir, ANNUAL_FEATURE_NAMES)
-        del _slim_df
-        gc.collect()
     _log_rss("after annual features")
 
     # --- Broadcast pixel labels → pixel-year labels via scan -----------------
@@ -316,12 +304,6 @@ def main(work_dir: Path, out_dir: Path, experiment: str) -> None:
     # --- Final PID sets -------------------------------------------------------
     train_pids_ds = set(k[0] for k in train_py_labels)
     val_pids_ds   = set(k[0] for k in val_py_labels)
-
-    # Slice annual features
-    if annual_feat_df is not None and not cfg.use_band_summaries:
-        annual_feat_df = annual_feat_df.select(
-            ["point_id"] + annual_feat_df.columns[1:cfg.n_annual_features + 1]
-        )
 
     # --- Build lazy scan with all column/row transforms applied --------------
     # SCL=6 rows are dropped; scl column is dropped after; S1 dropped if unused.

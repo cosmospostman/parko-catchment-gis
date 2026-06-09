@@ -140,7 +140,6 @@ def run_one(run: dict, out_dir: Path, pixel_df, pixel_coords, labels, device) ->
         val_region_ids=tuple(
             importlib.import_module("tam.experiments.v10").EXPERIMENT.val_region_ids
         ),
-        use_band_summaries=True,
         feature_cols_override=tuple(V10_FEATURE_COLS),
         s1_feature_cols=tuple(V10_S1_FEATURE_COLS),
     )

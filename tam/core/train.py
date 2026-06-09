@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import gc
-import hashlib
 import json
 import logging
 import multiprocessing
@@ -25,7 +24,6 @@ from torch.utils.data import DataLoader
 from tam.core.config import TAMConfig
 from tam.core.constants import DRY_DOY_MIN as _DRY_DOY_MIN, DRY_DOY_MAX as _DRY_DOY_MAX
 from tam.core.dataset import BAND_COLS, MAX_SEQ_LEN, S1_FEATURE_COLS, TAMDataset, V9_FEATURE_COLS, collate_fn, lin_to_db, ForcedGateDataset, GateAugDataset
-from tam.core.annual_features import ANNUAL_FEATURE_NAMES, compute_annual_features
 from tam.core.model import TAMClassifier
 
 logger = logging.getLogger(__name__)
@@ -119,12 +117,19 @@ def site_holdout_split(
 # Training
 # ---------------------------------------------------------------------------
 
-def _compute_band_summaries(pixel_df: pl.DataFrame, feature_cols: list[str]) -> pl.DataFrame:
+def _compute_band_summaries(
+    pixel_df: pl.DataFrame,
+    feature_cols: list[str],
+    s1_feature_cols: list[str] | None = None,
+) -> pl.DataFrame:
     """Per-(pixel, year) [p5, p95, std] for each feature column, computed from S2 rows.
 
     Returns a DataFrame with columns point_id, year, <col>_p5, <col>_p95, <col>_std
     for each col in feature_cols — one row per (point_id, year) observed in pixel_df.
-    Used as annual features when cfg.use_band_summaries=True.
+    When s1_feature_cols is provided and pixel_df contains S1 rows, the same
+    [p5, p95, std] statistics are also computed for those S1 columns and appended
+    after the S2 columns, giving the model absolute-magnitude context for SAR
+    backscatter (which is otherwise stripped by per-pixel z-scoring).
 
     Grouping by (point_id, year) — rather than point_id alone — is essential: at
     inference, `score` computes these same [p5, p95, std] statistics per pixel-year
@@ -183,41 +188,42 @@ def _compute_band_summaries(pixel_df: pl.DataFrame, feature_cols: list[str]) -> 
         data[f"{c}_p5"]  = out[:, i * 3]
         data[f"{c}_p95"] = out[:, i * 3 + 1]
         data[f"{c}_std"] = out[:, i * 3 + 2]
+
+    # S1 band summaries — same kernel, S1 rows only.
+    if s1_feature_cols and "source" in pixel_df.columns and "vh" in pixel_df.columns:
+        from tam.core.dataset import prepare_s1_frame
+        s1_df = (
+            pixel_df.lazy()
+            .filter(pl.col("source") == "S1")
+            .sort(["point_id", "year", "date"])
+            .collect()
+        )
+        if not s1_df.is_empty():
+            s1_df = prepare_s1_frame(s1_df)
+            s1_pid_arr  = s1_df["point_id"].to_numpy()
+            s1_year_arr = s1_df["year"].to_numpy().astype(np.int32)
+            s1_bounds, s1_ends = detect_pixel_year_windows(s1_pid_arr, s1_year_arr)
+            avail_s1_cols = [c for c in s1_feature_cols if c in s1_df.columns]
+            s1_feat = np.ascontiguousarray(
+                np.stack([s1_df[c].cast(pl.Float32).to_numpy() for c in avail_s1_cols], axis=1)
+            )
+            s1_out = np.empty((len(s1_bounds), len(avail_s1_cols) * 3), dtype=np.float32)
+            compute_band_summaries(s1_feat, s1_bounds, s1_ends, s1_out)
+            # Join S1 summaries onto S2 summary rows by (point_id, year).
+            s1_sum_df = pl.DataFrame(
+                {"point_id": s1_pid_arr[s1_bounds], "year": s1_year_arr[s1_bounds].astype(np.int64)}
+                | {f"{c}{sfx}": s1_out[:, i * 3 + j]
+                   for i, c in enumerate(avail_s1_cols)
+                   for j, sfx in enumerate(("_p5", "_p95", "_std"))}
+            )
+            result_df = pl.DataFrame(data)
+            result_df = result_df.join(s1_sum_df, on=["point_id", "year"], how="left")
+            s1_sum_cols = [f"{c}{sfx}" for c in avail_s1_cols for sfx in ("_p5", "_p95", "_std")]
+            ordered = ["point_id", "year"] + [f"{c}{s}" for c in cols for s in ("_p5", "_p95", "_std")] + s1_sum_cols
+            return result_df.select(ordered)
+
     ordered = ["point_id", "year"] + [f"{c}{s}" for c in cols for s in ("_p5", "_p95", "_std")]
     return pl.DataFrame(data).select(ordered)
-
-
-def _annual_features_cache_key(pixel_df: pl.DataFrame) -> str:
-    """Stable hash of the inputs to compute_annual_features."""
-    cols = [c for c in ("point_id", "year", "date", "B08", "B04", "vh", "vv", "source")
-            if c in pixel_df.columns]
-    key_df = pixel_df.select(cols).sort(cols)
-    return hashlib.md5(key_df.write_csv().encode()).hexdigest()
-
-
-def _load_or_compute_annual_features(
-    pixel_df: pl.DataFrame,
-    out_dir: Path,
-    feature_names: list[str],
-) -> pl.DataFrame:
-    cache_path = out_dir / "annual_features_cache.parquet"
-    key_path   = out_dir / "annual_features_cache.key"
-    cache_key  = _annual_features_cache_key(pixel_df)
-
-    if cache_path.exists() and key_path.exists() and key_path.read_text().strip() == cache_key:
-        logger.info("Loading cached annual features from %s", cache_path)
-        return pl.read_parquet(cache_path)
-
-    logger.info("Computing annual features: %s", feature_names)
-    annual_feat_df = compute_annual_features(pixel_df)
-    logger.info(
-        "Annual feature means — %s",
-        "  ".join(f"{k}={annual_feat_df[k].mean():.4f}" for k in feature_names),
-    )
-    annual_feat_df.write_parquet(cache_path)
-    key_path.write_text(cache_key)
-    logger.info("Cached annual features to %s", cache_path)
-    return annual_feat_df
 
 
 def _site_class(pid: str) -> tuple[str, str]:
@@ -773,17 +779,16 @@ def train_tam(
         _presence_filter_s2_slim: pl.DataFrame | None = None
         _has_source = "source" in pixel_df.columns
 
-        if cfg.use_band_summaries:
+        if cfg.n_annual_features != 0:
             if precomputed_band_summaries is not None:
                 annual_feat_df = precomputed_band_summaries
                 logger.info("Using precomputed band summaries: %d pixels, %d features", len(annual_feat_df), annual_feat_df.width - 1)
             else:
                 _s2_n = int((pixel_df["source"] == "S2").sum()) if _has_source else len(pixel_df)
                 logger.info("Computing band summaries (%d rows) ...", _s2_n)
-                annual_feat_df = _compute_band_summaries(pixel_df, V9_FEATURE_COLS)
+                _s1_cols_for_summary = list(cfg.s1_feature_cols) if cfg.use_s1 in (True, "mixed") else None
+                annual_feat_df = _compute_band_summaries(pixel_df, V9_FEATURE_COLS, s1_feature_cols=_s1_cols_for_summary)
                 logger.info("Band summaries computed: %d pixels, %d features", len(annual_feat_df), annual_feat_df.width - 1)
-        elif cfg.n_annual_features > 0:
-            annual_feat_df = _load_or_compute_annual_features(pixel_df, out_dir, ANNUAL_FEATURE_NAMES)
         _log_rss("after band summaries")
 
         if (cfg.presence_min_vh_dry_db > -99 and _has_source and "vh" in pixel_df.columns):
@@ -1047,12 +1052,6 @@ def train_tam(
         lines.append(row("TOTAL", total_px, total_raw, total_noise, total_stride_n, total_final))
         lines.append(sep)
         logger.info("Pixel summary (stride=%d):\n%s", cfg.spatial_stride, "\n".join(lines))
-
-        # Slice annual features to exactly the columns the model head expects.
-        if annual_feat_df is not None and not cfg.use_band_summaries:
-            annual_feat_df = annual_feat_df.select(
-                ["point_id"] + annual_feat_df.columns[1:cfg.n_annual_features + 1]
-            )
 
         # Slice pixel_df into train/val and free the original.
         if "source" in pixel_df.columns and cfg.use_s1 not in (True, "mixed", "s1_only"):
@@ -1327,7 +1326,7 @@ def train_tam(
         pos_weight = torch.tensor([n_neg / n_pos], dtype=torch.float32).to(device) if n_pos > 0 and n_neg > 0 else None
     
         # --- Model + optimiser --------------------------------------------------
-        if cfg.use_band_summaries and annual_feat_df is not None:
+        if annual_feat_df is not None and cfg.n_annual_features == -1:
             cfg.n_annual_features = annual_feat_df.width - 1  # exclude point_id column
         del annual_feat_df
         gc.collect()

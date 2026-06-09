@@ -18,6 +18,7 @@
   let timeseriesData = $state<PixelTimeseries[] | null>(null);
   let timeseriesLoading = $state(false);
   let selectedYear = $state<number | null>(null);
+  const timeseriesCache = new Map<number, PixelTimeseries>();
 
   $effect(() => {
     mapMode.current = 'bbox';
@@ -31,8 +32,10 @@
       coverageTiles = {};
       inspecting = false;
       timeseriesData = null;
+      timeseriesCache.clear();
       return;
     }
+    timeseriesCache.clear();
     fetchChunkCoverage(coords).then(cov => {
       coverageYears = cov.years;
       coverageTiles = cov.tiles;
@@ -46,12 +49,18 @@
       if (!inspecting) timeseriesData = null;
       return;
     }
+    const cached = timeseriesCache.get(selectedYear);
+    if (cached) {
+      timeseriesData = [cached];
+      return;
+    }
     timeseriesLoading = true;
     timeseriesData = null;
     const tiles = coverageTiles[selectedYear] ?? [];
     const tile = tiles[0];
     if (!tile) { timeseriesLoading = false; return; }
     fetchPixelTimeseries(coords, selectedYear, tile).then(result => {
+      if (result !== null) timeseriesCache.set(selectedYear!, result);
       timeseriesData = result !== null ? [result] : [];
       timeseriesLoading = false;
     });
@@ -83,6 +92,7 @@
     coverageYears = null;
     coverageTiles = {};
     selectedYear = null;
+    timeseriesCache.clear();
   }
 </script>
 

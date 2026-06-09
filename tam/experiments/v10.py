@@ -123,7 +123,7 @@ EXPERIMENT = Experiment(
         "n_layers": 3,
         "dropout":  0.5,
         "n_bands":  len(V10_FEATURE_COLS) + len(V10_S1_FEATURE_COLS),  # 18
-        "n_annual_features": 0,            # overridden at runtime by use_band_summaries
+        "n_annual_features": -1,           # auto: set from band summaries width at training time
     },
     train_kwargs={
         "lr":                    5e-5,
@@ -139,7 +139,6 @@ EXPERIMENT = Experiment(
         "doy_phase_shift":       False,
         "pixel_zscore":          True,
         "use_s1":                True,
-        "use_band_summaries":    True,
         "max_seq_len":           128,
         "feature_cols_override": tuple(V10_FEATURE_COLS),
         "s1_feature_cols":       tuple(V10_S1_FEATURE_COLS),  # s1_vh, s1_vv, s1_vh_vv, s1_rvi

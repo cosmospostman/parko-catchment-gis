@@ -221,14 +221,11 @@ def _cmd_train(args: argparse.Namespace) -> None:
 
         # Read tiles one at a time, filter and thin immediately — peak memory per
         # iteration is one raw tile, not the accumulation of all tiles.
-        # If band summaries are needed, compute them per tile here so we never need
-        # an S2-only copy of the full pixel_df later (avoids a ~25 GB transient spike).
-        _want_band_summaries = exp.train_kwargs.get("use_band_summaries", True)
-        _bs_feature_cols: list[str] | None = None
-        if _want_band_summaries:
-            from tam.core.train import _compute_band_summaries
-            from tam.core.dataset import V9_FEATURE_COLS as _V9_FEATURE_COLS
-            _bs_feature_cols = _V9_FEATURE_COLS
+        # Band summaries are computed per tile here so we never need an S2-only
+        # copy of the full pixel_df later (avoids a ~25 GB transient spike).
+        from tam.core.train import _compute_band_summaries
+        from tam.core.dataset import V9_FEATURE_COLS as _V9_FEATURE_COLS
+        _bs_feature_cols = _V9_FEATURE_COLS
 
         _zscore_feature_cols: list[str] | None = (
             list(exp.train_kwargs["feature_cols_override"]) if "feature_cols_override" in exp.train_kwargs
@@ -310,8 +307,7 @@ def _cmd_train(args: argparse.Namespace) -> None:
             logger.info("Loading tile %s (%d row groups) ...", path.name, n_rg)
             tile_df = _stride_tile(_filter_to_regions(_read_tile(path, cols, n_rg)), _load_stride)
             if len(tile_df) > 0:
-                if _want_band_summaries and _bs_feature_cols is not None:
-                    band_summary_dfs.append(_compute_band_summaries(tile_df, _bs_feature_cols))
+                band_summary_dfs.append(_compute_band_summaries(tile_df, _bs_feature_cols))
                 # Cast point_id to Categorical now so the accumulated tile_dfs use
                 # 4 bytes/row instead of ~29 bytes/row for the string column.
                 if "point_id" in tile_df.columns:
@@ -325,12 +321,10 @@ def _cmd_train(args: argparse.Namespace) -> None:
             logger.error("No training data found for experiment %s", exp.name)
             sys.exit(1)
 
-        band_summaries = None
-        if band_summary_dfs:
-            band_summaries = pl.concat(band_summary_dfs)
-            del band_summary_dfs
-            gc.collect()
-            logger.info("Band summaries precomputed per tile: %d pixel-years", len(band_summaries))
+        band_summaries = pl.concat(band_summary_dfs)
+        del band_summary_dfs
+        gc.collect()
+        logger.info("Band summaries precomputed per tile: %d pixel-years", len(band_summaries))
 
         pixel_df = pl.concat(tile_dfs)
         del tile_dfs

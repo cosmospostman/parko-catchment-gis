@@ -300,29 +300,6 @@ class TestTT10S2ColsLoadedForNoiseFilter:
                     })
         return pl.DataFrame(rows)
 
-    def test_s2_annual_features_not_nan_when_b08_b04_present(self):
-        from tam.core.annual_features import compute_annual_features
-
-        df = self._make_multiyear_df()
-        gf = compute_annual_features(df)
-
-        assert "dry_ndvi" in gf.columns
-        assert "rec_p" in gf.columns
-        assert "nir_cv" in gf.columns
-        assert gf["dry_ndvi"].is_not_null().any(), "dry_ndvi is all NaN — B08/B04 missing from pixel_df"
-        assert gf["rec_p"].is_not_null().any(),    "rec_p is all NaN — B08/B04 missing from pixel_df"
-        assert gf["nir_cv"].is_not_null().any(),   "nir_cv is all NaN — B08/B04 missing from pixel_df"
-
-    def test_s2_annual_features_all_nan_when_b08_b04_absent(self):
-        from tam.core.annual_features import compute_annual_features
-
-        df = self._make_multiyear_df().drop(["B08", "B04"])
-        gf = compute_annual_features(df)
-
-        assert gf["dry_ndvi"].is_null().all(), "dry_ndvi should be NaN when B08/B04 absent"
-        assert gf["rec_p"].is_null().all(),    "rec_p should be NaN when B08/B04 absent"
-        assert gf["nir_cv"].is_null().all(),   "nir_cv should be NaN when B08/B04 absent"
-
     def test_compute_band_summaries_groups_by_pixel_and_year(self):
         """_compute_band_summaries must produce one row per (point_id, year) —
         not one row per point_id — so that its scope matches what `score`

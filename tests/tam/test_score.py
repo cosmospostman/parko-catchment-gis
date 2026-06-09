@@ -975,12 +975,11 @@ def _stub_mixed_model_with_annual_features(
 ) -> tuple[TAMClassifier, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Mixed S2+S1 model stub with a non-trivial annual-feature head.
 
-    n_annual_features = n_s2 * 3 (p5/p95/std per S2 column), matching the real
-    "annual feature" convention (tam_config.json's feature_cols × 3 — see
-    score.py's compute_band_summaries call site). annual_feat_mean/std are set
-    to plausible reflectance-scale band-summary statistics (~0.01-0.5, std
-    ~0.01-0.1) — i.e. calibrated as if computed via ensure_float32_bands +
-    extract_features over reflectance-scale data, exactly like training does.
+    n_annual_features = (n_s2 + n_s1) * 3 (p5/p95/std per S2 column then per S1
+    column), matching the real "annual feature" convention — S2 summaries first,
+    then S1 summaries appended after (see score.py's compute_band_summaries call
+    site). annual_feat_mean/std are set to plausible reflectance-scale band-summary
+    statistics (~0.01-0.5, std ~0.01-0.1).
 
     This is the piece _stub_mixed_model lacks (n_annual_features=0): without it,
     a model can't exhibit the actual production failure mode, where ~10,000x
@@ -989,7 +988,7 @@ def _stub_mixed_model_with_annual_features(
     same extreme value.
     """
     n_bands = n_s2 + n_s1
-    n_annual = n_s2 * 3
+    n_annual = (n_s2 + n_s1) * 3
     cfg = TAMConfig(d_model=16, n_heads=2, n_layers=1, d_ff=32,
                     n_bands=n_bands, use_s1="mixed", n_annual_features=n_annual)
     torch.manual_seed(13)

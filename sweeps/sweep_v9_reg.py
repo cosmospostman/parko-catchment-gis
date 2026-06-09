@@ -170,7 +170,6 @@ def run_one(run: dict, out_dir: Path, pixel_df, pixel_coords, labels, device) ->
         val_region_ids=tuple(
             importlib.import_module("tam.experiments.v9_spectral").EXPERIMENT.val_region_ids
         ),
-        use_band_summaries=True,
         feature_cols_override=tuple(V9_FEATURE_COLS),
         max_seq_len=64,
     )

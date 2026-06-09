@@ -700,14 +700,17 @@ def _preprocess(
 
     # Compute per-window band summaries (p5/p95/std) from the assembled pixel data.
     # feat is still in raw (pre-z-score) units here, matching training convention.
-    # Only S2 columns are used; in mixed mode we build a compact S2-only view first.
+    # Only S2 columns are used for the S2 block; in mixed mode a compact S2-only
+    # view is built first. If S1 is also present, S1 summaries are appended after
+    # the S2 summaries so the model sees absolute SAR magnitude context (matching
+    # the s1_feature_cols passed to _compute_band_summaries at training time).
     # Each window is a (pixel, year) pair, so these are genuinely *annual* features —
     # matching the per-(point_id, year) statistics computed at training time.
     annual_feats_np: np.ndarray | None = None
     if n_annual_features > 0 and annual_feat_mean is not None and annual_feat_std is not None:
         n_sum_cols = n_s2 if mixed else n_feat
         if mixed and is_s1_np is not None:
-            # Build a compact array containing only S2 rows for the summary kernel.
+            # Build a compact array containing only S2 rows for the S2 summary kernel.
             s2_only_feat = feat[~is_s1_np, :n_sum_cols]
             # Per-window S2 row counts via cumsum — O(N) vs O(W*obs) Python loop.
             s2_cs = np.empty(len(is_s1_np) + 1, dtype=np.int64)
@@ -721,6 +724,21 @@ def _preprocess(
             s2_ends = s2_starts + s2_counts
             gf = np.empty((W, n_sum_cols * 3), dtype=np.float32)
             compute_band_summaries(s2_only_feat, s2_starts, s2_ends, gf)
+
+            # S1 band summaries — same kernel, S1 rows, last n_s1 columns of feat.
+            if n_s1 > 0:
+                s1_only_feat = feat[is_s1_np, n_s2:]
+                s1_cs = np.empty(len(is_s1_np) + 1, dtype=np.int64)
+                s1_cs[0] = 0
+                np.cumsum(is_s1_np, out=s1_cs[1:])
+                s1_counts = s1_cs[ends_v] - s1_cs[valid_starts]
+                s1_starts = np.empty(W, dtype=np.int64)
+                s1_starts[0] = 0
+                np.cumsum(s1_counts[:-1], out=s1_starts[1:])
+                s1_ends = s1_starts + s1_counts
+                gf_s1 = np.empty((W, n_s1 * 3), dtype=np.float32)
+                compute_band_summaries(s1_only_feat, s1_starts, s1_ends, gf_s1)
+                gf = np.concatenate([gf, gf_s1], axis=1)
         else:
             gf = np.empty((W, n_sum_cols * 3), dtype=np.float32)
             compute_band_summaries(feat[:, :n_sum_cols], valid_starts, ends[valid], gf)

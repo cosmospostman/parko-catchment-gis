@@ -3,7 +3,6 @@
 Usage
 -----
     python sweeps/train_one.py --out outputs/train-lr5e5 --lr 5e-5
-    python sweeps/train_one.py --out outputs/train-lr5e5 --lr 5e-5 --no-summaries
 """
 from __future__ import annotations
 
@@ -27,7 +26,6 @@ def main() -> None:
     ap.add_argument("--dropout", type=float, default=0.5)
     ap.add_argument("--weight-decay", type=float, default=0.1)
     ap.add_argument("--obs-dropout-min", type=int, default=15)
-    ap.add_argument("--no-summaries", action="store_true")
     ap.add_argument("--device", default=None)
     args = ap.parse_args()
 
@@ -86,12 +84,10 @@ def main() -> None:
         for row in labelled.iter_rows(named=True)
     }
 
-    use_band_summaries = not args.no_summaries
     log.info(
-        "lr=%.0e  d_model=%d  n_layers=%d  dropout=%.1f  wd=%.1f  "
-        "obs_dropout_min=%d  use_band_summaries=%s",
+        "lr=%.0e  d_model=%d  n_layers=%d  dropout=%.1f  wd=%.1f  obs_dropout_min=%d",
         args.lr, args.d_model, args.n_layers, args.dropout, args.weight_decay,
-        args.obs_dropout_min, use_band_summaries,
+        args.obs_dropout_min,
     )
 
     cfg = TAMConfig(
@@ -114,7 +110,6 @@ def main() -> None:
         dropout=args.dropout,
         weight_decay=args.weight_decay,
         obs_dropout_min=args.obs_dropout_min,
-        use_band_summaries=use_band_summaries,
     )
 
     _, best_val_auc = train_tam(
