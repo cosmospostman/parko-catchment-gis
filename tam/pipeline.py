@@ -153,6 +153,10 @@ def _cmd_train(args: argparse.Namespace) -> None:
 
     _want_pixel_zscore = exp.train_kwargs.get("pixel_zscore", False)
     _load_stride = args.spatial_stride or exp.train_kwargs.get("spatial_stride", 1) or 1
+    _bs_s1_cols: list[str] | None = (
+        list(exp.train_kwargs["s1_feature_cols"]) if "s1_feature_cols" in exp.train_kwargs
+        else None
+    ) if _want_s1_data else None
 
     # --- Cache check: skip tile loading if pixel_df_cache is up to date ------
     _cache_parquet = cache_dir / "pixel_df_cache.parquet"
@@ -169,12 +173,11 @@ def _cmd_train(args: argparse.Namespace) -> None:
 
     if _cache_hit:
         logger.info("pixel_df cache hit — skipping tile load (key=%s)", _cache_key[:12])
-        # Load supporting files written alongside the cache.
-        band_summaries: pl.DataFrame | None = None
-        _bs_cache = cache_dir / "pixel_df_band_summaries.parquet"
-        if _bs_cache.exists():
-            band_summaries = pl.from_arrow(pq.read_table(_bs_cache))
-            logger.info("Band summaries from cache: %d pixels", len(band_summaries))
+        from tam.core.train import _compute_band_summaries as _cbs
+        _cached_pixel_df = pl.from_arrow(pq.read_table(_cache_parquet))
+        logger.info("Computing band summaries from pixel cache (%d rows) ...", len(_cached_pixel_df))
+        band_summaries: pl.DataFrame | None = _cbs(_cached_pixel_df, list(exp.feature_cols), s1_feature_cols=_bs_s1_cols)
+        del _cached_pixel_df
     else:
         def _read_tile(path: Path, cols: list[str], n_rg: int) -> pl.DataFrame:
             """Read all row groups of one tile with bounded parallelism."""
@@ -224,8 +227,7 @@ def _cmd_train(args: argparse.Namespace) -> None:
         # Band summaries are computed per tile here so we never need an S2-only
         # copy of the full pixel_df later (avoids a ~25 GB transient spike).
         from tam.core.train import _compute_band_summaries
-        from tam.core.dataset import V9_FEATURE_COLS as _V9_FEATURE_COLS
-        _bs_feature_cols = _V9_FEATURE_COLS
+        _bs_feature_cols = list(exp.feature_cols)
 
         _zscore_feature_cols: list[str] | None = (
             list(exp.train_kwargs["feature_cols_override"]) if "feature_cols_override" in exp.train_kwargs
@@ -307,7 +309,7 @@ def _cmd_train(args: argparse.Namespace) -> None:
             logger.info("Loading tile %s (%d row groups) ...", path.name, n_rg)
             tile_df = _stride_tile(_filter_to_regions(_read_tile(path, cols, n_rg)), _load_stride)
             if len(tile_df) > 0:
-                band_summary_dfs.append(_compute_band_summaries(tile_df, _bs_feature_cols))
+                band_summary_dfs.append(_compute_band_summaries(tile_df, _bs_feature_cols, s1_feature_cols=_bs_s1_cols))
                 # Cast point_id to Categorical now so the accumulated tile_dfs use
                 # 4 bytes/row instead of ~29 bytes/row for the string column.
                 if "point_id" in tile_df.columns:
@@ -403,8 +405,6 @@ def _cmd_train(args: argparse.Namespace) -> None:
         logger.info("Cache key written: %s", _cache_key[:12])
 
         pixel_coords.write_parquet(cache_dir / "pixel_df_pixel_coords.parquet")
-        if band_summaries is not None:
-            band_summaries.write_parquet(cache_dir / "pixel_df_band_summaries.parquet")
         with open(cache_dir / "pixel_df_labels.json", "w") as _fh:
             json.dump(labels, _fh)
 
@@ -515,6 +515,75 @@ def _cmd_train(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 # score subcommand
 # ---------------------------------------------------------------------------
+
+def _point_ids_from_grid(tile_id: str, loc_geom) -> tuple[str, set[str], bool]:
+    """Reconstruct point_ids for tile_id from first principles without make_pixel_grid.
+
+    Mirrors the fetch pipeline (same snapped 10 m UTM grid) but works entirely
+    in numpy.  Projects the location geometry to UTM once (cheap) instead of
+    reprojecting 74M pixel coordinates to WGS84.  When the geometry covers most
+    of the tile, builds an exclusion set (smaller) and sets is_exclude=True so
+    the caller can pass it to ChunkPixelSource(exclude_point_ids=...).
+
+    Returns (tile_id, pid_set, is_exclude).
+    """
+    import polars as _pl
+    from pyproj import Transformer as _Transformer
+    from shapely import contains_xy as _contains_xy, prepare as _prepare
+    from shapely.ops import transform as _shp_transform
+    from utils.location import _tile_polygon
+    from utils.pixel_collector import _utm_crs_for_bbox
+    import numpy as _np
+
+    tile_poly = _tile_polygon(tile_id)
+    fetch_geom = tile_poly.intersection(loc_geom) if tile_poly is not None else loc_geom
+    if fetch_geom.is_empty:
+        return tile_id, set(), False
+
+    bbox = list(fetch_geom.bounds)
+    lon_min, lat_min, lon_max, lat_max = bbox
+    r = 10.0
+    utm_crs = _utm_crs_for_bbox(bbox)
+    to_utm = _Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
+
+    x0, y0 = to_utm.transform(lon_min, lat_min)
+    x1, y1 = to_utm.transform(lon_max, lat_max)
+    xs = _np.arange(_np.floor(x0 / r) * r, x1, r)
+    ys = _np.arange(_np.floor(y0 / r) * r, y1, r)
+
+    # Project geometry to UTM once instead of reprojecting 74M grid points.
+    loc_geom_utm = _shp_transform(to_utm.transform, loc_geom)
+    _prepare(loc_geom_utm)
+
+    xx, yy = _np.meshgrid(xs, ys, indexing="ij")
+    mask = _contains_xy(loc_geom_utm, xx.ravel(), yy.ravel())
+
+    ii, jj = _np.meshgrid(
+        _np.arange(len(xs), dtype=_np.int32),
+        _np.arange(len(ys), dtype=_np.int32),
+        indexing="ij",
+    )
+    ii_flat, jj_flat = ii.ravel(), jj.ravel()
+
+    n_keep = int(mask.sum())
+    use_exclude = n_keep > len(mask) // 2
+
+    sel_mask = ~mask if use_exclude else mask
+    ii_sel, jj_sel = ii_flat[sel_mask], jj_flat[sel_mask]
+
+    df = _pl.DataFrame({"i": ii_sel, "j": jj_sel})
+    pid_set = set(
+        df.select(
+            _pl.concat_str([
+                _pl.lit("px_"),
+                _pl.col("i").cast(_pl.String).str.pad_start(4, "0"),
+                _pl.lit("_"),
+                _pl.col("j").cast(_pl.String).str.pad_start(4, "0"),
+            ]).alias("pid")
+        )["pid"].to_list()
+    )
+    return tile_id, pid_set, use_exclude
+
 
 def _cmd_score(args: argparse.Namespace) -> None:
     """Score a location using an existing checkpoint."""
@@ -654,32 +723,8 @@ def _cmd_score(args: argparse.Namespace) -> None:
         # Chunk files are grouped by tile_id and wrapped in ChunkPixelSource (row-major order).
         tile_year_map: dict[str, list[tuple[int, PixelSource | Path]]] = {}
         _loc_geom = loc.geometry  # None for bbox-only locations
-        # Cache of point_id sets per tile (same geometry applies across all years).
-        _tile_point_ids: dict[str, set[str] | None] = {}
-
-        def _point_ids_from_grid(tile_id: str, loc_geom) -> set[str]:
-            """Reconstruct point_ids inside loc_geom for tile_id from first principles.
-
-            Mirrors the fetch pipeline exactly: intersect the tile polygon with the
-            location geometry, derive bbox from that intersection, regenerate the 10 m
-            pixel grid, then filter by geometry — no parquet read required.
-            """
-            from shapely import contains_xy as _contains_xy
-            from utils.location import _tile_polygon
-            from utils.pixel_collector import make_pixel_grid
-            import numpy as _np
-
-            tile_poly = _tile_polygon(tile_id)
-            fetch_geom = tile_poly.intersection(loc_geom) if tile_poly is not None else loc_geom
-            if fetch_geom.is_empty:
-                return set()
-            bbox = list(fetch_geom.bounds)
-            points = make_pixel_grid(bbox)
-            pids   = [p for p, _, _ in points]
-            lons   = _np.array([lo for _, lo, _ in points])
-            lats   = _np.array([la for _, _, la in points])
-            mask   = _contains_xy(loc_geom, lons, lats)
-            return {pid for pid, m in zip(pids, mask) if m}
+        # Cache: tile_id → (pid_set, is_exclude) or None when no geometry filter.
+        _tile_point_ids: dict[str, tuple[set[str], bool] | None] = {}
 
         _tile_id_filter = set(getattr(args, "tile_id", None) or [])
         for y, paths in sorted(tile_paths_by_year.items()):
@@ -694,15 +739,28 @@ def _cmd_score(args: argparse.Namespace) -> None:
                 non_chunk   = [p for p in tile_paths if not _CHUNK_PAT.search(p.stem)]
                 if chunk_files:
                     chunk_files.sort(key=lambda p: _chunk_key_stem(p.stem))
-                    # Compute point_id mask once per tile (geometry is year-independent).
                     if tid not in _tile_point_ids:
                         if _loc_geom is not None:
                             logger.info("Computing point_id mask for tile %s ...", tid)
-                            _tile_point_ids[tid] = _point_ids_from_grid(tid, _loc_geom)
-                            logger.info("  → %d pixels inside geometry", len(_tile_point_ids[tid]))
+                            _, pid_set, is_excl = _point_ids_from_grid(tid, _loc_geom)
+                            logger.info(
+                                "  → %d pixels %s geometry",
+                                len(pid_set),
+                                "excluded from" if is_excl else "inside",
+                            )
+                            _tile_point_ids[tid] = (pid_set, is_excl)
                         else:
                             _tile_point_ids[tid] = None
-                    source: PixelSource | Path = ChunkPixelSource(chunk_files, point_ids=_tile_point_ids[tid])
+                    cached = _tile_point_ids[tid]
+                    if cached is None:
+                        source: PixelSource | Path = ChunkPixelSource(chunk_files)
+                    else:
+                        pid_set, is_excl = cached
+                        source = ChunkPixelSource(
+                            chunk_files,
+                            exclude_point_ids=pid_set if is_excl else None,
+                            point_ids=pid_set if not is_excl else None,
+                        )
                 else:
                     source = non_chunk[0]
                 tile_year_map.setdefault(tid, []).append((y, source))

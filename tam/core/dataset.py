@@ -33,7 +33,7 @@ S1_FEATURE_COLS: list[str] = ["s1_vh", "s1_vv", "s1_vh_vv", "s1_rvi"]
 # MAVI, NDRE, CI_RE added after signal eval (2026-05-19): all cleared AUROC >= 0.75
 # at sparse_stress tier (CI_RE=0.816, MAVI=0.794, NDRE=0.780).
 V9_FEATURE_COLS: list[str] = [
-    "B02", "B03", "B04", "B05", "B07", "B08", "B8A", "B11", "B12",
+    "B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12",
     "NDVI", "NDWI", "MAVI", "NDRE", "CI_RE",
 ]
 
@@ -41,7 +41,7 @@ V9_FEATURE_COLS: list[str] = [
 # vh_vv ratio and RVI are derived; VH+VV alone until their discriminative
 # value is confirmed in sweep.
 V10_FEATURE_COLS: list[str] = [
-    "B02", "B03", "B04", "B05", "B07", "B08", "B8A", "B11", "B12",
+    "B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12",
     "NDVI", "NDWI", "MAVI", "NDRE", "CI_RE",
 ]
 V10_S1_FEATURE_COLS: list[str] = ["s1_vh", "s1_vv"]

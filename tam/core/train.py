@@ -169,7 +169,11 @@ def _compute_band_summaries(
                             schema={"point_id": pl.Utf8, "year": pl.Int64,
                                     **{c: pl.Float32 for c in ordered[2:]}})
 
-    band_arrs = [s2_df[b].cast(pl.Float32).to_numpy() for b in BAND_COLS]
+    band_arrs = [
+        s2_df[b].cast(pl.Float32).to_numpy() if b in s2_df.columns
+        else np.full(len(s2_df), np.nan, dtype=np.float32)
+        for b in BAND_COLS
+    ]
     feat = np.empty((len(s2_df), len(ALL_FEATURE_COLS)), dtype=np.float32)
     extract_features(*band_arrs, feat)
 

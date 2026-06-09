@@ -128,17 +128,33 @@ class ChunkPixelSource(PixelSource):
     paths:
         Chunk parquet paths in row-major order.
     point_ids:
-        Optional set of point_id strings to keep.  When supplied, rows whose
-        point_id is not in the set are dropped at read time.  Use this to mask
-        a full-tile pixel store to a location geometry without re-fetching.
+        Optional set of point_id strings to keep.  Rows whose point_id is not
+        in the set are dropped at read time.
+    exclude_point_ids:
+        Alternative to point_ids: set of point_ids to *drop*.  Use when the
+        exclusion set is smaller than the inclusion set (e.g. geometry covers
+        most of the tile).  Mutually exclusive with point_ids.
     """
-    def __init__(self, paths: list[Path], point_ids: "set[str] | None" = None):
+    def __init__(
+        self,
+        paths: list[Path],
+        point_ids: "set[str] | None" = None,
+        exclude_point_ids: "set[str] | None" = None,
+    ):
+        if point_ids is not None and exclude_point_ids is not None:
+            raise ValueError("point_ids and exclude_point_ids are mutually exclusive")
         self._paths = paths
         self._pfs = [pq.ParquetFile(p) for p in paths]
         self._offsets: list[int] = []  # cumulative row-group offsets
         self._point_ids = point_ids
-        self._pid_contains = (np.frompyfunc(point_ids.__contains__, 1, 1)
-                              if point_ids is not None else None)
+        self._exclude_point_ids = exclude_point_ids
+        if point_ids is not None:
+            self._pid_contains = np.frompyfunc(point_ids.__contains__, 1, 1)
+        elif exclude_point_ids is not None:
+            _excl = exclude_point_ids
+            self._pid_contains = np.frompyfunc(lambda p: p not in _excl, 1, 1)
+        else:
+            self._pid_contains = None
         total = 0
         for pf in self._pfs:
             self._offsets.append(total)
@@ -173,6 +189,9 @@ class ChunkPixelSource(PixelSource):
         if not hasattr(self, "_num_pixels_cache"):
             if self._point_ids is not None:
                 self._num_pixels_cache = len(self._point_ids)
+            elif self._exclude_point_ids is not None:
+                total = _count_distinct_pixels(self._paths)
+                self._num_pixels_cache = total - len(self._exclude_point_ids)
             else:
                 self._num_pixels_cache = _count_distinct_pixels(self._paths)
         return self._num_pixels_cache

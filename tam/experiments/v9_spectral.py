@@ -1,8 +1,8 @@
 """v9_spectral — S2-only TAM, v8_roper site set + Frenchs.
 
 S2-only leg of the three-way comparison (S2-only / S1-only / joint S1+S2).
-Feature set: B02 B03 B04 B05 B07 B08 B8A B11 B12 + NDVI + NDWI + MAVI + NDRE + CI_RE (14 bands).
-B06 and EVI excluded. Pixel z-score normalisation identical to V8.
+Feature set: B02 B03 B04 B05 B06 B07 B08 B8A B11 B12 + NDVI + NDWI + MAVI + NDRE + CI_RE (15 bands).
+EVI excluded. Pixel z-score normalisation identical to V8.
 Frenchs added to address bare-soil confusion and restore monsoonal site diversity.
 """
 

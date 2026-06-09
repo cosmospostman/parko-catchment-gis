@@ -1,8 +1,8 @@
 """v10 — joint S1+S2 TAM, identical site set to v9_spectral.
 
 S1+S2 joint leg of the three-way comparison (S2-only / S1-only / joint S1+S2).
-Feature set: B02 B03 B04 B05 B07 B08 B8A B11 B12 + NDVI + NDWI + MAVI + NDRE + CI_RE (14 S2)
-             + s1_vh + s1_vv + s1_vh_vv + s1_rvi (4 S1) = 18 bands total.
+Feature set: B02 B03 B04 B05 B06 B07 B08 B8A B11 B12 + NDVI + NDWI + MAVI + NDRE + CI_RE (15 S2)
+             + s1_vh + s1_vv + s1_vh_vv + s1_rvi (4 S1) = 19 bands total.
 """
 
 from tam.core.dataset import V10_FEATURE_COLS
