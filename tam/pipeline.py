@@ -147,7 +147,7 @@ def _cmd_train(args: argparse.Namespace) -> None:
                 s1_cols.append(_c)
         # B08/B04 needed by compute_annual_features even in S1-only experiments.
         s2_annual_cols = [c for c in ("B08", "B04") if c in available and c not in exp.feature_cols]
-        base_cols = ["point_id", "lon", "lat", "date", "scl_purity"]
+        base_cols = [c for c in ["point_id", "lon", "lat", "date", "year", "doy", "scl_purity"] if c in available]
         read_cols = base_cols + [c for c in exp.feature_cols if c in available] + s1_cols + s2_annual_cols
         tile_specs.append((path, read_cols, pf.metadata.num_row_groups))
 
@@ -171,13 +171,15 @@ def _cmd_train(args: argparse.Namespace) -> None:
         and _cache_key_path.read_text().strip() == _cache_key
     )
 
+    _bs_cache = cache_dir / "pixel_df_band_summaries.parquet"
+    if _cache_hit and not _bs_cache.exists():
+        logger.info("Band summaries cache missing — invalidating pixel_df cache to recompute per-tile")
+        _cache_hit = False
+
     if _cache_hit:
         logger.info("pixel_df cache hit — skipping tile load (key=%s)", _cache_key[:12])
-        from tam.core.train import _compute_band_summaries as _cbs
-        _cached_pixel_df = pl.from_arrow(pq.read_table(_cache_parquet))
-        logger.info("Computing band summaries from pixel cache (%d rows) ...", len(_cached_pixel_df))
-        band_summaries: pl.DataFrame | None = _cbs(_cached_pixel_df, list(exp.feature_cols), s1_feature_cols=_bs_s1_cols)
-        del _cached_pixel_df
+        band_summaries: pl.DataFrame | None = pl.from_arrow(pq.read_table(_bs_cache))
+        logger.info("Band summaries cache hit: %d pixel-years", len(band_summaries))
     else:
         def _read_tile(path: Path, cols: list[str], n_rg: int) -> pl.DataFrame:
             """Read all row groups of one tile with bounded parallelism."""
@@ -407,6 +409,9 @@ def _cmd_train(args: argparse.Namespace) -> None:
         pixel_coords.write_parquet(cache_dir / "pixel_df_pixel_coords.parquet")
         with open(cache_dir / "pixel_df_labels.json", "w") as _fh:
             json.dump(labels, _fh)
+        if band_summaries is not None:
+            band_summaries.write_parquet(cache_dir / "pixel_df_band_summaries.parquet")
+            logger.info("Band summaries cache written: %d pixel-years", len(band_summaries))
 
     # --- Build cfg (needed whether cache hit or miss) -------------------------
     if _cache_hit:

@@ -151,6 +151,8 @@ def _compute_band_summaries(
     from tam.core._preprocess_numba import compute_band_summaries, detect_pixel_year_windows, extract_features
     from tam.core.dataset import ALL_FEATURE_COLS
 
+    if "year" not in pixel_df.columns:
+        pixel_df = pixel_df.with_columns(pl.col("date").dt.year().alias("year"))
     lf = pixel_df.lazy()
     if "source" in pixel_df.columns:
         lf = lf.filter(pl.col("source") == "S2")
@@ -396,7 +398,7 @@ def _compute_band_stats_worker(
     annual_feat_std  = _np.ones(0,  dtype=_np.float32)
     if annual_features_df_path is not None:
         gf = _pl.from_arrow(_pq.read_table(annual_features_df_path))
-        feat_cols_gf = [c for c in gf.columns if c != "point_id"]
+        feat_cols_gf = [c for c in gf.columns if c not in ("point_id", "year")]
         gf_arr = gf.select(feat_cols_gf).to_numpy().astype(_np.float32)
         annual_feat_mean = _np.nanmean(gf_arr, axis=0)
         annual_feat_std  = _np.nanstd(gf_arr,  axis=0)
