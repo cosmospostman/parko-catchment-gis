@@ -74,6 +74,25 @@ def _count_distinct_pixels(paths: list[Path]) -> int:
     return total
 
 
+def _count_distinct_windows(paths: list[Path], end_year: int) -> int:
+    """Count distinct (point_id, year) pairs with year <= end_year.
+
+    This matches what detect_pixel_year_windows produces during scoring and is
+    the correct denominator for progress percentage logging.
+    """
+    import duckdb
+    total = 0
+    for p in paths:
+        total += duckdb.sql(
+            f"SELECT count(*) FROM ("
+            f"  SELECT DISTINCT point_id, year(date) AS yr"
+            f"  FROM read_parquet('{p}')"
+            f"  WHERE year(date) <= {end_year}"
+            f")"
+        ).fetchone()[0]
+    return total
+
+
 class PixelSource(ABC):
     @property
     @abstractmethod
@@ -88,6 +107,9 @@ class PixelSource(ABC):
 
     def num_pixels(self) -> int:
         raise NotImplementedError("num_pixels() requires a path-backed PixelSource")
+
+    def num_windows(self, end_year: int) -> int:
+        raise NotImplementedError("num_windows() requires a path-backed PixelSource")
 
 
 class ParquetPixelSource(PixelSource):
@@ -111,6 +133,9 @@ class ParquetPixelSource(PixelSource):
         if not hasattr(self, "_num_pixels_cache"):
             self._num_pixels_cache = _count_distinct_pixels([self._path])
         return self._num_pixels_cache
+
+    def num_windows(self, end_year: int) -> int:
+        return _count_distinct_windows([self._path], end_year)
 
 
 class ChunkPixelSource(PixelSource):
@@ -195,3 +220,6 @@ class ChunkPixelSource(PixelSource):
             else:
                 self._num_pixels_cache = _count_distinct_pixels(self._paths)
         return self._num_pixels_cache
+
+    def num_windows(self, end_year: int) -> int:
+        return _count_distinct_windows(self._paths, end_year)

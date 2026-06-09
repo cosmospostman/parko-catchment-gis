@@ -2165,12 +2165,13 @@ def _score_tile_worker(args: tuple) -> tuple[str, list[Path]]:
         batch_size, n_prep_workers, device, n_tile_workers, s1_only, mixed,
         s1_despeckle_window, s2_feature_cols, s1_feature_cols,
         annual_feat_mean, annual_feat_std,
-        n_tile_pixels, n_pixels_before,
+        windows_by_year, n_windows_before,
     ) = args
 
     torch.set_num_threads(max(1, (os.cpu_count() or 1) // n_tile_workers))
 
     paths = []
+    windows_offset = n_windows_before
     for year, source in year_parquets:
         p = score_tile_year(
             source=source,
@@ -2192,9 +2193,10 @@ def _score_tile_worker(args: tuple) -> tuple[str, list[Path]]:
             s1_feature_cols=s1_feature_cols,
             annual_feat_mean=annual_feat_mean,
             annual_feat_std=annual_feat_std,
-            n_total_pixels=n_tile_pixels,
-            n_pixels_before=n_pixels_before,
+            n_total_pixels=windows_by_year.get(year),
+            n_pixels_before=windows_offset,
         )
+        windows_offset += windows_by_year.get(year, 0)
         paths.append(p)
     return tile_id, paths
 
@@ -2265,21 +2267,24 @@ def score_tiles_chunked(
         len(tile_year_parquets), total_pairs, already_staged, total_pairs - already_staged,
     )
 
-    # Pre-compute per-tile pixel counts using the first-year source for each tile.
-    # Uses DuckDB count(distinct point_id) — fast enough even for large strip parquets.
-    pixels_by_tile: dict[str, int] = {}
+    # Pre-compute per-(tile, year) window counts: distinct (point_id, year) pairs with
+    # year <= scored_year. This matches what detect_pixel_year_windows produces so the
+    # progress percentage denominator is exact.
+    windows_by_tile_year: dict[str, dict[int, int]] = {}
     for tid, yps in tile_year_parquets.items():
-        first_source = yps[0][1]
-        if isinstance(first_source, Path):
-            from tam.core.pixel_source import ParquetPixelSource
-            first_source = ParquetPixelSource(first_source)
-        try:
-            pixels_by_tile[tid] = first_source.num_pixels()
-        except Exception as e:
-            logger.warning("Could not count pixels for tile %s: %s", tid, e)
-            pixels_by_tile[tid] = 0
-    total_pixels = sum(pixels_by_tile.values())
-    logger.info("Total pixels across %d tiles: %s", len(tile_year_parquets), f"{total_pixels:,}")
+        windows_by_tile_year[tid] = {}
+        for year, source in yps:
+            src = source
+            if isinstance(src, Path):
+                from tam.core.pixel_source import ParquetPixelSource
+                src = ParquetPixelSource(src)
+            try:
+                windows_by_tile_year[tid][year] = src.num_windows(year)
+            except Exception as e:
+                logger.warning("Could not count windows for tile %s year %d: %s", tid, year, e)
+                windows_by_tile_year[tid][year] = 0
+    total_windows = sum(w for wy in windows_by_tile_year.values() for w in wy.values())
+    logger.info("Total pixel-year windows across %d tiles: %s", len(tile_year_parquets), f"{total_windows:,}")
 
     # --- Phase 1: score each (tile, year) ---
     # n_pixels_before is 0 for multi-worker (interleaved order unknown); accumulated
@@ -2291,7 +2296,7 @@ def score_tiles_chunked(
             batch_size, n_prep_workers, device, n_tile_workers, s1_only, mixed,
             s1_despeckle_window, s2_feature_cols, s1_feature_cols,
             annual_feat_mean, annual_feat_std,
-            pixels_by_tile.get(tile_id), 0,
+            windows_by_tile_year.get(tile_id, {}), 0,
         )
         for tile_id, year_parquets in tile_year_parquets.items()
     ]
@@ -2306,13 +2311,13 @@ def score_tiles_chunked(
                 staging_by_tile[tile_id] = paths
                 logger.info("Tile %s complete (%d year files)", tile_id, len(paths))
     else:
-        pixels_before = 0
+        windows_before = 0
         for args in worker_args:
-            # Inject current accumulated pixel offset so inner progress shows global %.
-            args = args[:-1] + (pixels_before,)
+            # Inject current accumulated window offset so inner progress shows global %.
+            args = args[:-1] + (windows_before,)
             tile_id, paths = _score_tile_worker(args)
             staging_by_tile[tile_id] = paths
-            pixels_before += pixels_by_tile.get(tile_id, 0)
+            windows_before += sum(windows_by_tile_year.get(tile_id, {}).values())
             logger.info("Tile %s complete (%d year files)", tile_id, len(paths))
 
     # --- Phase 2: aggregate per tile and write final parquet ---

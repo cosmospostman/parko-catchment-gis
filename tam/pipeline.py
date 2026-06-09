@@ -330,9 +330,18 @@ def _cmd_train(args: argparse.Namespace) -> None:
         gc.collect()
         logger.info("Band summaries precomputed per tile: %d pixel-years", len(band_summaries))
 
-        pixel_df = pl.concat(tile_dfs)
+        # Tiles may have different schemas: old tiles pre-compute spectral indices
+        # (NDVI, NDWI, EVI, MAVI, NDRE, CI_RE) while new chunkstore-sourced tiles
+        # do not.  Use diagonal_relaxed so missing columns are filled with nulls,
+        # then drop those stale pre-computed columns — they are always recomputed
+        # from raw bands downstream and must not be read from pixel_df.
+        _PRECOMPUTED_INDEX_COLS = {"NDVI", "NDWI", "EVI", "MAVI", "NDRE", "CI_RE"}
+        pixel_df = pl.concat(tile_dfs, how="diagonal_relaxed")
         del tile_dfs
         gc.collect()
+        _stale_cols = [c for c in _PRECOMPUTED_INDEX_COLS if c in pixel_df.columns]
+        if _stale_cols:
+            pixel_df = pixel_df.drop(_stale_cols)
         logger.info(
             "After concat: %d rows  estimated_size=%.1f GB  RSS=%.1f GB",
             len(pixel_df), pixel_df.estimated_size() / 1e9, _rss_gb(),
@@ -382,6 +391,23 @@ def _cmd_train(args: argparse.Namespace) -> None:
         )
         labelled = label_pixels(pixel_coords, regions)
         labelled_known = labelled.filter(pl.col("is_presence").is_not_null())
+
+        # Log per-region pixel counts so missing regions are immediately visible.
+        if isinstance(regions, list):
+            labeled_coords = labelled_known.select(["point_id", "lon", "lat", "is_presence"])
+            for region in sorted(regions, key=lambda r: r.id):
+                if region.label not in ("presence", "absence"):
+                    continue
+                lon_min, lat_min, lon_max, lat_max = region.bbox
+                n = labeled_coords.filter(
+                    pl.col("lon").is_between(lon_min, lon_max) &
+                    pl.col("lat").is_between(lat_min, lat_max)
+                ).shape[0]
+                split = "val" if region.id in exp.val_region_ids else "train"
+                flag = "  *** NO PIXELS" if n == 0 else ""
+                logger.info("  region %-45s  %s  %-8s  %6d px%s",
+                            region.id, region.label, split, n, flag)
+
         labels: dict[str, float] = {
             row[0]: 1.0 if row[1] else 0.0
             for row in labelled_known.select(["point_id", "is_presence"]).iter_rows()
@@ -418,6 +444,21 @@ def _cmd_train(args: argparse.Namespace) -> None:
         with open(cache_dir / "pixel_df_labels.json") as _fh:
             labels = {k: float(v) for k, v in json.load(_fh).items()}
         pixel_coords = pl.from_arrow(pq.read_table(cache_dir / "pixel_df_pixel_coords.parquet"))
+
+        # On cache hit the per-region log didn't run above — emit it now.
+        if isinstance(regions, list):
+            for region in sorted(regions, key=lambda r: r.id):
+                if region.label not in ("presence", "absence"):
+                    continue
+                lon_min, lat_min, lon_max, lat_max = region.bbox
+                n = pixel_coords.filter(
+                    pl.col("lon").is_between(lon_min, lon_max) &
+                    pl.col("lat").is_between(lat_min, lat_max)
+                ).shape[0]
+                split = "val" if region.id in exp.val_region_ids else "train"
+                flag = "  *** NO PIXELS" if n == 0 else ""
+                logger.info("  region %-45s  %s  %-8s  %6d px%s",
+                            region.id, region.label, split, n, flag)
 
     train_kwargs = dict(exp.train_kwargs)
     model_kwargs = dict(exp.model_kwargs)

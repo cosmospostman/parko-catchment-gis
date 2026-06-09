@@ -788,13 +788,13 @@ def train_tam(
         if cfg.n_annual_features != 0:
             if precomputed_band_summaries is not None:
                 annual_feat_df = precomputed_band_summaries
-                logger.info("Using precomputed band summaries: %d pixels, %d features", len(annual_feat_df), annual_feat_df.width - 1)
+                logger.info("Using precomputed band summaries: %d pixels, %d features", len(annual_feat_df), annual_feat_df.width - 2)
             else:
                 _s2_n = int((pixel_df["source"] == "S2").sum()) if _has_source else len(pixel_df)
                 logger.info("Computing band summaries (%d rows) ...", _s2_n)
                 _s1_cols_for_summary = list(cfg.s1_feature_cols) if cfg.use_s1 in (True, "mixed") else None
                 annual_feat_df = _compute_band_summaries(pixel_df, V9_FEATURE_COLS, s1_feature_cols=_s1_cols_for_summary)
-                logger.info("Band summaries computed: %d pixels, %d features", len(annual_feat_df), annual_feat_df.width - 1)
+                logger.info("Band summaries computed: %d pixels, %d features", len(annual_feat_df), annual_feat_df.width - 2)
         _log_rss("after band summaries")
 
         if (cfg.presence_min_vh_dry_db > -99 and _has_source and "vh" in pixel_df.columns):
@@ -1333,7 +1333,7 @@ def train_tam(
     
         # --- Model + optimiser --------------------------------------------------
         if annual_feat_df is not None and cfg.n_annual_features == -1:
-            cfg.n_annual_features = annual_feat_df.width - 1  # exclude point_id column
+            cfg.n_annual_features = annual_feat_df.width - 2  # exclude point_id and year columns
         del annual_feat_df
         gc.collect()
         model = TAMClassifier.from_config(cfg)

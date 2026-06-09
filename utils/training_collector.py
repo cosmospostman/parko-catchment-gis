@@ -329,6 +329,19 @@ def _extract_region(
             combined = df2.to_arrow().cast(combined.schema)
             logger.info("Region %s: dropped %d S2 rows with null band values", region.id, n_null)
 
+    # Rewrite point_ids from chunkstore format (px_NNNN_NNNN) to region-scoped
+    # format (<region_id>_NNNN_NNNN) so that pipeline._filter_to_regions can
+    # match them by stripping the trailing _\d+_\d+ suffix.
+    if "point_id" in combined.schema.names:
+        pid_arr = combined.column("point_id")
+        if len(pid_arr) > 0 and str(pid_arr[0].as_py()).startswith("px_"):
+            pid_idx = combined.schema.get_field_index("point_id")
+            new_pids = pa.array(
+                [region.id + p[2:] if p.startswith("px") else p for p in pid_arr.to_pylist()],
+                type=combined.schema.field("point_id").type,
+            )
+            combined = combined.set_column(pid_idx, "point_id", new_pids)
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(combined, out_path)
     logger.info("Region %s: %d rows → %s", region.id, combined.num_rows, out_path.name)
@@ -362,8 +375,14 @@ def _normalise_schema(s: pa.Schema) -> pa.Schema:
     for name, canonical in _CANONICAL_TYPES.items():
         if name in s.names:
             idx = s.get_field_index(name)
-            if s.field(name).type != canonical:
-                s = s.set(idx, pa.field(name, canonical))
+            src_type = s.field(name).type
+            if src_type == canonical:
+                continue
+            # Don't retype float band columns to uint16 — they are old-format
+            # reflectance-scaled data that must stay as float.
+            if pa.types.is_floating(src_type) and pa.types.is_integer(canonical):
+                continue
+            s = s.set(idx, pa.field(name, canonical))
     return s
 
 
@@ -372,8 +391,14 @@ def _normalise_source(tbl: pa.Table) -> pa.Table:
     for name, canonical in _CANONICAL_TYPES.items():
         if name in tbl.schema.names:
             idx = tbl.schema.get_field_index(name)
-            if tbl.schema.field(name).type != canonical:
-                tbl = tbl.set_column(idx, name, tbl.column(name).cast(canonical))
+            src_type = tbl.schema.field(name).type
+            if src_type == canonical:
+                continue
+            # Don't cast float band values to uint16 — float bands are old-format
+            # reflectance-scaled data (0–1) that cannot round-trip through uint16.
+            if pa.types.is_floating(src_type) and pa.types.is_integer(canonical):
+                continue
+            tbl = tbl.set_column(idx, name, tbl.column(name).cast(canonical))
     return tbl
 
 
@@ -391,10 +416,20 @@ def _superset_schema(paths: list[Path]) -> pa.Schema:
 
 
 def _cast_to_schema(tbl: pa.Table, schema: pa.Schema) -> pa.Table:
-    for i, field in enumerate(schema):
-        if field.name not in tbl.schema.names:
-            tbl = tbl.append_column(field, pa.nulls(len(tbl), type=field.type))
-    return tbl.cast(schema)
+    arrays = []
+    for field in schema:
+        if field.name in tbl.schema.names:
+            col = tbl.column(field.name)
+            if col.type != field.type:
+                # Skip unsafe float→integer casts (old reflectance-format band columns).
+                if pa.types.is_floating(col.type) and pa.types.is_integer(field.type):
+                    arrays.append(col)
+                    continue
+                col = col.cast(field.type)
+            arrays.append(col)
+        else:
+            arrays.append(pa.nulls(len(tbl), type=field.type))
+    return pa.table({field.name: arr for field, arr in zip(schema, arrays)}, schema=schema)
 
 
 def _write_region_rows(writer_ref: list, tile_path: Path, rp: Path, schema: pa.Schema) -> int:
