@@ -28,9 +28,9 @@ def merge_scenes(
     """Merge per-scene parquets into one pixel-sorted chunk parquet.
 
     Streams through all input files in northing-band passes so peak RAM is
-    O(n_files × _NORTHING_BAND) rather than O(total_rows).  For a 1024×1024
-    chunk with 82 scenes the old in-memory sort required ~34 GB; this approach
-    uses ~200 MB regardless of scene count.
+    O(n_files × _NORTHING_BAND × pixels_per_row) rather than O(total_rows).
+    _NORTHING_BAND=64 keeps peak RAM ≤ ~1 GB for dense 1024-px-wide chunks
+    with 150 scenes.
 
     Input scene parquets are expected to be sorted by northing (ascending yi
     encoded in point_id suffix) — make_chunk_points guarantees this ordering.
@@ -45,9 +45,12 @@ def merge_scenes(
     import polars as pl
     from utils.parquet_utils import COMBINED_PIXEL_SCHEMA, _conform_table
 
-    # Northings processed per band pass.  1024 northing rows × ~82 scenes ×
-    # ~1 clear pixel/point/scene × ~120 bytes ≈ 10 MB per pass.
-    _NORTHING_BAND = 1024
+    # Northings processed per band pass.  Dense 1024×1024 chunks have up to
+    # 1024 pixels per northing row, so peak RAM per band scales as:
+    #   band_rows × n_scenes × pixels_per_row × ~120 bytes
+    # At 64 rows: 64 × 150 × 1024 × 120 ≈ 750 MB — safe on 16+ GB machines.
+    # At 1024 rows the whole 1024-px-tall chunk lands in one band → OOM.
+    _NORTHING_BAND = 64
 
     import time as _time_mod
     _t_start = _time_mod.perf_counter()

@@ -1032,8 +1032,8 @@ def main() -> None:
                      help="Fetch all regions in the YAML")
     tf.add_argument("--cloud-max", type=int, default=80, metavar="N")
     tf.add_argument("--no-nbar", action="store_true")
-    tf.add_argument("--max-concurrent", type=int, default=16, metavar="N",
-                    help="Max concurrent HTTP patch fetches per tile (default: 16)")
+    tf.add_argument("--max-concurrent", type=int, default=32, metavar="N",
+                    help="Max concurrent HTTP patch fetches per tile (default: 32)")
     tf.add_argument("--max-region-workers", type=int, default=2, metavar="N",
                     help="Max regions fetched in parallel (default: 2)")
     tf.add_argument("--chunkstore-dir", type=str,

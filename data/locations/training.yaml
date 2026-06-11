@@ -136,7 +136,7 @@ regions:
   - id: lake_mueller_absence_2
     name: "Lake Mueller — absence 2"
     label: absence
-    bbox: [145.550678, -22.784887, 145.554010, -22.781183]
+    bbox: [145.550678, -22.784707, 145.554010, -22.781183]
     years: [2016, 2017, 2018, 2019, 2020, 2021]
     tags: [arid, riparian]
 
@@ -1556,7 +1556,7 @@ regions:
   - id: rupert_ck_absence_1
     name: "Rupert Ck — absence 1"
     label: absence
-    bbox: [142.534921, -21.256466, 142.543543, -21.255218]
+    bbox: [142.534826, -21.255025, 142.543531, -21.253495]
     years: [2016, 2017, 2018, 2019, 2020]
     tags: [semi-arid, riparian]
 

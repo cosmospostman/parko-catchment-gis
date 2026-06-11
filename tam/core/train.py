@@ -171,6 +171,8 @@ def _compute_band_summaries(
                             schema={"point_id": pl.Utf8, "year": pl.Int64,
                                     **{c: pl.Float32 for c in ordered[2:]}})
 
+    from analysis.constants import ensure_float32_bands
+    s2_df = ensure_float32_bands(s2_df)
     band_arrs = [
         s2_df[b].cast(pl.Float32).to_numpy() if b in s2_df.columns
         else np.full(len(s2_df), np.nan, dtype=np.float32)
