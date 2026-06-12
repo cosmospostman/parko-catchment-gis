@@ -296,8 +296,8 @@ class TAMDataset(Dataset):
                     stats = (
                         df.lazy()
                         .filter(src_mask)
-                        .select(["point_id"] + zscore_cols)
-                        .group_by("point_id")
+                        .select(["point_id", "year"] + zscore_cols)
+                        .group_by(["point_id", "year"])
                         .agg([pl.col(c).mean().alias(f"{c}__mean") for c in zscore_cols] +
                              [pl.col(c).std().alias(f"{c}__std")  for c in zscore_cols])
                     )
@@ -314,7 +314,7 @@ class TAMDataset(Dataset):
                     stat_cols = [f"{c}__mean" for c in zscore_cols] + [f"{c}__std" for c in zscore_cols]
                     df = (
                         df.lazy()
-                        .join(stats, on="point_id", how="left")
+                        .join(stats, on=["point_id", "year"], how="left")
                         .with_columns(normed_exprs)
                         .drop(stat_cols)
                         .collect()
@@ -350,8 +350,8 @@ class TAMDataset(Dataset):
                 if s1_zscore_cols:
                     stats = (
                         df.lazy()
-                        .select(["point_id"] + s1_zscore_cols)
-                        .group_by("point_id")
+                        .select(["point_id", "year"] + s1_zscore_cols)
+                        .group_by(["point_id", "year"])
                         .agg([pl.col(c).mean().alias(f"{c}__mean") for c in s1_zscore_cols] +
                              [pl.col(c).std().alias(f"{c}__std")  for c in s1_zscore_cols])
                     )
@@ -363,7 +363,7 @@ class TAMDataset(Dataset):
                     stat_cols = [f"{c}__mean" for c in s1_zscore_cols] + [f"{c}__std" for c in s1_zscore_cols]
                     df = (
                         df.lazy()
-                        .join(stats, on="point_id", how="left")
+                        .join(stats, on=["point_id", "year"], how="left")
                         .with_columns(normed_exprs)
                         .drop(stat_cols)
                         .collect()
@@ -388,8 +388,8 @@ class TAMDataset(Dataset):
                 if s2_zscore_cols:
                     stats = (
                         df.lazy()
-                        .select(["point_id"] + s2_zscore_cols)
-                        .group_by("point_id")
+                        .select(["point_id", "year"] + s2_zscore_cols)
+                        .group_by(["point_id", "year"])
                         .agg([pl.col(c).mean().alias(f"{c}__mean") for c in s2_zscore_cols] +
                              [pl.col(c).std().alias(f"{c}__std")  for c in s2_zscore_cols])
                     )
@@ -401,7 +401,7 @@ class TAMDataset(Dataset):
                     stat_cols = [f"{c}__mean" for c in s2_zscore_cols] + [f"{c}__std" for c in s2_zscore_cols]
                     df = (
                         df.lazy()
-                        .join(stats, on="point_id", how="left")
+                        .join(stats, on=["point_id", "year"], how="left")
                         .with_columns(normed_exprs)
                         .drop(stat_cols)
                         .collect()
