@@ -9,7 +9,7 @@ FAILLISTS="$REPO_ROOT/scripts/rebuild/faillists"
 TRAINING_TILES="$REPO_ROOT/data/training/tiles"
 
 APPLY=0
-[[ "${1:-}" == "--apply" ]] && APPLY=1
+if [[ "${1:-}" == "--apply" ]]; then APPLY=1; fi
 
 _run() {  # echo, and run only when --apply
   echo "  \$ $*"
@@ -22,7 +22,7 @@ delete_chunks() {
   [[ -f "$list" ]] || { echo "  !! no fail list: $list"; exit 1; }
   echo "  Deleting $(wc -l < "$list") FAIL chunk parquets for $tile:"
   while IFS= read -r p; do
-    [[ -z "$p" ]] && continue
+    if [[ -z "$p" ]]; then continue; fi
     _run rm -f -- "$p"
     _run rm -f -- "${p%.parquet}.pixel_count"
   done < "$list"
@@ -30,5 +30,7 @@ delete_chunks() {
 
 banner() {
   echo; echo "=== $* ==="
-  [[ $APPLY -eq 0 ]] && echo "  (DRY RUN — pass --apply to execute)"
+  if [[ $APPLY -eq 0 ]]; then
+    echo "  (DRY RUN — pass --apply to execute)"
+  fi
 }

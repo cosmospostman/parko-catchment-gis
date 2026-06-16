@@ -86,7 +86,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
         return 0
 
     headers = ("YEAR", "TILE", "CHUNK", "PIXELS", "S1_DATES",
-               "MED_FRAC", "MAX_FRAC", f"%>={MIN_S1_OBS_PER_YEAR}OBS", "STATUS")
+               "%CMPL_DT", "MED_FRAC", f"%>={MIN_S1_OBS_PER_YEAR}OBS", "STATUS")
     rows = []
     for r in reports:
         rows.append((
@@ -95,8 +95,8 @@ def cmd_verify(args: argparse.Namespace) -> int:
             f"r{r.chunk_row:02d}_c{r.chunk_col:02d}" if r.chunk_row >= 0 else "-",
             f"{r.n_pixels:,}",
             str(r.n_s1_dates),
+            f"{100 * r.s1_complete_date_frac:.0f}",
             f"{r.s1_med_frac:.2f}",
-            f"{r.s1_max_frac:.2f}",
             f"{r.pct_ge_min_obs:.1f}",
             "OK" if r.ok else "FAIL",
         ))
@@ -104,6 +104,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
     widths = [max(len(h), max((len(row[i]) for row in rows), default=0))
               for i, h in enumerate(headers)]
 
+    # Left-align TILE, CHUNK, STATUS (indices 1, 2, 8); right-align numerics.
     def fmt(cols):
         return "  " + "  ".join(
             f"{c:<{widths[i]}}" if i in (1, 2, 8) else f"{c:>{widths[i]}}"

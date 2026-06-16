@@ -14,7 +14,7 @@ echo "  Deleting ALL training region + tile parquets (cheap to rebuild):"
 _run rm -rf -- "$TRAINING_TILES/regions"
 # Remove the rolled-up per-tile parquets but keep the regions/ dir layout sane.
 for f in "$TRAINING_TILES"/*.parquet; do
-  [[ -e "$f" ]] || continue
+  if [[ ! -e "$f" ]]; then continue; fi
   _run rm -f -- "$f"
 done
 

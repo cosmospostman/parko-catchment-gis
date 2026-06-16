@@ -1,0 +1,1 @@
+/mnt/gis-archive/chunkstore/2020/53LLD/53LLD_r03_c04.parquet

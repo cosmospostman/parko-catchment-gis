@@ -107,8 +107,14 @@ def _region_parquet_path(region_id: str) -> Path:
 def _chunkstore_dir(override: Path | None = None) -> Path:
     if override is not None:
         return override
-    import os
-    return Path(os.environ.get("CHUNKSTORE_DIR", "/mnt/external/chunkstore"))
+    # Resolve via config (loads .env); raw os.environ does not see .env and would
+    # silently fall back to the read-only /mnt/external/chunkstore.
+    try:
+        from config import CHUNKSTORE_DIR
+        return Path(CHUNKSTORE_DIR)
+    except Exception:
+        import os
+        return Path(os.environ.get("CHUNKSTORE_DIR", "/mnt/external/chunkstore"))
 
 
 # ---------------------------------------------------------------------------

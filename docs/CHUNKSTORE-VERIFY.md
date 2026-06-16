@@ -85,25 +85,33 @@ over the parquet) and raises a tagged issue when a value looks wrong.
 | `UNREADABLE` | parquet fails to open / query | Corrupt or truncated file. |
 | `EMPTY` | zero distinct pixels | No data in the chunk. |
 | `S1_MISS` | zero S1 observations | Chunk has no Sentinel-1 rows at all. |
-| `S1_TRUNC` | median per-date S1 row coverage `< 0.5` | **The truncation defect** — most S1 acquisitions only populate a thin band of pixel rows, so most pixels never reach the scorer's S1 obs threshold. Rebuild needed. |
+| `S1_INCOMPLETE` | `< 95%` of S1 dates cover `>= 95%` of rows | **The completeness defect** — S1 rows are missing on many acquisition dates. Rebuild needed. |
 
-### The key metric: per-date S1 row coverage
+### The key metric: per-date completeness
 
 A healthy Sentinel-1 IW/GRD acquisition is a ~250 km scene that fully covers any chunk,
-so **most S1 dates should cover all of the chunk's pixel rows**. The check is:
+so **every S1 date should cover ~all of the chunk's pixel rows**. The strict check is:
 
 ```
-s1_med_frac = median over S1 dates of
-                (distinct yi pixel-rows that date covers) / (chunk's total yi rows)
+complete_date_frac = (# S1 dates covering >= 95% of the chunk's rows) / (# S1 dates)
 ```
 
-- **Healthy chunk:** `s1_med_frac ≈ 1.0` — nearly every date covers the whole chunk.
-- **Truncated chunk:** `s1_med_frac ≈ 0.10` — most dates cover only a thin band.
+- **Complete chunk:** `complete_date_frac ≈ 1.0` — essentially every date covers the whole chunk.
+- **Damaged chunk:** `complete_date_frac` low — many dates are missing rows.
 
-`s1_max_frac` (the best single date) is reported alongside. When it is near `1.0` it
-proves the chunk *could* be fully covered, so a low median is unambiguously a defect
-rather than a genuine satellite-swath edge. A chunk is flagged `S1_TRUNC` when
-`s1_med_frac < 0.5` (`S1_TRUNCATION_MED_FRAC` in `utils/chunk_verify.py`).
+A chunk is flagged `S1_INCOMPLETE` when `complete_date_frac < 0.95`
+(`S1_MIN_COMPLETE_DATE_FRAC`; per-date threshold `S1_DATE_COMPLETE_FRAC = 0.95`).
+
+**Why not the median?** Earlier versions flagged on `s1_med_frac < 0.5` (median per-date
+coverage). That was too lenient: a chunk can have median coverage well above 0.5 while
+still missing rows on many dates — it would "pass verify but still be missing data". The
+`merge_scenes` northing-band bug (fixed in `_sort_s1_shards`) dropped rows on every date
+*after the first*, so the complete-date fraction is the reliable completeness signal.
+`s1_med_frac` is still reported (column `MED_FRAC`) for context.
+
+A tiny edge chunk where every pixel still reaches `MIN_S1_OBS_PER_YEAR` obs (so the scorer
+keeps it all) and `s1_med_frac < 0.5` is reported as a non-failing `S1_TRUNC_OK` note
+rather than a failure.
 
 ---
 

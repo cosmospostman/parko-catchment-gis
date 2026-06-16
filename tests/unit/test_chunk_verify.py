@@ -93,21 +93,20 @@ def test_cv1_healthy_chunk_passes(tmp_path: Path):
 
 
 def test_cv2_truncated_chunk_flagged(tmp_path: Path):
-    # Most dates cover only 10 of 100 rows -> median frac 0.1 < threshold.
+    # Most dates cover only 10 of 100 rows -> 0% complete dates -> S1_INCOMPLETE.
     p = _write_chunk(
         tmp_path / "2025" / "54TST" / "54TST_r01_c00.parquet",
         n_yi=100, s1_dates=10, s1_rows_per_date=10,
     )
     rep = verify_chunk(p)
     assert not rep.ok
-    assert any(i.startswith("S1_TRUNC") for i in rep.issues)
-    assert rep.s1_med_frac < S1_TRUNCATION_MED_FRAC
-    assert rep.s1_med_frac == pytest.approx(0.1, abs=0.01)
+    assert any(i.startswith("S1_INCOMPLETE") for i in rep.issues)
+    assert rep.s1_complete_date_frac == pytest.approx(0.0)
 
 
 def test_cv2b_one_full_date_does_not_rescue_truncated(tmp_path: Path):
-    # Replicates the real defect: 9 truncated dates + 1 full date.  The median is
-    # still truncated even though max_frac reaches 1.0 — that's the whole point.
+    # The real defect: 9 truncated dates + 1 full date.  Only 1/10 dates is
+    # complete, far below the 95% completeness gate, so still flagged.
     import datetime
     base = tmp_path / "2025" / "54TST" / "54TST_r02_c00.parquet"
     p = _write_chunk(base, n_yi=100, s1_dates=9, s1_rows_per_date=10)
@@ -127,7 +126,44 @@ def test_cv2b_one_full_date_does_not_rescue_truncated(tmp_path: Path):
     rep = verify_chunk(p)
     assert not rep.ok
     assert rep.s1_max_frac == pytest.approx(1.0)
-    assert rep.s1_med_frac < S1_TRUNCATION_MED_FRAC
+    assert rep.s1_complete_date_frac == pytest.approx(0.1, abs=0.01)  # 1 of 10 dates
+
+
+def test_cv2d_partially_damaged_chunk_caught_by_completeness_gate(tmp_path: Path):
+    """A chunk the OLD median gate would PASS but is still missing rows on many
+    dates — caught only by the strict complete-date gate.
+
+    Half the dates are full (100 rows), half cover 60 rows.  median coverage =
+    0.8 (> old 0.5 threshold → old gate passes), but only 50% of dates are
+    'complete' (>=95%) → new gate FAILS.  This is the case the user worried about:
+    'passes verify but may still be missing data'.
+    """
+    import datetime
+    pid, lon, lat, date, source, vh = ([] for _ in range(6))
+    n_yi, n_xi = 100, 8
+    # S2 base layer (full grid)
+    for yi in range(n_yi):
+        for xi in range(n_xi):
+            pid.append(f"px_{xi:04d}_{yi:04d}"); lon.append(145.0); lat.append(-16.0)
+            date.append(datetime.date(2025, 1, 1)); source.append(None); vh.append(None)
+    # 10 S1 dates: 5 full (100 rows), 5 partial (60 rows)
+    for d in range(10):
+        dt = datetime.date(2025, 1, 1) + datetime.timedelta(days=20 * (d + 1))
+        nrows = 100 if d % 2 == 0 else 60
+        for yi in range(nrows):
+            for xi in range(n_xi):
+                pid.append(f"px_{xi:04d}_{yi:04d}"); lon.append(145.0); lat.append(-16.0)
+                date.append(dt); source.append("S1"); vh.append(0.05)
+    p = tmp_path / "2025" / "54TST" / "54TST_r09_c00.parquet"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.table({"point_id": pid, "lon": lon, "lat": lat, "date": date,
+                             "source": source, "vh": vh}, schema=_SCHEMA), p)
+
+    rep = verify_chunk(p)
+    assert rep.s1_med_frac >= 0.5, "median should clear the OLD lenient gate"
+    assert rep.s1_complete_date_frac == pytest.approx(0.5)  # only 5/10 dates complete
+    assert not rep.ok, "strict completeness gate must flag the partially-damaged chunk"
+    assert any(i.startswith("S1_INCOMPLETE") for i in rep.issues)
 
 
 def test_cv2c_harmless_truncation_is_note_not_failure(tmp_path: Path):

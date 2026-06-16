@@ -38,6 +38,15 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+# Resolve the chunkstore default via config, which loads .env (raw os.environ
+# does NOT see .env, so reading the env var directly silently falls back to the
+# wrong root — e.g. the read-only /mnt/external/chunkstore).
+try:
+    from config import CHUNKSTORE_DIR as _DEFAULT_CHUNKSTORE
+    _DEFAULT_CHUNKSTORE = str(_DEFAULT_CHUNKSTORE)
+except Exception:
+    _DEFAULT_CHUNKSTORE = os.environ.get("CHUNKSTORE_DIR", "/mnt/external/chunkstore")
+
 
 # ---------------------------------------------------------------------------
 # Delightful progress formatter
@@ -988,7 +997,7 @@ def main() -> None:
     pf.add_argument("--tiles", nargs="+", metavar="TILE_ID", default=None,
                     help="Only fetch these MGRS tile IDs (default: all tiles for the location)")
     pf.add_argument("--output-dir", type=str,
-                    default=os.environ.get("CHUNKSTORE_DIR", "/mnt/external/chunkstore"),
+                    default=_DEFAULT_CHUNKSTORE,
                     metavar="DIR",
                     help="Root directory for final chunk parquets "
                          "(default: $CHUNKSTORE_DIR or /mnt/external/chunkstore). "
@@ -1037,7 +1046,7 @@ def main() -> None:
     tf.add_argument("--max-region-workers", type=int, default=2, metavar="N",
                     help="Max regions fetched in parallel (default: 2)")
     tf.add_argument("--chunkstore-dir", type=str,
-                    default=os.environ.get("CHUNKSTORE_DIR", "/mnt/external/chunkstore"),
+                    default=_DEFAULT_CHUNKSTORE,
                     metavar="DIR",
                     help="Chunkstore root directory (default: $CHUNKSTORE_DIR or /mnt/external/chunkstore)")
     tf.add_argument("--work-dir", type=str,

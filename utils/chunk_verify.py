@@ -29,15 +29,21 @@ from pathlib import Path
 # Matches the chunk suffix in a parquet stem, e.g. "55KCB_r01_c00" -> (1, 0).
 _CHUNK_RE = re.compile(r"_r(\d+)_c(\d+)$")
 
-# A chunk is flagged TRUNCATED only when BOTH hold:
-#   * median per-date S1 row coverage < S1_TRUNCATION_MED_FRAC, AND
-#   * the fraction of pixels that reach MIN_S1_OBS_PER_YEAR is below
-#     S1_TRUNCATION_MIN_PCT_OBS.
-# The second gate matters because some tiny edge chunks have a low med_frac purely
-# because the chunk is only a few rows tall — yet every pixel still accumulates >=4
-# obs across the year, so the scorer keeps them all and nothing is lost.  Such
-# chunks are reported as INFO (truncated but harmless), not FAIL.
-# Healthy chunks measure med_frac ~1.0; the harmful defect ~0.10 with ~10% obs.
+# --- Completeness check (the strict gate) -------------------------------------
+# Each Sentinel-1 GRD scene is a ~250 km swath that fully covers any chunk, so a
+# COMPLETE chunk has *every* acquisition date covering ~all of the chunk's pixel
+# rows.  The merge_scenes northing-band bug dropped rows for every date after the
+# first, so incomplete chunks have most dates well below full coverage.  We treat
+# a date as "complete" when it covers >= S1_DATE_COMPLETE_FRAC of the chunk's rows,
+# and flag the chunk when the fraction of complete dates is below
+# S1_MIN_COMPLETE_DATE_FRAC.  This catches partially-damaged chunks that the older
+# median-based heuristic let through (a chunk can have median coverage > 0.5 while
+# still missing rows on many dates).
+S1_DATE_COMPLETE_FRAC = 0.95        # a date covering >=95% of rows is "complete"
+S1_MIN_COMPLETE_DATE_FRAC = 0.95    # >=95% of dates must be complete
+
+# Legacy median-based thresholds, kept for the reported med_frac / harmless-note
+# distinction (a tiny edge chunk where every pixel still reaches MIN obs).
 S1_TRUNCATION_MED_FRAC = 0.5
 S1_TRUNCATION_MIN_PCT_OBS = 90.0
 
@@ -58,8 +64,9 @@ class ChunkReport:
     n_pixels: int = 0
     yi_rows: int = 0           # distinct pixel rows (yi) in the chunk
     n_s1_dates: int = 0
-    s1_med_frac: float = 0.0   # median per-date S1 row coverage (the key metric)
+    s1_med_frac: float = 0.0   # median per-date S1 row coverage
     s1_max_frac: float = 0.0   # best single date's row coverage
+    s1_complete_date_frac: float = 0.0  # fraction of dates covering >=95% of rows (the strict gate)
     pct_ge_min_obs: float = 0.0  # % pixels with >= MIN_S1_OBS_PER_YEAR S1 obs
     issues: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)  # non-failing INFO (e.g. harmless truncation)
@@ -123,7 +130,10 @@ def verify_chunk(path: Path, con=None) -> ChunkReport:
             con.close()
         return rep
 
-    # S1 per-date row coverage and per-pixel obs counts.
+    # S1 per-date row coverage and per-pixel obs counts.  The denominator for
+    # "complete" is the chunk's full row count (yi_rows); a date is complete when
+    # it covers >= S1_DATE_COMPLETE_FRAC of those rows.
+    _complete_rows = S1_DATE_COMPLETE_FRAC * (rep.yi_rows or 1)
     row = con.execute(
         f"""
         WITH perdate AS (
@@ -142,33 +152,38 @@ def verify_chunk(path: Path, con=None) -> ChunkReport:
             (SELECT COUNT(*) FROM perdate)                              AS n_dates,
             (SELECT median(yi_cov) FROM perdate)                        AS med_cov,
             (SELECT max(yi_cov) FROM perdate)                           AS max_cov,
+            (SELECT COUNT(*) FROM perdate WHERE yi_cov >= {_complete_rows}) AS n_complete_dates,
             (SELECT COUNT(*) FROM perpix WHERE n_s1 >= {MIN_S1_OBS_PER_YEAR}) AS n_ge_min,
             (SELECT COUNT(*) FROM perpix)                               AS n_total
         """
     ).fetchone()
-    n_dates, med_cov, max_cov, n_ge_min, n_total = row
+    n_dates, med_cov, max_cov, n_complete_dates, n_ge_min, n_total = row
     rep.n_s1_dates = int(n_dates or 0)
 
     denom = rep.yi_rows or 1
     rep.s1_med_frac = float(med_cov or 0) / denom
     rep.s1_max_frac = float(max_cov or 0) / denom
+    rep.s1_complete_date_frac = float(n_complete_dates or 0) / float(rep.n_s1_dates or 1)
     rep.pct_ge_min_obs = 100.0 * float(n_ge_min or 0) / float(n_total or 1)
 
     if rep.n_s1_dates == 0:
         rep.issues.append(f"S1_MISS     {stem} — no S1 observations")
-    elif rep.s1_med_frac < S1_TRUNCATION_MED_FRAC:
+    elif rep.s1_complete_date_frac < S1_MIN_COMPLETE_DATE_FRAC:
+        # Strict completeness gate: most dates should cover ~all rows.  The
+        # merge_scenes band bug dropped rows on every date after the first, so
+        # incomplete chunks have a low complete-date fraction even when the median
+        # coverage looks acceptable.
         _detail = (
-            f"median S1 date covers only {rep.s1_med_frac:.0%} of rows "
-            f"(max {rep.s1_max_frac:.0%}); {rep.pct_ge_min_obs:.1f}% of pixels reach "
-            f">={MIN_S1_OBS_PER_YEAR} obs"
+            f"only {rep.s1_complete_date_frac:.0%} of {rep.n_s1_dates} S1 dates cover "
+            f">={S1_DATE_COMPLETE_FRAC:.0%} of rows (median date {rep.s1_med_frac:.0%}); "
+            f"{rep.pct_ge_min_obs:.1f}% of pixels reach >={MIN_S1_OBS_PER_YEAR} obs"
         )
-        if rep.pct_ge_min_obs < S1_TRUNCATION_MIN_PCT_OBS:
-            # Truncation actually costs scored pixels → rebuild.
-            rep.issues.append(f"S1_TRUNC    {stem} — {_detail} — patches were truncated, rebuild needed")
-        else:
-            # Low med_frac but ~all pixels still reach the obs threshold (tiny edge
-            # chunk): the scorer keeps everything, so this is harmless.
+        # A tiny edge chunk where every pixel still reaches the obs threshold is
+        # harmless even if per-date coverage looks low — keep it a note, not a fail.
+        if rep.pct_ge_min_obs >= S1_TRUNCATION_MIN_PCT_OBS and rep.s1_med_frac < S1_TRUNCATION_MED_FRAC:
             rep.notes.append(f"S1_TRUNC_OK {stem} — {_detail} — harmless (all pixels still scored)")
+        else:
+            rep.issues.append(f"S1_INCOMPLETE {stem} — {_detail} — S1 rows missing, rebuild needed")
 
     if own_con:
         con.close()

@@ -591,3 +591,100 @@ def test_merge_scenes_output_is_pixel_sorted(tmp_path):
     assert is_pixel_sorted(out_path), (
         "merge_scenes output is not pixel-sorted — sort step missing or broken"
     )
+
+
+# ---------------------------------------------------------------------------
+# S1 shard sorting (regression for the S1_TRUNC defect).
+#
+# S1 shards are written DATE-major (rows in acquisition-submission order), but
+# merge_scenes streams inputs in northing-band passes and silently drops any row
+# whose yi is below the current band cursor.  _sort_s1_shards must therefore
+# materialise a real northing (yi) sort — not just concatenate the shards.
+# ---------------------------------------------------------------------------
+
+def _write_date_major_s1(path: Path, dates, n_rows: int) -> Path:
+    """Write an S1 shard the way _collect_s1_shards does: date-major.
+
+    For each date, append a block of rows spanning ALL northings 0..n_rows-1
+    (one easting column).  The resulting file is ordered by date, then yi —
+    i.e. NOT globally northing-sorted.
+    """
+    import pyarrow as pa
+    schema = pa.schema([
+        ("point_id", pa.string()),
+        ("date", pa.date32()),
+        ("source", pa.string()),
+        ("vh", pa.float32()),
+    ])
+    writer = pq.ParquetWriter(path, schema)
+    for d in dates:
+        pids = [f"px_0000_{yi:04d}" for yi in range(n_rows)]
+        tbl = pa.table({
+            "point_id": pids,
+            "date": [d] * n_rows,
+            "source": ["S1"] * n_rows,
+            "vh": np.full(n_rows, 0.05, dtype=np.float32),
+        }, schema=schema)
+        writer.write_table(tbl)
+    writer.close()
+    return path
+
+
+def test_sort_s1_shards_sorts_date_major_input_by_northing(tmp_path: Path):
+    """PS-14  _sort_s1_shards turns date-major input into northing-ascending output
+    with no row loss (the S1_TRUNC root cause)."""
+    from utils.parquet_utils import _sort_s1_shards, COMBINED_PIXEL_SCHEMA
+
+    dates = [datetime.date(2021, 1, 6), datetime.date(2021, 1, 18), datetime.date(2021, 1, 30)]
+    n_rows = 50
+    shard = _write_date_major_s1(tmp_path / "shard_0000.parquet", dates, n_rows)
+
+    # Sanity: the input is NOT northing-sorted (date-major).
+    in_df = pl.read_parquet(shard).with_columns(
+        pl.col("point_id").str.extract(r"_(\d+)$", 1).cast(pl.Int32).alias("yi")
+    )
+    assert not in_df["yi"].is_sorted(), "fixture should be date-major (not yi-sorted)"
+
+    out = tmp_path / "s1_sorted.parquet"
+    _sort_s1_shards([shard], out, COMBINED_PIXEL_SCHEMA)
+
+    out_df = pl.read_parquet(out).with_columns(
+        pl.col("point_id").str.extract(r"_(\d+)$", 1).cast(pl.Int32).alias("yi")
+    )
+    # No row loss across all dates.
+    assert len(out_df) == n_rows * len(dates)
+    # Output is northing-ascending — what merge_scenes' band cursor requires.
+    assert out_df["yi"].is_sorted(), "output is not northing-sorted"
+    # Every date retains all northings (the defect dropped all but the first date's).
+    for d in dates:
+        assert out_df.filter(pl.col("date") == d).height == n_rows
+
+
+def test_merge_scenes_keeps_all_s1_rows_from_date_major_shard(tmp_path: Path):
+    """PS-15  Feeding a (correctly northing-sorted) S1 file through merge_scenes
+    retains every S1 row for every date — guards the band-cursor row-drop."""
+    from proxy._pipeline import merge_scenes
+    from utils.parquet_utils import _sort_s1_shards, COMBINED_PIXEL_SCHEMA
+
+    dates = [datetime.date(2021, m, 6) for m in range(1, 8)]  # 7 acquisitions
+    n_rows = 200  # > _NORTHING_BAND (64) so multiple band passes are exercised
+    shard = _write_date_major_s1(tmp_path / "shard_0000.parquet", dates, n_rows)
+
+    s1_sorted = tmp_path / "s1.parquet"
+    _sort_s1_shards([shard], s1_sorted, COMBINED_PIXEL_SCHEMA)
+
+    out = tmp_path / "chunk.parquet"
+    merge_scenes([], s1_path=s1_sorted, out_path=out)
+
+    merged = pl.read_parquet(out).filter(pl.col("source") == "S1").with_columns(
+        pl.col("point_id").str.extract(r"_(\d+)$", 1).cast(pl.Int32).alias("yi")
+    )
+    # Every date must still cover all n_rows northings (no thin-band collapse).
+    per_date_rows = merged.group_by("date").agg(
+        pl.col("yi").n_unique().alias("nrows")
+    )
+    assert per_date_rows["nrows"].min() == n_rows, (
+        f"S1 rows dropped in merge: min per-date northings "
+        f"{per_date_rows['nrows'].min()} < {n_rows}"
+    )
+    assert merged.height == n_rows * len(dates)

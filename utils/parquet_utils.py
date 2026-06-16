@@ -209,32 +209,38 @@ def _sort_s1_shards(
     combined_schema: "pa.Schema",
     n_workers: int | None = None,
 ) -> None:
-    """Concat S1 shards (already northing-sorted) into one parquet.
+    """Concat S1 shards and sort the result by **northing (yi) ascending**.
 
-    Shards cover non-overlapping northing ranges written in order, so a plain
-    sequential concat produces a sorted output without any sort step.
-    Streams one shard at a time to avoid loading all 136 shards into RAM.
+    The S1 shards are written *date-major* (rows accumulated in item submission
+    order — see _collect_s1_shards), NOT northing-sorted.  merge_scenes streams
+    its inputs in northing-band passes and assumes each input file is sorted by
+    yi ascending; feeding it date-major data makes it silently drop every S1 row
+    whose yi is below the current band cursor (all acquisitions after the first
+    collapse to a thin band — the S1_TRUNC defect).  So we must materialise a
+    real northing sort here, keyed on the yi encoded in the point_id suffix.
+
+    Uses Polars' streaming engine so peak RAM stays bounded.
     """
-    import pyarrow as pa
-    import pyarrow.parquet as pq
+    import polars as pl
 
     _log = logging.getLogger(__name__)
-    _log.info("merging %d S1 shards → %s ...", len(shard_paths), out_path.name)
+    _log.info("sorting %d S1 shards by northing → %s ...", len(shard_paths), out_path.name)
 
     tmp_path = out_path.with_suffix(".shards_tmp.parquet")
     tmp_path.unlink(missing_ok=True)
-    writer = pq.ParquetWriter(str(tmp_path), combined_schema, compression="none", write_statistics=False)
-    try:
-        for shard_path in shard_paths:
-            pf = pq.ParquetFile(str(shard_path))
-            for batch in pf.iter_batches(batch_size=250_000):
-                tbl = pa.Table.from_batches([batch])
-                tbl = _conform_table(tbl, combined_schema)
-                writer.write_table(tbl)
-    finally:
-        writer.close()
+    (
+        pl.scan_parquet([str(p) for p in shard_paths])
+        # yi (northing index) is the trailing _\d+ group of point_id; merge_scenes
+        # extracts the same field, so sort on it to match its band expectation.
+        .with_columns(
+            pl.col("point_id").str.extract(r"_(\d+)$", 1).cast(pl.Int32).alias("_yi")
+        )
+        .sort(["_yi", "date"])
+        .drop("_yi")
+        .sink_parquet(str(tmp_path), compression="zstd", compression_level=3)
+    )
     tmp_path.replace(out_path)
-    _log.info("merge done → %s", out_path.name)
+    _log.info("sort done → %s", out_path.name)
 
 
 def _merge_sorted_parquets(
