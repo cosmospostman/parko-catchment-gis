@@ -1,0 +1,3 @@
+/mnt/gis-archive/chunkstore/2022/55KEU/55KEU_r06_c05.parquet
+/mnt/gis-archive/chunkstore/2023/55KEU/55KEU_r06_c05.parquet
+/mnt/gis-archive/chunkstore/2024/55KEU/55KEU_r06_c05.parquet
