@@ -91,6 +91,18 @@ def _read_bbox_patch(
                     max(1, win.width), max(1, win.height),
                 )
                 arr = src.read(1, window=win).astype(np.float32)
+                # Guard against truncated/short reads: src.read must return an
+                # array matching the requested window.  A partial read that
+                # silently returns fewer rows/cols (observed in the June 2026 S1
+                # build — see docs/S1-COVERAGE.md) would otherwise be cached as a
+                # valid sub-window, dropping most pixels at extract time.  Raise so
+                # the retry loop re-fetches instead of persisting bad data.
+                exp_h, exp_w = round(win.height), round(win.width)
+                if arr.shape != (exp_h, exp_w):
+                    raise IOError(
+                        f"short read: got {arr.shape}, expected {(exp_h, exp_w)} "
+                        f"for window {win} of {href}"
+                    )
                 patch_transform = rasterio.windows.transform(win, src.transform)
                 return arr, patch_transform, src.crs
         except Exception as exc:
@@ -154,6 +166,13 @@ def _patch_covers_bbox(
 
     Fallback for legacy patches that lack fetch_bbox: check whether all four WGS84
     bbox corners project inside the patch extent (±1 pixel slop).
+
+    Note: this trusts the stored stamp and does NOT re-validate array dimensions,
+    because a smaller-than-window array can be legitimate (a border-tile item whose
+    raster genuinely ends inside the bbox).  The defence against *truncated* patches
+    (short reads with a correct stamp — see docs/S1-COVERAGE.md) lives at write time
+    in _read_bbox_patch, which rejects a read whose shape != the requested window, so
+    a truncated patch is never cached in the first place.
     """
     if path is not None:
         stored_bbox = _load_patch_cache_bbox(path)

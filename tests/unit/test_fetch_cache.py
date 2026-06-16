@@ -156,3 +156,76 @@ def test_write_is_atomic(tmp_path):
     assert path.exists()
     data = np.load(path, allow_pickle=False)
     assert "arr" in data
+
+
+# ---------------------------------------------------------------------------
+# FC-4. Short-read guard in _read_bbox_patch (docs/S1-COVERAGE.md regression).
+#       A src.read() that returns fewer rows than the requested window must be
+#       rejected (return None after retries), never returned as a valid patch.
+# ---------------------------------------------------------------------------
+
+class _FakeSrc:
+    """Minimal rasterio dataset stand-in for _read_bbox_patch."""
+
+    def __init__(self, read_shape, width=1000, height=1000):
+        self._read_shape = read_shape
+        self.width = width
+        self.height = height
+        self.crs = CRS.from_epsg(32755)
+        # 10 m grid positioned so the test bbox (UTM ~286411..287257 E,
+        # ~8185765..8186659 N) lands well inside the raster.
+        self.transform = from_bounds(
+            285_000, 8_184_000, 285_000 + width * 10, 8_184_000 + height * 10,
+            width, height,
+        )
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self, band, window=None):
+        return np.ones(self._read_shape, dtype=np.float32)
+
+
+def _run_read(monkeypatch, read_shape):
+    import rasterio
+    from utils import fetch
+
+    def fake_open(href):
+        # Window for this bbox is ~96x96 px (see _EXPAND=4 padding) at 10 m.
+        return _FakeSrc(read_shape)
+
+    monkeypatch.setattr(rasterio, "open", fake_open)
+    # tiny bbox -> a small but well-formed window inside the fake raster
+    bbox = [145.0, -16.40, 145.008, -16.392]
+    return fetch._read_bbox_patch("fake://cog", bbox, max_retries=0)
+
+
+def test_fc4_full_read_returns_patch(monkeypatch):
+    """A read whose shape matches the requested window is returned normally."""
+    import rasterio
+    from utils import fetch
+
+    captured = {}
+
+    class _RecordingSrc(_FakeSrc):
+        def read(self, band, window=None):
+            captured["h"] = round(window.height)
+            captured["w"] = round(window.width)
+            return np.ones((captured["h"], captured["w"]), dtype=np.float32)
+
+    monkeypatch.setattr(rasterio, "open", lambda href: _RecordingSrc((1, 1)))
+    bbox = [145.0, -16.40, 145.008, -16.392]
+    res = fetch._read_bbox_patch("fake://cog", bbox, max_retries=0)
+    assert res is not None
+    arr, _, _ = res
+    assert arr.shape == (captured["h"], captured["w"])
+
+
+def test_fc4_short_read_rejected(monkeypatch):
+    """A truncated read (too few rows) must be rejected, not cached as valid."""
+    # Force a tiny 8-row array regardless of the (much larger) requested window.
+    res = _run_read(monkeypatch, read_shape=(8, 96))
+    assert res is None, "truncated patch was accepted — guard failed"
