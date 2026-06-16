@@ -7,6 +7,12 @@ All scientific parameters are defined as module-level constants (not from env).
 import os
 from pathlib import Path
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent / ".env", override=False)
+except ImportError:
+    pass
+
 # ---------------------------------------------------------------------------
 # Path constants — sourced from environment
 # ---------------------------------------------------------------------------
