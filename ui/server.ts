@@ -3,14 +3,20 @@ import { join, dirname, fromFileUrl } from "jsr:@std/path";
 import { serveDir } from "jsr:@std/http/file-server";
 import { ensureDirSync } from "jsr:@std/fs";
 import { encodeHex } from "jsr:@std/encoding/hex";
+import { load as loadDotenv } from "jsr:@std/dotenv";
 import { listRankings, renderTile, listS1Locations, listS1Dates, loadS1Grid, getS1BinState } from "./tile_renderer.ts";
 
 const __dirname = dirname(fromFileUrl(import.meta.url));
+
+// Load repo-root .env so the server and the Python subprocesses it spawns share
+// the same config (e.g. CHUNKSTORE_DIR). Existing process env wins over .env.
+// export: true makes the vars visible to spawned Deno.Command processes.
+await loadDotenv({ envPath: join(__dirname, "..", ".env"), export: true });
 const LOCATIONS_DIR = join(__dirname, "..", "data", "locations");
 const WMS_CACHE_DIR = join(__dirname, "..", "data", "cache", "wms");
 const SCORES_DIR    = join(__dirname, "..", "outputs", "scores");
 const PORT = Number(Deno.env.get("PORT") ?? 3000);
-const CHUNKS_ROOT = Deno.env.get("CHUNKS_ROOT") ?? "/mnt/external/chunkstore";
+const CHUNKS_ROOT = Deno.env.get("CHUNKS_ROOT") ?? Deno.env.get("CHUNKSTORE_DIR") ?? "/mnt/external/chunkstore";
 const VENV_PYTHON = join(__dirname, "..", ".venv", "bin", "python3");
 
 // ---------------------------------------------------------------------------
