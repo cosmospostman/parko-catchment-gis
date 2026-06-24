@@ -2274,7 +2274,7 @@ def score_tiles_chunked(
     gate_threshold: float = 0.0,
     T_gate: int = 8,
     pmtiles_out: Path | None = None,
-    coords_by_tile: dict[str, Path] | None = None,
+    coords_by_tile: dict[str, list[Path]] | None = None,
     annual_feat_mean: np.ndarray | None = None,
     annual_feat_std: np.ndarray | None = None,
 ) -> list[Path]:
@@ -2409,8 +2409,8 @@ def score_tiles_chunked(
         final_paths.append(final_path)
 
         if pmtiles_out is not None and coords_by_tile is not None:
-            _coords_path = coords_by_tile.get(tile_id)
-            if _coords_path is not None:
+            _coords_paths = coords_by_tile.get(tile_id)
+            if _coords_paths:
                 from utils.raster import rasterize_tile_to_pmtiles
                 _tile_pmtiles = pmtiles_out.parent / f"{pmtiles_out.stem}_{tile_id}{pmtiles_out.suffix}" \
                     if pmtiles_out.suffix else pmtiles_out / f"{tile_id}.pmtiles"
@@ -2421,8 +2421,9 @@ def score_tiles_chunked(
                     _tile_pmtiles = pmtiles_out.parent / f"{pmtiles_out.stem}_{tile_id}.pmtiles"
                 else:
                     _tile_pmtiles = pmtiles_out / f"{tile_id}.pmtiles"
-                logger.info("Rasterising %s → %s", tile_id, _tile_pmtiles)
-                rasterize_tile_to_pmtiles(final_path, _coords_path, tile_id, _tile_pmtiles)
+                logger.info("Rasterising %s (%d coord chunks) → %s",
+                            tile_id, len(_coords_paths), _tile_pmtiles)
+                rasterize_tile_to_pmtiles(final_path, _coords_paths, tile_id, _tile_pmtiles)
                 logger.info("Wrote PMTiles %s", _tile_pmtiles.name)
             else:
                 logger.warning("No coords path for tile %s — skipping PMTiles output", tile_id)
