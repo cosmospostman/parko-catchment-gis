@@ -582,14 +582,19 @@ def test_cs2_all_points_in_exactly_one_strip():
         cog_utm_crs=_CS_CRS, cog_y_top=cog_y_top, cog_x_left=cog_x_left,
     )
 
-    seen: dict[str, int] = {}
+    # Compare by physical position (lon/lat), not point_id: point_ids are now
+    # tile-absolute (COG-anchored) while make_pixel_grid's _CS_POINTS use the
+    # legacy bbox-relative scheme, so the ID strings differ — but the SET OF
+    # PIXELS must match exactly (no point missing, none duplicated).
+    seen: dict[tuple[float, float], int] = {}
     for c in chunks:
-        for pid, _, _ in make_chunk_points(c, meta):
-            seen[pid] = seen.get(pid, 0) + 1
+        for _pid, lon, lat in make_chunk_points(c, meta):
+            key = (round(lon, 6), round(lat, 6))
+            seen[key] = seen.get(key, 0) + 1
 
-    all_ids = {pid for pid, _, _ in _CS_POINTS}
-    missing = all_ids - seen.keys()
-    dups = {pid for pid, cnt in seen.items() if cnt > 1}
+    all_pts = {(round(lon, 6), round(lat, 6)) for _, lon, lat in _CS_POINTS}
+    missing = all_pts - seen.keys()
+    dups = {k for k, cnt in seen.items() if cnt > 1}
     assert not missing, f"{len(missing)} points missing from chunks: {list(missing)[:5]}"
     assert not dups,    f"{len(dups)} points duplicated across chunks: {list(dups)[:5]}"
 
@@ -608,12 +613,18 @@ def test_cs3_utm_and_geographic_assign_same_points():
     )
     chunks_geo, meta_geo = compute_chunks(_CS_BBOX, 1024, 1024, None)
 
-    utm_ids = {pid for c in chunks_utm for pid, _, _ in make_chunk_points(c, meta_utm)}
-    geo_ids = {pid for c in chunks_geo for pid, _, _ in make_chunk_points(c, meta_geo)}
-    all_ids = {pid for pid, _, _ in _CS_POINTS}
+    # Compare by physical position (lon/lat): the COG-anchored UTM path and the
+    # legacy geographic-fallback path use different point_id schemes (tile-
+    # absolute vs bbox-relative) but must cover the SAME set of ground pixels.
+    def pts(chunks, meta):
+        return {(round(lon, 6), round(lat, 6)) for c in chunks
+                for _, lon, lat in make_chunk_points(c, meta)}
+    utm_pts = pts(chunks_utm, meta_utm)
+    geo_pts = pts(chunks_geo, meta_geo)
+    all_pts = {(round(lon, 6), round(lat, 6)) for _, lon, lat in _CS_POINTS}
 
-    assert utm_ids == all_ids, "UTM path lost some points"
-    assert geo_ids == all_ids, "geographic path lost some points"
+    assert utm_pts == all_pts, "UTM path lost some points"
+    assert geo_pts == all_pts, "geographic path lost some points"
 
 
 # CS-4: alignment holds when cog_y_top has a non-trivial offset
@@ -786,6 +797,48 @@ def test_cs10_strips_contiguous():
             assert gap <= block_m + 10.0, f"col {col} gap between chunks {i} and {i+1} is {gap:.1f} m > block_m"
 
 
+# CS-12: point_id is tile-absolute (bbox-independent) — regression for the
+# training-vs-scoring grid mismatch. The same ground pixel fetched with two
+# different bboxes (a subset vs the full area) sharing the same COG origin MUST
+# get the same point_id; otherwise training- and scoring-fetched chunks land on
+# incompatible grids in the shared chunkstore (the 55KCB beige-block bug).
+def test_cs12_point_id_bbox_independent():
+    from proxy._pipeline import compute_chunks, make_chunk_points
+
+    full_bbox = _CS_BBOX
+    # A sub-window offset into the NE corner of the full bbox — a different SW
+    # corner, so the OLD bbox-relative x0_snap/y0_snap would renumber xi/yi.
+    lon0, lat0, lon1, lat1 = full_bbox
+    sub_bbox = [lon0 + (lon1 - lon0) * 0.4, lat0 + (lat1 - lat0) * 0.4, lon1, lat1]
+
+    # SAME COG origin for both fetches (same tile).
+    cog_y_top  = _reference_y_top(full_bbox, _CS_CRS, extra_m=500.0)
+    cog_x_left = _reference_x_left(full_bbox, _CS_CRS)
+
+    def pid_map(bbox):
+        chunks, meta = compute_chunks(
+            bbox, 1024, 1024, None,
+            cog_utm_crs=_CS_CRS, cog_y_top=cog_y_top, cog_x_left=cog_x_left,
+        )
+        out = {}
+        for c in chunks:
+            for pid, lon, lat in make_chunk_points(c, meta):
+                out[(round(lon, 6), round(lat, 6))] = pid
+        return out
+
+    full = pid_map(full_bbox)
+    sub  = pid_map(sub_bbox)
+
+    shared = set(full) & set(sub)
+    assert len(shared) > 100, f"expected overlapping pixels, got {len(shared)}"
+    mismatches = [(k, full[k], sub[k]) for k in shared if full[k] != sub[k]]
+    assert not mismatches, (
+        f"{len(mismatches)}/{len(shared)} shared pixels got different point_ids "
+        f"between full-bbox and sub-bbox fetches, e.g. {mismatches[:3]} — "
+        "point_id is not tile-absolute"
+    )
+
+
 # CS-11: Mitchell River catchment × tile 54LWJ — exact chunk set
 def test_cs11_mitchell_54lwj_chunk_set():
     """Only chunks that intersect the catchment-∩-tile polygon are fetched.
@@ -934,6 +987,18 @@ def test_mcp1_tiny_grid_point_ids_match_utm_position():
 
 
 # MCP-2: reconstructed UTM from (xi, yi) matches stored lon/lat for a larger grid
+# Shared roundtrip helper: reconstruct UTM easting/northing from a point_id's
+# xi/yi using the TILE-ABSOLUTE anchors the pipeline now emits in meta.
+#   xi increases east from xi_anchor_x; yi increases north from (yi_anchor_y - SPAN).
+def _xiyi_to_utm(pid: str, meta: dict) -> tuple[float, float]:
+    from proxy._pipeline import _S2_TILE_SPAN_M
+    r = meta["r"]
+    xi = int(pid.split("_")[1]); yi = int(pid.split("_")[2])
+    x = meta["xi_anchor_x"] + xi * r
+    y = (meta["yi_anchor_y"] - _S2_TILE_SPAN_M) + yi * r
+    return x, y
+
+
 def test_mcp2_point_id_utm_roundtrip():
     """xi/yi in every point_id reconstruct the same UTM as the stored lon/lat."""
     from proxy._pipeline import compute_chunks, make_chunk_points
@@ -945,21 +1010,10 @@ def test_mcp2_point_id_utm_roundtrip():
     assert chunks
 
     to_utm = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
-    r = meta["r"]
-    x0_snap = meta["x0_snap"]
-    y0_snap = meta["y0_snap"]
 
     for chunk in chunks:
         for pid, lon, lat in make_chunk_points(chunk, meta):
-            parts = pid.split("_")
-            xi = int(parts[1])
-            yi = int(parts[2])
-
-            # xi=0 is at x0_snap, yi=0 is at y0_snap; each step = r metres
-            expected_x = x0_snap + xi * r
-            expected_y = y0_snap + yi * r
-
-            # Confirm against the stored lon/lat
+            expected_x, expected_y = _xiyi_to_utm(pid, meta)
             actual_x, actual_y = to_utm.transform(lon, lat)
 
             assert abs(actual_x - expected_x) < 1.0, (
@@ -984,29 +1038,14 @@ def test_mcp3_xi_yi_monotonicity():
     for chunk in chunks:
         pts = make_chunk_points(chunk, meta)
         for pid, lon, lat in pts:
-            parts = pid.split("_")
-            xi = int(parts[1])
-            yi = int(parts[2])
             utm_x, utm_y = to_utm.transform(lon, lat)
-
-            # A western point must have a smaller xi than an eastern one.
-            # We verify by checking that xi/yi reconstruct the right UTM position.
-            r = meta["r"]
-            x0_snap = meta["x0_snap"]
-            y0_snap = meta["y0_snap"]
-
-            # xi=0 is at x0_snap; each step = r metres
-            xi_implied_x = x0_snap + xi * r
-            yi_implied_y = y0_snap + yi * r
-
-            # If xi/yi were swapped the implied position would be wrong.
-            # (For a square grid xi=yi, this check may be vacuous — the tiny 1-km
-            # bbox spans ~100 px east and ~110 px north so xi ≠ yi for edge points.)
+            # xi/yi reconstruct the right UTM position (would fail if swapped).
+            xi_implied_x, yi_implied_y = _xiyi_to_utm(pid, meta)
             assert abs(xi_implied_x - utm_x) < 1.0, (
-                f"{pid}: xi={xi} implies x={xi_implied_x:.1f} but utm_x={utm_x:.1f}"
+                f"{pid}: xi implies x={xi_implied_x:.1f} but utm_x={utm_x:.1f}"
             )
             assert abs(yi_implied_y - utm_y) < 1.0, (
-                f"{pid}: yi={yi} implies y={yi_implied_y:.1f} but utm_y={utm_y:.1f}"
+                f"{pid}: yi implies y={yi_implied_y:.1f} but utm_y={utm_y:.1f}"
             )
 
 
@@ -1066,18 +1105,9 @@ def test_mcp6_geographic_fallback_xi_yi_correctness():
     chunks, meta = compute_chunks(bbox, 1024, 1024, None)
     to_utm = Transformer.from_crs("EPSG:4326", meta["utm_crs"], always_xy=True)
 
-    r = meta["r"]
-    x0_snap = meta["x0_snap"]
-    y0_snap = meta["y0_snap"]
-
     for chunk in chunks:
         for pid, lon, lat in make_chunk_points(chunk, meta):
-            parts = pid.split("_")
-            xi = int(parts[1])
-            yi = int(parts[2])
-
-            expected_x = x0_snap + xi * r
-            expected_y = y0_snap + yi * r
+            expected_x, expected_y = _xiyi_to_utm(pid, meta)
             actual_x, actual_y = to_utm.transform(lon, lat)
 
             assert abs(actual_x - expected_x) < 1.0, (
@@ -1147,21 +1177,19 @@ def test_mcp7_cog_overhang_xi_yi_contiguous():
     yi_gaps = [yis[i+1] - yis[i] for i in range(len(yis)-1) if yis[i+1] - yis[i] > 1]
     assert not yi_gaps, f"yi has gaps: {yi_gaps}  (yi range: {yis[0]}..{yis[-1]})"
 
-    # xi=0 must correspond to the actual x0_snap easting
+    # xi/yi must reconstruct the stored UTM via the tile-absolute anchors.
     to_utm = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
-    x0_snap = meta["x0_snap"]
     for pid, lon, lat in all_pts:
-        xi = int(pid.split("_")[1])
-        yi = int(pid.split("_")[2])
         ux, uy = to_utm.transform(lon, lat)
-        expected_x = x0_snap + xi * r
-        expected_y = meta["y0_snap"] + yi * r
+        expected_x, expected_y = _xiyi_to_utm(pid, meta)
         assert abs(ux - expected_x) < 1.0, (
-            f"{pid}: easting {ux:.1f} != x0_snap+xi*r={expected_x:.1f}"
+            f"{pid}: easting {ux:.1f} != anchor-derived {expected_x:.1f}"
         )
         assert abs(uy - expected_y) < 1.0, (
-            f"{pid}: northing {uy:.1f} != y0_snap+yi*r={expected_y:.1f}"
+            f"{pid}: northing {uy:.1f} != anchor-derived {expected_y:.1f}"
         )
+    # All point_ids must be non-negative (merge_scenes / px_DDDD contract).
+    assert all(int(p.split("_")[1]) >= 0 and int(p.split("_")[2]) >= 0 for p, _, _ in all_pts)
 
 
 # ---------------------------------------------------------------------------
@@ -1329,22 +1357,15 @@ def test_cpo3_parquet_coords_consistent_with_point_id(tmp_path):
     lons_back = tbl2.column("lon").to_pylist()
     lats_back = tbl2.column("lat").to_pylist()
 
-    x0_snap = meta["x0_snap"]
-    y0_snap = meta["y0_snap"]
-
     for pid, lon, lat in zip(pids_back, lons_back, lats_back):
-        parts = pid.split("_")
-        xi = int(parts[1])
-        yi = int(parts[2])
-        xi_x = x0_snap + xi * r
-        yi_y = y0_snap + yi * r
+        xi_x, yi_y = _xiyi_to_utm(pid, meta)
         actual_x, actual_y = to_utm.transform(lon, lat)
 
         assert abs(actual_x - xi_x) < 1.0, (
-            f"{pid}: stored lon→easting {actual_x:.1f} ≠ x0_snap+xi*r={xi_x:.1f}"
+            f"{pid}: stored lon→easting {actual_x:.1f} ≠ anchor-derived {xi_x:.1f}"
         )
         assert abs(actual_y - yi_y) < 1.0, (
-            f"{pid}: stored lat→northing {actual_y:.1f} ≠ y0_snap+yi*r={yi_y:.1f}"
+            f"{pid}: stored lat→northing {actual_y:.1f} ≠ anchor-derived {yi_y:.1f}"
         )
 
 
@@ -1461,16 +1482,13 @@ def test_cpo4_multi_chunk_parquet_xi_yi_consistent_with_cog_overhang(tmp_path):
 
     # Every stored lon/lat must decode to the UTM coordinate implied by xi/yi
     for pid, lon, lat in zip(all_pids, all_lons, all_lats):
-        xi = int(pid.split("_")[1])
-        yi = int(pid.split("_")[2])
-        expected_x = x0_snap + xi * r
-        expected_y = y0_snap + yi * r
+        expected_x, expected_y = _xiyi_to_utm(pid, meta)
         actual_x, actual_y = to_utm.transform(lon, lat)
         assert abs(actual_x - expected_x) < 1.0, (
-            f"{pid}: easting {actual_x:.1f} ≠ x0_snap+xi*r={expected_x:.1f}"
+            f"{pid}: easting {actual_x:.1f} ≠ anchor-derived {expected_x:.1f}"
         )
         assert abs(actual_y - expected_y) < 1.0, (
-            f"{pid}: northing {actual_y:.1f} ≠ y0_snap+yi*r={expected_y:.1f}"
+            f"{pid}: northing {actual_y:.1f} ≠ anchor-derived {expected_y:.1f}"
         )
 
 

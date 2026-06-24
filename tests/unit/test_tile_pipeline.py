@@ -689,8 +689,11 @@ def test_compute_strips_make_strip_points_point_id_format():
         chunk_width_px=256,
         polygon_geometry=polygon,
         cog_utm_crs="EPSG:32755",
-        cog_y_top=7_502_080.0,
-        cog_x_left=500_000.0,
+        # COG origin must actually bound the tile's pixels (left edge ≤ min
+        # easting, top ≥ max northing) — point_id xi/yi are now measured from it,
+        # so an origin east of / below the pixels would yield negative indices.
+        cog_y_top=7_485_440.0,
+        cog_x_left=335_360.0,
     )
 
     assert chunks, "compute_chunks returned no chunks"
