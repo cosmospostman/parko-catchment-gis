@@ -1585,17 +1585,28 @@ def score_pixels_chunked(
         torch.cuda.Stream(device=device) if use_cuda else None)
 
     # --- Stage B: H2D transfer thread ---
+    # Per-thread budget: the transfer thread's wall time is partitioned into
+    # bgt + h2d + push + get_wait, where get_wait is time blocked on xfer_q.get()
+    # (i.e. waiting for prep to deliver a batch). These sum to xfer_wall and so
+    # are a true partition — unlike the cross-thread numbers below.
     _t_xfer_bgt_total  = 0.0   # transfer thread: Numba build_gate_tensors
     _t_xfer_h2d_total  = 0.0   # transfer thread: pin+H2D enqueue
     _t_xfer_push_total = 0.0   # transfer thread: blocked on gpu_ready_q.put()
+    _t_xfer_get_total  = 0.0   # transfer thread: blocked on xfer_q.get() (prep-starved)
+    _t_xfer_wall       = 0.0   # transfer thread: total wall (first get → sentinel)
 
     def _transfer_worker() -> None:
         nonlocal _t_xfer_bgt_total, _t_xfer_h2d_total, _t_xfer_push_total
+        nonlocal _t_xfer_get_total, _t_xfer_wall
         from tam.core._preprocess_numba import build_gate_tensors as _bgt
+        _wall_start = _time.monotonic()
         while True:
+            _tg = _time.monotonic()
             item = xfer_q.get()
+            _t_xfer_get_total += _time.monotonic() - _tg
             if item is _SENTINEL:
                 gpu_ready_q.put(_SENTINEL)
+                _t_xfer_wall = _time.monotonic() - _wall_start
                 break
             merged: _PreparedBatch = item
             B_ = len(merged.pids)
@@ -1683,20 +1694,28 @@ def score_pixels_chunked(
 
     # --- Stage C: dedicated GPU forward thread ---
     # Model forward confirmed safe to call from a background thread (tested).
+    # Per-thread budget: score + gpu_starvation ≈ gpu_wall (true partition).
+    # gpu_starvation is the only meaningful "is the GPU fed?" signal — it is the
+    # time the GPU thread sat blocked waiting for a batch. Duty cycle =
+    # score / gpu_wall. (The main/transfer threads blocking on the GPU is normal
+    # and is NOT lost time — see the breakdown logging below.)
     _n_gpu_calls   = 0
     _t_score_total = 0.0
-    _t_gpu_wait_total = 0.0   # time GPU worker spent blocked on gpu_ready_q
+    _t_gpu_wait_total = 0.0   # time GPU worker spent blocked on gpu_ready_q (starvation)
+    _t_gpu_wall       = 0.0   # GPU thread wall (first get → sentinel)
 
     _gpu_batch_times: list[float] = []   # per-batch forward time for variance analysis
 
     def _gpu_worker() -> None:
-        nonlocal _n_gpu_calls, _t_score_total, _t_gpu_wait_total
+        nonlocal _n_gpu_calls, _t_score_total, _t_gpu_wait_total, _t_gpu_wall
+        _wall_start = _time.monotonic()
         while True:
             _tw = _time.monotonic()
             tb = gpu_ready_q.get()
             _t_gpu_wait_total += _time.monotonic() - _tw
             if tb is _SENTINEL:
                 result_q.put(_SENTINEL)
+                _t_gpu_wall = _time.monotonic() - _wall_start
                 break
             if _n_gpu_calls == 0:
                 logger.info("First batch on GPU (B=%d) — pipeline is running", tb.B)
@@ -1904,26 +1923,58 @@ def score_pixels_chunked(
         raise
 
     _t_total = _time.monotonic() - _t0
-    _t_other  = max(0.0, _t_total - _t_idle_total - _t_merge_total - _t_score_total)
+
+    # --- Per-thread budgets ---
+    # Each line below partitions ONE thread's wall clock, so its components sum
+    # to ~100%. Earlier versions mixed timers measured in different threads and
+    # divided them all by the main thread's wall, producing percentages that
+    # summed well past 100% (e.g. prep_wait 95% + score 79% + gpu_starvation 21%)
+    # and falsely implied prep starvation when the pipeline was GPU-bound. The
+    # main thread (and transfer thread) blocking on a downstream queue is normal
+    # back-pressure — it means a later stage is pacing — and is NOT lost time.
+    #
+    # The GPU thread is the pacing stage, so its duty cycle (score / gpu_wall) is
+    # the headline "is the GPU the bottleneck and is it fed?" number.
+
+    # 1) GPU thread budget — the one that decides throughput.
+    _gpu_wall = _t_gpu_wall or (_t_score_total + _t_gpu_wait_total) or 1.0
+    _gpu_duty = 100.0 * _t_score_total / _gpu_wall
     logger.info(
-        "GPU pipeline breakdown — total %.1fs: score %.1fs (%.0f%%), "
-        "merge %.1fs (%.0f%%), prep_wait %.1fs (%.0f%%), xfer_backpressure %.1fs (%.0f%%), "
-        "gpu_starvation %.1fs (%.0f%%), other %.1fs (%.0f%%) | %d GPU calls",
-        _t_total,
-        _t_score_total,    100.0 * _t_score_total    / _t_total if _t_total else 0,
-        _t_merge_total,    100.0 * _t_merge_total     / _t_total if _t_total else 0,
-        _t_idle_total,     100.0 * _t_idle_total      / _t_total if _t_total else 0,
-        _t_xfer_wait_total,100.0 * _t_xfer_wait_total / _t_total if _t_total else 0,
-        _t_gpu_wait_total, 100.0 * _t_gpu_wait_total  / _t_total if _t_total else 0,
-        _t_other,          100.0 * _t_other            / _t_total if _t_total else 0,
-        _n_gpu_calls,
+        "GPU thread budget — wall %.1fs: score %.1fs (%.0f%%), "
+        "gpu_starvation %.1fs (%.0f%%) | duty=%.0f%%  %d GPU calls  (total run %.1fs)",
+        _gpu_wall,
+        _t_score_total,    100.0 * _t_score_total    / _gpu_wall,
+        _t_gpu_wait_total, 100.0 * _t_gpu_wait_total / _gpu_wall,
+        _gpu_duty, _n_gpu_calls, _t_total,
     )
+
+    # 2) Transfer thread budget — bgt + h2d + push + get_wait = xfer_wall.
+    _xfer_wall = _t_xfer_wall or (
+        _t_xfer_bgt_total + _t_xfer_h2d_total + _t_xfer_push_total + _t_xfer_get_total
+    ) or 1.0
     logger.info(
-        "Transfer thread breakdown — bgt %.1fs (%.0f%%), h2d %.1fs (%.0f%%), "
-        "push_wait %.1fs (%.0f%%)",
-        _t_xfer_bgt_total,  100.0 * _t_xfer_bgt_total  / _t_total if _t_total else 0,
-        _t_xfer_h2d_total,  100.0 * _t_xfer_h2d_total  / _t_total if _t_total else 0,
-        _t_xfer_push_total, 100.0 * _t_xfer_push_total / _t_total if _t_total else 0,
+        "Transfer thread budget — wall %.1fs: bgt %.1fs (%.0f%%), h2d %.1fs (%.0f%%), "
+        "push_wait %.1fs (%.0f%%), get_wait %.1fs (%.0f%%)",
+        _xfer_wall,
+        _t_xfer_bgt_total,  100.0 * _t_xfer_bgt_total  / _xfer_wall,
+        _t_xfer_h2d_total,  100.0 * _t_xfer_h2d_total  / _xfer_wall,
+        _t_xfer_push_total, 100.0 * _t_xfer_push_total / _xfer_wall,
+        _t_xfer_get_total,  100.0 * _t_xfer_get_total  / _xfer_wall,
+    )
+
+    # 3) Main (orchestrator) thread — informational only; these OVERLAP GPU work.
+    # High prep_wait here just means the main loop correctly idles while the GPU
+    # paces; it is not a bottleneck. Reported against the main thread's own wall.
+    _t_other = max(0.0, _t_total - _t_idle_total - _t_merge_total - _t_xfer_wait_total)
+    logger.info(
+        "Main thread budget (informational — overlaps GPU work) — wall %.1fs: "
+        "prep_wait %.1fs (%.0f%%), merge %.1fs (%.0f%%), "
+        "xfer_backpressure %.1fs (%.0f%%), other %.1fs (%.0f%%)",
+        _t_total,
+        _t_idle_total,      100.0 * _t_idle_total      / _t_total if _t_total else 0,
+        _t_merge_total,     100.0 * _t_merge_total     / _t_total if _t_total else 0,
+        _t_xfer_wait_total, 100.0 * _t_xfer_wait_total / _t_total if _t_total else 0,
+        _t_other,           100.0 * _t_other           / _t_total if _t_total else 0,
     )
     if _gpu_batch_times:
         _bt = np.array(_gpu_batch_times)

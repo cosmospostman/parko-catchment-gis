@@ -22,6 +22,18 @@ Run:
     # RSS per writer flush to verify memory stays flat (no full accumulation)
     python scripts/bench_score.py --bench-tile-year --mixed --pixel-zscore
 
+    # Real-data mode: benchmark ONE chunkstore chunk (1024x1024 px) on the exact
+    # production path (load_tam -> score_tile_year), capturing the prep_wait /
+    # gpu_starvation / transfer breakdown into a machine-readable run.json.
+    python scripts/bench_score.py --real \
+        --checkpoint outputs/models/tam-v10 --location mitchell \
+        --pixel-dir /mnt/gis-archive/chunkstore --years 2025 --tile-id 54LWH \
+        --label baseline --out-json bench_runs.jsonl
+    # ...change n_prep_workers and compare:
+    python scripts/bench_score.py --real ... --n-prep-workers 10 \
+        --label workers10 --out-json bench_runs.jsonl
+    python scripts/bench_score.py --compare bench_runs.jsonl   # side-by-side delta table
+
 Exit codes: 0 = ok, 1 = assertion failure (--assert-*), 2 = timeout.
 """
 
@@ -30,7 +42,9 @@ from __future__ import annotations
 import argparse
 import datetime
 import gc
+import json
 import logging
+import re
 import signal
 import sys
 import tempfile
@@ -89,6 +103,75 @@ def probe(tag: str, df: pl.DataFrame | None = None, rows: int | None = None, ext
     rows_s  = f"  rows={rows:,}" if rows is not None else ""
     extra_s = f"  {extra}" if extra else ""
     print(f"  [{_probes[-1].elapsed_s:7.2f}s]  {tag}  RSS={r:.2f}GB{delta_s}GB{frame_s}{rows_s}{extra_s}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Breakdown capture — parse score_pixels_chunked's logger.info breakdown lines
+# ---------------------------------------------------------------------------
+
+# Matches the per-thread budget lines emitted at the end of score_pixels_chunked
+# (tam/core/score.py). Kept loose (float capture only) so format tweaks like
+# added percentages don't silently break parsing — we only read the seconds.
+# The GPU-thread line is the headline: score + gpu_starvation = gpu_wall, and
+# duty = score/gpu_wall is the "is the GPU the bottleneck and is it fed?" number.
+_RE_GPU = re.compile(
+    r"GPU thread budget — wall ([\d.]+)s: score ([\d.]+)s .*?"
+    r"gpu_starvation ([\d.]+)s .*?duty=([\d.]+)% +(\d+) GPU calls .*?total run ([\d.]+)s"
+)
+_RE_XFER = re.compile(
+    r"Transfer thread budget — wall ([\d.]+)s: bgt ([\d.]+)s .*?h2d ([\d.]+)s .*?"
+    r"push_wait ([\d.]+)s .*?get_wait ([\d.]+)s"
+)
+_RE_MAIN = re.compile(
+    r"Main thread budget .*? wall ([\d.]+)s: prep_wait ([\d.]+)s .*?"
+    r"merge ([\d.]+)s .*?xfer_backpressure ([\d.]+)s .*?other ([\d.]+)s"
+)
+_RE_BATCH = re.compile(
+    r"GPU forward per-batch \(ms\): mean=([\d.]+)\s+median=([\d.]+)\s+"
+    r"p95=([\d.]+)\s+max=([\d.]+)\s+min=([\d.]+)\s+n=(\d+)"
+)
+
+
+class BreakdownCapture(logging.Handler):
+    """Attach to the 'tam.core.score' logger to extract pipeline breakdown stats.
+
+    score_pixels_chunked only *logs* its per-thread timing budgets; it doesn't
+    return them. Rather than refactor the production signature, we parse the
+    summary lines back into a dict so the bench can fold them into run.json. If a
+    tile emits multiple budgets (multi-year), the last one wins — real-data mode
+    scores a single chunk/year so there is exactly one.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.stats: dict[str, float] = {}
+
+    def emit(self, record: logging.LogRecord) -> None:
+        msg = record.getMessage()
+        if (m := _RE_GPU.search(msg)):
+            g = [float(x) for x in m.groups()]
+            self.stats.update(
+                gpu_wall_s=g[0], score_s=g[1], gpu_starvation_s=g[2],
+                gpu_duty_pct=g[3], n_gpu_calls=g[4], total_s=g[5],
+            )
+        elif (m := _RE_MAIN.search(msg)):
+            g = [float(x) for x in m.groups()]
+            self.stats.update(
+                main_wall_s=g[0], prep_wait_s=g[1], merge_s=g[2],
+                xfer_backpressure_s=g[3], other_s=g[4],
+            )
+        elif (m := _RE_XFER.search(msg)):
+            g = [float(x) for x in m.groups()]
+            self.stats.update(
+                xfer_wall_s=g[0], xfer_bgt_s=g[1], xfer_h2d_s=g[2],
+                xfer_push_s=g[3], xfer_get_s=g[4],
+            )
+        elif (m := _RE_BATCH.search(msg)):
+            g = [float(x) for x in m.groups()]
+            self.stats.update(
+                batch_ms_mean=g[0], batch_ms_median=g[1], batch_ms_p95=g[2],
+                batch_ms_max=g[3], batch_ms_min=g[4], n_batches=g[5],
+            )
 
 
 def print_report(
@@ -742,6 +825,240 @@ def run_bench(args: argparse.Namespace, tmp_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Real-data mode — benchmark ONE chunkstore chunk on the production path
+# ---------------------------------------------------------------------------
+
+def _resolve_chunks(args: argparse.Namespace) -> tuple[str, int, list[Path]]:
+    """Resolve (tile_id, year, [chunk_paths]) for the real-data bench.
+
+    Either --chunk-file gives one path directly, or --location/--pixel-dir/
+    --tile-id/--years select the first --n-chunks chunks (row-major) for that
+    tile-year. Multiple chunks are wrapped in a single ChunkPixelSource so the
+    bench exercises the production cross-chunk streaming path.
+    """
+    from tam.pipeline import _CHUNK_PAT, _chunk_key_stem, _tile_id_from_stem
+
+    n_chunks = max(1, getattr(args, "n_chunks", 1))
+
+    if args.chunk_file:
+        chunk = Path(args.chunk_file)
+        if not chunk.is_file():
+            sys.exit(f"--chunk-file not found: {chunk}")
+        return _tile_id_from_stem(chunk.stem), (args.years[0] if args.years else 0), [chunk]
+
+    from utils.location import get as get_location
+
+    if not args.location:
+        sys.exit("real mode needs --chunk-file or (--location and --tile-id)")
+    loc = get_location(args.location)
+    pixel_dir = Path(args.pixel_dir) if args.pixel_dir else None
+    tile_paths_by_year = loc.parquet_tile_paths(base_dir=pixel_dir)
+    if args.years:
+        tile_paths_by_year = {y: ps for y, ps in tile_paths_by_year.items() if y in args.years}
+    if not tile_paths_by_year:
+        sys.exit(f"No parquets found for {args.location} years={args.years}")
+    year = max(tile_paths_by_year)
+    tid_filter = set(args.tile_id or [])
+    chunks = [
+        p for p in tile_paths_by_year[year]
+        if _CHUNK_PAT.search(p.stem) and (not tid_filter or _tile_id_from_stem(p.stem) in tid_filter)
+    ]
+    if not chunks:
+        sys.exit(f"No chunk files for tile(s) {sorted(tid_filter) or 'ANY'} in year {year}")
+    chunks.sort(key=lambda p: _chunk_key_stem(p.stem))
+    selected = chunks[:n_chunks]
+    if len(selected) < n_chunks:
+        print(f"WARN: requested {n_chunks} chunks but only {len(selected)} available for tile")
+    return _tile_id_from_stem(selected[0].stem), year, selected
+
+
+def run_real(args: argparse.Namespace, tmp_dir: Path) -> None:
+    """Score one real chunkstore chunk via score_tile_year, capture breakdown → run.json."""
+    import torch
+    from tam.core.pixel_source import ChunkPixelSource
+    from tam.core.score import score_tile_year
+    from tam.core.train import load_tam
+
+    if args.device is None:
+        args.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    tile_id, year, chunk_paths = _resolve_chunks(args)
+    chunk_mb = sum(p.stat().st_size for p in chunk_paths) / 1e6
+    n_chunks = len(chunk_paths)
+    chunk_desc = (chunk_paths[0].name if n_chunks == 1
+                  else f"{n_chunks} chunks {chunk_paths[0].name}..{chunk_paths[-1].name}")
+    print(f"\nbench_score --real: {chunk_desc} ({chunk_mb:.0f} MB total)  "
+          f"tile={tile_id}  year={year}  device={args.device}\n"
+          f"  checkpoint={args.checkpoint}  batch_size={args.batch_size}  "
+          f"n_prep_workers={args.n_prep_workers}  label={args.label or '-'}\n", flush=True)
+    probe("baseline")
+
+    # --- Load checkpoint exactly as tam.pipeline._cmd_score does ---
+    checkpoint_dir = Path(args.checkpoint)
+    model, band_mean, band_std, annual_feat_mean, annual_feat_std = load_tam(
+        checkpoint_dir, device=args.device
+    )
+    with open(checkpoint_dir / "tam_config.json") as fh:
+        cfg = json.load(fh)
+    use_s1 = cfg.get("use_s1", False)
+    s1_only = model.n_bands == 4
+    mixed = (not s1_only) and bool(use_s1)
+    s2_cols = cfg.get("feature_cols", None)
+    s1_cols = cfg.get("s1_feature_cols", None) or (["s1_vh", "s1_vv"] if mixed else None)
+    s1_despeckle_window = cfg.get("s1_despeckle_window", 0)
+    probe("load_tam", rows=sum(p.numel() for p in model.parameters()),
+          extra=f"mixed={mixed} s1_only={s1_only}")
+
+    # Warm numba + CUDA so JIT cost isn't charged to the timed run.
+    if not args.skip_warmup:
+        run_warmup(args.device)
+        gc.collect()
+        probe("warmup")
+
+    # --- Capture the breakdown log lines emitted inside score_pixels_chunked ---
+    # The breakdown is logged at INFO; the bench never calls basicConfig, so the
+    # logger's effective level defaults to WARNING and would drop INFO records
+    # before they reach our handler. Force INFO on this logger so capture works
+    # without spamming the rest of the bench output with score's progress logs.
+    score_logger = logging.getLogger("tam.core.score")
+    score_logger.setLevel(logging.INFO)
+    cap = BreakdownCapture()
+    score_logger.addHandler(cap)
+
+    source = ChunkPixelSource(chunk_paths)   # N chunks as one stream, no geometry filter
+    staging_dir = tmp_dir / "staging_real"
+
+    probe("score_start")
+    t0 = time.perf_counter()
+    try:
+        out_path = score_tile_year(
+            source=source,
+            tile_id=tile_id,
+            year=year,
+            model=model,
+            band_mean=band_mean,
+            band_std=band_std,
+            staging_dir=staging_dir,
+            scl_purity_min=args.scl_purity,
+            batch_size=args.batch_size,
+            n_prep_workers=args.n_prep_workers,
+            device=args.device,
+            s1_only=s1_only,
+            mixed=mixed,
+            s1_despeckle_window=s1_despeckle_window,
+            s2_feature_cols=s2_cols if mixed else None,
+            s1_feature_cols=s1_cols if mixed else None,
+            annual_feat_mean=annual_feat_mean,
+            annual_feat_std=annual_feat_std,
+        )
+    finally:
+        score_logger.removeHandler(cap)
+    elapsed = time.perf_counter() - t0
+
+    import pyarrow.parquet as pq
+    out_rows = pq.ParquetFile(out_path).metadata.num_rows if out_path.exists() else 0
+    probe("score_done", rows=out_rows, extra=f"{elapsed:.1f}s")
+    probe("done")
+
+    # n_scored pixels = output rows (one row per scored pixel-window).
+    pps = out_rows / elapsed if elapsed > 0 else 0.0
+    stats = cap.stats
+    if not stats:
+        print("\nWARN: no breakdown line captured — log format may have changed "
+              "(check _RE_GPU in bench_score.py).")
+
+    run = {
+        "label": args.label,
+        "tile_id": tile_id,
+        "year": year,
+        "n_chunks": n_chunks,
+        "chunk": chunk_desc,
+        "chunk_mb": round(chunk_mb, 1),
+        "checkpoint": str(checkpoint_dir),
+        "device": args.device,
+        "batch_size": args.batch_size,
+        "n_prep_workers": args.n_prep_workers,
+        "scored_rows": out_rows,
+        "wall_s": round(elapsed, 2),
+        "px_per_s": round(pps, 0),
+        "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+        **{k: round(v, 2) for k, v in stats.items()},
+    }
+
+    # --- Report ---
+    W = 60
+    print("\n" + "=" * W)
+    print(f"  REAL-DATA BENCH  [{args.label or 'run'}]")
+    print("-" * W)
+    print(f"  chunks:           {n_chunks}  ({chunk_mb:.0f} MB total)")
+    print(f"  scored rows:      {out_rows:,}")
+    print(f"  wall:             {elapsed:.1f} s")
+    print(f"  throughput:       {pps:,.0f} px/s")
+    if stats:
+        # GPU thread is the pacing stage: score + gpu_starvation = gpu_wall.
+        gpu_wall = stats.get("gpu_wall_s", 0.0) or 1.0
+        duty = stats.get("gpu_duty_pct", 100.0 * stats.get("score_s", 0) / gpu_wall)
+        print(f"  GPU duty cycle:   {duty:5.1f}%   <- headline (score / gpu_wall)")
+        print(f"    score (work):   {stats.get('score_s', 0):7.1f}s")
+        print(f"    gpu_starvation: {stats.get('gpu_starvation_s', 0):7.1f}s   <- GPU idle/unfed")
+        xw = stats.get("xfer_wall_s", 0.0) or 1.0
+        print(f"  transfer (wall {xw:.1f}s):  bgt {stats.get('xfer_bgt_s', 0):.1f}s  "
+              f"h2d {stats.get('xfer_h2d_s', 0):.1f}s  push {stats.get('xfer_push_s', 0):.1f}s  "
+              f"get_wait {stats.get('xfer_get_s', 0):.1f}s")
+        print(f"  main thread (overlaps GPU, not lost time):  "
+              f"prep_wait {stats.get('prep_wait_s', 0):.1f}s  "
+              f"xfer_backp {stats.get('xfer_backpressure_s', 0):.1f}s")
+        if "batch_ms_p95" in stats:
+            print(f"  per-batch ms:     mean={stats['batch_ms_mean']:.1f} "
+                  f"p95={stats['batch_ms_p95']:.1f} max={stats['batch_ms_max']:.1f} "
+                  f"n={int(stats.get('n_batches', 0))}")
+    print("=" * W)
+
+    if args.out_json:
+        with open(args.out_json, "a") as fh:
+            fh.write(json.dumps(run) + "\n")
+        print(f"\nAppended run to {args.out_json}")
+    else:
+        print("\n(no --out-json given; run not persisted for comparison)")
+
+
+def run_compare(path: Path) -> None:
+    """Print a side-by-side delta table from a JSONL of real-data runs."""
+    runs = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    if not runs:
+        sys.exit(f"No runs in {path}")
+    rows = [
+        ("label",          lambda r: str(r.get("label") or "-")),
+        ("chunks",         lambda r: str(r.get("n_chunks", 1))),
+        ("workers",        lambda r: str(r.get("n_prep_workers", "-"))),
+        ("batch",          lambda r: str(r.get("batch_size", "-"))),
+        ("px/s",           lambda r: f"{r.get('px_per_s', 0):,.0f}"),
+        ("wall s",         lambda r: f"{r.get('wall_s', 0):.1f}"),
+        ("gpu_duty %",     lambda r: f"{r.get('gpu_duty_pct', 0):.1f}"),
+        ("score s",        lambda r: f"{r.get('score_s', 0):.1f}"),
+        ("gpu_starv s",    lambda r: f"{r.get('gpu_starvation_s', 0):.1f}"),
+        ("xfer h2d s",     lambda r: f"{r.get('xfer_h2d_s', 0):.1f}"),
+        ("xfer get s",     lambda r: f"{r.get('xfer_get_s', 0):.1f}"),
+        ("batch p95 ms",   lambda r: f"{r.get('batch_ms_p95', 0):.1f}"),
+    ]
+    label_w = max(12, max(len(str(r.get("label") or "-")) for r in runs) + 1)
+    head = f"  {'metric':<14}" + "".join(f"{f'run{i}':>{label_w}}" for i in range(len(runs)))
+    print("\n" + "=" * len(head))
+    print(head)
+    print("-" * len(head))
+    for name, fn in rows:
+        line = f"  {name:<14}" + "".join(f"{fn(r):>{label_w}}" for r in runs)
+        print(line)
+    print("=" * len(head))
+    # px/s delta vs first run
+    base = runs[0].get("px_per_s", 0) or 1
+    print("\n  px/s vs run0:")
+    for i, r in enumerate(runs):
+        d = r.get("px_per_s", 0)
+        print(f"    run{i} [{r.get('label') or '-'}]: {d:,.0f} px/s  ({100*(d-base)/base:+.1f}%)")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -790,16 +1107,50 @@ if __name__ == "__main__":
                         help="Gate threshold for --bench-gate (default: 0.5)")
     parser.add_argument("--t-gate",          type=int,   default=8,
                         help="Gate sequence length for --bench-gate (default: 8)")
+    # --- Real-data mode: benchmark one chunkstore chunk on the production path ---
+    parser.add_argument("--real",            action="store_true", default=False,
+                        help="Benchmark ONE real chunkstore chunk via score_tile_year")
+    parser.add_argument("--checkpoint",      default=None,
+                        help="[real] Checkpoint dir, e.g. outputs/models/tam-v10")
+    parser.add_argument("--location",        default=None,
+                        help="[real] Location id (e.g. mitchell) to resolve chunks")
+    parser.add_argument("--pixel-dir",       default=None,
+                        help="[real] Chunkstore base dir (e.g. /mnt/gis-archive/chunkstore)")
+    parser.add_argument("--tile-id",         nargs="+", default=None, metavar="TILE_ID",
+                        help="[real] MGRS tile(s); first matching chunk is benched")
+    parser.add_argument("--chunk-file",      default=None,
+                        help="[real] Explicit chunk parquet path (overrides --location/--tile-id)")
+    parser.add_argument("--n-chunks",        type=int, default=1,
+                        help="[real] Score the first N chunks of the tile as one stream "
+                             "(default 1; raise to probe cross-chunk gpu_starvation)")
+    parser.add_argument("--years",           type=int, nargs="+", default=None, metavar="YEAR",
+                        help="[real] Year(s); the max matching year is scored")
+    parser.add_argument("--scl-purity",      type=float, default=0.5,
+                        help="[real] scl_purity_min passed to score_tile_year")
+    parser.add_argument("--label",           default=None,
+                        help="[real] Tag this run in the JSON output for comparison")
+    parser.add_argument("--out-json",        default=None,
+                        help="[real] Append run record (JSONL) for --compare")
+    parser.add_argument("--compare",         default=None, metavar="JSONL",
+                        help="Print side-by-side delta table from a runs JSONL and exit")
     args = parser.parse_args()
+
+    if args.compare:
+        run_compare(Path(args.compare))
+        sys.exit(0)
 
     def _timeout_handler(signum, frame):  # noqa: ARG001
         print(f"\nTIMEOUT: exceeded {args.timeout}s")
         sys.exit(2)
 
     signal.signal(signal.SIGALRM, _timeout_handler)
-    signal.alarm(args.timeout)
+    # Real-data runs include checkpoint load + IO from chunkstore; give them room.
+    signal.alarm(max(args.timeout, 1800) if args.real else args.timeout)
 
     with tempfile.TemporaryDirectory(prefix="bench_score_") as _tmp:
-        run_bench(args, Path(_tmp))
+        if args.real:
+            run_real(args, Path(_tmp))
+        else:
+            run_bench(args, Path(_tmp))
 
     signal.alarm(0)
