@@ -259,6 +259,11 @@ def _fetch_tile_chunks(
         apply_nbar=apply_nbar,
         max_concurrent=max_concurrent,
         work_dir=work_dir,
+        # Store COMPLETE chunks: multi_geom selects which chunks to fetch (those
+        # intersecting training regions), but each must be stored full so the
+        # shared chunkstore never holds a partial chunk that is incomplete when
+        # read at score time or thins a region straddling a chunk edge.
+        full_chunks=True,
     )
 
 

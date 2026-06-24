@@ -819,13 +819,17 @@ def _cmd_score(args: argparse.Namespace) -> None:
             len(tile_year_map), parquet_out_dir,
         )
 
-        # coords_by_tile: map tile_id → first-year parquet path for lon/lat lookup
-        coords_by_tile: dict[str, Path] = {}
-        for y, paths in sorted(tile_paths_by_year.items()):
-            for p in paths:
-                tid = _tile_id_from_stem(p.stem)
-                if tid not in coords_by_tile:
-                    coords_by_tile[tid] = p
+        # coords_by_tile: map tile_id → ALL first-year parquet paths for lon/lat lookup.
+        # A chunked tile is split across many chunk files (r##_c##), each covering a
+        # different ground region with its OWN xi/yi origin — so coords MUST be
+        # gathered from every chunk, not just the first. Using one chunk's coords
+        # (and reconstructing position from xi/yi) misplaces all other chunks'
+        # pixels by km, leaving their real area blank in the PMTiles output.
+        first_year = min(tile_paths_by_year)
+        coords_by_tile: dict[str, list[Path]] = {}
+        for p in tile_paths_by_year[first_year]:
+            tid = _tile_id_from_stem(p.stem)
+            coords_by_tile.setdefault(tid, []).append(p)
 
         pmtiles_out = Path(args.pmtiles) if getattr(args, "pmtiles", None) else None
 

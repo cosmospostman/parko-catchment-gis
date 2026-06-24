@@ -72,6 +72,7 @@ def fetch_tile_local(
     calibration_out: Path | None = None,
     point_id_prefix: str = "px",
     work_dir: Path | None = None,
+    full_chunks: bool = False,
 ) -> list[Path] | None:
     """Fetch one tile × one-or-more years locally using the same pipeline as the proxy VM.
 
@@ -220,6 +221,7 @@ def fetch_tile_local(
                 log_dir=out_dir,
                 progress=tile_progress,
                 grid_cache=grid_cache,
+                full_chunks=full_chunks,
             ):
                 if _copy_errors:
                     raise _copy_errors[0]

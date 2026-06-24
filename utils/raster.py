@@ -14,98 +14,6 @@ import pyarrow.parquet as pq
 logger = logging.getLogger(__name__)
 
 
-def scores_to_grid(
-    scores_df: pl.DataFrame,
-    lon_lat_df: pl.DataFrame,
-) -> tuple[np.ndarray, object, object]:
-    """Rasterise (point_id, prob_tam) scores to a UTM uint8 grid.
-
-    Parameters
-    ----------
-    scores_df:
-        Polars DataFrame with columns ``point_id`` (str) and
-        ``prob_tam`` (uint8, values 0–100).
-    lon_lat_df:
-        Polars DataFrame with columns ``point_id``, ``lon``, ``lat``.
-
-    Returns
-    -------
-    (grid, transform, crs)
-        grid      — numpy uint8[height, width], 0 = no data.
-        transform — rasterio Affine with 10 m UTM pixel size.
-        crs       — rasterio CRS for the tile's UTM zone.
-    """
-    from rasterio.transform import Affine
-    from rasterio.crs import CRS
-    from pyproj import Transformer
-
-    # Join scores with coordinates on point_id
-    joined = scores_df.join(
-        lon_lat_df.select(["point_id", "lon", "lat"]),
-        on="point_id",
-        how="inner",
-    )
-
-    if joined.is_empty():
-        raise ValueError("No matching point_ids between scores_df and lon_lat_df")
-
-    # Parse xi, yi from point_id: "px_{xi:04d}_{yi:04d}"
-    pid_col = joined["point_id"].to_list()
-    xi_list = []
-    yi_list = []
-    for pid in pid_col:
-        # pid looks like "px_0123_0456"
-        parts = pid.split("_")
-        xi_list.append(int(parts[1]))
-        yi_list.append(int(parts[2]))
-
-    xi_arr = np.array(xi_list, dtype=np.int32)
-    yi_arr = np.array(yi_list, dtype=np.int32)
-    prob_arr = joined["prob_tam"].to_numpy().astype(np.uint8)
-    lon_arr = joined["lon"].to_numpy()
-    lat_arr = joined["lat"].to_numpy()
-
-    # Grid dimensions
-    width = int(xi_arr.max()) + 1
-    height = int(yi_arr.max()) + 1
-
-    # Determine UTM zone from mean lon/lat
-    lon_mean = float(lon_arr.mean())
-    lat_mean = float(lat_arr.mean())
-    zone = int((lon_mean + 180) / 6) + 1
-    south = lat_mean < 0
-    utm_epsg = (32700 + zone) if south else (32600 + zone)
-    crs = CRS.from_epsg(utm_epsg)
-
-    # Project all lon/lat to UTM
-    transformer = Transformer.from_crs("EPSG:4326", utm_epsg, always_xy=True)
-    easting_arr, northing_arr = transformer.transform(lon_arr, lat_arr)
-
-    # Compute SW-corner origin: pixel (xi=0, yi=0) is southernmost
-    # Each pixel's easting = origin_e + xi * 10
-    # Each pixel's northing = origin_n + yi * 10
-    # Solve: origin_e = easting - xi*10, origin_n = northing - yi*10
-    origin_e_arr = easting_arr - xi_arr * 10.0
-    origin_n_arr = northing_arr - yi_arr * 10.0
-
-    # Snap origin to nearest 10m grid (floor)
-    origin_e = float(np.floor(origin_e_arr.mean() / 10.0) * 10.0)
-    origin_n = float(np.floor(origin_n_arr.mean() / 10.0) * 10.0)
-
-    # Build grid: rasterio convention — row 0 = top (maximum northing)
-    # yi=0 is southernmost, so row index = height - 1 - yi
-    grid = np.zeros((height, width), dtype=np.uint8)
-    for i in range(len(xi_arr)):
-        row = height - 1 - int(yi_arr[i])
-        col = int(xi_arr[i])
-        grid[row, col] = prob_arr[i]
-
-    # Affine transform: top-left corner is (origin_e, origin_n + height*10)
-    transform = Affine.translation(origin_e, origin_n + height * 10) * Affine.scale(10, -10)
-
-    return grid, transform, crs
-
-
 def warp_to_mercator(
     grid: np.ndarray,
     src_transform: object,
@@ -360,50 +268,119 @@ def _scores_to_grid_from_xi_yi(
     from rasterio.crs import CRS
     from pyproj import Transformer
 
-    pid_col = scores_df["point_id"].to_list()
-    xi_arr = np.array([int(p.split("_")[1]) for p in pid_col], dtype=np.int32)
-    yi_arr = np.array([int(p.split("_")[2]) for p in pid_col], dtype=np.int32)
-    prob_arr = scores_df["prob_tam"].to_numpy().astype(np.uint8)
-
-    width = int(xi_arr.max()) + 1
-    height = int(yi_arr.max()) + 1
-
     utm_epsg = _mgrs_utm_epsg(tile_id)
     crs = CRS.from_epsg(utm_epsg)
 
     if lon_lat_df is not None:
+        # Place each pixel by its REAL lon/lat, not by reconstructing position
+        # from point_id xi/yi. A chunked tile's xi/yi are origin-relative *per
+        # chunk* (different chunks reuse low xi/yi for different ground), so
+        # xi/yi-on-one-grid placement misplaces every chunk but the origin one
+        # by kilometres. Projecting actual coords to UTM and binning to a 10 m
+        # grid is correct regardless of how point_ids were assigned.
+        n_scored = len(scores_df)
         joined = scores_df.join(
             lon_lat_df.select(["point_id", "lon", "lat"]),
             on="point_id",
             how="inner",
         )
+        n_matched = len(joined)
+        if n_matched == 0:
+            raise ValueError(
+                f"Tile {tile_id}: no scored point_ids matched the coords parquet(s) — "
+                "coords source does not cover this tile's pixels."
+            )
+        # Guard: silently dropping scored pixels here is exactly the bug that hid
+        # whole regions (one chunk's coords used for the whole tile). Fail loud.
+        drop_frac = 1.0 - n_matched / n_scored
+        if drop_frac > 0.001:
+            msg = (f"Tile {tile_id}: {n_scored - n_matched:,}/{n_scored:,} "
+                   f"scored pixels ({100*drop_frac:.1f}%) have no coords and would "
+                   "be dropped from the raster — coords source is incomplete "
+                   "(pass ALL chunk parquets for this tile).")
+            if drop_frac > 0.05:
+                raise ValueError(msg)
+            logger.warning(msg)
+
         lon_arr = joined["lon"].to_numpy()
         lat_arr = joined["lat"].to_numpy()
+        prob_arr = joined["prob_tam"].to_numpy().astype(np.uint8)
         transformer = Transformer.from_crs("EPSG:4326", utm_epsg, always_xy=True)
         easting_arr, northing_arr = transformer.transform(lon_arr, lat_arr)
-        xi_j = np.array([int(p.split("_")[1]) for p in joined["point_id"].to_list()], dtype=np.int32)
-        yi_j = np.array([int(p.split("_")[2]) for p in joined["point_id"].to_list()], dtype=np.int32)
-        origin_e = float(np.floor((easting_arr  - xi_j * 10.0).mean() / 10.0) * 10.0)
-        origin_n = float(np.floor((northing_arr - yi_j * 10.0).mean() / 10.0) * 10.0)
+
+        # 10 m grid spanning the matched pixels' UTM extent.
+        origin_e = float(np.floor(easting_arr.min()  / 10.0) * 10.0)
+        origin_n = float(np.floor(northing_arr.min() / 10.0) * 10.0)
+        col_arr = np.rint((easting_arr  - origin_e) / 10.0).astype(np.int64)
+        row_from_bottom = np.rint((northing_arr - origin_n) / 10.0).astype(np.int64)
+        width  = int(col_arr.max()) + 1
+        height = int(row_from_bottom.max()) + 1
+
+        grid = np.zeros((height, width), dtype=np.uint8)
+        rows = height - 1 - row_from_bottom   # row 0 = northernmost
+        # Last write wins on the rare event of two coords sharing a 10m cell;
+        # take the max so a real detection isn't overwritten by a zero.
+        np.maximum.at(grid, (rows, col_arr), prob_arr)
     else:
+        pid_col = scores_df["point_id"].to_list()
+        xi_arr = np.array([int(p.split("_")[1]) for p in pid_col], dtype=np.int32)
+        yi_arr = np.array([int(p.split("_")[2]) for p in pid_col], dtype=np.int32)
+        prob_arr = scores_df["prob_tam"].to_numpy().astype(np.uint8)
+        width = int(xi_arr.max()) + 1
+        height = int(yi_arr.max()) + 1
         origin_e, origin_n, utm_epsg = _grid_origin_from_tile(tile_id, loc_geom)
         crs = CRS.from_epsg(utm_epsg)
-
-    grid = np.zeros((height, width), dtype=np.uint8)
-    for i in range(len(xi_arr)):
-        row = height - 1 - int(yi_arr[i])
-        col = int(xi_arr[i])
-        grid[row, col] = prob_arr[i]
+        grid = np.zeros((height, width), dtype=np.uint8)
+        rows = height - 1 - yi_arr
+        np.maximum.at(grid, (rows, xi_arr.astype(np.int64)), prob_arr)
 
     transform = Affine.translation(origin_e, origin_n + height * 10) * Affine.scale(10, -10)
     return grid, transform, crs
 
 
+def _load_coords(
+    coords_paths: list[Path],
+    want_pids: "pl.Series | None" = None,
+) -> pl.DataFrame:
+    """Load deduped (point_id, lon, lat) from one or more pixel parquets.
+
+    Pixel parquets hold one row per (point_id, date) observation, so a tile's
+    point_ids are repeated ~50× per chunk. We dedup per-chunk (lazily, via
+    scan_parquet group_by-first) before concat, collapsing that ~50× before any
+    cross-chunk work. When want_pids (the scored pixels) is given we restrict to
+    them via a lazy semi-join — a Polars hash join, NOT an is_in() against a
+    multi-million-element Python set (which is pathologically slow at tile scale).
+    """
+    want_lf = (
+        pl.LazyFrame({"point_id": want_pids}).unique("point_id")
+        if want_pids is not None else None
+    )
+    frames: list[pl.DataFrame] = []
+    for p in coords_paths:
+        # group_by-first is cheaper than unique(): lon/lat are constant per
+        # point_id, so we just need one row each.
+        lf = (pl.scan_parquet(p)
+              .select(["point_id", "lon", "lat"])
+              .group_by("point_id").first())
+        if want_lf is not None:
+            lf = lf.join(want_lf, on="point_id", how="semi")
+        frames.append(lf.collect())
+    out = pl.concat(frames) if len(frames) > 1 else frames[0]
+    # A point_id can appear in >1 chunk only at chunk seams; collapse those too.
+    return out.unique("point_id") if len(frames) > 1 else out
+
+
+def _coords_cache_path(scores_path: Path) -> Path:
+    """Sidecar path holding deduped (point_id, lon, lat) for a scored tile."""
+    return scores_path.with_suffix(".coords.parquet")
+
+
 def rasterize_tile_to_pmtiles(
     scores_path: Path,
-    coords_path: Path,
+    coords_paths: Path | list[Path],
     tile_id: str,
     out_pmtiles: Path,
+    coords_cache: Path | None = None,
 ) -> None:
     """Rasterise a tile's scores parquet to a PMTiles archive.
 
@@ -411,21 +388,44 @@ def rasterize_tile_to_pmtiles(
     ----------
     scores_path:
         Path to ``.scores.parquet`` with columns ``point_id`` and ``prob_tam``.
-    coords_path:
-        Path to a pixel parquet containing ``point_id``, ``lon``, ``lat``.
+    coords_paths:
+        Pixel parquet(s) containing ``point_id``, ``lon``, ``lat``. For a chunked
+        tile this MUST be every chunk file: each chunk uses its own xi/yi origin,
+        so pixels are placed by their real lon/lat and the coords for every
+        scored pixel must be available. A single Path is accepted for the
+        unchunked (flat) case.
     tile_id:
         Tile identifier string (e.g. ``"54LWH"``).
     out_pmtiles:
         Output path for the ``.pmtiles`` file.
+    coords_cache:
+        Optional sidecar parquet of deduped (point_id, lon, lat). Extracting
+        coords means scanning every chunk's ~100M-row per-observation table
+        (minutes for a big tile); the cache holds the ~1M-row result so repeat
+        rasterisation reads MBs not GBs. Read if present; otherwise built from
+        coords_paths and written here. Defaults to <scores>.coords.parquet.
     """
     from pmtiles.writer import Writer
     from pmtiles.tile import zxy_to_tileid, TileType, Compression
 
+    if isinstance(coords_paths, (str, Path)):
+        coords_paths = [Path(coords_paths)]
+
     scores_df = pl.read_parquet(scores_path, columns=["point_id", "prob_tam"])
-    lon_lat_df = (
-        pl.read_parquet(coords_path, columns=["point_id", "lon", "lat"])
-        .unique("point_id")
-    )
+
+    if coords_cache is None:
+        coords_cache = _coords_cache_path(scores_path)
+    if coords_cache.exists():
+        logger.info("Loading coords cache %s", coords_cache.name)
+        lon_lat_df = pl.read_parquet(coords_cache, columns=["point_id", "lon", "lat"])
+    else:
+        lon_lat_df = _load_coords(coords_paths, want_pids=scores_df["point_id"])
+        # Atomic write so a crash mid-write can't leave a truncated cache.
+        _tmp = coords_cache.with_suffix(".tmp.parquet")
+        coords_cache.parent.mkdir(parents=True, exist_ok=True)
+        lon_lat_df.write_parquet(_tmp)
+        _tmp.rename(coords_cache)
+        logger.info("Wrote coords cache %s (%d pixels)", coords_cache.name, len(lon_lat_df))
 
     grid, transform, crs = _scores_to_grid_from_xi_yi(scores_df, lon_lat_df, tile_id)
     merc_grid, merc_transform = warp_to_mercator(grid, transform, crs)
