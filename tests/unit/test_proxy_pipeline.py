@@ -839,6 +839,59 @@ def test_cs12_point_id_bbox_independent():
     )
 
 
+# CS-13: full_chunks=True stores COMPLETE chunks. A chunk selected by a tiny
+# sub-bbox must contain the SAME pixel set as that chunk fetched full-tile —
+# otherwise the training collector leaves partial chunks in the chunkstore that
+# are incomplete at score time (the under-covered training regions we found).
+def test_cs13_full_chunks_stores_complete_block():
+    from proxy._pipeline import compute_chunks, make_chunk_points
+    from shapely.geometry import box
+
+    # Use a sub-bbox that lands inside ONE chunk but covers only part of it.
+    full_bbox = _CS_BBOX
+    lon0, lat0, lon1, lat1 = full_bbox
+    sub_bbox = [lon0, lat0,
+                lon0 + (lon1 - lon0) * 0.3, lat0 + (lat1 - lat0) * 0.3]
+
+    cog_y_top  = _reference_y_top(full_bbox, _CS_CRS, extra_m=500.0)
+    cog_x_left = _reference_x_left(full_bbox, _CS_CRS)
+    chunk_px = 64  # small chunks so the tiny bbox clearly under-fills one
+
+    def pixels(bbox, full):
+        chunks, meta = compute_chunks(
+            bbox, chunk_px, chunk_px, box(*bbox),
+            cog_utm_crs=_CS_CRS, cog_y_top=cog_y_top, cog_x_left=cog_x_left,
+            full_chunks=full,
+        )
+        # keyed by (chunk_row, chunk_col) → set of point_ids
+        out: dict[tuple[int, int], set[str]] = {}
+        for c in chunks:
+            out.setdefault((c["chunk_row"], c["chunk_col"]), set()).update(
+                pid for pid, _, _ in make_chunk_points(c, meta))
+        return out
+
+    sub_partial = pixels(sub_bbox, full=False)   # old behaviour: bbox-clipped
+    sub_full    = pixels(sub_bbox, full=True)    # new: complete chunks
+    full_tile   = pixels(full_bbox, full=False)  # full-bbox (also edge-clipped)
+
+    assert sub_full, "sub-bbox should select at least one chunk"
+    for key, pids_full in sub_full.items():
+        # full_chunks yields the COMPLETE block: chunk_px² pixels (the block is
+        # COG-snapped and lies within the tile for these interior chunks).
+        assert len(pids_full) == chunk_px * chunk_px, (
+            f"chunk {key}: full_chunks gave {len(pids_full)} px, "
+            f"expected complete block {chunk_px*chunk_px}")
+        # It must be a SUPERSET of the bbox-clipped version (recovers dropped px)
+        # and of whatever the full-tile (edge-clipped) fetch saw for that chunk.
+        assert sub_partial.get(key, set()) <= pids_full, (
+            f"chunk {key}: clipped pixels not contained in full chunk")
+        assert full_tile.get(key, set()) <= pids_full, (
+            f"chunk {key}: full-tile pixels not contained in full chunk")
+    # Demonstrate the fix recovers pixels that bbox-clipping dropped.
+    assert any(len(sub_full[k]) > len(sub_partial.get(k, set())) for k in sub_full), (
+        "expected full_chunks to recover pixels that bbox-clipping dropped")
+
+
 # CS-11: Mitchell River catchment × tile 54LWJ — exact chunk set
 def test_cs11_mitchell_54lwj_chunk_set():
     """Only chunks that intersect the catchment-∩-tile polygon are fetched.

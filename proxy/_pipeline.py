@@ -354,8 +354,15 @@ def compute_chunks(
     cog_utm_crs: str | None = None,
     cog_y_top: float | None = None,
     cog_x_left: float | None = None,
+    full_chunks: bool = False,
 ) -> tuple[list[dict], dict]:
     """Divide bbox into 2D chunks of chunk_height_px × chunk_width_px pixels.
+
+    full_chunks: when True, make_chunk_points emits each selected chunk's COMPLETE
+    block footprint instead of clipping pixels to the request bbox. Chunk
+    SELECTION still uses polygon_geometry (only chunks intersecting it are
+    returned), but each is stored full — required by the training collector so a
+    region-subset fetch doesn't leave partial chunks in the shared chunkstore.
 
     Generates chunk metadata without materialising point coordinates — points
     are generated on demand via make_chunk_points() so only one chunk's worth
@@ -481,6 +488,7 @@ def compute_chunks(
         # legacy single-bbox behaviour is unchanged.
         "xi_anchor_x": cog_x_left_eff,   # easting of COG col 0 (xi increases east)
         "yi_anchor_y": cog_y_top_eff,    # northing of COG row 0 (yi increases south)
+        "full_chunks": full_chunks,
         "point_id_prefix": "px",
     }
     return chunks, chunks_meta
@@ -515,11 +523,27 @@ def make_chunk_points(chunk: dict, meta: dict) -> list[tuple[str, float, float]]
 
     y_lower       = chunk["y_lower"]
     x_left_chunk  = chunk["x_left_chunk"]
+    # full_chunks: emit the chunk's COMPLETE block footprint rather than clipping
+    # pixels to the request bbox. Required for the training collector, which
+    # fetches only chunks intersecting training regions but must store each as a
+    # full chunk — a bbox-clipped (partial) chunk in the shared chunkstore is
+    # incomplete when later read at score time, and thins training regions whose
+    # bbox straddles a chunk edge.
+    full_chunks   = meta.get("full_chunks", False)
 
     ys = np.arange(y_lower, y_lower + block_h_m, r)
-    ys = ys[(ys >= y0_snap) & (ys < y1)]
     xs = np.arange(x_left_chunk, x_left_chunk + block_w_m, r)
-    xs = xs[(xs >= x0_snap) & (xs < x1)]
+    if full_chunks:
+        # Emit the chunk's full block footprint (one COG block). compute_chunks
+        # only emitted blocks intersecting the tile, and the block boundaries are
+        # COG-snapped, so the whole block is valid tile data — no request-bbox
+        # clip. Upper bound is the block edge (implicit in the arange); the lower
+        # COG-aligned edges (first_*) are the grid origin so xi/yi stay ≥ 0.
+        ys = ys[ys >= first_y_lower]
+        xs = xs[xs >= first_x_left]
+    else:
+        ys = ys[(ys >= y0_snap) & (ys < y1)]
+        xs = xs[(xs >= x0_snap) & (xs < x1)]
 
     if len(ys) == 0 or len(xs) == 0:
         return []
@@ -587,6 +611,7 @@ def run_tile_pipeline_v2(
     log_dir: Path | None = None,
     progress=None,   # TileProgress | None
     grid_cache: Path | None = None,  # path to write/read _grid.json
+    full_chunks: bool = False,  # store complete chunks (training collector)
 ) -> Iterator[tuple[int, int, int, Path]]:
     """Two-pool network→disk / disk→extract pipeline for memory-constrained machines.
 
@@ -750,6 +775,7 @@ def run_tile_pipeline_v2(
     chunks, chunks_meta = compute_chunks(
         bbox_wgs84, cog_block_height, cog_block_width, polygon_geometry,
         cog_utm_crs=cog_utm_crs, cog_y_top=cog_y_top, cog_x_left=cog_x_left,
+        full_chunks=full_chunks,
     )
     chunks_meta["point_id_prefix"] = point_id_prefix
     logger.info("[v2 tile %s] %d chunks (%dx%d px each) × %d years",
